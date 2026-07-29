@@ -1,0 +1,11 @@
+ref/
+bin/
+*.log
+rootfs.img
+*.tar.gz
+agentpvm
+umlctl
+*.img
+webui/node-modules/
+webui/.nuxt/
+webui/.output/

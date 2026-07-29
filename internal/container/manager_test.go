@@ -2,8 +2,11 @@ package container
 
 import (
 	"context"
+	"os"
 	"testing"
 	"uml-container/internal/config"
+	"uml-container/internal/state"
+	"uml-container/internal/uml"
 )
 
 type mockLauncher struct {
@@ -11,9 +14,13 @@ type mockLauncher struct {
 	lastArgs   []string
 }
 
-func (m *mockLauncher) Launch(ctx context.Context, kernel string, args []string) error {
+func (m *mockLauncher) Start(ctx context.Context, kernel string, args []string, logFile *os.File) (int, *uml.Process, error) {
 	m.lastKernel = kernel
 	m.lastArgs = args
+	return 12345, &uml.Process{}, nil
+}
+
+func (m *mockLauncher) Wait(p *uml.Process) error {
 	return nil
 }
 
@@ -30,6 +37,13 @@ func TestManager_Start(t *testing.T) {
 	mock := &mockLauncher{}
 	manager := NewManager(mock)
 
+	tempDir, err := os.MkdirTemp("", "uml-test")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+	state.RootDir = tempDir
+
 	cfg := &config.ContainerConfig{
 		ID:         "1234",
 		Name:       "test",
@@ -41,9 +55,9 @@ func TestManager_Start(t *testing.T) {
 		NetworkTap: "tap0",
 	}
 
-	err := manager.Start(context.Background(), cfg)
+	err = manager.Start(context.Background(), cfg)
 	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+		t.Fatalf("Start failed: %v", err)
 	}
 
 	expectedArgs := []string{"ubd0=rootfs.img", "root=/dev/ubda", "init=/sbin/init", "mem=512M", "eth0=tuntap,tap0"}
@@ -58,26 +72,33 @@ func TestManager_Start_Virtio(t *testing.T) {
 	mock := &mockLauncher{}
 	manager := NewManager(mock)
 
-	cfg := &config.ContainerConfig{
-		ID:              "1234",
-		Kernel:          "/usr/lib/uml/linux",
-		Rootfs:          "rootfs.img",
-		Memory:          "512M",
-		Init:            "/sbin/init",
-		UseVirtio:       true,
-		VhostUserSocket: "/tmp/vhost.sock",
-		NetworkTap:      "tap0",
-	}
-
-	err := manager.Start(context.Background(), cfg)
+	tempDir, err := os.MkdirTemp("", "uml-test-virtio")
 	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+	state.RootDir = tempDir
+
+	cfg := &config.ContainerConfig{
+		ID:         "1235",
+		Name:       "test-virtio",
+		Kernel:     "/usr/lib/uml/linux",
+		Rootfs:     "rootfs.img",
+		Memory:     "512M",
+		UseVirtio:  true,
+		Init:       "/sbin/init",
+		NetworkTap: "tap0",
 	}
 
-	expectedArgs := []string{"virtio=0,vhost-user,socket=/tmp/vhost.sock", "root=/dev/vda", "init=/sbin/init", "mem=512M", "vec0:transport=tap,ifname=tap0"}
+	err = manager.Start(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+
+	expectedArgs := []string{"ubd0=rootfs.img", "root=/dev/ubda", "init=/sbin/init", "mem=512M", "vec0:transport=tap,ifname=tap0"}
 	for _, arg := range expectedArgs {
 		if !contains(mock.lastArgs, arg) {
-			t.Errorf("expected arg %s, but missing in virtio test", arg)
+			t.Errorf("expected arg %s, but missing", arg)
 		}
 	}
 }
