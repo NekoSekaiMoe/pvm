@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"uml-container/internal/filesystem"
+	"uml-container/internal/state"
 
 	"github.com/google/go-containerregistry/pkg/crane"
 )
@@ -34,7 +35,9 @@ func Pull(imageRef string) error {
 	mnt := filepath.Join(imgDir, "mnt")
 	os.MkdirAll(mnt, 0755)
 
-	exec.Command("sudo", "mount", "-o", "loop", imgPath, mnt).Run()
+	if err := exec.Command("sudo", "mount", "-o", "loop", imgPath, mnt).Run(); err != nil {
+		return fmt.Errorf("failed to mount image: %v", err)
+	}
 	defer exec.Command("sudo", "umount", mnt).Run()
 
 	fmt.Printf("Exporting docker image %s...\n", imageRef)
@@ -50,12 +53,12 @@ func Pull(imageRef string) error {
 	if err != nil {
 		return fmt.Errorf("failed to create tar file: %v", err)
 	}
+	defer os.Remove(tarFile)
 	if err := crane.Export(img, f); err != nil {
 		f.Close()
 		return fmt.Errorf("crane export failed: %v", err)
 	}
 	f.Close()
-	defer os.Remove(tarFile)
 
 	cmd := exec.Command("sudo", "tar", "-xf", tarFile, "-C", mnt)
 	if err := cmd.Run(); err != nil {
@@ -66,6 +69,6 @@ func Pull(imageRef string) error {
 }
 
 func CreateLayer(containerID string) error {
-	dir := filepath.Join("/var/lib/uml-container/containers", containerID)
+	dir := state.ContainerDir(containerID)
 	return filesystem.SetupOverlayfs(dir)
 }

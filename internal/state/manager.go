@@ -8,6 +8,12 @@ import (
 	"time"
 )
 
+var RootDir = "/var/lib/uml-container/containers"
+
+func ContainerDir(id string) string {
+	return filepath.Join(RootDir, id)
+}
+
 type ContainerState struct {
 	ID        string    `json:"id"`
 	Status    string    `json:"status"`
@@ -16,7 +22,7 @@ type ContainerState struct {
 }
 
 func SaveState(containerID string, state *ContainerState) error {
-	dir := filepath.Join("/var/lib/uml-container/containers", containerID)
+	dir := ContainerDir(containerID)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return err
 	}
@@ -30,7 +36,7 @@ func SaveState(containerID string, state *ContainerState) error {
 }
 
 func LoadState(containerID string) (*ContainerState, error) {
-	data, err := os.ReadFile(filepath.Join("/var/lib/uml-container/containers", containerID, "state.json"))
+	data, err := os.ReadFile(filepath.Join(ContainerDir(containerID), "state.json"))
 	if err != nil {
 		return nil, err
 	}
