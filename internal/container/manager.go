@@ -53,7 +53,7 @@ func (m *Manager) Start(ctx context.Context, cfg *config.ContainerConfig) error 
 
 	if cfg.NetworkTap != "" {
 		if cfg.UseVirtio {
-			args = append(args, fmt.Sprintf("vec0:transport=tap,ifname=%s", cfg.NetworkTap))
+			args = append(args, fmt.Sprintf("vec0:transport=tap,ifname=%s,vnet=1", cfg.NetworkTap))
 		} else {
 			args = append(args, fmt.Sprintf("eth0=tuntap,%s", cfg.NetworkTap))
 		}
