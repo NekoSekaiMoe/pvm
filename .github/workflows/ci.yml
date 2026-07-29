@@ -1,0 +1,54 @@
+name: CI Pipeline
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+
+    - name: Build WebUI (Nuxt)
+      working-directory: ./webui
+      run: |
+        npm install
+        npm run generate
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.22'
+
+    - name: Install eBPF (C) Dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y clang llvm libbpf-dev linux-libc-dev gcc-multilib
+
+    - name: Generate eBPF Bytecode
+      run: go generate ./...
+
+    - name: Build Main Binary
+      run: go build ./cmd/umlctl
+
+    - name: Run unit tests
+      run: go test -v ./...
+      
+    - name: Build UML Kernel
+      run: |
+        chmod +x scripts/build_kernel.sh
+        sudo apt-get install -y build-essential libelf-dev pkg-config bc
+        ./scripts/build_kernel.sh
+        
+    - name: Run Integration Script
+      run: |
+        chmod +x scripts/test_integration.sh
+        ./scripts/test_integration.sh
