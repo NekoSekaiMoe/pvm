@@ -23,6 +23,17 @@ func SetupBridge(bridgeName string, tapName string, gatewayIP string) error {
 	return nil
 }
 
+// SetupQoS sets bandwidth limits on a tap interface to prevent abuse
+func SetupQoS(tapName string, rate string) error {
+	// e.g. rate="10mbit"
+	// tc qdisc add dev tap0 root tbf rate 10mbit burst 32kbit latency 400ms
+	cmd := exec.Command("tc", "qdisc", "add", "dev", tapName, "root", "tbf", "rate", rate, "burst", "32kbit", "latency", "400ms")
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("failed to setup QoS: %v", err)
+	}
+	return nil
+}
+
 // DeleteBridge removes a bridge
 func DeleteBridge(bridgeName string) error {
 	exec.Command("ip", "link", "set", bridgeName, "down").Run()

@@ -35,6 +35,15 @@ int egress_filter(struct __sk_buff *skb) {
         return TC_ACT_OK;
     }
 
+    // SSRF Protection: Block internal IP addresses regardless of whitelist
+    __u32 dest_ip_host = __builtin_bswap32(ip->daddr);
+    // 10.0.0.0/8
+    if ((dest_ip_host & 0xFF000000) == 0x0A000000) return TC_ACT_SHOT;
+    // 172.16.0.0/12
+    if ((dest_ip_host & 0xFFF00000) == 0xAC100000) return TC_ACT_SHOT;
+    // 192.168.0.0/16
+    if ((dest_ip_host & 0xFFFF0000) == 0xC0A80000) return TC_ACT_SHOT;
+
     __u32 dest_ip = ip->daddr;
     __u32 *allowed = bpf_map_lookup_elem(&whitelist_map, &dest_ip);
     

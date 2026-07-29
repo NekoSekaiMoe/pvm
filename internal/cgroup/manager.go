@@ -51,3 +51,17 @@ func (m *Manager) Setup(containerID string, pid int, memory int64, cpu int) erro
 
 	return nil
 }
+
+// Freeze suspends all processes in the cgroup
+func (m *Manager) Freeze(containerID string) error {
+	cgPath := filepath.Join(m.CgroupRoot, containerID)
+	freezeFile := filepath.Join(cgPath, "cgroup.freeze")
+	return os.WriteFile(freezeFile, []byte("1"), 0644)
+}
+
+// Thaw resumes all processes in the cgroup
+func (m *Manager) Thaw(containerID string) error {
+	cgPath := filepath.Join(m.CgroupRoot, containerID)
+	freezeFile := filepath.Join(cgPath, "cgroup.freeze")
+	return os.WriteFile(freezeFile, []byte("0"), 0644)
+}

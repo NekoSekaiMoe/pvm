@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"os"
 	"uml-container/internal/api"
+	"uml-container/internal/cgroup"
 	"uml-container/internal/ebpf"
+	"uml-container/internal/network"
 	"uml-container/internal/snapshot"
 	"uml-container/internal/vhost"
 )
@@ -74,13 +76,46 @@ func main() {
 		}
 
 	case "network":
-		if len(os.Args) < 5 {
-			fmt.Println("Usage: agentpvm network whitelist add <domain> <ip>")
+		if len(os.Args) < 4 {
+			fmt.Println("Usage: agentpvm network [whitelist|qos]")
 			return
 		}
-		domain := os.Args[3]
-		ip := os.Args[4]
-		ebpf.UpdateWhitelist(domain, ip)
+		sub := os.Args[2]
+		if sub == "whitelist" && len(os.Args) >= 6 && os.Args[3] == "add" {
+			domain := os.Args[4]
+			ip := os.Args[5]
+			ebpf.UpdateWhitelist(domain, ip)
+		} else if sub == "qos" && len(os.Args) >= 5 {
+			tap := os.Args[3]
+			rate := os.Args[4]
+			if err := network.SetupQoS(tap, rate); err != nil {
+				fmt.Printf("QoS Error: %v\n", err)
+			} else {
+				fmt.Printf("QoS limit set to %s on %s\n", rate, tap)
+			}
+		}
+
+	case "cgroup":
+		if len(os.Args) < 4 {
+			fmt.Println("Usage: agentpvm cgroup [freeze|thaw] <id>")
+			return
+		}
+		sub := os.Args[2]
+		id := os.Args[3]
+		cg := cgroup.NewManager()
+		if sub == "freeze" {
+			if err := cg.Freeze(id); err != nil {
+				fmt.Printf("Freeze failed: %v\n", err)
+			} else {
+				fmt.Println("Container frozen successfully (0 CPU usage)")
+			}
+		} else if sub == "thaw" {
+			if err := cg.Thaw(id); err != nil {
+				fmt.Printf("Thaw failed: %v\n", err)
+			} else {
+				fmt.Println("Container thawed successfully (CPU restored)")
+			}
+		}
 
 	default:
 		fmt.Println("Unknown command:", cmd)
