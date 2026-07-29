@@ -18,10 +18,15 @@ func StartStorageDaemon(containerID string, imagePath string) (string, *exec.Cmd
 	// If it already exists, remove it
 	os.Remove(socketPath)
 
+	formatDriver := "raw"
+	if filepath.Ext(imagePath) == ".qcow2" {
+		formatDriver = "qcow2"
+	}
+
 	cmd := exec.Command("qemu-storage-daemon",
 		"--blockdev", fmt.Sprintf("driver=file,node-name=disk0,filename=%s", imagePath),
-		"--blockdev", "driver=raw,node-name=raw0,file=disk0",
-		"--export", fmt.Sprintf("type=vhost-user-blk,id=export0,node-name=raw0,addr.type=unix,addr.path=%s,writable=on", socketPath),
+		"--blockdev", fmt.Sprintf("driver=%s,node-name=format0,file=disk0", formatDriver),
+		"--export", fmt.Sprintf("type=vhost-user-blk,id=export0,node-name=format0,addr.type=unix,addr.path=%s,writable=on", socketPath),
 	)
 	
 	if err := cmd.Start(); err != nil {
