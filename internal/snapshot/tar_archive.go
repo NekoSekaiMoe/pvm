@@ -10,8 +10,8 @@ import (
 func Export(containerID string, destTgz string) error {
 	dir := filepath.Join("/var/lib/uml-container/containers", containerID)
 	cmd := exec.Command("tar", "-czf", destTgz, "-C", dir, ".")
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("tar export failed: %v", err)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("tar export failed: %v, output: %s", err, string(out))
 	}
 	return nil
 }
@@ -22,8 +22,8 @@ func Import(srcTgz string, newContainerID string) error {
 	exec.Command("mkdir", "-p", dir).Run()
 	
 	cmd := exec.Command("tar", "-xzf", srcTgz, "-C", dir)
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("tar import failed: %v", err)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("tar import failed: %v, output: %s", err, string(out))
 	}
 	return nil
 }
