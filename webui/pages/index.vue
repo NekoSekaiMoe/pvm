@@ -62,19 +62,29 @@ const fetchContainers = async () => {
 
 const startContainer = async () => {
   if (!newContainer.value.name) return
-  await fetch('/api/containers/start', {
+  const res = await fetch('/api/containers/start', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(newContainer.value)
   })
-  newContainer.value.name = ''
-  setTimeout(fetchContainers, 500)
+  if (res.ok) {
+    newContainer.value.name = ''
+    setTimeout(fetchContainers, 500)
+  } else {
+    const err = await res.json()
+    alert(`Error starting container: ${err.error || res.statusText}`)
+  }
 }
 
 const deleteContainer = async (id) => {
   if(!confirm(`Delete container ${id}?`)) return
-  await fetch(`/api/containers/${id}`, { method: 'DELETE' })
-  fetchContainers()
+  const res = await fetch(`/api/containers/${id}`, { method: 'DELETE' })
+  if (res.ok) {
+    fetchContainers()
+  } else {
+    const err = await res.json()
+    alert(`Error deleting container: ${err.error || res.statusText}`)
+  }
 }
 
 onMounted(() => {

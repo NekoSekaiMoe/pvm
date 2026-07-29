@@ -5,12 +5,16 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"time"
 )
 
 var RootDir = "/var/lib/uml-container/containers"
 
 func ContainerDir(id string) string {
+	if !regexp.MustCompile(`^[a-zA-Z0-9_-]+$`).MatchString(id) {
+		panic("invalid container ID")
+	}
 	return filepath.Join(RootDir, id)
 }
 

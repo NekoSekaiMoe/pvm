@@ -6,6 +6,7 @@ import (
 	"net/http"
 )
 
+//go:generate npm run generate
 //go:embed all:.output/public
 var embedFS embed.FS
 

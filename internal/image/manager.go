@@ -32,8 +32,11 @@ func Pull(imageRef string) error {
 		return err
 	}
 
-	mnt := filepath.Join(imgDir, "mnt")
-	os.MkdirAll(mnt, 0755)
+	mnt, err := os.MkdirTemp(imgDir, "mnt-"+safeName+"-*")
+	if err != nil {
+		return fmt.Errorf("failed to create temp mount dir: %v", err)
+	}
+	defer os.RemoveAll(mnt)
 
 	if err := exec.Command("sudo", "mount", "-o", "loop", imgPath, mnt).Run(); err != nil {
 		return fmt.Errorf("failed to mount image: %v", err)
@@ -41,19 +44,19 @@ func Pull(imageRef string) error {
 	defer exec.Command("sudo", "umount", mnt).Run()
 
 	fmt.Printf("Exporting docker image %s...\n", imageRef)
-	// Pull from docker registry and extract to mnt
-	tarFile := filepath.Join(imgDir, "temp.tar")
 	
 	img, err := crane.Pull(imageRef)
 	if err != nil {
 		return fmt.Errorf("crane pull failed: %v", err)
 	}
 
-	f, err := os.Create(tarFile)
+	f, err := os.CreateTemp(imgDir, "temp-"+safeName+"-*.tar")
 	if err != nil {
-		return fmt.Errorf("failed to create tar file: %v", err)
+		return fmt.Errorf("failed to create temp tar file: %v", err)
 	}
+	tarFile := f.Name()
 	defer os.Remove(tarFile)
+	
 	if err := crane.Export(img, f); err != nil {
 		f.Close()
 		return fmt.Errorf("crane export failed: %v", err)

@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"uml-container/internal/api"
 	"uml-container/internal/config"
@@ -57,7 +58,11 @@ func main() {
 				fmt.Printf("Failed to create overlay layer: %v\n", err)
 				os.Exit(1)
 			}
-			cfg.Rootfs = state.ContainerDir(*name)
+			if err := image.MountLayer(*name, *rootfs); err != nil {
+				fmt.Printf("Failed to mount overlay layer: %v\n", err)
+				os.Exit(1)
+			}
+			cfg.Rootfs = filepath.Join(state.ContainerDir(*name), "merged")
 		}
 
 		manager := container.NewManager(&uml.DefaultLauncher{})
@@ -78,6 +83,9 @@ func main() {
 			if len(parts) == 2 {
 				ctx = context.WithValue(ctx, container.KeyVolumeHost, parts[0])
 				ctx = context.WithValue(ctx, container.KeyVolumeGuest, parts[1])
+			} else {
+				fmt.Println("Invalid volume format. Expected host:guest")
+				os.Exit(1)
 			}
 		}
 
@@ -148,6 +156,10 @@ func main() {
 			return
 		}
 		id := os.Args[2]
+		if !regexp.MustCompile(`^[a-zA-Z0-9_-]+$`).MatchString(id) {
+			fmt.Printf("Invalid container ID: %s\n", id)
+			return
+		}
 		logPath := filepath.Join(state.ContainerDir(id), "logs", "console.log")
 		file, err := os.Open(logPath)
 		if err != nil {
@@ -176,6 +188,11 @@ func main() {
 	case "webui":
 		webuiCmd := flag.NewFlagSet("webui", flag.ExitOnError)
 		port := webuiCmd.Int("port", 3000, "Port to run WebUI on")
+		webuiCmd.Usage = func() {
+			fmt.Fprintf(os.Stderr, "Usage of webui:\n")
+			fmt.Fprintf(os.Stderr, "  Starts the WebUI. WARNING: WebUI exposes container and image management APIs.\n")
+			webuiCmd.PrintDefaults()
+		}
 		webuiCmd.Parse(os.Args[2:])
 		if err := api.StartE2BServer(*port); err != nil {
 			fmt.Printf("WebUI server failed: %v\n", err)

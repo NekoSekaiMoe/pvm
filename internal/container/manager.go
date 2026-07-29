@@ -43,14 +43,9 @@ func (m *Manager) Start(ctx context.Context, cfg *config.ContainerConfig) error 
 		args = append(args, "con=null")
 	}
 
-	if cfg.UseVirtio {
-		if cfg.VhostUserSocket != "" {
-			args = append(args, fmt.Sprintf("virtio=0,vhost-user,socket=%s", cfg.VhostUserSocket))
-			args = append(args, "root=/dev/vda")
-		} else {
-			args = append(args, fmt.Sprintf("ubd0=%s", cfg.Rootfs))
-			args = append(args, "root=/dev/ubda")
-		}
+	if cfg.UseVirtio && cfg.VhostUserSocket != "" {
+		args = append(args, fmt.Sprintf("virtio=0,vhost-user,socket=%s", cfg.VhostUserSocket))
+		args = append(args, "root=/dev/vda")
 	} else {
 		args = append(args, fmt.Sprintf("ubd0=%s", cfg.Rootfs))
 		args = append(args, "root=/dev/ubda")

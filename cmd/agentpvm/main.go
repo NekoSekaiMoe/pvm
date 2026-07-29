@@ -1,11 +1,14 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
 	"uml-container/internal/api"
 	"uml-container/internal/cgroup"
+	"uml-container/internal/config"
+	"uml-container/internal/container"
 	"uml-container/internal/ebpf"
 	"uml-container/internal/network"
 	"uml-container/internal/snapshot"
@@ -26,10 +29,11 @@ func main() {
 		name := runCmd.String("name", "agent1", "Sandbox name")
 		rootfs := runCmd.String("rootfs", "rootfs.img", "Root filesystem")
 		useVhost := runCmd.Bool("vhost", true, "Use vhost-user-blk for storage")
-		
+
 		runCmd.Parse(os.Args[2:])
-		
+
 		fmt.Printf("Starting sandbox %s...\n", *name)
+		var sockPath string
 		if *useVhost {
 			fmt.Println("Starting qemu-storage-daemon for vhost-user block device...")
 			sock, daemonCmd, err := vhost.StartStorageDaemon(*name, *rootfs)
@@ -37,30 +41,42 @@ func main() {
 				fmt.Printf("Error starting vhost: %v\n", err)
 			} else {
 				defer daemonCmd.Process.Kill()
+				sockPath = sock
 				fmt.Printf("Vhost socket ready at %s\n", sock)
 			}
 		}
-		// Assuming we call container.Manager.Start here ...
-		fmt.Println("Sandbox running. (Mocked for CLI architecture demo)")
+
+		mgr := container.NewManager(nil)
+		cfg := &config.ContainerConfig{
+			Name:            *name,
+			Rootfs:          *rootfs,
+			UseVirtio:       *useVhost,
+			VhostUserSocket: sockPath,
+		}
+		if err := mgr.Start(context.Background(), cfg); err != nil {
+			fmt.Printf("Container start failed: %v\n", err)
+		} else {
+			fmt.Println("Sandbox exited.")
+		}
 
 	case "api":
 		apiCmd := flag.NewFlagSet("api", flag.ExitOnError)
 		port := apiCmd.Int("port", 8080, "API Server Port")
 		apiCmd.Parse(os.Args[2:])
-		
+
 		if err := api.StartE2BServer(*port); err != nil {
 			fmt.Printf("API Server Error: %v\n", err)
 		}
 
 	case "snapshot":
-		if len(os.Args) < 4 {
+		if len(os.Args) < 5 {
 			fmt.Println("Usage: agentpvm snapshot [export|import] <id> <file.tgz>")
 			return
 		}
 		sub := os.Args[2]
 		id := os.Args[3]
 		file := os.Args[4]
-		
+
 		if sub == "export" {
 			if err := snapshot.Export(id, file); err != nil {
 				fmt.Printf("Export failed: %v\n", err)

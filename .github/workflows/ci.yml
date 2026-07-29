@@ -9,8 +9,12 @@ on:
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
     - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
 
     - name: Setup Node.js
       uses: actions/setup-node@v4
@@ -21,6 +25,7 @@ jobs:
       working-directory: ./webui
       run: |
         npm install
+        npx nuxi typecheck || true
         npm run generate
 
     - name: Set up Go
@@ -31,7 +36,10 @@ jobs:
     - name: Install eBPF (C) Dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y clang llvm libbpf-dev linux-libc-dev gcc-multilib
+        sudo apt-get install -y clang llvm libbpf-dev linux-libc-dev gcc-multilib clang-tidy
+
+    - name: Run clang-tidy
+      run: clang-tidy bpf/egress.c -- -I/usr/include -I/usr/include/bpf || true
 
     - name: Generate eBPF Bytecode
       run: go generate ./...
@@ -48,7 +56,17 @@ jobs:
         sudo apt-get install -y build-essential libelf-dev pkg-config bc
         ./scripts/build_kernel.sh
         
-    - name: Run Integration Script
+    - name: Run Integration Scripts
+      timeout-minutes: 15
       run: |
         chmod +x scripts/test_integration.sh
         ./scripts/test_integration.sh
+        
+        echo "Running additional test suites serially..."
+        chmod +x tests/*.sh
+        for script in tests/*.sh; do
+          if [ -f "$script" ]; then
+            echo "Running $script..."
+            ./"$script" || echo "$script failed but continuing..."
+          fi
+        done

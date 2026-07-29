@@ -9,7 +9,8 @@ import requests
 
 # Send an execution request to the local E2B compatible API
 res = requests.post("http://127.0.0.1:8080/exec", json={"cmd": "apk update && apk add python3"})
+res.raise_for_status()
 print("Response from Agent Sandbox:", res.json())
 EOF
 
-python3 test_script.py || echo "Python script failed or requests not installed"
+python3 test_script.py

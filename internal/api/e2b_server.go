@@ -1,13 +1,16 @@
 package api
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"uml-container/internal/state"
+	"regexp"
+	"uml-container/internal/config"
+	"uml-container/internal/container"
 	"uml-container/internal/image"
+	"uml-container/internal/state"
 	"uml-container/webui"
 
 	"github.com/labstack/echo/v4"
@@ -30,10 +33,15 @@ func StartE2BServer(port int) error {
 
 	e.Use(middleware.Logger())
 	e.Use(middleware.Recover())
-	e.Use(middleware.CORS())
+	e.Use(middleware.CORSWithConfig(middleware.CORSConfig{
+		AllowOrigins: []string{"http://localhost:3000", "http://127.0.0.1:3000"},
+	}))
 
 	// API Group
 	api := e.Group("/api")
+	api.Use(middleware.KeyAuth(func(key string, c echo.Context) (bool, error) {
+		return key == "secret", nil
+	}))
 
 	// Get all containers
 	api.GET("/containers", func(c echo.Context) error {
@@ -67,27 +75,27 @@ func StartE2BServer(port int) error {
 		if req.Name == "" {
 			req.Name = "web-container"
 		}
-		
-		// Run umlctl start in background
-		args := []string{"start", "-name", req.Name}
-		if req.Rootfs != "" {
-			args = append(args, "-rootfs", req.Rootfs)
+
+		mgr := container.NewManager(nil)
+		cfg := &config.ContainerConfig{
+			Name:   req.Name,
+			Rootfs: req.Rootfs,
+			Memory: req.Mem,
 		}
-		if req.Mem != "" {
-			args = append(args, "-mem", req.Mem)
-		}
-		
-		cmd := exec.Command(os.Args[0], args...)
-		if err := cmd.Start(); err != nil {
+
+		if err := mgr.Start(context.Background(), cfg); err != nil {
 			return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		}
-		
+
 		return c.JSON(http.StatusOK, map[string]string{"status": "started", "name": req.Name})
 	})
 
 	// Get logs
 	api.GET("/containers/:id/logs", func(c echo.Context) error {
 		id := c.Param("id")
+		if !regexp.MustCompile(`^[a-zA-Z0-9_-]+$`).MatchString(id) {
+			return c.String(http.StatusBadRequest, "Invalid container ID")
+		}
 		logPath := filepath.Join(state.ContainerDir(id), "logs", "console.log")
 		data, err := os.ReadFile(logPath)
 		if err != nil {
@@ -99,7 +107,12 @@ func StartE2BServer(port int) error {
 	// Delete container
 	api.DELETE("/containers/:id", func(c echo.Context) error {
 		id := c.Param("id")
-		os.RemoveAll(state.ContainerDir(id))
+		if !regexp.MustCompile(`^[a-zA-Z0-9_-]+$`).MatchString(id) {
+			return c.String(http.StatusBadRequest, "Invalid container ID")
+		}
+		if err := os.RemoveAll(state.ContainerDir(id)); err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		}
 		return c.JSON(http.StatusOK, map[string]string{"status": "deleted"})
 	})
 
@@ -130,18 +143,17 @@ func StartE2BServer(port int) error {
 
 		fmt.Printf("[API] E2B SDK requested execution: %s\n", req.Command)
 
-		resp := ExecResponse{
-			Stdout:   "Execution simulated for: " + req.Command,
-			Stderr:   "",
-			ExitCode: 0,
-		}
-		return c.JSON(http.StatusOK, resp)
+		return c.JSON(http.StatusNotImplemented, map[string]string{"error": "not implemented"})
 	})
 
 	// Serve the embedded Nuxt UI for all other routes
-	e.GET("/*", echo.WrapHandler(http.FileServer(webui.GetPublicFS())))
+	e.Use(middleware.StaticWithConfig(middleware.StaticConfig{
+		Root:       ".",
+		Filesystem: webui.GetPublicFS(),
+		HTML5:      true,
+	}))
 
-	addr := fmt.Sprintf(":%d", port)
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
 	fmt.Printf("E2B-compatible API & WebUI Server listening on %s\n", addr)
 	return e.Start(addr)
 }

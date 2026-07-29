@@ -13,7 +13,7 @@
         </button>
       </div>
       
-      <div v-if="message" style="margin-top: 1rem; color: var(--success); font-weight: 500;">
+      <div v-if="message" :style="{ marginTop: '1rem', fontWeight: '500', color: isError ? 'var(--danger)' : 'var(--success)' }">
         {{ message }}
       </div>
     </div>
@@ -26,11 +26,13 @@ import { ref } from 'vue'
 const imageName = ref('')
 const pulling = ref(false)
 const message = ref('')
+const isError = ref(false)
 
 const pullImage = async () => {
   if (!imageName.value) return
   pulling.value = true
   message.value = ''
+  isError.value = false
   
   try {
     const res = await fetch('/api/images/pull', {
@@ -45,9 +47,11 @@ const pullImage = async () => {
     } else {
       const err = await res.json()
       message.value = `Error: ${err.error}`
+      isError.value = true
     }
   } catch (e) {
     message.value = `Network error.`
+    isError.value = true
   } finally {
     pulling.value = false
   }

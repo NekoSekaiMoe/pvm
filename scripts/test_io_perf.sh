@@ -1,11 +1,7 @@
 #!/bin/bash
-set -ex
+set -eo pipefail
 echo "Testing IO Performance..."
 
-# We generate a quick dd command to test speed differences
-echo "Writing 100MB file using standard ubd..."
-# simulated dd test
-
-echo "Writing 100MB file using vhost-user-blk..."
-# simulated dd test
-echo "vhost-user shows 3x improvement!"
+echo "This script is currently a placeholder for I/O performance testing."
+echo "Real devices and measurements are not yet provided."
+exit 0

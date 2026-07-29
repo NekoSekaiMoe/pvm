@@ -10,22 +10,32 @@ go build -o agentpvm cmd/agentpvm/main.go
 ./agentpvm api -port 8081 &
 API_PID=$!
 
-# Give it a second to start
-sleep 1
+trap "kill $API_PID && wait $API_PID 2>/dev/null || true" EXIT
+
+# Readiness retry loop
+for i in {1..10}; do
+    if curl -s -f http://127.0.0.1:8081/ > /dev/null 2>&1 || curl -s http://127.0.0.1:8081/ > /dev/null 2>&1; then
+        break
+    fi
+    sleep 0.5
+done
 
 echo "Sending execution request to E2B API..."
-RESPONSE=$(curl -s -X POST http://127.0.0.1:8081/exec \
+HTTP_STATUS=$(curl -s -o resp.json -w "%{http_code}" -X POST http://127.0.0.1:8081/exec \
   -H "Content-Type: application/json" \
   -d '{"cmd": "apk update && apk add python3"}')
 
-echo "API Response: $RESPONSE"
+echo "API Response:"
+cat resp.json
 
-if echo "$RESPONSE" | grep -q "Execution simulated for: apk update"; then
-    echo "✅ E2B API Test Passed"
-else
-    echo "❌ E2B API Test Failed"
-    kill $API_PID
+if [ "$HTTP_STATUS" != "200" ]; then
+    echo "❌ E2B API Test Failed: HTTP status $HTTP_STATUS"
     exit 1
 fi
 
-kill $API_PID
+if ! grep -q '"exitCode"' resp.json; then
+    echo "❌ E2B API Test Failed: Missing exitCode in JSON response"
+    exit 1
+fi
+
+echo "✅ E2B API Test Passed"

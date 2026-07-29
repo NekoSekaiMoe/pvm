@@ -29,7 +29,8 @@ func TestSnapshot_ExportImport(t *testing.T) {
 	dummyFile := filepath.Join(containerDir, "config.json")
 	os.WriteFile(dummyFile, []byte(`{"test":true}`), 0644)
 	
-	tgzPath := "/tmp/test-export.tgz"
+	tempDir := t.TempDir()
+	tgzPath := filepath.Join(tempDir, "test-export.tgz")
 	
 	err := Export(containerID, tgzPath)
 	if err != nil {
@@ -39,7 +40,6 @@ func TestSnapshot_ExportImport(t *testing.T) {
 	if _, err := os.Stat(tgzPath); err != nil {
 		t.Fatalf("Export did not create archive: %v", err)
 	}
-	defer os.Remove(tgzPath)
 	
 	newID := "test-snap-2"
 	err = Import(tgzPath, newID)

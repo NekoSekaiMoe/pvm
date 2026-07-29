@@ -24,19 +24,18 @@ int egress_filter(struct __sk_buff *skb) {
         return TC_ACT_OK;
 
     if (eth->h_proto != __builtin_bswap16(ETH_P_IP))
-        return TC_ACT_OK;
+        return TC_ACT_SHOT;
 
     struct iphdr *ip = data + sizeof(*eth);
     if ((void*)(ip + 1) > data_end)
-        return TC_ACT_OK;
-        
-    // Allow UDP (e.g. DNS) to pass through so we can resolve domains
-    if (ip->protocol == 17) {
-        return TC_ACT_OK;
-    }
+        return TC_ACT_SHOT;
 
-    // SSRF Protection: Block internal IP addresses regardless of whitelist
+    // SSRF Protection: Block internal and sensitive IP addresses regardless of whitelist
     __u32 dest_ip_host = __builtin_bswap32(ip->daddr);
+    // Loopback: 127.0.0.0/8
+    if ((dest_ip_host & 0xFF000000) == 0x7F000000) return TC_ACT_SHOT;
+    // Link-local: 169.254.0.0/16
+    if ((dest_ip_host & 0xFFFF0000) == 0xA9FE0000) return TC_ACT_SHOT;
     // 10.0.0.0/8
     if ((dest_ip_host & 0xFF000000) == 0x0A000000) return TC_ACT_SHOT;
     // 172.16.0.0/12
@@ -51,7 +50,7 @@ int egress_filter(struct __sk_buff *skb) {
         return TC_ACT_OK;
     }
 
-    // Default DROP for non-whitelisted TCP traffic
+    // Default DROP for non-whitelisted traffic
     return TC_ACT_SHOT;
 }
 
