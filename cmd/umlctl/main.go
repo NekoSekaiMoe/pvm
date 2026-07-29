@@ -62,7 +62,12 @@ func main() {
 				fmt.Printf("Failed to mount overlay layer: %v\n", err)
 				os.Exit(1)
 			}
-			cfg.Rootfs = filepath.Join(state.ContainerDir(*name), "merged")
+			dir, err := state.ContainerDir(*name)
+			if err != nil {
+				fmt.Printf("Failed to get container dir: %v\n", err)
+				os.Exit(1)
+			}
+			cfg.Rootfs = filepath.Join(dir, "merged")
 		}
 
 		manager := container.NewManager(&uml.DefaultLauncher{})
@@ -94,7 +99,10 @@ func main() {
 		
 		if *rm {
 			fmt.Println("Cleaning up container state and files (--rm)...")
-			os.RemoveAll(state.ContainerDir(*name))
+			dir, err := state.ContainerDir(*name)
+			if err == nil {
+				os.RemoveAll(dir)
+			}
 		}
 
 		if err != nil {
@@ -160,7 +168,12 @@ func main() {
 			fmt.Printf("Invalid container ID: %s\n", id)
 			return
 		}
-		logPath := filepath.Join(state.ContainerDir(id), "logs", "console.log")
+		dir, err := state.ContainerDir(id)
+		if err != nil {
+			fmt.Printf("Failed to get container dir: %v\n", err)
+			return
+		}
+		logPath := filepath.Join(dir, "logs", "console.log")
 		file, err := os.Open(logPath)
 		if err != nil {
 			fmt.Printf("Failed to open logs for %s: %v\n", id, err)
