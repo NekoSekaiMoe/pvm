@@ -4,6 +4,8 @@ import (
 	"encoding/binary"
 	"fmt"
 	"syscall"
+
+	"github.com/iceber/iouring-go"
 )
 
 type VirtQueue struct {
@@ -121,48 +123,50 @@ func (vq *VirtQueue) processDescChain(mem *Memory, headIdx uint16, blk *BlockDev
 		case VirtioBlkTIn:
 			// Read from disk to guest memory
 			go func() {
+				ch := make(chan iouring.Result, 1)
+				blk.IOUR().SubmitRequest(iouring.Preadv(blk.Fd(), dataSlices, uint64(offset)), ch)
+				res := <-ch
 				var st byte = VirtioBlkSOk
-				var totalWritten uint32
-				for _, data := range dataSlices {
-					n, err := blk.ReadAt(data, offset)
-					totalWritten += uint32(n)
-					offset += int64(n)
-					if err != nil {
-						st = VirtioBlkSIoErr
-						break
-					}
+				if res.Err() != nil {
+					st = VirtioBlkSIoErr
 				}
 				if statusSlice != nil && len(statusSlice) >= 1 {
 					statusSlice[0] = st
 				}
-				vq.completeRequest(mem, headIdx, totalWritten+1)
+				
+				// +1 for the status byte
+				ret, _ := res.ReturnInt()
+				if ret < 0 { ret = 0 }
+				vq.completeRequest(mem, headIdx, uint32(ret)+1)
 			}()
 			return // return immediately, completion is handled async
 
 		case VirtioBlkTOut:
 			// Write from guest memory to disk
 			go func() {
+				ch := make(chan iouring.Result, 1)
+				blk.IOUR().SubmitRequest(iouring.Pwritev(blk.Fd(), dataSlices, offset), ch)
+				res := <-ch
 				var st byte = VirtioBlkSOk
-				var totalWritten uint32
-				for _, data := range dataSlices {
-					n, err := blk.WriteAt(data, offset)
-					totalWritten += uint32(n) // we just count processed bytes
-					offset += int64(n)
-					if err != nil {
-						st = VirtioBlkSIoErr
-						break
-					}
+				if res.Err() != nil {
+					st = VirtioBlkSIoErr
 				}
 				if statusSlice != nil && len(statusSlice) >= 1 {
 					statusSlice[0] = st
 				}
-				vq.completeRequest(mem, headIdx, totalWritten+1)
+				
+				// +1 for the status byte
+				ret, _ := res.ReturnInt()
+				if ret < 0 { ret = 0 }
+				vq.completeRequest(mem, headIdx, uint32(ret)+1)
 			}()
 			return // return immediately, completion is handled async
 
 		case VirtioBlkTFlush:
 			go func() {
-				blk.Sync()
+				ch := make(chan iouring.Result, 1)
+				blk.IOUR().SubmitRequest(iouring.Fsync(blk.Fd()), ch)
+				<-ch
 				if statusSlice != nil && len(statusSlice) >= 1 {
 					statusSlice[0] = VirtioBlkSOk
 				}

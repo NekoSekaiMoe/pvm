@@ -2,6 +2,8 @@ package vhost
 
 import (
 	"os"
+
+	"github.com/iceber/iouring-go"
 )
 
 const (
@@ -16,6 +18,7 @@ const (
 
 type BlockDevice struct {
 	file *os.File
+	iour *iouring.IOURing
 }
 
 func NewBlockDevice(path string) (*BlockDevice, error) {
@@ -23,7 +26,27 @@ func NewBlockDevice(path string) (*BlockDevice, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &BlockDevice{file: f}, nil
+	
+	// Create IOURing with 256 entries
+	iour, err := iouring.New(256)
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+
+	return &BlockDevice{
+		file: f,
+		iour: iour,
+	}, nil
+}
+
+// IOUR returns the underlying IOURing instance
+func (b *BlockDevice) IOUR() *iouring.IOURing {
+	return b.iour
+}
+
+func (b *BlockDevice) Fd() int {
+	return int(b.file.Fd())
 }
 
 func (b *BlockDevice) ReadAt(p []byte, off int64) (n int, err error) {
@@ -39,5 +62,8 @@ func (b *BlockDevice) Sync() error {
 }
 
 func (b *BlockDevice) Close() error {
+	if b.iour != nil {
+		b.iour.Close()
+	}
 	return b.file.Close()
 }

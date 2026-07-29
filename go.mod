@@ -13,6 +13,7 @@ require (
 require (
 	github.com/docker/cli v29.5.3+incompatible // indirect
 	github.com/docker/docker-credential-helpers v0.9.3 // indirect
+	github.com/iceber/iouring-go v0.0.0-20230403020409-002cfd2e2a90 // indirect
 	github.com/klauspost/compress v1.18.6 // indirect
 	github.com/labstack/gommon v0.5.0 // indirect
 	github.com/mattn/go-colorable v0.1.15 // indirect
@@ -30,3 +31,5 @@ require (
 	golang.org/x/time v0.15.0 // indirect
 	gotest.tools/v3 v3.5.2 // indirect
 )
+
+replace github.com/iceber/iouring-go => ./internal/pkg/iouring-go
