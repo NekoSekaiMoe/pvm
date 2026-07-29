@@ -17,7 +17,7 @@ PVM is a lightweight, User-Mode Linux (UML)-based container management system. I
 go build ./cmd/umlctl
 
 # Start the WebUI
-./umlctl webui --port 3000
+./agentpvm webui --port 3000
 
 # Start a container via CLI
 ./umlctl start -name my-container -rootfs alpine

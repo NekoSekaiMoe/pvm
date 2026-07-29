@@ -9,6 +9,7 @@ import (
 	"uml-container/internal/cgroup"
 	"uml-container/internal/config"
 	"uml-container/internal/container"
+	"uml-container/internal/cow"
 	"uml-container/internal/ebpf"
 	"uml-container/internal/network"
 	"uml-container/internal/snapshot"
@@ -17,7 +18,7 @@ import (
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Println("Usage: agentpvm [run|api|snapshot|network]")
+		fmt.Println("Usage: agentpvm [run|api|webui|snapshot|network|cgroup|cow]")
 		os.Exit(1)
 	}
 
@@ -74,6 +75,41 @@ func main() {
 		if err := api.StartE2BServer(*port); err != nil {
 			fmt.Printf("API Server Error: %v\n", err)
 		}
+
+	case "webui":
+		// WebUI / management API. Equivalent to `api` but defaults to the
+		// dashboard port and is the intended entry point for the glassmorphism
+		// WebUI embedded in the binary (see webui/embed.go).
+		webuiCmd := flag.NewFlagSet("webui", flag.ExitOnError)
+		port := webuiCmd.Int("port", 3000, "Port to run WebUI on")
+		webuiCmd.Usage = func() {
+			fmt.Fprintf(os.Stderr, "Usage of webui:\n")
+			fmt.Fprintf(os.Stderr, "  Starts the WebUI + E2B-compatible management API.\n")
+			webuiCmd.PrintDefaults()
+		}
+		webuiCmd.Parse(os.Args[2:])
+		if err := api.StartE2BServer(*port); err != nil {
+			fmt.Printf("WebUI server failed: %v\n", err)
+			os.Exit(1)
+		}
+
+	case "cow":
+		// Create a qcow2 Copy-on-Write overlay over a base image. Keeps the
+		// base image read-only and writes diverge into the overlay.
+		cowCmd := flag.NewFlagSet("cow", flag.ExitOnError)
+		backing := cowCmd.String("backing", "", "Backing (base) image path")
+		overlay := cowCmd.String("overlay", "", "Output qcow2 overlay path")
+		backingFormat := cowCmd.String("backing-format", "raw", "Backing file format (raw/qcow2)")
+		cowCmd.Parse(os.Args[2:])
+		if *backing == "" || *overlay == "" {
+			fmt.Println("Usage: agentpvm cow -backing <base.img> -overlay <overlay.qcow2> [-backing-format raw]")
+			os.Exit(1)
+		}
+		if err := cow.CreateOverlay(*backing, *overlay, *backingFormat); err != nil {
+			fmt.Printf("CoW overlay creation failed: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("CoW overlay created: %s -> %s\n", *backing, *overlay)
 
 	case "snapshot":
 		if len(os.Args) < 5 {

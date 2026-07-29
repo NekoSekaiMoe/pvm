@@ -9,7 +9,6 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
-	"uml-container/internal/api"
 	"uml-container/internal/config"
 	"uml-container/internal/container"
 	"uml-container/internal/image"
@@ -20,7 +19,7 @@ import (
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Println("Usage: umlctl [start|image|logs|ps|network|webui]")
+		fmt.Println("Usage: umlctl [start|image|logs|ps|network]")
 		os.Exit(1)
 	}
 	cmd := os.Args[1]
@@ -193,20 +192,6 @@ func main() {
 					fmt.Printf("%-15s %-15s %-10d\n", st.ID, st.Status, st.PID)
 				}
 			}
-		}
-
-	case "webui":
-		webuiCmd := flag.NewFlagSet("webui", flag.ExitOnError)
-		port := webuiCmd.Int("port", 3000, "Port to run WebUI on")
-		webuiCmd.Usage = func() {
-			fmt.Fprintf(os.Stderr, "Usage of webui:\n")
-			fmt.Fprintf(os.Stderr, "  Starts the WebUI. WARNING: WebUI exposes container and image management APIs.\n")
-			webuiCmd.PrintDefaults()
-		}
-		webuiCmd.Parse(os.Args[2:])
-		if err := api.StartE2BServer(*port); err != nil {
-			fmt.Printf("WebUI server failed: %v\n", err)
-			os.Exit(1)
 		}
 
 	default:
