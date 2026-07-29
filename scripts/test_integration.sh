@@ -1,9 +1,8 @@
 #!/bin/bash
 set -ex
 
-echo "Building binaries..."
+echo "Building binary..."
 go build -o bin/umlctl ./cmd/umlctl
-go build -o bin/umld ./cmd/umld
 
 echo "Creating rootfs.img..."
 dd if=/dev/zero of=rootfs.img bs=1M count=100
