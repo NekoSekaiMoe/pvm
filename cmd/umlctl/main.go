@@ -42,13 +42,28 @@ func main() {
 
 		startCmd.Parse(os.Args[2:])
 
+		if !regexp.MustCompile(`^[a-zA-Z0-9_-]+$`).MatchString(*name) {
+			fmt.Println("Error: Invalid container name format")
+			os.Exit(1)
+		}
+
+		if *cpu < 0 {
+			fmt.Printf("Error: CPU limit cannot be negative\n")
+			os.Exit(1)
+		}
+		memBytes, err := config.ParseMemory(*mem)
+		if err != nil {
+			fmt.Printf("Error: %v\n", err)
+			os.Exit(1)
+		}
+
 		cfg := &config.ContainerConfig{
 			ID:         *name,
 			Name:       *name,
 			Kernel:     *kernel,
 			Rootfs:     *rootfs,
 			Memory:     *mem,
-			MemoryBytes: config.ParseMemory(*mem),
+			MemoryBytes: memBytes,
 			CPU:        *cpu,
 			UseVirtio:  *virtio,
 			Init:       *initCmd,
@@ -94,7 +109,7 @@ func main() {
 		}
 
 		fmt.Printf("Starting container %s...\n", *name)
-		err := manager.Start(ctx, cfg)
+		err = manager.Start(ctx, cfg)
 		
 		if *rm {
 			fmt.Println("Cleaning up container state and files (--rm)...")

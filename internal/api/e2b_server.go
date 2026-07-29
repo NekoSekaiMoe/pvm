@@ -81,20 +81,31 @@ func StartE2BServer(port int) error {
 			req.Name = "web-container"
 		}
 
+		if !regexp.MustCompile(`^[a-zA-Z0-9_-]+$`).MatchString(req.Name) {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "Invalid container ID format"})
+		}
+		if req.CPU < 0 {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "CPU limit cannot be negative"})
+		}
+
 		mgr := container.NewManager(nil)
 		mem := req.Mem
 		if mem == "" {
 			mem = "512M"
 		}
+		memBytes, err := config.ParseMemory(mem)
+		if err != nil {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+		}
 		cfg := &config.ContainerConfig{
-			ID:     req.Name,
-			Name:   req.Name,
-			Rootfs: req.Rootfs,
-			Kernel: "./bin/linux",
-			Init:   "/init.sh",
-			Memory: mem,
-			MemoryBytes: config.ParseMemory(mem),
-			CPU:    req.CPU,
+			ID:          req.Name,
+			Name:        req.Name,
+			Rootfs:      req.Rootfs,
+			Kernel:      "./bin/linux",
+			Init:        "/init.sh",
+			Memory:      mem,
+			MemoryBytes: memBytes,
+			CPU:         req.CPU,
 		}
 
 		if err := mgr.Start(context.Background(), cfg); err != nil {

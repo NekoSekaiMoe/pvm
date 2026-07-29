@@ -45,7 +45,9 @@ jobs:
       run: go generate ./...
 
     - name: Build Main Binary
-      run: go build ./cmd/umlctl
+      run: |
+        go build ./cmd/umlctl
+        go build -o agentpvm ./cmd/agentpvm
 
     - name: Run unit tests
       run: go test -v ./...

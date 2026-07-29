@@ -19,20 +19,30 @@ type ContainerConfig struct {
 }
 
 // ParseMemory parses strings like "512M", "1G" into bytes
-func ParseMemory(mem string) int64 {
+func ParseMemory(mem string) (int64, error) {
+	if mem == "" {
+		return 0, fmt.Errorf("memory cannot be empty")
+	}
 	var val int64
 	var unit string
 	if _, err := fmt.Sscanf(mem, "%d%s", &val, &unit); err != nil {
-		return 0
+		return 0, fmt.Errorf("invalid memory format: %s", mem)
+	}
+	if val < 0 {
+		return 0, fmt.Errorf("memory cannot be negative")
 	}
 	switch unit {
 	case "K", "k", "KB", "kb":
-		return val * 1024
+		val = val * 1024
 	case "M", "m", "MB", "mb":
-		return val * 1024 * 1024
+		val = val * 1024 * 1024
 	case "G", "g", "GB", "gb":
-		return val * 1024 * 1024 * 1024
+		val = val * 1024 * 1024 * 1024
 	default:
-		return val
+		return 0, fmt.Errorf("unsupported or missing memory unit: %s", unit)
 	}
+	if val < 0 {
+		return 0, fmt.Errorf("memory value overflow")
+	}
+	return val, nil
 }

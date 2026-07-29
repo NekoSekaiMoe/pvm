@@ -74,7 +74,7 @@ guest app
 		 
 		 核心收益：
 		 
-		 减少频繁的小 syscall。
+		 减少通知、边界穿越及批量处理开销。
 		 
 		 例如：
 		 
@@ -85,15 +85,16 @@ guest app
 		 send()
 		 send()
 		 
-		 可能每次都穿越边界。
+		 可能每次都触发边界穿越和通知。
 		 
 		 virtio：
 		 
 		 多个 packet
 		  ↓
-		  一次提交 queue
+		  提交至 virtqueue
 		   ↓
 		   backend 批量处理
+		   （注：实际 syscall 数量取决于 guest 驱动及 backend 的通知/处理策略，并非必然合并成单次 I/O）
 		   3. io_uring 后端
 		   
 		   这个其实非常适合 UML。
@@ -153,11 +154,12 @@ guest app
 					 |
 					 virtio-uml
 					  |
-					  vhost-like backend
+					  vhost-user (当前实现: qemu-storage-daemon 等导出 Unix socket)
 					   |
-					   host kernel
+					   Host Userspace
 					   
-					   把数据处理尽量放到 host kernel。
+					   明确当前实现使用 vhost-user 将 I/O 交由专门的后端进程处理。
+					   （未来方向：直接对接触发 host kernel 的 vhost-like backend 以追求极限性能）
 					   
 					   5. 减少 guest syscall 数量
 					   

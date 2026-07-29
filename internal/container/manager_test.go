@@ -44,6 +44,14 @@ func TestManager_Start(t *testing.T) {
 	defer os.RemoveAll(tempDir)
 	state.RootDir = tempDir
 
+	cgTempDir, err := os.MkdirTemp("", "uml-cgroup-test")
+	if err != nil {
+		t.Fatalf("failed to create cgroup temp dir: %v", err)
+	}
+	defer os.RemoveAll(cgTempDir)
+	os.Setenv("PVM_CGROUP_ROOT", cgTempDir)
+	defer os.Unsetenv("PVM_CGROUP_ROOT")
+
 	cfg := &config.ContainerConfig{
 		ID:         "1234",
 		Name:       "test",
@@ -78,6 +86,14 @@ func TestManager_Start_Virtio(t *testing.T) {
 	}
 	defer os.RemoveAll(tempDir)
 	state.RootDir = tempDir
+
+	cgTempDir, err := os.MkdirTemp("", "uml-cgroup-test-virtio")
+	if err != nil {
+		t.Fatalf("failed to create cgroup temp dir: %v", err)
+	}
+	defer os.RemoveAll(cgTempDir)
+	os.Setenv("PVM_CGROUP_ROOT", cgTempDir)
+	defer os.Unsetenv("PVM_CGROUP_ROOT")
 
 	cfg := &config.ContainerConfig{
 		ID:         "1235",

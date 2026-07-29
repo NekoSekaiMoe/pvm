@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 )
 
@@ -37,6 +38,9 @@ func resolveCgroupRoot() string {
 }
 
 func (m *Manager) Setup(containerID string, pid int, memory int64, cpu int) error {
+	if !regexp.MustCompile(`^[a-zA-Z0-9_-]+$`).MatchString(containerID) {
+		return fmt.Errorf("invalid container ID")
+	}
 	cgPath := filepath.Join(m.CgroupRoot, containerID)
 	if err := os.MkdirAll(cgPath, 0755); err != nil {
 		return fmt.Errorf("failed to create cgroup directory: %v", err)
@@ -72,6 +76,9 @@ func (m *Manager) Setup(containerID string, pid int, memory int64, cpu int) erro
 
 // Freeze suspends all processes in the cgroup
 func (m *Manager) Freeze(containerID string) error {
+	if !regexp.MustCompile(`^[a-zA-Z0-9_-]+$`).MatchString(containerID) {
+		return fmt.Errorf("invalid container ID")
+	}
 	cgPath := filepath.Join(m.CgroupRoot, containerID)
 	freezeFile := filepath.Join(cgPath, "cgroup.freeze")
 	return os.WriteFile(freezeFile, []byte("1"), 0644)
@@ -79,6 +86,9 @@ func (m *Manager) Freeze(containerID string) error {
 
 // Thaw resumes all processes in the cgroup
 func (m *Manager) Thaw(containerID string) error {
+	if !regexp.MustCompile(`^[a-zA-Z0-9_-]+$`).MatchString(containerID) {
+		return fmt.Errorf("invalid container ID")
+	}
 	cgPath := filepath.Join(m.CgroupRoot, containerID)
 	freezeFile := filepath.Join(cgPath, "cgroup.freeze")
 	return os.WriteFile(freezeFile, []byte("0"), 0644)

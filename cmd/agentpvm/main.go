@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"regexp"
 	"uml-container/internal/api"
 	"uml-container/internal/cgroup"
 	"uml-container/internal/config"
@@ -37,6 +38,11 @@ func main() {
 
 		runCmd.Parse(os.Args[2:])
 
+		if !regexp.MustCompile(`^[a-zA-Z0-9_-]+$`).MatchString(*name) {
+			fmt.Println("Error: Invalid container name format")
+			os.Exit(1)
+		}
+
 		fmt.Printf("Starting sandbox %s...\n", *name)
 		var sockPath string
 		if *useVhost {
@@ -52,6 +58,16 @@ func main() {
 		}
 
 		mgr := container.NewManager(nil)
+		if *cpu < 0 {
+			fmt.Printf("Error: CPU limit cannot be negative\n")
+			os.Exit(1)
+		}
+		memBytes, err := config.ParseMemory(*memory)
+		if err != nil {
+			fmt.Printf("Error: %v\n", err)
+			os.Exit(1)
+		}
+
 		cfg := &config.ContainerConfig{
 			ID:              *name,
 			Name:            *name,
@@ -59,7 +75,7 @@ func main() {
 			Kernel:          *kernel,
 			Init:            *initPath,
 			Memory:          *memory,
-			MemoryBytes:     config.ParseMemory(*memory),
+			MemoryBytes:     memBytes,
 			CPU:             *cpu,
 			UseVirtio:       *useVhost,
 			VhostUserSocket: sockPath,

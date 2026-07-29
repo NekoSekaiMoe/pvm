@@ -17,6 +17,7 @@ Contributor guide for **PVM** (`uml-container`), a User-Mode Linux (UML) contain
 ```bash
 go build ./cmd/umlctl                 # build the main CLI (CI default)
 go build -o bin/umlctl ./cmd/umlctl   # build umlctl (integration script)
+go build -o agentpvm ./cmd/agentpvm   # build the agentpvm management binary
 go generate ./...                     # regenerate eBPF bytecode (requires clang/llvm/libbpf-dev)
 go test -v ./...                      # run all Go unit tests (CI default)
 go vet ./...                          # static checks before pushing
