@@ -17,11 +17,14 @@ type Memory struct {
 
 // MapRegion mmaps a file descriptor shared by the UML guest into the host Go process
 func (m *Memory) MapRegion(region VhostUserMemoryRegion, fd int) error {
-	// Map the shared memory. MUST be MAP_SHARED to see guest writes.
 	b, err := syscall.Mmap(fd, int64(region.MmapOffset), int(region.MemorySize), syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED)
 	if err != nil {
 		return fmt.Errorf("failed to mmap fd %d: %v", fd, err)
 	}
+
+	// Attempt to use Transparent Huge Pages (THP) / HugeTLB for this region
+	// This drastically reduces TLB misses for the VM's physical memory
+	_ = syscall.Madvise(b, syscall.MADV_HUGEPAGE)
 
 	m.Regions = append(m.Regions, MappedRegion{
 		VhostUserMemoryRegion: region,

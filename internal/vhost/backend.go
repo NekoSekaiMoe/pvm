@@ -28,7 +28,7 @@ func StartNativeDaemon(containerID string, imagePath string) (string, *Server, e
 		return "", nil, fmt.Errorf("failed to open block device %s: %v", imagePath, err)
 	}
 
-	server := NewServer(socketPath, blk)
+	server := NewServer(socketPath, blk, nil)
 	if err := server.Start(); err != nil {
 		return "", nil, fmt.Errorf("native vhost server failed to start: %v", err)
 	}
@@ -103,6 +103,27 @@ func StartStorageDaemon(containerID string, imagePath string) (string, *exec.Cmd
 	}
 	
 	return socketPath, cmd, nil
+}
+
+// StartNativeNetDaemon starts a native Go vhost-user server for virtio-net
+func StartNativeNetDaemon(containerID string, tapName string, bridgeName string) (string, *Server, error) {
+	dir := filepath.Join("/var/lib/uml-container/containers", containerID)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return "", nil, err
+	}
+	socketPath := filepath.Join(dir, "vhost-net.sock")
+
+	netDev, err := NewNetDevice(tapName, bridgeName)
+	if err != nil {
+		return "", nil, fmt.Errorf("failed to init net device: %v", err)
+	}
+
+	server := NewServer(socketPath, nil, netDev)
+	if err := server.Start(); err != nil {
+		return "", nil, fmt.Errorf("native vhost net server failed to start: %v", err)
+	}
+
+	return socketPath, server, nil
 }
 
 func supportsIoUring() bool {

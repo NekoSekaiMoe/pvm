@@ -37,6 +37,8 @@ func main() {
 		initPath := runCmd.String("init", "/init.sh", "Init script path")
 		memory := runCmd.String("memory", "512M", "Container memory")
 		cpu := runCmd.Int("cpu", 0, "CPU limit (0 means no limit)")
+		netTap := runCmd.String("net-tap", "", "Network tap device to use")
+		nativeVhostNet := runCmd.Bool("native-vhost-net", false, "Use native Go vhost-user-net backend for networking")
 
 		runCmd.Parse(os.Args[2:])
 
@@ -93,7 +95,20 @@ func main() {
 			CPU:             *cpu,
 			UseVirtio:       *useVhost,
 			VhostUserSocket: sockPath,
+			NetworkTap:      *netTap,
 		}
+
+		if *netTap != "" && *nativeVhostNet {
+			fmt.Println("Starting native vhost-user-net backend...")
+			// Create a default bridge name or assume it's set up
+			netSock, _, err := vhost.StartNativeNetDaemon(*name, *netTap, "")
+			if err != nil {
+				fmt.Printf("Error starting native vhost net: %v\n", err)
+			} else {
+				cfg.VhostNetSocket = netSock
+			}
+		}
+
 		if err := mgr.Start(context.Background(), cfg); err != nil {
 			fmt.Printf("Container start failed: %v\n", err)
 		} else {

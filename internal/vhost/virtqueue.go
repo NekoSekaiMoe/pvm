@@ -120,28 +120,55 @@ func (vq *VirtQueue) processDescChain(mem *Memory, headIdx uint16, blk *BlockDev
 		switch reqType {
 		case VirtioBlkTIn:
 			// Read from disk to guest memory
-			for _, data := range dataSlices {
-				n, err := blk.ReadAt(data, offset)
-				written += uint32(n)
-				offset += int64(n)
-				if err != nil {
-					break
+			go func() {
+				var st byte = VirtioBlkSOk
+				var totalWritten uint32
+				for _, data := range dataSlices {
+					n, err := blk.ReadAt(data, offset)
+					totalWritten += uint32(n)
+					offset += int64(n)
+					if err != nil {
+						st = VirtioBlkSIoErr
+						break
+					}
 				}
-			}
-			status = VirtioBlkSOk
+				if statusSlice != nil && len(statusSlice) >= 1 {
+					statusSlice[0] = st
+				}
+				vq.completeRequest(mem, headIdx, totalWritten+1)
+			}()
+			return // return immediately, completion is handled async
+
 		case VirtioBlkTOut:
 			// Write from guest memory to disk
-			for _, data := range dataSlices {
-				n, err := blk.WriteAt(data, offset)
-				offset += int64(n)
-				if err != nil {
-					break
+			go func() {
+				var st byte = VirtioBlkSOk
+				var totalWritten uint32
+				for _, data := range dataSlices {
+					n, err := blk.WriteAt(data, offset)
+					totalWritten += uint32(n) // we just count processed bytes
+					offset += int64(n)
+					if err != nil {
+						st = VirtioBlkSIoErr
+						break
+					}
 				}
-			}
-			status = VirtioBlkSOk
+				if statusSlice != nil && len(statusSlice) >= 1 {
+					statusSlice[0] = st
+				}
+				vq.completeRequest(mem, headIdx, totalWritten+1)
+			}()
+			return // return immediately, completion is handled async
+
 		case VirtioBlkTFlush:
-			blk.Sync()
-			status = VirtioBlkSOk
+			go func() {
+				blk.Sync()
+				if statusSlice != nil && len(statusSlice) >= 1 {
+					statusSlice[0] = VirtioBlkSOk
+				}
+				vq.completeRequest(mem, headIdx, 1)
+			}()
+			return
 		}
 	}
 
@@ -150,6 +177,10 @@ func (vq *VirtQueue) processDescChain(mem *Memory, headIdx uint16, blk *BlockDev
 		written++ // status byte counts as written
 	}
 	
+	vq.completeRequest(mem, headIdx, written)
+}
+
+func (vq *VirtQueue) completeRequest(mem *Memory, headIdx uint16, written uint32) {
 	// Write back to Used ring to acknowledge completion
 	// used ring header: flags (2 bytes), idx (2 bytes), ring (num * 8 bytes), avail_event (2 bytes)
 	usedIdxBytes, err := mem.GuestToHost(vq.UsedAddr+2, 2)

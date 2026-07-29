@@ -14,14 +14,16 @@ type Server struct {
 	mem        *Memory
 	queues     []*VirtQueue
 	blk        *BlockDevice
+	netDev     *NetDevice
 }
 
-func NewServer(socketPath string, blk *BlockDevice) *Server {
+func NewServer(socketPath string, blk *BlockDevice, netDev *NetDevice) *Server {
 	return &Server{
 		socketPath: socketPath,
 		mem:        &Memory{},
 		queues:     make([]*VirtQueue, 2),
 		blk:        blk,
+		netDev:     netDev,
 	}
 }
 
@@ -98,7 +100,14 @@ func (s *Server) handleConn(conn *net.UnixConn) {
 
 		switch hdr.Request {
 		case VhostUserGetFeatures:
-			var features uint64 = (1 << 32) | (1 << 30) | (1 << 1) | (1 << 2) | (1 << 6) | (1 << 9)
+			var features uint64 = (1 << 32) | (1 << 24) // VIRTIO_F_VERSION_1 | VIRTIO_F_NOTIFY_ON_EMPTY
+			if s.blk != nil {
+				// Block features
+				features |= (1 << 30) | (1 << 1) | (1 << 2) | (1 << 6) | (1 << 9)
+			} else if s.netDev != nil {
+				// Net features (MAC, MRG_RXBUF, STATUS)
+				features |= (1 << 5) | (1 << 15) | (1 << 16)
+			}
 			hdr.Flags |= VhostUserReplyMask
 			hdr.Size = 8
 			hdr.Encode(replyBuf[:12])
@@ -117,7 +126,11 @@ func (s *Server) handleConn(conn *net.UnixConn) {
 			hdr.Flags |= VhostUserReplyMask
 			hdr.Size = 8
 			hdr.Encode(replyBuf[:12])
-			binary.LittleEndian.PutUint64(replyBuf[12:20], 1)
+			if s.netDev != nil {
+				binary.LittleEndian.PutUint64(replyBuf[12:20], 2) // RX and TX queues
+			} else {
+				binary.LittleEndian.PutUint64(replyBuf[12:20], 1)
+			}
 			conn.Write(replyBuf)
 
 		case VhostUserSetOwner, VhostUserSetFeatures, VhostUserSetProtocolFeatures:
@@ -179,7 +192,15 @@ func (s *Server) handleConn(conn *net.UnixConn) {
 				s.queues[idx].KickFd = fds[0]
 				// Virtqueue is ready! Start processing ring in background
 				fmt.Printf("[Vhost-User] Virtqueue %d Kick FD received, starting processor...\n", idx)
-				go s.queues[idx].ProcessRing(s.mem, s.blk)
+				if s.blk != nil {
+					go s.queues[idx].ProcessRing(s.mem, s.blk)
+				} else if s.netDev != nil {
+					if idx == 0 {
+						go s.netDev.StartRX(s.queues[idx], s.mem)
+					} else if idx == 1 {
+						go s.netDev.StartTX(s.queues[idx], s.mem)
+					}
+				}
 			}
 
 		default:
