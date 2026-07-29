@@ -52,10 +52,20 @@ echo "=============================="
 
 # Do a large write to measure sequential write performance
 echo "Running sequential write test (100MB)..."
-dd if=/dev/zero of=/test_write.dat bs=1M count=100 oflag=direct 2>&1 | grep -E "copied|records"
+if dd if=/dev/zero of=/test_write.dat bs=1M count=100 oflag=direct > /tmp/dd_write.log 2>&1; then
+    grep -E "copied|records" /tmp/dd_write.log
+else
+    cat /tmp/dd_write.log
+    exit 1
+fi
 
 echo "Running sequential read test (100MB)..."
-dd if=/test_write.dat of=/dev/null bs=1M count=100 iflag=direct 2>&1 | grep -E "copied|records"
+if dd if=/test_write.dat of=/dev/null bs=1M count=100 iflag=direct > /tmp/dd_read.log 2>&1; then
+    grep -E "copied|records" /tmp/dd_read.log
+else
+    cat /tmp/dd_read.log
+    exit 1
+fi
 
 echo "=============================="
 echo " PERF_TEST_COMPLETED "

@@ -1,0 +1,19 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "snapshot",
+    srcs = ["tar_archive.go"],
+    importpath = "uml-container/internal/snapshot",
+    visibility = ["//:__subpackages__"],
+    deps = ["//internal/state"],
+)
+
+go_test(
+    name = "snapshot_test",
+    srcs = [
+        "tar_archive_links_test.go",
+        "tar_archive_test.go",
+    ],
+    embed = [":snapshot"],
+    deps = ["//internal/state"],
+)

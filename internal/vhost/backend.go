@@ -107,7 +107,10 @@ func StartStorageDaemon(containerID string, imagePath string) (string, *exec.Cmd
 
 // StartNativeNetDaemon starts a native Go vhost-user server for virtio-net
 func StartNativeNetDaemon(containerID string, tapName string, bridgeName string) (string, *Server, error) {
-	dir := filepath.Join("/var/lib/uml-container/containers", containerID)
+	dir, err := state.ContainerDir(containerID)
+	if err != nil {
+		return "", nil, err
+	}
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return "", nil, err
 	}

@@ -1,0 +1,20 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "image",
+    srcs = ["manager.go"],
+    importpath = "uml-container/internal/image",
+    visibility = ["//:__subpackages__"],
+    deps = [
+        "//internal/filesystem",
+        "//internal/state",
+        "@com_github_google_go_containerregistry//pkg/crane",
+    ],
+)
+
+go_test(
+    name = "image_test",
+    srcs = ["manager_test.go"],
+    embed = [":image"],
+    deps = ["//internal/state"],
+)

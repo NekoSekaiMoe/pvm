@@ -239,7 +239,7 @@ func Writev(fd int, bs [][]byte) PrepRequest {
 	}
 }
 
-func Pwritev(fd int, bs [][]byte, offset int64) PrepRequest {
+func Pwritev(fd int, bs [][]byte, offset uint64) PrepRequest {
 	iovecs := bytes2iovec(bs)
 
 	var bp unsafe.Pointer
@@ -329,7 +329,6 @@ func Sendmsg(sockfd int, p, oob []byte, to syscall.Sockaddr, flags int) (PrepReq
 	var dummy byte
 	if len(oob) > 0 {
 		if len(p) == 0 {
-			var sockType int
 			sockType, err := syscall.GetsockoptInt(sockfd, syscall.SOL_SOCKET, syscall.SO_TYPE)
 			if err != nil {
 				return nil, err
@@ -383,7 +382,6 @@ func Recvmsg(sockfd int, p, oob []byte, to syscall.Sockaddr, flags int) (PrepReq
 	var dummy byte
 	if len(oob) > 0 {
 		if len(p) == 0 {
-			var sockType int
 			sockType, err := syscall.GetsockoptInt(sockfd, syscall.SOL_SOCKET, syscall.SO_TYPE)
 			if err != nil {
 				return nil, err
@@ -458,7 +456,7 @@ func Accept(sockfd int) PrepRequest {
 
 func Accept4(sockfd int, flags int) PrepRequest {
 	var rsa syscall.RawSockaddrAny
-	var len uint32 = syscall.SizeofSockaddrAny
+	var salen uint32 = syscall.SizeofSockaddrAny
 
 	resolver := func(req Request) {
 		result := req.(*request)
@@ -468,7 +466,7 @@ func Accept4(sockfd int, flags int) PrepRequest {
 			return
 		}
 
-		if len > syscall.SizeofSockaddrAny {
+		if salen > syscall.SizeofSockaddrAny {
 			panic("RawSockaddrAny too small")
 		}
 
@@ -480,7 +478,7 @@ func Accept4(sockfd int, flags int) PrepRequest {
 		}
 	}
 	return func(sqe iouring_syscall.SubmissionQueueEntry, userData *UserData) {
-		userData.hold(&rsa, &len)
+		userData.hold(&rsa, &salen)
 		userData.request.resolver = resolver
 
 		sqe.PrepOperation(
@@ -488,7 +486,7 @@ func Accept4(sockfd int, flags int) PrepRequest {
 			int32(sockfd),
 			uint64(uintptr(unsafe.Pointer(&rsa))),
 			0,
-			uint64(uintptr(unsafe.Pointer(&len))),
+			uint64(uintptr(unsafe.Pointer(&salen))),
 		)
 		sqe.SetOpFlags(uint32(flags))
 	}

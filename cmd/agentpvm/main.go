@@ -47,6 +47,16 @@ func main() {
 			os.Exit(1)
 		}
 
+		if *cpu < 0 {
+			fmt.Printf("Error: CPU limit cannot be negative\n")
+			os.Exit(1)
+		}
+		memBytes, err := config.ParseMemory(*memory)
+		if err != nil {
+			fmt.Printf("Error: %v\n", err)
+			os.Exit(1)
+		}
+
 		fmt.Printf("Starting sandbox %s...\n", *name)
 		var sockPath string
 		var vhostProcess *exec.Cmd
@@ -74,15 +84,6 @@ func main() {
 		}
 
 		mgr := container.NewManager(nil)
-		if *cpu < 0 {
-			fmt.Printf("Error: CPU limit cannot be negative\n")
-			os.Exit(1)
-		}
-		memBytes, err := config.ParseMemory(*memory)
-		if err != nil {
-			fmt.Printf("Error: %v\n", err)
-			os.Exit(1)
-		}
 
 		cfg := &config.ContainerConfig{
 			ID:              *name,

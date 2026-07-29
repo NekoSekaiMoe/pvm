@@ -1,0 +1,14 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "config",
+    srcs = ["config.go"],
+    importpath = "uml-container/internal/config",
+    visibility = ["//:__subpackages__"],
+)
+
+go_test(
+    name = "config_test",
+    srcs = ["config_test.go"],
+    embed = [":config"],
+)

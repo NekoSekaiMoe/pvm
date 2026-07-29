@@ -1,0 +1,28 @@
+load("@rules_go//go:def.bzl", "go_library")
+
+go_library(
+    name = "webui",
+    srcs = ["embed.go"],
+    embedsrcs = [
+        ".output/public/200.html",
+        ".output/public/404.html",
+        ".output/public/_nuxt/BAkab4Z1.js",
+        ".output/public/_nuxt/BQbWdjGy.js",
+        ".output/public/_nuxt/Bc_VBlYm.js",
+        ".output/public/_nuxt/BhKT5qtv.js",
+        ".output/public/_nuxt/CU0oSCxG.js",
+        ".output/public/_nuxt/CoVLOPa7.js",
+        ".output/public/_nuxt/DW5zBP-W.js",
+        ".output/public/_nuxt/_id_.b3KS7aCp.css",
+        ".output/public/_nuxt/builds/latest.json",
+        ".output/public/_nuxt/builds/meta/af48a791-c123-46c3-96bf-3dce0db66628.json",
+        ".output/public/_nuxt/entry.BtWQilkg.css",
+        ".output/public/_nuxt/error-404.DL_4WIao.css",
+        ".output/public/_nuxt/error-500.I1Dtv2V5.css",
+        ".output/public/_nuxt/obNFrV6N.js",
+        ".output/public/images/index.html",
+        ".output/public/index.html",
+    ],
+    importpath = "uml-container/webui",
+    visibility = ["//visibility:public"],
+)

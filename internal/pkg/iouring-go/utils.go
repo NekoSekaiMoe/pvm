@@ -1,8 +1,10 @@
+//go:build linux
 // +build linux
 
 package iouring
 
 import (
+	"errors"
 	"syscall"
 	"unsafe"
 )
@@ -22,6 +24,10 @@ func bytes2iovec(bs [][]byte) []syscall.Iovec {
 	return iovecs
 }
 
-func sockaddr(addr syscall.Sockaddr) (unsafe.Pointer, uint32, error) { return nil, 0, nil }
+func sockaddr(addr syscall.Sockaddr) (unsafe.Pointer, uint32, error) {
+	return nil, 0, errors.New("unsupported operation")
+}
 
-func anyToSockaddr(rsa *syscall.RawSockaddrAny) (syscall.Sockaddr, error) { return nil, nil }
+func anyToSockaddr(rsa *syscall.RawSockaddrAny) (syscall.Sockaddr, error) {
+	return nil, errors.New("unsupported operation")
+}

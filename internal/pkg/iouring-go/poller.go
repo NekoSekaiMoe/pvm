@@ -25,11 +25,6 @@ var (
 )
 
 func initpoller() error {
-	// fast path
-	if poller != nil {
-		return nil
-	}
-
 	initpollerLock.Lock()
 	defer initpollerLock.Unlock()
 	if poller != nil {
@@ -56,15 +51,19 @@ func registerIOURing(iour *IOURing) error {
 		return err
 	}
 
-	if err := unix.EpollCtl(poller.fd, unix.EPOLL_CTL_ADD, iour.eventfd,
-		&unix.EpollEvent{Fd: int32(iour.eventfd), Events: unix.EPOLLIN | unix.EPOLLET},
-	); err != nil {
-		return os.NewSyscallError("epoll_ctl_add", err)
-	}
-
 	poller.Lock()
 	poller.iours[iour.eventfd] = iour
 	poller.Unlock()
+
+	if err := unix.EpollCtl(poller.fd, unix.EPOLL_CTL_ADD, iour.eventfd,
+		&unix.EpollEvent{Fd: int32(iour.eventfd), Events: unix.EPOLLIN | unix.EPOLLET},
+	); err != nil {
+		poller.Lock()
+		delete(poller.iours, iour.eventfd)
+		poller.Unlock()
+		return os.NewSyscallError("epoll_ctl_add", err)
+	}
+
 	return nil
 }
 

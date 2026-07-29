@@ -8,6 +8,8 @@ import (
 	"strconv"
 )
 
+var validContainerID = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
+
 // Manager handles cgroup v2 resource limits for a container.
 type Manager struct {
 	CgroupRoot string
@@ -38,7 +40,7 @@ func resolveCgroupRoot() string {
 }
 
 func (m *Manager) Setup(containerID string, pid int, memory int64, cpu int) error {
-	if !regexp.MustCompile(`^[a-zA-Z0-9_-]+$`).MatchString(containerID) {
+	if !validContainerID.MatchString(containerID) {
 		return fmt.Errorf("invalid container ID")
 	}
 	cgPath := filepath.Join(m.CgroupRoot, containerID)
@@ -62,6 +64,9 @@ func (m *Manager) Setup(containerID string, pid int, memory int64, cpu int) erro
 
 	// Set CPU limit if provided (cgroup v2 cpu.max format: "MAX PERIOD")
 	if cpu > 0 {
+		if cpu > 1024 {
+			return fmt.Errorf("cpu limit exceeds maximum allowed value")
+		}
 		cpuFile := filepath.Join(cgPath, "cpu.max")
 		// e.g. 1 cpu = "100000 100000"
 		quota := cpu * 100000
@@ -76,7 +81,7 @@ func (m *Manager) Setup(containerID string, pid int, memory int64, cpu int) erro
 
 // Freeze suspends all processes in the cgroup
 func (m *Manager) Freeze(containerID string) error {
-	if !regexp.MustCompile(`^[a-zA-Z0-9_-]+$`).MatchString(containerID) {
+	if !validContainerID.MatchString(containerID) {
 		return fmt.Errorf("invalid container ID")
 	}
 	cgPath := filepath.Join(m.CgroupRoot, containerID)
@@ -86,7 +91,7 @@ func (m *Manager) Freeze(containerID string) error {
 
 // Thaw resumes all processes in the cgroup
 func (m *Manager) Thaw(containerID string) error {
-	if !regexp.MustCompile(`^[a-zA-Z0-9_-]+$`).MatchString(containerID) {
+	if !validContainerID.MatchString(containerID) {
 		return fmt.Errorf("invalid container ID")
 	}
 	cgPath := filepath.Join(m.CgroupRoot, containerID)

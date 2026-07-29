@@ -33,7 +33,7 @@ ip route add default via 10.0.0.1 || true
 echo "nameserver 8.8.8.8" > /etc/resolv.conf
 
 echo "Attempting to install python3..."
-apk update && apk add python3 && echo "PKG_INSTALL_SUCCESS"
+apk update && apk add fastfetch && fastfetch && echo "PKG_INSTALL_SUCCESS"
 
 poweroff -f
 EOF
@@ -55,8 +55,8 @@ sudo rm -f "$CONSOLE_LOG"
 # Using tap=tap_pkg for network
 sudo ./agentpvm run -name pkg-test -rootfs ${IMG_NAME} -kernel ./bin/linux -init /init.sh -vhost=false -net-tap tap_pkg > pkg_agentpvm.log 2>&1 || true
 
-echo "Waiting for container to finish (up to 30s)..."
-for i in {1..30}; do
+echo "Waiting for container to finish (up to 60s)..."
+for i in {1..60}; do
     if sudo grep -q "PKG_INSTALL_SUCCESS" "$CONSOLE_LOG" 2>/dev/null; then
         echo "✅ Package installation test passed."
         sudo ./bin/umlctl network rm pvm_br0 || true

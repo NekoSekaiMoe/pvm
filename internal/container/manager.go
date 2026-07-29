@@ -109,6 +109,7 @@ func (m *Manager) Start(ctx context.Context, cfg *config.ContainerConfig) error 
 	if setupErr := cg.Setup(cfg.ID, pid, cfg.MemoryBytes, cfg.CPU); setupErr != nil {
 		fmt.Printf("Error: failed to setup cgroup limits for %s: %v\n", cfg.ID, setupErr)
 		p.Cmd.Process.Kill()
+		p.Cmd.Wait()
 		st.Status = "exited"
 		state.SaveState(cfg.ID, st)
 		return fmt.Errorf("cgroup setup failed: %v", setupErr)

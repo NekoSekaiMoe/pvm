@@ -4,12 +4,12 @@
 package iouring
 
 import (
-	"errors"
 	"log"
 	"os"
 	"runtime"
 	"sync"
 	"syscall"
+	"time"
 
 	iouring_syscall "github.com/iceber/iouring-go/syscall"
 )
@@ -76,11 +76,13 @@ func New(entries uint, opts ...IOURingOption) (*IOURing, error) {
 	iour.Features = iour.params.Features
 
 	if err := iour.registerEventfd(); err != nil {
+		close(iour.closed)
 		iour.Close()
 		return nil, err
 	}
 
 	if err := registerIOURing(iour); err != nil {
+		close(iour.closed)
 		iour.Close()
 		return nil, err
 	}
@@ -210,6 +212,7 @@ func (iour *IOURing) SubmitRequest(request PrepRequest, ch chan<- Result) (Reque
 		iour.userDataLock.Lock()
 		delete(iour.userDatas, userData.id)
 		iour.userDataLock.Unlock()
+		userDataPool.Put(userData)
 		return nil, err
 	}
 
@@ -218,54 +221,7 @@ func (iour *IOURing) SubmitRequest(request PrepRequest, ch chan<- Result) (Reque
 
 // SubmitRequests by Request functions and io results are notified via channel
 func (iour *IOURing) SubmitRequests(requests []PrepRequest, ch chan<- Result) (RequestSet, error) {
-	// TODO(iceber): no length limit
-	if len(requests) > int(*iour.sq.entries) {
-		return nil, errors.New("too many requests")
-	}
-
-	iour.submitLock.Lock()
-	defer iour.submitLock.Unlock()
-
-	if iour.IsClosed() {
-		return nil, ErrIOURingClosed
-	}
-
-	var sqeN uint32
-	userDatas := make([]*UserData, 0, len(requests))
-	for _, request := range requests {
-		sqe := iour.getSQEntry()
-		sqeN++
-
-		userData, err := iour.doRequest(sqe, request, ch)
-		if err != nil {
-			iour.sq.fallback(sqeN)
-			return nil, err
-		}
-		userDatas = append(userDatas, userData)
-	}
-
-	// must be located before the lock operation to
-	// avoid the compiler's adjustment of the code order.
-	// issue: https://github.com/Iceber/iouring-go/issues/8
-	rset := newRequestSet(userDatas)
-
-	iour.userDataLock.Lock()
-	for _, data := range userDatas {
-		iour.userDatas[data.id] = data
-	}
-	iour.userDataLock.Unlock()
-
-	if _, err := iour.submit(); err != nil {
-		iour.userDataLock.Lock()
-		for _, data := range userDatas {
-			delete(iour.userDatas, data.id)
-		}
-		iour.userDataLock.Unlock()
-
-		return nil, err
-	}
-
-	return rset, nil
+	return iour.submitBatch(requests, ch, nil)
 }
 
 func (iour *IOURing) needEnter(flags *uint32) bool {
@@ -359,6 +315,7 @@ func (iour *IOURing) run() {
 				return
 			}
 			log.Println("runComplete error: ", err)
+			time.Sleep(10 * time.Millisecond)
 			continue
 		}
 
@@ -374,16 +331,18 @@ func (iour *IOURing) run() {
 		delete(iour.userDatas, cqe.UserData())
 		iour.userDataLock.Unlock()
 
-		userData.request.complate(cqe)
+		userData.request.complete(cqe)
 
 		// ignore link timeout
 		if userData.opcode == iouring_syscall.IORING_OP_LINK_TIMEOUT {
+			userDataPool.Put(userData)
 			continue
 		}
 
 		if userData.resulter != nil {
 			userData.resulter <- userData.request
 		}
+		userDataPool.Put(userData)
 	}
 }
 

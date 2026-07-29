@@ -74,7 +74,17 @@ func (vq *VirtQueue) processDescChain(mem *Memory, headIdx uint16, blk *BlockDev
 	var statusSlice []byte
 	
 	isFirst := true
+	iter := uint32(0)
 	for {
+		if iter >= vq.Num {
+			if statusSlice != nil && len(statusSlice) >= 1 {
+				statusSlice[0] = VirtioBlkSIoErr
+			}
+			vq.completeRequest(mem, headIdx, 1)
+			return
+		}
+		iter++
+		
 		descBytes, err := mem.GuestToHost(vq.DescAddr+uint64(currIdx)*16, 16)
 		if err != nil {
 			fmt.Printf("[VirtQueue %d] failed to map desc %d\n", vq.Index, currIdx)
@@ -124,7 +134,14 @@ func (vq *VirtQueue) processDescChain(mem *Memory, headIdx uint16, blk *BlockDev
 			// Read from disk to guest memory
 			go func() {
 				ch := make(chan iouring.Result, 1)
-				blk.IOUR().SubmitRequest(iouring.Preadv(blk.Fd(), dataSlices, uint64(offset)), ch)
+				_, err := blk.IOUR().SubmitRequest(iouring.Preadv(blk.Fd(), dataSlices, uint64(offset)), ch)
+				if err != nil {
+					if statusSlice != nil && len(statusSlice) >= 1 {
+						statusSlice[0] = VirtioBlkSIoErr
+					}
+					vq.completeRequest(mem, headIdx, 1)
+					return
+				}
 				res := <-ch
 				var st byte = VirtioBlkSOk
 				if res.Err() != nil {
@@ -145,7 +162,14 @@ func (vq *VirtQueue) processDescChain(mem *Memory, headIdx uint16, blk *BlockDev
 			// Write from guest memory to disk
 			go func() {
 				ch := make(chan iouring.Result, 1)
-				blk.IOUR().SubmitRequest(iouring.Pwritev(blk.Fd(), dataSlices, offset), ch)
+				_, err := blk.IOUR().SubmitRequest(iouring.Pwritev(blk.Fd(), dataSlices, uint64(offset)), ch)
+				if err != nil {
+					if statusSlice != nil && len(statusSlice) >= 1 {
+						statusSlice[0] = VirtioBlkSIoErr
+					}
+					vq.completeRequest(mem, headIdx, 1)
+					return
+				}
 				res := <-ch
 				var st byte = VirtioBlkSOk
 				if res.Err() != nil {
@@ -165,7 +189,14 @@ func (vq *VirtQueue) processDescChain(mem *Memory, headIdx uint16, blk *BlockDev
 		case VirtioBlkTFlush:
 			go func() {
 				ch := make(chan iouring.Result, 1)
-				blk.IOUR().SubmitRequest(iouring.Fsync(blk.Fd()), ch)
+				_, err := blk.IOUR().SubmitRequest(iouring.Fsync(blk.Fd()), ch)
+				if err != nil {
+					if statusSlice != nil && len(statusSlice) >= 1 {
+						statusSlice[0] = VirtioBlkSIoErr
+					}
+					vq.completeRequest(mem, headIdx, 1)
+					return
+				}
 				<-ch
 				if statusSlice != nil && len(statusSlice) >= 1 {
 					statusSlice[0] = VirtioBlkSOk

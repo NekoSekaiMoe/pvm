@@ -61,12 +61,13 @@ jobs:
     - name: Run Integration Scripts
       timeout-minutes: 15
       run: |
+        FAILED=0
         echo "Running scripts in scripts/test_*.sh serially..."
         chmod +x scripts/test_*.sh || true
         for script in scripts/test_*.sh; do
           if [ -f "$script" ] && [ -x "$script" ]; then
             echo "Running $script..."
-            ./"$script" || echo "$script failed but continuing..."
+            ./"$script" || { echo "$script failed"; FAILED=1; }
           fi
         done
         
@@ -75,9 +76,14 @@ jobs:
         for script in tests/*.sh; do
           if [ -f "$script" ]; then
             echo "Running $script..."
-            ./"$script" || echo "$script failed but continuing..."
+            ./"$script" || { echo "$script failed"; FAILED=1; }
           fi
         done
+
+        if [ $FAILED -ne 0 ]; then
+          echo "One or more integration tests failed."
+          exit 1
+        fi
 
     - name: Dump logs on failure
       if: failure()

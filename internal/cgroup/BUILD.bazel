@@ -1,0 +1,14 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "cgroup",
+    srcs = ["manager.go"],
+    importpath = "uml-container/internal/cgroup",
+    visibility = ["//:__subpackages__"],
+)
+
+go_test(
+    name = "cgroup_test",
+    srcs = ["manager_test.go"],
+    embed = [":cgroup"],
+)

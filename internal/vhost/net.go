@@ -87,7 +87,13 @@ func (n *NetDevice) processTXChain(mem *Memory, vq *VirtQueue, headIdx uint16) u
 	// Data immediately follows the header or is in the next descriptor.
 	// We just read all buffers.
 	isFirst := true
+	iter := uint32(0)
 	for {
+		if iter >= vq.Num {
+			return written
+		}
+		iter++
+
 		descBytes, err := mem.GuestToHost(vq.DescAddr+uint64(currIdx)*16, 16)
 		if err != nil { return written }
 		
@@ -103,13 +109,19 @@ func (n *NetDevice) processTXChain(mem *Memory, vq *VirtQueue, headIdx uint16) u
 			// virtio-net header (10/12 bytes). Skip it for TAP write.
 			hdrLen := uint32(10)
 			if length > hdrLen {
-				n.tapFile.Write(buf[hdrLen:])
-				written += length - hdrLen
+				nw, err := n.tapFile.Write(buf[hdrLen:])
+				if nw > 0 {
+					written += uint32(nw)
+				}
+				if err != nil { return written }
 			}
 			isFirst = false
 		} else {
-			n.tapFile.Write(buf)
-			written += length
+			nw, err := n.tapFile.Write(buf)
+			if nw > 0 {
+				written += uint32(nw)
+			}
+			if err != nil { return written }
 		}
 
 		if (flags & VRingDescFNext) == 0 {
@@ -158,7 +170,13 @@ func (n *NetDevice) processRXChain(mem *Memory, vq *VirtQueue, headIdx uint16, p
 	pktOffset := uint32(0)
 	
 	isFirst := true
+	iter := uint32(0)
 	for {
+		if iter >= vq.Num {
+			return written
+		}
+		iter++
+
 		descBytes, err := mem.GuestToHost(vq.DescAddr+uint64(currIdx)*16, 16)
 		if err != nil { return written }
 		

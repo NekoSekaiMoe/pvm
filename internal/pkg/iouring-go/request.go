@@ -22,6 +22,7 @@ type Request interface {
 	Cancel() (Request, error)
 	Done() <-chan struct{}
 
+	ID() uint64
 	GetRes() (int, error)
 	// Can Only be used in ResultResolver
 	SetResult(r0, r1 interface{}, err error) error
@@ -98,7 +99,7 @@ func (req *request) resolve() {
 	})
 }
 
-func (req *request) complate(cqe iouring_syscall.CompletionQueueEvent) {
+func (req *request) complete(cqe iouring_syscall.CompletionQueueEvent) {
 	req.res = cqe.Result()
 	req.ext1 = cqe.Extra1()
 	req.ext2 = cqe.Extra2()
@@ -106,7 +107,7 @@ func (req *request) complate(cqe iouring_syscall.CompletionQueueEvent) {
 	close(req.done)
 
 	if req.set != nil {
-		req.set.complateOne()
+		req.set.completeOne()
 		req.set = nil
 	}
 }
@@ -138,6 +139,8 @@ func (req *request) Cancel() (Request, error) {
 		return nil, ErrRequestCompleted
 	}
 
+	// req.iour may have been set to nil if the request is completed just now.
+	// submitCancel gracefully handles a nil receiver to prevent panic.
 	return req.iour.submitCancel(req.id)
 }
 
@@ -147,6 +150,10 @@ func (req *request) Done() <-chan struct{} {
 
 func (req *request) Opcode() uint8 {
 	return req.opcode
+}
+
+func (req *request) ID() uint64 {
+	return req.id
 }
 
 func (req *request) Fd() int {
@@ -262,7 +269,7 @@ func newRequestSet(userData []*UserData) *requestSet {
 	return set
 }
 
-func (set *requestSet) complateOne() {
+func (set *requestSet) completeOne() {
 	if atomic.AddInt32(&set.complates, 1) == int32(len(set.requests)) {
 		close(set.done)
 	}

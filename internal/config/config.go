@@ -1,6 +1,9 @@
 package config
 
-import "fmt"
+import (
+	"fmt"
+	"math"
+)
 
 type ContainerConfig struct {
 	ID        string `json:"id"`
@@ -34,16 +37,22 @@ func ParseMemory(mem string) (int64, error) {
 	}
 	switch unit {
 	case "K", "k", "KB", "kb":
+		if val > math.MaxInt64/1024 {
+			return 0, fmt.Errorf("memory value overflow")
+		}
 		val = val * 1024
 	case "M", "m", "MB", "mb":
+		if val > math.MaxInt64/(1024*1024) {
+			return 0, fmt.Errorf("memory value overflow")
+		}
 		val = val * 1024 * 1024
 	case "G", "g", "GB", "gb":
+		if val > math.MaxInt64/(1024*1024*1024) {
+			return 0, fmt.Errorf("memory value overflow")
+		}
 		val = val * 1024 * 1024 * 1024
 	default:
 		return 0, fmt.Errorf("unsupported or missing memory unit: %s", unit)
-	}
-	if val < 0 {
-		return 0, fmt.Errorf("memory value overflow")
 	}
 	return val, nil
 }

@@ -28,7 +28,7 @@
 
 
 # Installation
-```
+```bash
 go get github.com/iceber/iouring-go
 ```
 [doc](https://pkg.go.dev/github.com/iceber/iouring-go)
@@ -105,7 +105,7 @@ if _, err := request.Cancel(); err != nil{
 <- request.Done()
 if err := request.Err(); err != nil{
     if err == iouring.ErrRequestCanceled{
-        fmt.Println("request is canceled"0
+        fmt.Println("request is canceled")
         return
     }
     fmt.Printf("request error: %v\n", err)
@@ -123,7 +123,7 @@ prep1:= iouring.Pread(fd, buf1, offset)
 
 offset += 1024
 buf2 := make([]byte, 1024)
-prep2:= iouring.Pread(fd, buf1, offset)
+prep2:= iouring.Pread(fd, buf2, offset)
 
 requests, err := iour.SubmitRequests([]iouring.PrepRequest{prep1,prep2}, nil)
 if err != nil{
@@ -138,7 +138,7 @@ requests is concurrent execution
 ```golang
 var offset uint64
 buf := make([]byte, 1024)
-prep1 := iouring.Pread(fd, buf1, offset)
+prep1 := iouring.Pread(fd, buf, offset)
 prep2 := iouring.Write(int(os.Stdout.Fd()), buf)
 
 iour.SubmitLinkRequests([]iouring.PrepRequest{prep1, prep2}, nil)

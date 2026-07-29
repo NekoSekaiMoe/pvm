@@ -1,0 +1,16 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "log",
+    srcs = ["logger.go"],
+    importpath = "uml-container/internal/log",
+    visibility = ["//:__subpackages__"],
+    deps = ["//internal/state"],
+)
+
+go_test(
+    name = "log_test",
+    srcs = ["logger_test.go"],
+    embed = [":log"],
+    deps = ["//internal/state"],
+)

@@ -30,6 +30,7 @@ func mmapIOURing(iour *IOURing) (err error) {
 
 	if (iour.params.Features & iouring_syscall.IORING_FEAT_SINGLE_MMAP) != 0 {
 		iour.cq.ptr = iour.sq.ptr
+		iour.cq.size = iour.sq.size
 	}
 
 	if err = mmapCQ(iour); err != nil {
@@ -47,6 +48,15 @@ func mmapSQ(iour *IOURing) (err error) {
 	params := iour.params
 
 	sq.size = params.SQOffset.Array + params.SQEntries*uint32Size
+	
+	if (params.Features & iouring_syscall.IORING_FEAT_SINGLE_MMAP) != 0 {
+		cqes := makeCompletionQueueRing(params.Flags)
+		cqSize := params.CQOffset.Cqes + params.CQEntries*cqes.entrySz()
+		if cqSize > sq.size {
+			sq.size = cqSize
+		}
+	}
+
 	sq.ptr, err = mmap(iour.fd, sq.size, iouring_syscall.IORING_OFF_SQ_RING)
 	if err != nil {
 		return fmt.Errorf("mmap sq ring: %w", err)
@@ -113,7 +123,7 @@ func mmapSQEs(iour *IOURing) error {
 
 func munmapIOURing(iour *IOURing) error {
 	if iour.sq != nil && iour.sq.ptr != 0 {
-		if iour.sq.sqes.isActive() {
+		if iour.sq.sqes != nil && iour.sq.sqes.isActive() {
 			err := munmap(iour.sq.sqes.mappedPtr(), iour.sq.sqes.ringSz())
 			if err != nil {
 				return fmt.Errorf("ummap sqe array: %w", err)

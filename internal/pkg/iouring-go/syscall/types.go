@@ -164,7 +164,7 @@ func (sqe *sqeCore) SetFlags(flags uint8) {
 }
 
 func (sqe *sqeCore) CleanFlags(flags uint8) {
-	sqe.flags ^= flags
+	sqe.flags &^= flags
 }
 
 func (sqe *sqeCore) SetIoprio(ioprio uint16) {
@@ -212,7 +212,17 @@ func (sqe *SubmissionQueueEntry128) Reset() {
 }
 
 func (sqe *SubmissionQueueEntry128) CMD(castType interface{}) interface{} {
-	return reflect.NewAt(reflect.TypeOf(castType), unsafe.Pointer(&sqe.cmd[0])).Interface()
+	if castType == nil {
+		panic(fmt.Errorf("castType cannot be nil"))
+	}
+	typ := reflect.TypeOf(castType)
+	if typ.Kind() == reflect.Ptr {
+		panic(fmt.Errorf("castType cannot be a pointer"))
+	}
+	if typ.Size() > 80 {
+		panic(fmt.Errorf("castType size exceeds 80-byte cmd region"))
+	}
+	return reflect.NewAt(typ, unsafe.Pointer(&sqe.cmd[0])).Interface()
 }
 
 type CompletionQueueEvent interface {
@@ -283,3 +293,4 @@ func (cqe *CompletionQueueEvent32) Clone() CompletionQueueEvent {
 
 const IORING_FSYNC_DATASYNC uint32 = 1
 const IORING_TIMEOUT_ABS uint32 = 1
+const IORING_TIMEOUT_REALTIME uint32 = 8

@@ -42,15 +42,17 @@ func TimeoutWithTime(t time.Time) (PrepRequest, error) {
 		userData.request.resolver = timeoutResolver
 
 		sqe.PrepOperation(iouring_syscall.IORING_OP_TIMEOUT, -1, uint64(uintptr(unsafe.Pointer(&timespec))), 1, 0)
-		sqe.SetOpFlags(iouring_syscall.IORING_TIMEOUT_ABS)
+		sqe.SetOpFlags(iouring_syscall.IORING_TIMEOUT_ABS | iouring_syscall.IORING_TIMEOUT_REALTIME)
 	}, nil
 }
 
 func CountCompletionEvent(n uint64) PrepRequest {
+	var timespec unix.Timespec
 	return func(sqe iouring_syscall.SubmissionQueueEntry, userData *UserData) {
+		userData.hold(&timespec)
 		userData.request.resolver = timeoutResolver
 
-		sqe.PrepOperation(iouring_syscall.IORING_OP_TIMEOUT, -1, 0, 0, n)
+		sqe.PrepOperation(iouring_syscall.IORING_OP_TIMEOUT, -1, uint64(uintptr(unsafe.Pointer(&timespec))), 1, n)
 	}
 }
 
@@ -58,6 +60,6 @@ func RemoveTimeout(id uint64) PrepRequest {
 	return func(sqe iouring_syscall.SubmissionQueueEntry, userData *UserData) {
 		userData.request.resolver = removeTimeoutResolver
 
-		sqe.PrepOperation(iouring_syscall.IORING_OP_TIMEOUT, -1, id, 0, 0)
+		sqe.PrepOperation(iouring_syscall.IORING_OP_TIMEOUT_REMOVE, -1, id, 0, 0)
 	}
 }

@@ -137,7 +137,13 @@ func (s *Server) handleConn(conn *net.UnixConn) {
 			// Ack
 
 		case VhostUserSetMemTable:
+			if len(payload) < 8 {
+				continue
+			}
 			numRegions := binary.LittleEndian.Uint32(payload[0:4])
+			if len(payload) < 8+int(numRegions)*32 {
+				continue
+			}
 			for i := 0; i < int(numRegions); i++ {
 				offset := 8 + i*32
 				region := VhostUserMemoryRegion{
@@ -155,7 +161,13 @@ func (s *Server) handleConn(conn *net.UnixConn) {
 			fmt.Printf("[Vhost-User] Mapped %d memory regions\n", numRegions)
 
 		case VhostUserSetVringNum:
+			if len(payload) < 8 {
+				continue
+			}
 			idx := binary.LittleEndian.Uint32(payload[0:4])
+			if idx >= uint32(len(s.queues)) {
+				continue
+			}
 			num := binary.LittleEndian.Uint32(payload[4:8])
 			if s.queues[idx] == nil {
 				s.queues[idx] = &VirtQueue{Index: idx}
@@ -163,14 +175,26 @@ func (s *Server) handleConn(conn *net.UnixConn) {
 			s.queues[idx].Num = num
 
 		case VhostUserSetVringBase:
+			if len(payload) < 8 {
+				continue
+			}
 			idx := binary.LittleEndian.Uint32(payload[0:4])
+			if idx >= uint32(len(s.queues)) {
+				continue
+			}
 			base := binary.LittleEndian.Uint32(payload[4:8])
 			if s.queues[idx] != nil {
 				s.queues[idx].LastAvail = uint16(base)
 			}
 
 		case VhostUserSetVringAddr:
+			if len(payload) < 32 {
+				continue
+			}
 			idx := binary.LittleEndian.Uint32(payload[0:4])
+			if idx >= uint32(len(s.queues)) {
+				continue
+			}
 			if s.queues[idx] != nil {
 				s.queues[idx].DescAddr = binary.LittleEndian.Uint64(payload[8:16])
 				s.queues[idx].UsedAddr = binary.LittleEndian.Uint64(payload[16:24])
@@ -178,16 +202,28 @@ func (s *Server) handleConn(conn *net.UnixConn) {
 			}
 
 		case VhostUserSetVringCall:
+			if len(payload) < 8 {
+				continue
+			}
 			// payload is u64 where lower 32 bit is index.
 			u64 := binary.LittleEndian.Uint64(payload[0:8])
 			idx := uint32(u64 & 0xFFFFFFFF)
+			if idx >= uint32(len(s.queues)) {
+				continue
+			}
 			if len(fds) > 0 && s.queues[idx] != nil {
 				s.queues[idx].CallFd = fds[0]
 			}
 
 		case VhostUserSetVringKick:
+			if len(payload) < 8 {
+				continue
+			}
 			u64 := binary.LittleEndian.Uint64(payload[0:8])
 			idx := uint32(u64 & 0xFFFFFFFF)
+			if idx >= uint32(len(s.queues)) {
+				continue
+			}
 			if len(fds) > 0 && s.queues[idx] != nil {
 				s.queues[idx].KickFd = fds[0]
 				// Virtqueue is ready! Start processing ring in background

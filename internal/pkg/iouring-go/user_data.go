@@ -1,10 +1,18 @@
+//go:build linux
 // +build linux
 
 package iouring
 
 import (
+	"sync"
 	"unsafe"
 )
+
+var userDataPool = sync.Pool{
+	New: func() interface{} {
+		return &UserData{}
+	},
+}
 
 type UserData struct {
 	id uint64
@@ -49,12 +57,12 @@ func (data *UserData) setOpcode(opcode uint8) {
 	data.request.opcode = opcode
 }
 
-// TODO(iceber): use sync.Poll
 func makeUserData(iour *IOURing, ch chan<- Result) *UserData {
-	userData := &UserData{
-		resulter: ch,
-		request:  &request{iour: iour, done: make(chan struct{})},
-	}
+	userData := userDataPool.Get().(*UserData)
+	userData.resulter = ch
+	userData.opcode = 0
+	userData.holds = nil
+	userData.request = &request{iour: iour, done: make(chan struct{})}
 
 	userData.id = uint64(uintptr(unsafe.Pointer(userData)))
 	userData.request.id = userData.id

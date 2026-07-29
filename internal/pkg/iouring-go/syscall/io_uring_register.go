@@ -26,8 +26,8 @@ const (
 
 type IOURingFilesUpdate struct {
 	Offset uint32
-	recv   uint32
-	Fds    *int32
+	resv   uint32
+	Fds    uint64
 }
 
 func IOURingRegister(fd int, opcode uint8, args unsafe.Pointer, nrArgs uint32) error {

@@ -21,15 +21,9 @@ func (iour *IOURing) SubmitHardLinkRequests(requests []PrepRequest, ch chan<- Re
 	return iour.submitLinkRequest(requests, ch, true)
 }
 
-func (iour *IOURing) submitLinkRequest(requests []PrepRequest, ch chan<- Result, hard bool) (RequestSet, error) {
-	// TODO(iceber): no length limit
-	if len(requests) > int(*iour.sq.entries) {
+func (iour *IOURing) submitBatch(requests []PrepRequest, ch chan<- Result, decorate func(sqe iouring_syscall.SubmissionQueueEntry, i int)) (RequestSet, error) {
+	if decorate != nil && len(requests) > int(*iour.sq.entries) {
 		return nil, errors.New("too many requests")
-	}
-
-	flags := iouring_syscall.IOSQE_FLAGS_IO_LINK
-	if hard {
-		flags = iouring_syscall.IOSQE_FLAGS_IO_HARDLINK
 	}
 
 	iour.submitLock.Lock()
@@ -40,21 +34,50 @@ func (iour *IOURing) submitLinkRequest(requests []PrepRequest, ch chan<- Result,
 	}
 
 	var sqeN uint32
+	var submittedDataIdx int
 	userDatas := make([]*UserData, 0, len(requests))
+
 	for i := range requests {
-		sqe := iour.getSQEntry()
+		sqe := iour.sq.getSQEntry()
+		if sqe == nil {
+			iour.userDataLock.Lock()
+			for j := submittedDataIdx; j < len(userDatas); j++ {
+				data := userDatas[j]
+				iour.userDatas[data.id] = data
+			}
+			iour.userDataLock.Unlock()
+
+			if _, err := iour.submit(); err != nil {
+				iour.userDataLock.Lock()
+				for _, data := range userDatas {
+					delete(iour.userDatas, data.id)
+				}
+				iour.userDataLock.Unlock()
+
+				for _, data := range userDatas {
+					userDataPool.Put(data)
+				}
+				return nil, err
+			}
+			submittedDataIdx = len(userDatas)
+			sqeN = 0
+			sqe = iour.getSQEntry()
+		}
+
 		sqeN++
 
 		userData, err := iour.doRequest(sqe, requests[i], ch)
 		if err != nil {
 			iour.sq.fallback(sqeN)
+			for _, data := range userDatas[submittedDataIdx:] {
+				userDataPool.Put(data)
+			}
 			return nil, err
 		}
 		userDatas = append(userDatas, userData)
 
-		sqe.CleanFlags(iouring_syscall.IOSQE_FLAGS_IO_HARDLINK | iouring_syscall.IOSQE_FLAGS_IO_LINK)
-		if i < len(requests)-1 {
-			sqe.SetFlags(flags)
+		if decorate != nil {
+			decorate(sqe, i)
 		}
 	}
 
@@ -64,7 +87,8 @@ func (iour *IOURing) submitLinkRequest(requests []PrepRequest, ch chan<- Result,
 	rset := newRequestSet(userDatas)
 
 	iour.userDataLock.Lock()
-	for _, data := range userDatas {
+	for j := submittedDataIdx; j < len(userDatas); j++ {
+		data := userDatas[j]
 		iour.userDatas[data.id] = data
 	}
 	iour.userDataLock.Unlock()
@@ -76,10 +100,27 @@ func (iour *IOURing) submitLinkRequest(requests []PrepRequest, ch chan<- Result,
 		}
 		iour.userDataLock.Unlock()
 
+		for _, data := range userDatas {
+			userDataPool.Put(data)
+		}
 		return nil, err
 	}
 
 	return rset, nil
+}
+
+func (iour *IOURing) submitLinkRequest(requests []PrepRequest, ch chan<- Result, hard bool) (RequestSet, error) {
+	flags := iouring_syscall.IOSQE_FLAGS_IO_LINK
+	if hard {
+		flags = iouring_syscall.IOSQE_FLAGS_IO_HARDLINK
+	}
+
+	return iour.submitBatch(requests, ch, func(sqe iouring_syscall.SubmissionQueueEntry, i int) {
+		sqe.CleanFlags(iouring_syscall.IOSQE_FLAGS_IO_HARDLINK | iouring_syscall.IOSQE_FLAGS_IO_LINK)
+		if i < len(requests)-1 {
+			sqe.SetFlags(flags)
+		}
+	})
 }
 
 func linkTimeout(t time.Duration) PrepRequest {

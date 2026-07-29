@@ -34,7 +34,8 @@ func WithSQPollThreadIdle(idle time.Duration) IOURingOption {
 	}
 }
 
-// WithParams use params
+// WithParams replaces the existing params and can discard flags configured by earlier options such as WithSQPoll
+// It must be used as the first option.
 func WithParams(params *iouring_syscall.IOURingParams) IOURingOption {
 	return func(iour *IOURing) {
 		iour.params = params
@@ -52,10 +53,10 @@ func WithCQSize(size uint32) IOURingOption {
 
 // WithAttachWQ new iouring instance being create will share the asynchronous worker thread
 // backend of the specified io_uring ring, rather than create a new separate thread pool
-func WithAttachWQ(iour *IOURing) IOURingOption {
+func WithAttachWQ(targetRing *IOURing) IOURingOption {
 	return func(iour *IOURing) {
 		iour.params.Flags |= iouring_syscall.IORING_SETUP_ATTACH_WQ
-		iour.params.WQFd = uint32(iour.fd)
+		iour.params.WQFd = uint32(targetRing.fd)
 	}
 }
 

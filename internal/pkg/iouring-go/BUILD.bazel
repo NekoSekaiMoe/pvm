@@ -1,5 +1,5 @@
-load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
-load("@bazel_gazelle//:def.bzl", "gazelle")
+load("@gazelle//:def.bzl", "gazelle")
+load("@rules_go//go:def.bzl", "go_library", "go_test")
 
 # gazelle:prefix github.com/iceber/iouring-go
 gazelle(name = "gazelle")
@@ -27,13 +27,13 @@ go_library(
     importpath = "github.com/iceber/iouring-go",
     visibility = ["//visibility:public"],
     deps = select({
-        "@io_bazel_rules_go//go/platform:android": [
-            "//syscall",
-            "@org_golang_x_sys//unix:go_default_library",
+        "@rules_go//go/platform:android": [
+            "//internal/pkg/iouring-go/syscall",
+            "@org_golang_x_sys//unix",
         ],
-        "@io_bazel_rules_go//go/platform:linux": [
-            "//syscall",
-            "@org_golang_x_sys//unix:go_default_library",
+        "@rules_go//go/platform:linux": [
+            "//internal/pkg/iouring-go/syscall",
+            "@org_golang_x_sys//unix",
         ],
         "//conditions:default": [],
     }),

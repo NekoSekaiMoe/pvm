@@ -1,3 +1,4 @@
+//go:build linux
 // +build linux
 
 package iouring
@@ -128,41 +129,50 @@ func (register *fileRegister) RegisterFiles(fds []int32) error {
 	}
 
 	var fdi int
-	indexs := make(map[int32]int, len(fds))
-	updatedSpares := make(map[int]int, len(fds))
 	for i, spares := range register.sparseIndexs {
-		updatedSpares[i] = spares
-		for si := 0; si < spares; si++ {
-			for ; fdi < len(fds); fdi++ {
-				register.fds[i+si] = fds[fdi]
-				indexs[fds[fdi]] = i + si
+		filled := 0
+		for si := 0; si < spares && fdi < len(fds); si++ {
+			register.fds[i+si] = fds[fdi]
+			filled++
+			fdi++
+		}
+		if filled > 0 {
+			delete(register.sparseIndexs, i)
+			if filled < spares {
+				register.sparseIndexs[i+filled] = spares - filled
+			}
+		}
+		if fdi >= len(fds) {
+			break
+		}
+	}
 
-				fdi++
-				updatedSpares[i]--
+	appended := false
+	if fdi < len(fds) {
+		register.fds = append(register.fds, fds[fdi:]...)
+		appended = true
+	}
+
+	if appended {
+		if err := register.unregister(); err != nil {
+			return err
+		}
+		if err := register.register(); err != nil {
+			return err
+		}
+	} else {
+		if err := register.fresh(0, len(register.fds)); err != nil {
+			return err
+		}
+	}
+
+	for _, fd := range fds {
+		for i, vfd := range register.fds {
+			if fd == vfd {
+				register.indexs.Store(fd, i)
 				break
 			}
-
-			if fdi >= len(fds) {
-				goto update
-			}
 		}
-	}
-	register.fds = append(register.fds, fds[fdi:]...)
-
-update:
-	if err := register.fresh(0, len(register.fds)); err != nil {
-		return err
-	}
-
-	for i, spares := range updatedSpares {
-		if spares > 0 {
-			register.sparseIndexs[i] = spares
-			continue
-		}
-		delete(register.sparseIndexs, i)
-	}
-	for i, fd := range register.fds {
-		register.indexs.Store(fd, i)
 	}
 
 	return nil
@@ -185,11 +195,23 @@ func (register *fileRegister) RegisterFile(fd int32) error {
 		return register.register()
 	}
 
-	var fdi int
+	var fdi int = -1
 	var spares int
 	for fdi, spares = range register.sparseIndexs {
 		break
 	}
+
+	if fdi == -1 {
+		register.fds = append(register.fds, fd)
+		fdi = len(register.fds) - 1
+		register.indexs.Store(fd, fdi)
+		
+		if err := register.unregister(); err != nil {
+			return err
+		}
+		return register.register()
+	}
+
 	register.fds[fdi] = fd
 
 	if err := register.fresh(fdi, 1); err != nil {
@@ -199,7 +221,8 @@ func (register *fileRegister) RegisterFile(fd int32) error {
 	if spares == 1 {
 		delete(register.sparseIndexs, fdi)
 	} else {
-		register.sparseIndexs[fdi]--
+		register.sparseIndexs[fdi+1] = spares - 1
+		delete(register.sparseIndexs, fdi)
 	}
 
 	register.indexs.Store(fd, fdi)
@@ -238,7 +261,7 @@ func (register *fileRegister) UnregisterFiles(fds []int32) error {
 		}
 		unregistered = true
 	}
-	if unregistered {
+	if !unregistered {
 		return nil
 	}
 
@@ -279,12 +302,12 @@ func (register *fileRegister) deleteFile(fd int32) (fdi int, ok bool) {
 func (register *fileRegister) fresh(offset int, length int) error {
 	update := iouring_syscall.IOURingFilesUpdate{
 		Offset: uint32(offset),
-		Fds:    &register.fds[offset],
+		Fds:    uint64(uintptr(unsafe.Pointer(&register.fds[offset]))),
 	}
 	return iouring_syscall.IOURingRegister(
 		register.iouringFd,
 		iouring_syscall.IORING_REGISTER_FILES_UPDATE,
 		unsafe.Pointer(&update),
-		uint32(len(register.fds)),
+		uint32(length),
 	)
 }
