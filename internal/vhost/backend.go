@@ -12,6 +12,26 @@ import (
 	"uml-container/internal/state"
 )
 
+// StartNativeDaemon starts the experimental native Go vhost-user server
+func StartNativeDaemon(containerID string, imagePath string) (string, *Server, error) {
+	dir, err := state.ContainerDir(containerID)
+	if err != nil {
+		return "", nil, err
+	}
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return "", nil, fmt.Errorf("failed to create dir: %v", err)
+	}
+	socketPath := filepath.Join(dir, "vhost-blk.sock")
+
+	server := NewServer(socketPath)
+	if err := server.Start(); err != nil {
+		return "", nil, fmt.Errorf("native vhost server failed to start: %v", err)
+	}
+
+	// For the native server, it runs in goroutines, so it's instantly ready
+	return socketPath, server, nil
+}
+
 // StartStorageDaemon starts qemu-storage-daemon to provide a vhost-user-blk socket.
 // Requires qemu-storage-daemon installed on the host.
 func StartStorageDaemon(containerID string, imagePath string) (string, *exec.Cmd, error) {
