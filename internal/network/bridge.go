@@ -117,8 +117,14 @@ func DeleteBridge(bridgeName string, gatewayIP string) error {
 	}
 
 	exec.Command("ip", "link", "set", bridgeName, "down").Run()
-	// Ignore errors because the bridge might already be deleted or not exist
-	exec.Command("ip", "link", "delete", bridgeName, "type", "bridge").Run()
+	// 仅在网桥确实不存在时忽略错误；权限不足、设备忙、名称错误等其他
+	// 错误必须返回给调用方，否则引用计数和 ip_forward 恢复逻辑会基于
+	// “已删除”的假象继续执行。
+	if err := exec.Command("ip", "link", "delete", bridgeName, "type", "bridge").Run(); err != nil {
+		if !isDeviceNotExist(err) {
+			return fmt.Errorf("failed to delete bridge %s: %v", bridgeName, err)
+		}
+	}
 
 	ipForwardMu.Lock()
 	ipForwardRefCount--
@@ -134,4 +140,14 @@ func DeleteBridge(bridgeName string, gatewayIP string) error {
 	ipForwardMu.Unlock()
 
 	return nil
+}
+
+// isDeviceNotExist reports whether err from `ip link delete` indicates the
+// device simply does not exist (the only case where we silently continue).
+func isDeviceNotExist(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "cannot find device") || strings.Contains(msg, "device not found") || strings.Contains(msg, "no such device")
 }

@@ -8,7 +8,7 @@
         <input v-model="newContainer.name" placeholder="Container Name (e.g. web1)" />
         <input v-model="newContainer.rootfs" placeholder="Rootfs Image (default: alpine)" />
         <button class="btn btn-primary" @click="startContainer">Launch Container</button>
-        <button class="btn btn-primary" @click="restoreContainer" style="background: var(--text-muted); color: #111;">Restore from Snapshot</button>
+        <button class="btn btn-primary" @click="restoreContainer">Restore from Snapshot</button>
       </div>
     </div>
 
@@ -32,7 +32,7 @@
               <td>{{ c.pid }}</td>
               <td>
                 <NuxtLink :to="`/logs/${c.id}`" class="btn btn-primary" style="margin-right: 0.5rem; text-decoration: none; font-size: 0.875rem;">Logs</NuxtLink>
-                <button class="btn btn-primary" @click="snapshotContainer(c.id)" style="margin-right: 0.5rem; background: var(--success);">Snapshot</button>
+                <button class="btn btn-primary" @click="snapshotContainer(c.id)" :disabled="snapshotInFlight(c.id)" style="margin-right: 0.5rem; background: var(--success);">{{ snapshotInFlight(c.id) ? 'Snapshotting…' : 'Snapshot' }}</button>
                 <button class="btn btn-danger" @click="deleteContainer(c.id)">Delete</button>
               </td>
             </tr>
@@ -51,7 +51,10 @@ import { ref, onMounted, onUnmounted } from 'vue'
 
 const containers = ref([])
 const newContainer = ref({ name: '', rootfs: 'alpine', mem: '512M' })
+const snapshottingIds = ref(new Set())
 let timer
+
+const snapshotInFlight = (id) => snapshottingIds.value.has(id)
 
 const fetchContainers = async () => {
   try {
@@ -84,12 +87,17 @@ const startContainer = async () => {
 }
 
 const restoreContainer = async () => {
-  if (!newContainer.value.name) {
+  const name = (newContainer.value.name || '').trim()
+  if (!name) {
     alert("Please enter the original container name to restore from")
     return
   }
+  if (!/^[a-zA-Z0-9_-]+$/.test(name)) {
+    alert("Invalid container name: only letters, numbers, '_' and '-' are allowed")
+    return
+  }
   try {
-    const res = await fetch(`/api/containers/${newContainer.value.name}/restore`, { method: 'POST' })
+    const res = await fetch(`/api/containers/${encodeURIComponent(name)}/restore`, { method: 'POST' })
     if (res.ok) {
       newContainer.value.name = ''
       alert("Container restored successfully!")
@@ -121,7 +129,10 @@ const deleteContainer = async (id) => {
 }
 
 const snapshotContainer = async (id) => {
+  if (snapshotInFlight(id)) return
   if(!confirm(`Snapshot container ${id}?`)) return
+  snapshottingIds.value.add(id)
+  snapshottingIds.value = new Set(snapshottingIds.value)
   try {
     const res = await fetch(`/api/containers/${id}/snapshot`, { method: 'POST' })
     if (res.ok) {
@@ -133,6 +144,9 @@ const snapshotContainer = async (id) => {
   } catch (e) {
     console.error(e)
     alert(`Network error: ${e.message}`)
+  } finally {
+    snapshottingIds.value.delete(id)
+    snapshottingIds.value = new Set(snapshottingIds.value)
   }
 }
 

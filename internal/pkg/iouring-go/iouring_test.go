@@ -80,7 +80,7 @@ func TestTimeoutAndBuffers(t *testing.T) {
 	}
 	<-req.Done()
 	if err := req.Err(); err != nil && err.Error() != "timeout" && err.Error() != "timer expired" {
-		t.Logf("Timeout error (expected): %v", err)
+		t.Fatalf("Timeout returned unexpected error: %v", err)
 	}
 
 	// Test Timeout Cancel
@@ -91,7 +91,7 @@ func TestTimeoutAndBuffers(t *testing.T) {
 	req2.Cancel()
 	<-req2.Done()
 	if err := req2.Err(); err != ErrRequestCanceled && err.Error() != "request is canceled" && err.Error() != "request canceled" {
-		t.Logf("Timeout Cancel error: %v", err)
+		t.Fatalf("Timeout Cancel returned unexpected error: %v", err)
 	}
 
 	// Test RemoveTimeout
@@ -106,6 +106,6 @@ func TestTimeoutAndBuffers(t *testing.T) {
 	<-req4.Done()
 	<-req3.Done()
 	if err := req4.Err(); err != nil {
-		t.Logf("RemoveTimeout error: %v", err)
+		t.Fatalf("RemoveTimeout returned unexpected error: %v", err)
 	}
 }

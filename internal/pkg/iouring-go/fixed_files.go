@@ -204,12 +204,15 @@ func (register *fileRegister) RegisterFile(fd int32) error {
 	if fdi == -1 {
 		register.fds = append(register.fds, fd)
 		fdi = len(register.fds) - 1
-		register.indexs.Store(fd, fdi)
-		
+
 		if err := register.unregister(); err != nil {
 			return err
 		}
-		return register.register()
+		if err := register.register(); err != nil {
+			return err
+		}
+		register.indexs.Store(fd, fdi)
+		return nil
 	}
 
 	register.fds[fdi] = fd
