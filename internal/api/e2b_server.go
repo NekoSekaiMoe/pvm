@@ -71,6 +71,7 @@ func StartE2BServer(port int) error {
 			Name   string `json:"name"`
 			Rootfs string `json:"rootfs"`
 			Mem    string `json:"mem"`
+			CPU    int    `json:"cpu"`
 		}
 		var req StartReq
 		if err := c.Bind(&req); err != nil {
@@ -92,6 +93,8 @@ func StartE2BServer(port int) error {
 			Kernel: "./bin/linux",
 			Init:   "/init.sh",
 			Memory: mem,
+			MemoryBytes: config.ParseMemory(mem),
+			CPU:    req.CPU,
 		}
 
 		if err := mgr.Start(context.Background(), cfg); err != nil {

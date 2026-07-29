@@ -1,655 +1,269 @@
-下面是一份偏工程设计文档风格的实现方案。我会按照你当前确定的方向：
+先说结论：
 
-Go 编写 runtime
-UML 作为 kernel backend
-不依赖 CPU 虚拟化
-每个实例独立 Linux kernel
-支持完整 userspace（systemd）
-第一阶段 ext4 image
-后续 overlayfs
-host cgroup 管理资源
+UML 的 syscall 开销可以通过减少 guest↔host 边界切换、使用更高层的 virtio 后端、批量化 I/O 等方式缓解，但无法像 KVM 那样彻底消除，因为 UML 的架构决定了 guest kernel 本身运行在 host userspace 中。
 
-来设计。
+具体有几个方向：
 
-UML Container Runtime 设计文档
+1. 使用 skas0 / skas3 模式优化
 
-版本：v0.1 Draft
+UML 历史上有两种运行模式：
 
-1. 项目定位
-1.1 目标
+TT（tracing thread）
 
-实现一个轻量级 Linux 容器运行时：
+早期模式：
 
-特点：
+guest process
+      |
+ptrace
+      |
+host kernel
 
-不依赖 KVM / VT-x / AMD-V
-每个容器拥有独立 Linux kernel
-支持完整 Linux userspace
-支持 systemd 作为 PID 1
-支持持久化 filesystem
-使用 Linux cgroup 管理资源
-使用 Go 实现管理层
+性能很差。
 
-定位：
+SKAS（Separate Kernel Address Space）
 
-LXC 的管理体验
-+
-UML 的独立 kernel
-+
-microVM 的隔离模型
-2. 总体架构
-2.1 分层结构
-                    CLI
+现代 UML：
+
+UML kernel process
+        |
+host mmap / signals
+        |
+host kernel
+
+减少 ptrace 依赖。
+
+现在基本都用 SKAS。
+
+如果你看到：
+
+CONFIG_MODE_SKAS=y
+
+就是这个方向。
+
+2. 使用 virtio-uml（你提到的）
+
+这是最重要的。
+
+传统 UML：
+
+例如网络：
+
+guest app
+ ↓
+ guest syscall
+  ↓
+  UML kernel
+   ↓
+   UML eth driver
+    ↓
+	tuntap
+	 ↓
+	 host kernel
+	 
+	 virtio-uml：
+	 
+	 guest app
+	  ↓
+	  UML kernel
+	   ↓
+	   virtio-net
+	    ↓
+		virtqueue
+		 ↓
+		 backend
+		 
+		 核心收益：
+		 
+		 减少频繁的小 syscall。
+		 
+		 例如：
+		 
+		 传统：
+		 
+		 send()
+		 send()
+		 send()
+		 send()
+		 
+		 可能每次都穿越边界。
+		 
+		 virtio：
+		 
+		 多个 packet
+		  ↓
+		  一次提交 queue
+		   ↓
+		   backend 批量处理
+		   3. io_uring 后端
+		   
+		   这个其实非常适合 UML。
+		   
+		   传统 block：
+		   
+		   guest
+		    |
+			virtio-blk
+			 |
+			 host write()
+			  |
+			  filesystem
+			  
+			  大量 syscall。
+			  
+			  如果 backend：
+			  
+			  UML
+			   |
+			   virtio-uml
+			    |
+				io_uring
+				 |
+				 block device
+				 
+				 可以：
+				 
+				 批量提交
+				 异步执行
+				 减少 syscall 次数
+				 
+				 类似：
+				 
+				 1000 次 write()
+				 
+				 变成：
+				 
+				 1 次 io_uring submit
+				 4. vhost 思路
+				 
+				 KVM 里：
+				 
+				 guest
+				  |
+				  virtio
+				   |
+				   vhost kernel
+				    |
+					hardware
 					
-					                     |
-										                      |
-															  
-															                Go Runtime Daemon
+					性能很好。
+					
+					UML 可以借鉴：
+					
+					UML
+					 |
+					 virtio-uml
+					  |
+					  vhost-like backend
+					   |
+					   host kernel
+					   
+					   把数据处理尽量放到 host kernel。
+					   
+					   5. 减少 guest syscall 数量
+					   
+					   这个是软件层面的。
+					   
+					   例如：
+					   
+					   不好的：
+					   read()
+					   read()
+					   read()
+					   read()
+					   好的：
+					   readv()
+					   splice()
+					   mmap()
+					   
+					   UML 本身无法改变：
+					   
+					   但是运行在里面的软件可以优化。
+					   
+					   6. hostfs 少用
+					   
+					   UML 有个方便功能：
+					   
+					   hostfs
+					   
+					   直接访问宿主文件。
+					   
+					   但是：
+					   
+					   guest filesystem
+					         |
+							 hostfs
+							       |
+								   host filesystem
+								   
+								   每次文件操作都会经过额外路径。
+								   
+								   更好的：
+								   
+								   virtio-blk
+								    |
+									ext4/xfs
+									
+									让 UML 自己管理 filesystem。
+									
+									性能排序大概：
+									
+									对于 I/O：
+									
+									virtio-uml + io_uring
+									        ↑
+											virtio-uml
+											        ↑
+													UML block/net
+													        ↑
+															hostfs / slirp
+															还有一个容易忽略的问题：UML syscall 本身
+															
+															用户程序调用：
+															
+															open()
+															
+															流程：
+															
+															application
+															    |
+																UML syscall handler
+																    |
+																	UML kernel
+																	    |
+																		host syscall
+																		    |
+																			host kernel
 																			
-																			                     |
-																								        +-------------+-------------+
-																										
-																										       |                           |
-																											   
-																											    Container Manager          Resource Manager
-																												
-																												       |                           |
-																													   
-																													          |                         cgroup v2
-																															         |
-																																	        |
-																																			
-																																			    UML Manager
-																																				
-																																				       |
-																																					          |
-																																							         +----------------+
-																																									 
-																																									                         |
-																																															 
-																																															                   UML Kernel
-																																																			   
-																																																			                           |
-																																																									   
-																																																									                     rootfs.ext4
-																																																														 
-																																																														                         |
-																																																																				 
-																																																																				                    systemd
-																																																																									3. 核心组件设计
-																																																																									
-																																																																									目录：
-																																																																									
-																																																																									uml-container/
-																																																																									
-																																																																									├── cmd/
-																																																																									│   ├── umlctl/
-																																																																									│   └── umld/
-																																																																									│
-																																																																									├── internal/
-																																																																									│
-																																																																									│   ├── container/
-																																																																									│   │    ├── create.go
-																																																																									│   │    ├── start.go
-																																																																									│   │    ├── stop.go
-																																																																									│   │    └── state.go
-																																																																									│   │
-																																																																									│   ├── uml/
-																																																																									│   │    ├── launcher.go
-																																																																									│   │    ├── kernel.go
-																																																																									│   │    └── console.go
-																																																																									│   │
-																																																																									│   ├── filesystem/
-																																																																									│   │    ├── ext4.go
-																																																																									│   │    └── overlay.go
-																																																																									│   │
-																																																																									│   ├── cgroup/
-																																																																									│   │    └── manager.go
-																																																																									│   │
-																																																																									│   ├── network/
-																																																																									│   │    └── tap.go
-																																																																									│   │
-																																																																									│   └── config/
-																																																																									│        └── config.go
-																																																																									│
-																																																																									├── images/
-																																																																									│
-																																																																									└── containers/
-																																																																									4. Container 数据结构
-																																																																									
-																																																																									每个 container：
-																																																																									
-																																																																									/var/lib/uml-container/
-																																																																									
-																																																																									container-id/
-																																																																									
-																																																																									├── config.json
-																																																																									
-																																																																									├── rootfs.img
-																																																																									
-																																																																									├── kernel
-																																																																									
-																																																																									├── state
-																																																																									
-																																																																									├── console.sock
-																																																																									
-																																																																									└── logs/
-																																																																									
-																																																																									config:
-																																																																									
-																																																																									{
-																																																																									    "name":"test",
-																																																																										
-																																																																										    "kernel":
-																																																																											    "/usr/lib/uml/linux",
-																																																																												
-																																																																												    "rootfs":
-																																																																													    "rootfs.img",
-																																																																														
-																																																																														    "memory":
-																																																																															    "512M",
-																																																																																
-																																																																																    "cpu":
-																																																																																	    2,
-																																																																																		
-																																																																																		    "init":
-																																																																																			    "/sbin/init"
-																																																																																				}
-																																																																																				5. Kernel 方案
-																																																																																				5.1 UML 编译
-																																																																																				
-																																																																																				目标：
-																																																																																				
-																																																																																				ARCH=um
-																																																																																				
-																																																																																				配置：
-																																																																																				
-																																																																																				基础：
-																																																																																				
-																																																																																				CONFIG_UML=y
-																																																																																				
-																																																																																				CONFIG_BLK_DEV_UBD=y
-																																																																																				
-																																																																																				CONFIG_EXT4_FS=y
-																																																																																				
-																																																																																				CONFIG_TMPFS=y
-																																																																																				
-																																																																																				CONFIG_PROC_FS=y
-																																																																																				
-																																																																																				CONFIG_SYSFS=y
-																																																																																				systemd 必需
-																																																																																				
-																																																																																				追加：
-																																																																																				
-																																																																																				CONFIG_NAMESPACES=y
-																																																																																				
-																																																																																				CONFIG_PID_NS=y
-																																																																																				
-																																																																																				CONFIG_NET_NS=y
-																																																																																				
-																																																																																				
-																																																																																				CONFIG_CGROUPS=y
-																																																																																				
-																																																																																				CONFIG_CGROUP_FREEZER=y
-																																																																																				
-																																																																																				CONFIG_CGROUP_SCHED=y
-																																																																																				
-																																																																																				
-																																																																																				CONFIG_DEVTMPFS=y
-																																																																																				
-																																																																																				CONFIG_DEVTMPFS_MOUNT=y
-																																																																																				
-																																																																																				
-																																																																																				CONFIG_UNIX=y
-																																																																																				编译
-																																																																																				make ARCH=um defconfig
-																																																																																				
-																																																																																				make ARCH=um menuconfig
-																																																																																				
-																																																																																				make ARCH=um -j$(nproc)
-																																																																																				
-																																																																																				输出：
-																																																																																				
-																																																																																				linux
-																																																																																				6. Root filesystem
-																																																																																				第一阶段：ext4 image
-																																																																																				
-																																																																																				结构：
-																																																																																				
-																																																																																				rootfs.img
-																																																																																				
-																																																																																				/
-																																																																																				
-																																																																																				├── bin
-																																																																																				
-																																																																																				├── etc
-																																																																																				
-																																																																																				├── usr
-																																																																																				
-																																																																																				├── var
-																																																																																				
-																																																																																				├── lib
-																																																																																				
-																																																																																				└── sbin/init
-																																																																																				
-																																																																																				创建：
-																																																																																				
-																																																																																				dd \
-																																																																																				 if=/dev/zero \
-																																																																																				  of=rootfs.img \
-																																																																																				   bs=1M \
-																																																																																				    count=2048
-																																																																																					
-																																																																																					格式化：
-																																																																																					
-																																																																																					mkfs.ext4 rootfs.img
-																																																																																					
-																																																																																					挂载：
-																																																																																					
-																																																																																					mount -o loop rootfs.img /mnt/rootfs
-																																																																																					
-																																																																																					安装系统：
-																																																																																					
-																																																																																					例如：
-																																																																																					
-																																																																																					debootstrap
-																																																																																					
-																																																																																					或者：
-																																																																																					
-																																																																																					alpine minirootfs
-																																																																																					7. 启动流程
-																																																																																					container start
-																																																																																					
-																																																																																					流程：
-																																																																																					
-																																																																																					umlctl start test
-																																																																																					
-																																																																																					        |
-																																																																																							
-																																																																																							读取 config
-																																																																																							
-																																																																																							        |
-																																																																																									
-																																																																																									创建 cgroup
-																																																																																									
-																																																																																									        |
-																																																																																											
-																																																																																											启动 UML
-																																																																																											
-																																																																																											        |
-																																																																																													
-																																																																																													等待 console
-																																																																																													
-																																																																																													        |
-																																																																																															
-																																																																																															systemd 启动完成
-																																																																																															
-																																																																																															实际命令：
-																																																																																															
-																																																																																															linux \
-																																																																																															 root=/dev/ubda \
-																																																																																															  ubd0=rootfs.img \
-																																																																																															   init=/sbin/init \
-																																																																																															    mem=512M
-																																																																																																
-																																																																																																Go：
-																																																																																																
-																																																																																																cmd := exec.Command(
-																																																																																																    "./linux",
-																																																																																																	
-																																																																																																	    "ubd0=rootfs.img",
-																																																																																																		
-																																																																																																		    "root=/dev/ubda",
-																																																																																																			
-																																																																																																			    "init=/sbin/init",
-																																																																																																				)
-																																																																																																				8. 生命周期管理
-																																																																																																				状态
-																																																																																																				created
-																																																																																																				
-																																																																																																				  |
-																																																																																																				  
-																																																																																																				  stopped
-																																																																																																				  
-																																																																																																				    |
-																																																																																																					
-																																																																																																					running
-																																																																																																					
-																																																																																																					  |
-																																																																																																					  
-																																																																																																					  stopping
-																																																																																																					  
-																																																																																																					    |
-																																																																																																						
-																																																																																																						destroyed
-																																																																																																						
-																																																																																																						state 文件：
-																																																																																																						
-																																																																																																						{
-																																																																																																						 "status":"running",
-																																																																																																						 
-																																																																																																						  "pid":12345,
-																																																																																																						  
-																																																																																																						   "started":"2026-07-29"
-																																																																																																						   }
-																																																																																																						   9. cgroup 设计
-																																																																																																						   
-																																																																																																						   由于 UML 是一个 host process：
-																																																																																																						   
-																																																																																																						   结构：
-																																																																																																						   
-																																																																																																						   /sys/fs/cgroup/
-																																																																																																						   
-																																																																																																						   uml/
-																																																																																																						   
-																																																																																																						    └── container-id/
-																																																																																																							
-																																																																																																							        memory.max
-																																																																																																									
-																																																																																																									        cpu.max
-																																																																																																											
-																																																																																																											        io.max
-																																																																																																													
-																																																																																																													例如：
-																																																																																																													
-																																																																																																													限制：
-																																																																																																													
-																																																																																																													512MB：
-																																																																																																													
-																																																																																																													memory.max=536870912
-																																																																																																													
-																																																																																																													CPU：
-																																																																																																													
-																																																																																																													cpu.max="200000 100000"
-																																																																																																													
-																																																																																																													启动：
-																																																																																																													
-																																																																																																													create cgroup
-																																																																																																													
-																																																																																																													↓
-																																																																																																													
-																																																																																																													fork UML
-																																																																																																													
-																																																																																																													↓
-																																																																																																													
-																																																																																																													move pid into cgroup
-																																																																																																													10. Console
-																																																																																																													
-																																																																																																													第一阶段：
-																																																																																																													
-																																																																																																													使用 UML 自带 console：
-																																																																																																													
-																																																																																																													参数：
-																																																																																																													
-																																																																																																													con0=fd:0,fd:1
-																																																																																																													
-																																																																																																													或者：
-																																																																																																													
-																																																																																																													con=pts
-																																																																																																													
-																																																																																																													之后：
-																																																																																																													
-																																																																																																													实现：
-																																																																																																													
-																																																																																																													unix socket
-																																																																																																													
-																																																																																																													↓
-																																																																																																													
-																																																																																																													console attach
-																																																																																																													
-																																																																																																													类似：
-																																																																																																													
-																																																																																																													docker attach
-																																																																																																													11. 网络设计
-																																																																																																													
-																																																																																																													第一阶段：
-																																																																																																													
-																																																																																																													不实现热插拔。
-																																																																																																													
-																																																																																																													只提供：
-																																																																																																													
-																																																																																																													启动时 TAP。
-																																																																																																													
-																																																																																																													结构：
-																																																																																																													
-																																																																																																													UML
-																																																																																																													
-																																																																																																													eth0
-																																																																																																													
-																																																																																																													 |
-																																																																																																													 
-																																																																																																													 TAP
-																																																																																																													 
-																																																																																																													  |
-																																																																																																													  
-																																																																																																													  bridge
-																																																																																																													  
-																																																																																																													   |
-																																																																																																													   
-																																																																																																													   host network
-																																																																																																													   
-																																																																																																													   参数：
-																																																																																																													   
-																																																																																																													   eth0=tuntap,tap0
-																																																																																																													   
-																																																																																																													   Go:
-																																																																																																													   
-																																																																																																													   创建：
-																																																																																																													   
-																																																																																																													   /dev/net/tun
-																																																																																																													   
-																																																																																																													   配置：
-																																																																																																													   
-																																																																																																													   ip link add
-																																																																																																													   bridge
-																																																																																																													   12. Overlayfs 设计（第二阶段）
-																																																																																																													   
-																																																																																																													   目标：
-																																																																																																													   
-																																																																																																													   类似 Docker image layer。
-																																																																																																													   
-																																																																																																													   结构：
-																																																																																																													   
-																																																																																																													   images/
-																																																																																																													   
-																																																																																																													   ubuntu-base.img
-																																																																																																													   
-																																																																																																													   
-																																																																																																													   containers/
-																																																																																																													   
-																																																																																																													   test/
-																																																																																																													   
-																																																																																																													    upper/
-																																																																																																														
-																																																																																																														 work/
-																																																																																																														 
-																																																																																																														 
-																																																																																																														 启动：
-																																																																																																														 
-																																																																																																														 overlayfs
-																																																																																																														 
-																																																																																																														 lowerdir=base
-																																																																																																														 
-																																																																																																														 upperdir=container
-																																																																																																														 
-																																																																																																														 merged=rootfs
-																																																																																																														 
-																																																																																																														 注意：
-																																																																																																														 
-																																																																																																														 overlay 必须运行在 UML guest kernel 内。
-																																																																																																														 
-																																																																																																														 13. 镜像管理
-																																																																																																														 
-																																																																																																														 未来：
-																																																																																																														 
-																																																																																																														 umlctl image create
-																																																																																																														 
-																																																																																																														 umlctl image import
-																																																																																																														 
-																																																																																																														 umlctl image snapshot
-																																																																																																														 
-																																																																																																														 格式：
-																																																																																																														 
-																																																																																																														 image/
-																																																																																																														 
-																																																																																																														 ├── kernel
-																																																																																																														 
-																																																																																																														 ├── rootfs.img
-																																																																																																														 
-																																																																																																														 └── metadata.json
-																																																																																																														 14. 与 OCI 的兼容
-																																																																																																														 
-																																																																																																														 可以实现：
-																																																																																																														 
-																																																																																																														 OCI runtime interface
-																																																																																																														 
-																																																																																																														 结构：
-																																																																																																														 
-																																																																																																														 containerd
-																																																																																																														 
-																																																																																																														     |
-																																																																																																															 
-																																																																																																															  uml-runtime
-																																																																																																															  
-																																																																																																															      |
-																																																																																																																  
-																																																																																																																   UML kernel
-																																																																																																																   
-																																																																																																																   实现：
-																																																																																																																   
-																																																																																																																   create
-																																																																																																																   
-																																																																																																																   start
-																																																																																																																   
-																																																																																																																   kill
-																																																																																																																   
-																																																																																																																   delete
-																																																																																																																   
-																																																																																																																   这样可以接入：
-																																																																																																																   
-																																																																																																																   Docker
-																																																																																																																   Kubernetes（理论）
-																																																																																																																   nerdctl
-																																																																																																																   15. 第一阶段 MVP
-																																																																																																																   
-																																																																																																																   目标：
-																																																																																																																   
-																																																																																																																   一个月版本：
-																																																																																																																   
-																																																																																																																   支持：
-																																																																																																																   
-																																																																																																																   ✅ UML kernel 启动
-																																																																																																																   
-																																																																																																																   ✅ ext4 rootfs
-																																																																																																																   
-																																																																																																																   ✅ systemd
-																																																																																																																   
-																																																																																																																   ✅ start/stop
-																																																																																																																   
-																																																																																																																   ✅ cgroup v2
-																																																																																																																   
-																																																																																																																   ✅ console attach
-																																																																																																																   
-																																																																																																																   不做：
-																																																																																																																   
-																																																																																																																   ❌ overlay
-																																																																																																																   
-																																																																																																																   ❌ USB
-																																																																																																																   
-																																																																																																																   ❌ 热插拔
-																																																																																																																   
-																																																																																																																   ❌ OCI
-																																																																																																																   
-																																																																																																																   16. 后续路线
-																																																																																																																   v0.2
-																																																																																																																   
-																																																																																																																   加入：
-																																																																																																																   
-																																																																																																																   overlayfs
-																																																																																																																   snapshot
-																																																																																																																   image 管理
-																																																																																																																   v0.3
-																																																																																																																   
-																																																																																																																   加入：
-																																																																																																																   
-																																																																																																																   TAP 网络
-																																																																																																																   DNS
-																																																																																																																   port forwarding
-																																																																																																																   v0.4
-																																																																																																																   
-																																																																																																																   加入：
-																																																																																																																   
-																																																																																																																   OCI runtime
-																																																																																																																   containerd 集成
-																																																																																																																   17. 关键风险
-																																																																																																																   1. UML 维护状态
-																																																																																																																   
-																																																																																																																   风险：
-																																																																																																																   
-																																																																																																																   新 kernel 兼容性
-																																																																																																																   文档较少
-																																																																																																																   2. systemd 支持
-																																																																																																																   
-																																																																																																																   需要：
-																																																																																																																   
-																																																																																																																   正确 kernel config。
-																																																																																																																   
-																																																																																																																   否则：
-																																																																																																																   
-																																																																																																																   Failed to mount cgroup
-																																																																																																																   3. 性能
-																																																																																																																   
-																																																																																																																   主要瓶颈：
-																																																																																																																   
-																																																																																																																   syscall
-																																																																																																																   fork
-																																																																																																																   IO flush
-																																																																																																																   
-																																																																																																																   但是：
-																																																																																																																   
-																																																																																																																   普通服务：
-																																																																																																																   
-																																																																																																																   可接受。
-																																																																																																																   
-																																																																																																																   总结
-																																																																																																																   
-																																																																																																																   最终架构：
-																																																																																																																   
-																																																																																																																                   Go Runtime
-																																																																																																																				   
-																																																																																																																				                        |
-																																																																																																																										
-																																																																																																																										              cgroup manager
-																																																																																																																													  
-																																																																																																																													                       |
-																																																																																																																																		   
-																																																																																																																																		                 UML launcher
-																																																																																																																																						 
-																																																																																																																																						                      |
-																																																																																																																																											  
-																																																																																																																																											            +------------------+
-																																																																																																																																														
-																																																																																																																																														          |  UML Linux       |
-																																																																																																																																																  
-																																																																																																																																																            |                  |
-																																																																																																																																																			
-																																																																																																																																																			          |  systemd         |
-																																																																																																																																																					  
-																																																																																																																																																					            |  services        |
-																																																																																																																																																								
-																																																																																																																																																								          |                  |
-																																																																																																																																																										  
-																																																																																																																																																										            |  ext4 rootfs.img |
-																																																																																																																																																													
-																																																																																																																																																													          +------------------+
-																																																																																																																																																															  
-																																																																																																																																																															  这个方案本质是：
-																																																																																																																																																															  
-																																																																																																																																																															  没有硬件虚拟化的 microVM，但保留容器管理方式。
-																																																																																																																																																															  
-																																																																																																																																																															  第一版不要追求 overlay、OCI、热插拔，先证明：
-																																																																																																																																																															  
-																																																																																																																																																															  “一个 Go 程序能可靠地创建、启动、停止一个拥有独立 Linux kernel 和 systemd 的实例。”
-																																																																																																																																																															  
-																																																																																																																																																															  这一步完成，后面的功能都是管理层扩展
-																																																																																																																																																															  
+																			这个双 kernel syscall 是 UML 固有成本。
+																			
+																			理论上可以优化：
+																			
+																			syscall batching
+																			vDSO
+																			减少 timer tick
+																			io_uring
+																			
+																			但不能完全消除。
+																			
+																			所以如果设计一个现代 UML 平台，我觉得比较合理的架构应该是：
+																			
+																			             Go manager
+																						                   |
+																										           virtio-uml devices
+																												                     |
+																																	         +---------+---------+
+																																			         |                   |
+																																					     virtio-blk          virtio-net
+																																						         |                   |
+																																								     io_uring             tap/vhost
+																																									         |
+																																											    host storage
+																																												
+																																												这种情况下：
+																																												
+																																												CPU 密集：接近原生
+																																												网络：接近轻量 VM
+																																												磁盘：可以接近 KVM virtio
+																																												syscall-heavy：仍有损耗，但比传统 UML 小很多
+																																												
+																																												实际上这也是为什么 virtio-uml 这个方向比传统 UML 更有价值：它不是试图让 UML 变成 KVM，而是把 UML 最大的问题（I/O 边界）尽量消掉。你之前想做的「无硬件虚拟化轻量 VM」路线，用它作为底层比从零写 syscall 隔离要现实很多。

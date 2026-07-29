@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"time"
+	"uml-container/internal/cgroup"
 	"uml-container/internal/config"
 	"uml-container/internal/log"
 	"uml-container/internal/state"
@@ -100,6 +101,11 @@ func (m *Manager) Start(ctx context.Context, cfg *config.ContainerConfig) error 
 		st.Status = "exited"
 		state.SaveState(cfg.ID, st)
 		return err
+	}
+
+	cg := cgroup.NewManager()
+	if setupErr := cg.Setup(cfg.ID, pid, cfg.MemoryBytes, cfg.CPU); setupErr != nil {
+		fmt.Printf("Warning: failed to setup cgroup limits for %s: %v\n", cfg.ID, setupErr)
 	}
 
 	st.Status = "running"

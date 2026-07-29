@@ -33,6 +33,7 @@ func main() {
 		kernel := runCmd.String("kernel", "./bin/linux", "Kernel path")
 		initPath := runCmd.String("init", "/init.sh", "Init script path")
 		memory := runCmd.String("memory", "512M", "Container memory")
+		cpu := runCmd.Int("cpu", 0, "CPU limit (0 means no limit)")
 
 		runCmd.Parse(os.Args[2:])
 
@@ -58,6 +59,8 @@ func main() {
 			Kernel:          *kernel,
 			Init:            *initPath,
 			Memory:          *memory,
+			MemoryBytes:     config.ParseMemory(*memory),
+			CPU:             *cpu,
 			UseVirtio:       *useVhost,
 			VhostUserSocket: sockPath,
 		}

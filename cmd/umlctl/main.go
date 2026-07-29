@@ -31,6 +31,7 @@ func main() {
 		virtio := startCmd.Bool("virtio", false, "Use virtio-uml")
 		rootfs := startCmd.String("rootfs", "rootfs.img", "Path to rootfs (or base image)")
 		mem := startCmd.String("mem", "512M", "Memory size")
+		cpu := startCmd.Int("cpu", 0, "CPU limit (0 means no limit)")
 		kernel := startCmd.String("kernel", "linux", "UML Kernel binary")
 		netTap := startCmd.String("tap", "", "Network tap device (optional)")
 		initCmd := startCmd.String("init", "/sbin/init", "Init command inside container")
@@ -47,6 +48,8 @@ func main() {
 			Kernel:     *kernel,
 			Rootfs:     *rootfs,
 			Memory:     *mem,
+			MemoryBytes: config.ParseMemory(*mem),
+			CPU:        *cpu,
 			UseVirtio:  *virtio,
 			Init:       *initCmd,
 			NetworkTap: *netTap,
