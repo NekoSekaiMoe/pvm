@@ -12,6 +12,7 @@ struct {
     __uint(max_entries, 1024);
     __type(key, __u32);
     __type(value, __u32);
+    __uint(pinning, LIBBPF_PIN_BY_NAME);
 } whitelist_map SEC(".maps");
 
 SEC("tc")
@@ -21,6 +22,9 @@ int egress_filter(struct __sk_buff *skb) {
 
     struct ethhdr *eth = data;
     if (data + sizeof(*eth) > data_end)
+        return TC_ACT_OK;
+
+    if (eth->h_proto == __builtin_bswap16(ETH_P_ARP))
         return TC_ACT_OK;
 
     if (eth->h_proto != __builtin_bswap16(ETH_P_IP))

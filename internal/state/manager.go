@@ -11,11 +11,11 @@ import (
 
 var RootDir = "/var/lib/uml-container/containers"
 
-func ContainerDir(id string) string {
+func ContainerDir(id string) (string, error) {
 	if !regexp.MustCompile(`^[a-zA-Z0-9_-]+$`).MatchString(id) {
-		panic("invalid container ID")
+		return "", fmt.Errorf("invalid container ID")
 	}
-	return filepath.Join(RootDir, id)
+	return filepath.Join(RootDir, id), nil
 }
 
 type ContainerState struct {
@@ -26,7 +26,10 @@ type ContainerState struct {
 }
 
 func SaveState(containerID string, state *ContainerState) error {
-	dir := ContainerDir(containerID)
+	dir, err := ContainerDir(containerID)
+	if err != nil {
+		return err
+	}
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return err
 	}
@@ -40,7 +43,11 @@ func SaveState(containerID string, state *ContainerState) error {
 }
 
 func LoadState(containerID string) (*ContainerState, error) {
-	data, err := os.ReadFile(filepath.Join(ContainerDir(containerID), "state.json"))
+	dir, err := ContainerDir(containerID)
+	if err != nil {
+		return nil, err
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "state.json"))
 	if err != nil {
 		return nil, err
 	}

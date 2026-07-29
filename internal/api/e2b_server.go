@@ -40,7 +40,11 @@ func StartE2BServer(port int) error {
 	// API Group
 	api := e.Group("/api")
 	api.Use(middleware.KeyAuth(func(key string, c echo.Context) (bool, error) {
-		return key == "secret", nil
+		expected := os.Getenv("API_SECRET")
+		if expected == "" {
+			expected = "secret"
+		}
+		return key == expected, nil
 	}))
 
 	// Get all containers
@@ -77,10 +81,17 @@ func StartE2BServer(port int) error {
 		}
 
 		mgr := container.NewManager(nil)
+		mem := req.Mem
+		if mem == "" {
+			mem = "512M"
+		}
 		cfg := &config.ContainerConfig{
+			ID:     req.Name,
 			Name:   req.Name,
 			Rootfs: req.Rootfs,
-			Memory: req.Mem,
+			Kernel: "./bin/linux",
+			Init:   "/init.sh",
+			Memory: mem,
 		}
 
 		if err := mgr.Start(context.Background(), cfg); err != nil {
@@ -96,7 +107,11 @@ func StartE2BServer(port int) error {
 		if !regexp.MustCompile(`^[a-zA-Z0-9_-]+$`).MatchString(id) {
 			return c.String(http.StatusBadRequest, "Invalid container ID")
 		}
-		logPath := filepath.Join(state.ContainerDir(id), "logs", "console.log")
+		dir, err := state.ContainerDir(id)
+		if err != nil {
+			return c.String(http.StatusBadRequest, err.Error())
+		}
+		logPath := filepath.Join(dir, "logs", "console.log")
 		data, err := os.ReadFile(logPath)
 		if err != nil {
 			return c.String(http.StatusNotFound, "Logs not found or container not started")
@@ -110,7 +125,11 @@ func StartE2BServer(port int) error {
 		if !regexp.MustCompile(`^[a-zA-Z0-9_-]+$`).MatchString(id) {
 			return c.String(http.StatusBadRequest, "Invalid container ID")
 		}
-		if err := os.RemoveAll(state.ContainerDir(id)); err != nil {
+		dir, err := state.ContainerDir(id)
+		if err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		}
+		if err := os.RemoveAll(dir); err != nil {
 			return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		}
 		return c.JSON(http.StatusOK, map[string]string{"status": "deleted"})

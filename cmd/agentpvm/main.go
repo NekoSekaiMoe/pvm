@@ -29,6 +29,9 @@ func main() {
 		name := runCmd.String("name", "agent1", "Sandbox name")
 		rootfs := runCmd.String("rootfs", "rootfs.img", "Root filesystem")
 		useVhost := runCmd.Bool("vhost", true, "Use vhost-user-blk for storage")
+		kernel := runCmd.String("kernel", "./bin/linux", "Kernel path")
+		initPath := runCmd.String("init", "/init.sh", "Init script path")
+		memory := runCmd.String("memory", "512M", "Container memory")
 
 		runCmd.Parse(os.Args[2:])
 
@@ -48,8 +51,12 @@ func main() {
 
 		mgr := container.NewManager(nil)
 		cfg := &config.ContainerConfig{
+			ID:              *name,
 			Name:            *name,
 			Rootfs:          *rootfs,
+			Kernel:          *kernel,
+			Init:            *initPath,
+			Memory:          *memory,
 			UseVirtio:       *useVhost,
 			VhostUserSocket: sockPath,
 		}

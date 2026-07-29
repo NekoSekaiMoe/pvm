@@ -2,11 +2,12 @@ package vhost
 
 import (
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
-	"os"
 
 	"uml-container/internal/state"
 )
@@ -14,12 +15,19 @@ import (
 // StartStorageDaemon starts qemu-storage-daemon to provide a vhost-user-blk socket.
 // Requires qemu-storage-daemon installed on the host.
 func StartStorageDaemon(containerID string, imagePath string) (string, *exec.Cmd, error) {
-	dir := state.ContainerDir(containerID)
-	os.MkdirAll(dir, 0755)
+	dir, err := state.ContainerDir(containerID)
+	if err != nil {
+		return "", nil, err
+	}
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return "", nil, fmt.Errorf("failed to create dir: %v", err)
+	}
 	socketPath := filepath.Join(dir, "vhost-blk.sock")
 	
 	// If it already exists, remove it
-	os.Remove(socketPath)
+	if err := os.Remove(socketPath); err != nil && !os.IsNotExist(err) {
+		return "", nil, fmt.Errorf("failed to remove socket: %v", err)
+	}
 
 	formatDriver := "raw"
 	if filepath.Ext(imagePath) == ".qcow2" {
@@ -47,10 +55,20 @@ func StartStorageDaemon(containerID string, imagePath string) (string, *exec.Cmd
 			found = true
 			break
 		}
+		if cmd.Process != nil {
+			if err := cmd.Process.Signal(syscall.Signal(0)); err != nil {
+				// Process dead
+				break
+			}
+		}
 		time.Sleep(100 * time.Millisecond)
 	}
 	
 	if !found {
+		if cmd.Process != nil {
+			cmd.Process.Kill()
+			cmd.Wait()
+		}
 		return "", nil, fmt.Errorf("timeout waiting for socket to be created: %s", socketPath)
 	}
 	

@@ -2,6 +2,7 @@ package uml
 
 import (
 	"context"
+	"io"
 	"os"
 	"os/exec"
 )
@@ -16,13 +17,17 @@ type DefaultLauncher struct{}
 
 func (l *DefaultLauncher) Start(ctx context.Context, kernel string, args []string, logFile *os.File) (int, *exec.Cmd, error) {
 	cmd := exec.CommandContext(ctx, kernel, args...)
+	// Use pipes for stdout/stderr to prevent UML epoll_ctl errors on regular files
+	stdout, _ := cmd.StdoutPipe()
+	stderr, _ := cmd.StderrPipe()
+	
 	if logFile != nil {
-		cmd.Stdout = logFile
-		cmd.Stderr = logFile
+		go io.Copy(logFile, stdout)
+		go io.Copy(logFile, stderr)
 	} else {
 		cmd.Stdin = os.Stdin
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
+		go io.Copy(os.Stdout, stdout)
+		go io.Copy(os.Stderr, stderr)
 	}
 	err := cmd.Start()
 	if err != nil {

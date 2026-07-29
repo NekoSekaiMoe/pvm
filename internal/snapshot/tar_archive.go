@@ -18,7 +18,13 @@ var validContainerID = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 
 // Export packages a container's state and data into a .tgz archive
 func Export(containerID string, destTgz string) error {
-	dir := state.ContainerDir(containerID)
+	if !validContainerID.MatchString(containerID) {
+		return fmt.Errorf("invalid container ID")
+	}
+	dir, err := state.ContainerDir(containerID)
+	if err != nil {
+		return err
+	}
 	cmd := exec.Command("tar", "-czf", destTgz, "-C", dir, ".")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("tar export failed: %v, output: %s", err, string(out))
@@ -32,7 +38,10 @@ func Import(srcTgz string, newContainerID string) error {
 		return fmt.Errorf("invalid container ID")
 	}
 
-	dir := state.ContainerDir(newContainerID)
+	dir, err := state.ContainerDir(newContainerID)
+	if err != nil {
+		return err
+	}
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return fmt.Errorf("failed to create directory: %v", err)
 	}

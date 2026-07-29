@@ -62,28 +62,38 @@ const fetchContainers = async () => {
 
 const startContainer = async () => {
   if (!newContainer.value.name) return
-  const res = await fetch('/api/containers/start', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(newContainer.value)
-  })
-  if (res.ok) {
-    newContainer.value.name = ''
-    setTimeout(fetchContainers, 500)
-  } else {
-    const err = await res.json()
-    alert(`Error starting container: ${err.error || res.statusText}`)
+  try {
+    const res = await fetch('/api/containers/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(newContainer.value)
+    })
+    if (res.ok) {
+      newContainer.value.name = ''
+      setTimeout(fetchContainers, 500)
+    } else {
+      const err = await res.json()
+      alert(`Error starting container: ${err.error || res.statusText}`)
+    }
+  } catch (e) {
+    console.error(e)
+    alert(`Network error starting container: ${e.message}`)
   }
 }
 
 const deleteContainer = async (id) => {
   if(!confirm(`Delete container ${id}?`)) return
-  const res = await fetch(`/api/containers/${id}`, { method: 'DELETE' })
-  if (res.ok) {
-    fetchContainers()
-  } else {
-    const err = await res.json()
-    alert(`Error deleting container: ${err.error || res.statusText}`)
+  try {
+    const res = await fetch(`/api/containers/${id}`, { method: 'DELETE' })
+    if (res.ok) {
+      fetchContainers()
+    } else {
+      const err = await res.json()
+      alert(`Error deleting container: ${err.error || res.statusText}`)
+    }
+  } catch (e) {
+    console.error(e)
+    alert(`Network error deleting container: ${e.message}`)
   }
 }
 

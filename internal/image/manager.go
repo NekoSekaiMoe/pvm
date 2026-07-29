@@ -72,12 +72,18 @@ func Pull(imageRef string) error {
 }
 
 func CreateLayer(containerID string) error {
-	dir := state.ContainerDir(containerID)
+	dir, err := state.ContainerDir(containerID)
+	if err != nil {
+		return err
+	}
 	return filesystem.SetupOverlayfs(dir)
 }
 
 func MountLayer(containerID, rootfs string) error {
-	dir := state.ContainerDir(containerID)
+	dir, err := state.ContainerDir(containerID)
+	if err != nil {
+		return err
+	}
 	lower := rootfs
 	upper := filepath.Join(dir, "upper")
 	work := filepath.Join(dir, "work")

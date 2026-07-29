@@ -5,15 +5,24 @@ import (
 	"net"
 	"os/exec"
 	"strings"
+	"sync"
 )
 
 var (
 	ipForwardOriginal string
 	ipForwardRefCount int
+	ipForwardMu       sync.Mutex
 )
 
 // SetupBridge creates a NAT bridge
 func SetupBridge(bridgeName string, tapName string, gatewayIP string) error {
+	success := false
+	defer func() {
+		if !success {
+			DeleteBridge(bridgeName, gatewayIP)
+		}
+	}()
+
 	if err := exec.Command("ip", "link", "add", "name", bridgeName, "type", "bridge").Run(); err != nil {
 		return fmt.Errorf("failed to add bridge %s: %v", bridgeName, err)
 	}
@@ -43,17 +52,23 @@ func SetupBridge(bridgeName string, tapName string, gatewayIP string) error {
 		return fmt.Errorf("failed to setup iptables NAT: %v", err)
 	}
 
+	ipForwardMu.Lock()
 	if ipForwardRefCount == 0 {
 		if out, err := exec.Command("sysctl", "-n", "net.ipv4.ip_forward").Output(); err == nil {
 			ipForwardOriginal = strings.TrimSpace(string(out))
 		}
 	}
 	ipForwardRefCount++
+	ipForwardMu.Unlock()
 
 	if err := exec.Command("sysctl", "-w", "net.ipv4.ip_forward=1").Run(); err != nil {
+		ipForwardMu.Lock()
+		ipForwardRefCount--
+		ipForwardMu.Unlock()
 		return fmt.Errorf("failed to enable ip_forward: %v", err)
 	}
 
+	success = true
 	return nil
 }
 
@@ -82,6 +97,7 @@ func DeleteBridge(bridgeName string, gatewayIP string) error {
 		return fmt.Errorf("failed to delete bridge %s: %v", bridgeName, err)
 	}
 
+	ipForwardMu.Lock()
 	ipForwardRefCount--
 	if ipForwardRefCount <= 0 {
 		ipForwardRefCount = 0
@@ -89,6 +105,7 @@ func DeleteBridge(bridgeName string, gatewayIP string) error {
 			exec.Command("sysctl", "-w", fmt.Sprintf("net.ipv4.ip_forward=%s", ipForwardOriginal)).Run()
 		}
 	}
+	ipForwardMu.Unlock()
 
 	return nil
 }

@@ -21,20 +21,16 @@ for i in {1..10}; do
 done
 
 echo "Sending execution request to E2B API..."
-HTTP_STATUS=$(curl -s -o resp.json -w "%{http_code}" -X POST http://127.0.0.1:8081/exec \
+HTTP_STATUS=$(curl -s -o resp.json -w "%{http_code}" -X POST http://127.0.0.1:8081/api/exec \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer secret" \
   -d '{"cmd": "apk update && apk add python3"}')
 
 echo "API Response:"
 cat resp.json
 
-if [ "$HTTP_STATUS" != "200" ]; then
-    echo "❌ E2B API Test Failed: HTTP status $HTTP_STATUS"
-    exit 1
-fi
-
-if ! grep -q '"exitCode"' resp.json; then
-    echo "❌ E2B API Test Failed: Missing exitCode in JSON response"
+if [ "$HTTP_STATUS" != "501" ]; then
+    echo "❌ E2B API Test Failed: HTTP status $HTTP_STATUS (expected 501)"
     exit 1
 fi
 

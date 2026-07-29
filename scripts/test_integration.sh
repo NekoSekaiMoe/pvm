@@ -32,7 +32,7 @@ sudo chmod +x mnt/init.sh
 sudo umount mnt
 
 echo "Running UML with custom compiled linux kernel..."
-./bin/umlctl start --name integration-test --kernel ./bin/linux --rootfs rootfs.img --init /init.sh > uml.log 2>&1 || true
+sudo ./bin/umlctl start --name integration-test --kernel ./bin/linux --rootfs rootfs.img --init /init.sh > uml.log 2>&1 || true
 
 cat uml.log
 
