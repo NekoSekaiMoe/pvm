@@ -46,6 +46,15 @@ func Import(srcTgz string, newContainerID string) error {
 		return fmt.Errorf("failed to create directory: %v", err)
 	}
 
+	// If any entry fails to extract, remove the half-populated dir so a later
+	// import does not silently reuse a corrupted rootfs.
+	importOk := false
+	defer func() {
+		if !importOk {
+			os.RemoveAll(dir)
+		}
+	}()
+
 	f, err := os.Open(srcTgz)
 	if err != nil {
 		return fmt.Errorf("tar import failed: %v", err)
@@ -83,7 +92,7 @@ func Import(srcTgz string, newContainerID string) error {
 			if err := os.MkdirAll(target, os.FileMode(header.Mode)); err != nil {
 				return fmt.Errorf("tar import failed: mkdir: %v", err)
 			}
-		case tar.TypeReg:
+		case tar.TypeReg, tar.TypeRegA:
 			if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
 				return fmt.Errorf("tar import failed: mkdir: %v", err)
 			}
@@ -96,7 +105,40 @@ func Import(srcTgz string, newContainerID string) error {
 				return fmt.Errorf("tar import failed: copy: %v", err)
 			}
 			out.Close()
+		case tar.TypeSymlink:
+			//(header.Linkname is the link target; not path-escaped because it's interpreted by the guest kernel)
+			if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
+				return fmt.Errorf("tar import failed: mkdir: %v", err)
+			}
+			if err := os.Remove(target); err != nil && !os.IsNotExist(err) {
+				return fmt.Errorf("tar import failed: remove existing symlink: %v", err)
+			}
+			if err := os.Symlink(header.Linkname, target); err != nil {
+				return fmt.Errorf("tar import failed: symlink: %v", err)
+			}
+		case tar.TypeLink:
+			// Hard link to a previously extracted entry. Resolve against the dest root.
+			linkSrc := filepath.Join(dir, filepath.Clean(header.Linkname))
+			if !strings.HasPrefix(linkSrc, filepath.Clean(dir)+string(filepath.Separator)) && linkSrc != filepath.Clean(dir) {
+				return fmt.Errorf("tar import failed: hardlink target escapes dir %s", header.Linkname)
+			}
+			if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
+				return fmt.Errorf("tar import failed: mkdir: %v", err)
+			}
+			if err := os.Remove(target); err != nil && !os.IsNotExist(err) {
+				return fmt.Errorf("tar import failed: remove existing hardlink: %v", err)
+			}
+			if err := os.Link(linkSrc, target); err != nil {
+				return fmt.Errorf("tar import failed: hardlink: %v", err)
+			}
+		case tar.TypeChar, tar.TypeBlock:
+			// Device nodes require root + CAP_MKNOD; surface as an explicit error instead
+			// of silently skipping, so a corrupted rootfs cannot go unnoticed.
+			return fmt.Errorf("tar import failed: unsupported entry type %d at %q (device node); aborting", header.Typeflag, header.Name)
+		default:
+			return fmt.Errorf("tar import failed: unsupported entry type %d at %q; aborting", header.Typeflag, header.Name)
 		}
 	}
+	importOk = true
 	return nil
 }

@@ -16,16 +16,35 @@ var (
 
 // SetupBridge creates a NAT bridge
 func SetupBridge(bridgeName string, tapName string, gatewayIP string) error {
-	success := false
+	// Track exactly which resources this invocation created/registered so the
+	// deferred cleanup only unwinds what we actually own. A failure before, say,
+	// ip_forward refcount++ must not touch the refcount or tear down another
+	// container's forwarding state.
+	bridgeCreated := false
+	ipForwardRegistered := false
 	defer func() {
-		if !success {
+		if bridgeCreated {
 			DeleteBridge(bridgeName, gatewayIP)
+		}
+		// If we incremented the refcount but failed to actually enable ip_forward,
+		// roll back our registration so the count stays honest.
+		if ipForwardRegistered {
+			ipForwardMu.Lock()
+			ipForwardRefCount--
+			if ipForwardRefCount <= 0 {
+				ipForwardRefCount = 0
+				if ipForwardOriginal != "" {
+					exec.Command("sysctl", "-w", fmt.Sprintf("net.ipv4.ip_forward=%s", ipForwardOriginal)).Run()
+				}
+			}
+			ipForwardMu.Unlock()
 		}
 	}()
 
 	if err := exec.Command("ip", "link", "add", "name", bridgeName, "type", "bridge").Run(); err != nil {
 		return fmt.Errorf("failed to add bridge %s: %v", bridgeName, err)
 	}
+	bridgeCreated = true
 	if err := exec.Command("ip", "link", "set", bridgeName, "up").Run(); err != nil {
 		return fmt.Errorf("failed to set bridge %s up: %v", bridgeName, err)
 	}
@@ -54,21 +73,26 @@ func SetupBridge(bridgeName string, tapName string, gatewayIP string) error {
 
 	ipForwardMu.Lock()
 	if ipForwardRefCount == 0 {
-		if out, err := exec.Command("sysctl", "-n", "net.ipv4.ip_forward").Output(); err == nil {
-			ipForwardOriginal = strings.TrimSpace(string(out))
+		out, err := exec.Command("sysctl", "-n", "net.ipv4.ip_forward").Output()
+		if err != nil {
+			ipForwardMu.Unlock()
+			return fmt.Errorf("failed to read net.ipv4.ip_forward: %v", err)
 		}
+		val := strings.TrimSpace(string(out))
+		if val != "0" && val != "1" {
+			ipForwardMu.Unlock()
+			return fmt.Errorf("unexpected net.ipv4.ip_forward value %q (expected 0 or 1)", val)
+		}
+		ipForwardOriginal = val
 	}
 	ipForwardRefCount++
 	ipForwardMu.Unlock()
+	ipForwardRegistered = true
 
 	if err := exec.Command("sysctl", "-w", "net.ipv4.ip_forward=1").Run(); err != nil {
-		ipForwardMu.Lock()
-		ipForwardRefCount--
-		ipForwardMu.Unlock()
 		return fmt.Errorf("failed to enable ip_forward: %v", err)
 	}
 
-	success = true
 	return nil
 }
 
@@ -102,7 +126,10 @@ func DeleteBridge(bridgeName string, gatewayIP string) error {
 	if ipForwardRefCount <= 0 {
 		ipForwardRefCount = 0
 		if ipForwardOriginal != "" {
-			exec.Command("sysctl", "-w", fmt.Sprintf("net.ipv4.ip_forward=%s", ipForwardOriginal)).Run()
+			if err := exec.Command("sysctl", "-w", fmt.Sprintf("net.ipv4.ip_forward=%s", ipForwardOriginal)).Run(); err != nil {
+				return fmt.Errorf("failed to restore net.ipv4.ip_forward=%s: %v", ipForwardOriginal, err)
+			}
+			ipForwardOriginal = ""
 		}
 	}
 	ipForwardMu.Unlock()

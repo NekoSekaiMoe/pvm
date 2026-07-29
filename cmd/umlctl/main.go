@@ -58,16 +58,13 @@ func main() {
 				fmt.Printf("Failed to create overlay layer: %v\n", err)
 				os.Exit(1)
 			}
-			if err := image.MountLayer(*name, *rootfs); err != nil {
-				fmt.Printf("Failed to mount overlay layer: %v\n", err)
-				os.Exit(1)
-			}
-			dir, err := state.ContainerDir(*name)
+			mergedImg, err := image.MountLayer(*name, *rootfs)
 			if err != nil {
-				fmt.Printf("Failed to get container dir: %v\n", err)
+				fmt.Printf("Failed to prepare overlay image: %v\n", err)
 				os.Exit(1)
 			}
-			cfg.Rootfs = filepath.Join(dir, "merged")
+			// mergedImg is a real ext4 image file; ubd0=<file> + root=/dev/ubda works.
+			cfg.Rootfs = mergedImg
 		}
 
 		manager := container.NewManager(&uml.DefaultLauncher{})

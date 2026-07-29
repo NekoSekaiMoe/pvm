@@ -3,10 +3,10 @@ package container
 import (
 	"context"
 	"os"
-	"os/exec"
 	"testing"
 	"uml-container/internal/config"
 	"uml-container/internal/state"
+	"uml-container/internal/uml"
 )
 
 type mockLauncher struct {
@@ -14,13 +14,13 @@ type mockLauncher struct {
 	lastArgs   []string
 }
 
-func (m *mockLauncher) Start(ctx context.Context, kernel string, args []string, logFile *os.File) (int, *exec.Cmd, error) {
+func (m *mockLauncher) Start(ctx context.Context, kernel string, args []string, logFile *os.File) (int, *uml.Process, error) {
 	m.lastKernel = kernel
 	m.lastArgs = args
-	return 12345, nil, nil
+	return 12345, &uml.Process{}, nil
 }
 
-func (m *mockLauncher) Wait(cmd *exec.Cmd) error {
+func (m *mockLauncher) Wait(p *uml.Process) error {
 	return nil
 }
 
