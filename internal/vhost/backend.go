@@ -38,8 +38,13 @@ func StartStorageDaemon(containerID string, imagePath string) (string, *exec.Cmd
 		return "", nil, fmt.Errorf("invalid imagePath: cannot contain comma")
 	}
 
+	aioMode := "threads"
+	if supportsIoUring() {
+		aioMode = "io_uring"
+	}
+
 	cmd := exec.Command("qemu-storage-daemon",
-		"--blockdev", fmt.Sprintf("driver=file,node-name=disk0,filename=%s,aio=io_uring", imagePath),
+		"--blockdev", fmt.Sprintf("driver=file,node-name=disk0,filename=%s,aio=%s", imagePath, aioMode),
 		"--blockdev", fmt.Sprintf("driver=%s,node-name=format0,file=disk0", formatDriver),
 		"--export", fmt.Sprintf("type=vhost-user-blk,id=export0,node-name=format0,addr.type=unix,addr.path=%s,writable=on", socketPath),
 	)
@@ -73,4 +78,9 @@ func StartStorageDaemon(containerID string, imagePath string) (string, *exec.Cmd
 	}
 	
 	return socketPath, cmd, nil
+}
+
+func supportsIoUring() bool {
+	out, _ := exec.Command("qemu-img", "--help").CombinedOutput()
+	return strings.Contains(string(out), "io_uring")
 }

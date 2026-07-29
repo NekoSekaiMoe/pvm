@@ -17,6 +17,12 @@ if ! command -v qemu-storage-daemon &> /dev/null; then
     exit 0
 fi
 
+if qemu-img --help | grep -q "io_uring"; then
+    echo "AIO Backend: io_uring supported and will be used."
+else
+    echo "AIO Backend: io_uring not supported, will fallback to threads."
+fi
+
 IMG_NAME="perf_rootfs.img"
 echo "Creating ${IMG_NAME} (300MB)..."
 dd if=/dev/zero of=${IMG_NAME} bs=1M count=300 >/dev/null 2>&1
@@ -32,6 +38,7 @@ fi
 echo "Mounting and extracting..."
 mkdir -p mnt
 sudo mount -o loop ${IMG_NAME} mnt
+trap 'sudo umount mnt 2>/dev/null || true' EXIT
 sudo tar -xzf alpine.tar.gz -C mnt/
 
 echo "Creating performance init script..."
@@ -57,13 +64,15 @@ poweroff -f
 EOF
 sudo chmod +x mnt/init.sh
 
+trap - EXIT
 sudo umount mnt
 
 echo "Running UML with virtio-blk and io_uring..."
 CONSOLE_LOG=/var/lib/uml-container/containers/perf-test/logs/console.log
 
-# Ensure daemon isn't left running in case of previous failure
-sudo killall qemu-storage-daemon 2>/dev/null || true
+# Clean up socket and logs if they exist from a previous run to avoid false positives and conflicts
+sudo rm -f /var/lib/uml-container/containers/perf-test/vhost-blk.sock
+sudo rm -f "$CONSOLE_LOG"
 
 sudo ./agentpvm run -name perf-test -rootfs ${IMG_NAME} -kernel ./bin/linux -init /init.sh -vhost=true > agentpvm.log 2>&1 || true
 

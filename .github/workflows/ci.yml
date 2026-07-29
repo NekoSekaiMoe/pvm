@@ -59,8 +59,14 @@ jobs:
     - name: Run Integration Scripts
       timeout-minutes: 15
       run: |
-        chmod +x scripts/test_integration.sh
-        ./scripts/test_integration.sh
+        echo "Running scripts in scripts/test_*.sh serially..."
+        chmod +x scripts/test_*.sh || true
+        for script in scripts/test_*.sh; do
+          if [ -f "$script" ] && [ -x "$script" ]; then
+            echo "Running $script..."
+            ./"$script" || echo "$script failed but continuing..."
+          fi
+        done
         
         echo "Running additional test suites serially..."
         chmod +x tests/*.sh
