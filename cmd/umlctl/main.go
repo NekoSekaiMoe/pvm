@@ -136,7 +136,7 @@ func main() {
 					fmt.Printf("Network %s created.\n", name)
 				}
 			} else if subcmd == "rm" {
-				err := network.DeleteBridge(name)
+				err := network.DeleteBridge(name, "")
 				if err != nil {
 					fmt.Printf("Error deleting network: %v\n", err)
 				} else {

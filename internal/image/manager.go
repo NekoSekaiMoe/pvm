@@ -75,3 +75,18 @@ func CreateLayer(containerID string) error {
 	dir := state.ContainerDir(containerID)
 	return filesystem.SetupOverlayfs(dir)
 }
+
+func MountLayer(containerID, rootfs string) error {
+	dir := state.ContainerDir(containerID)
+	lower := rootfs
+	upper := filepath.Join(dir, "upper")
+	work := filepath.Join(dir, "work")
+	merged := filepath.Join(dir, "merged")
+	opts := fmt.Sprintf("lowerdir=%s,upperdir=%s,workdir=%s", lower, upper, work)
+	
+	cmd := exec.Command("sudo", "mount", "-t", "overlay", "overlay", "-o", opts, merged)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("overlay mount failed: %v, out: %s", err, string(out))
+	}
+	return nil
+}

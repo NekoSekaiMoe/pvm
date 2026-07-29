@@ -93,8 +93,21 @@ func (m *Manager) Start(ctx context.Context, cfg *config.ContainerConfig) error 
 		fmt.Printf("Warning: failed to save state: %v\n", saveErr)
 	}
 
-	pid, err := m.Launcher.Launch(ctx, cfg.Kernel, args, logFile)
+	pid, cmd, err := m.Launcher.Start(ctx, cfg.Kernel, args, logFile)
 	st.PID = pid
+
+	if err != nil {
+		st.Status = "exited"
+		state.SaveState(cfg.ID, st)
+		return err
+	}
+
+	st.Status = "running"
+	if saveErr := state.SaveState(cfg.ID, st); saveErr != nil {
+		fmt.Printf("Warning: failed to save state: %v\n", saveErr)
+	}
+
+	err = m.Launcher.Wait(cmd)
 
 	if err != nil {
 		st.Status = "exited"
