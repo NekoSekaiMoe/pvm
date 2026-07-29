@@ -10,6 +10,7 @@ import (
 	"uml-container/internal/config"
 	"uml-container/internal/container"
 	"uml-container/internal/image"
+	"uml-container/internal/snapshot"
 	"uml-container/internal/state"
 	"uml-container/webui"
 
@@ -139,15 +140,49 @@ func StartE2BServer(port int) error {
 		if !regexp.MustCompile(`^[a-zA-Z0-9_-]+$`).MatchString(id) {
 			return c.String(http.StatusBadRequest, "Invalid container ID")
 		}
+		
+		st, err := state.LoadState(id)
+		if err == nil && st.PID > 0 {
+			proc, err := os.FindProcess(st.PID)
+			if err == nil {
+				proc.Kill()
+			}
+		}
+
 		dir, err := state.ContainerDir(id)
-		if err != nil {
-			return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		if err == nil {
+			os.RemoveAll(dir)
 		}
-		if err := os.RemoveAll(dir); err != nil {
-			return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
-		}
-		return c.JSON(http.StatusOK, map[string]string{"status": "deleted"})
+
+		return c.String(http.StatusOK, "Deleted")
 	})
+
+	// Snapshot container
+	api.POST("/containers/:id/snapshot", func(c echo.Context) error {
+		id := c.Param("id")
+		if !regexp.MustCompile(`^[a-zA-Z0-9_-]+$`).MatchString(id) {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "Invalid container ID"})
+		}
+		dest := filepath.Join("/var/lib/uml-container/containers", id+".tgz")
+		if err := snapshot.Export(id, dest); err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		}
+		return c.JSON(http.StatusOK, map[string]string{"status": "success", "file": dest})
+	})
+
+	// Restore container
+	api.POST("/containers/:id/restore", func(c echo.Context) error {
+		id := c.Param("id")
+		if !regexp.MustCompile(`^[a-zA-Z0-9_-]+$`).MatchString(id) {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "Invalid container ID"})
+		}
+		src := filepath.Join("/var/lib/uml-container/containers", id+".tgz")
+		if err := snapshot.Import(src, id+"-restored"); err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		}
+		return c.JSON(http.StatusOK, map[string]string{"status": "success", "new_id": id+"-restored"})
+	})
+	// End of restore container
 
 	// Pull image
 	api.POST("/images/pull", func(c echo.Context) error {

@@ -53,7 +53,7 @@ CONSOLE_LOG=/var/lib/uml-container/containers/pkg-test/logs/console.log
 sudo rm -f "$CONSOLE_LOG"
 
 # Using tap=tap_pkg for network
-sudo ./agentpvm run -name pkg-test -rootfs ${IMG_NAME} -kernel ./bin/linux -init /init.sh -vhost=false -tap tap_pkg > pkg_agentpvm.log 2>&1 || true
+sudo ./agentpvm run -name pkg-test -rootfs ${IMG_NAME} -kernel ./bin/linux -init /init.sh -vhost=false -net-tap tap_pkg > pkg_agentpvm.log 2>&1 || true
 
 echo "Waiting for container to finish (up to 30s)..."
 for i in {1..30}; do

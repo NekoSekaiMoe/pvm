@@ -8,6 +8,7 @@
         <input v-model="newContainer.name" placeholder="Container Name (e.g. web1)" />
         <input v-model="newContainer.rootfs" placeholder="Rootfs Image (default: alpine)" />
         <button class="btn btn-primary" @click="startContainer">Launch Container</button>
+        <button class="btn btn-primary" @click="restoreContainer" style="background: var(--text-muted); color: #111;">Restore from Snapshot</button>
       </div>
     </div>
 
@@ -31,6 +32,7 @@
               <td>{{ c.pid }}</td>
               <td>
                 <NuxtLink :to="`/logs/${c.id}`" class="btn btn-primary" style="margin-right: 0.5rem; text-decoration: none; font-size: 0.875rem;">Logs</NuxtLink>
+                <button class="btn btn-primary" @click="snapshotContainer(c.id)" style="margin-right: 0.5rem; background: var(--success);">Snapshot</button>
                 <button class="btn btn-danger" @click="deleteContainer(c.id)">Delete</button>
               </td>
             </tr>
@@ -81,6 +83,27 @@ const startContainer = async () => {
   }
 }
 
+const restoreContainer = async () => {
+  if (!newContainer.value.name) {
+    alert("Please enter the original container name to restore from")
+    return
+  }
+  try {
+    const res = await fetch(`/api/containers/${newContainer.value.name}/restore`, { method: 'POST' })
+    if (res.ok) {
+      newContainer.value.name = ''
+      alert("Container restored successfully!")
+      setTimeout(fetchContainers, 500)
+    } else {
+      const err = await res.json()
+      alert(`Error restoring container: ${err.error || res.statusText}`)
+    }
+  } catch (e) {
+    console.error(e)
+    alert(`Network error restoring container: ${e.message}`)
+  }
+}
+
 const deleteContainer = async (id) => {
   if(!confirm(`Delete container ${id}?`)) return
   try {
@@ -94,6 +117,22 @@ const deleteContainer = async (id) => {
   } catch (e) {
     console.error(e)
     alert(`Network error deleting container: ${e.message}`)
+  }
+}
+
+const snapshotContainer = async (id) => {
+  if(!confirm(`Snapshot container ${id}?`)) return
+  try {
+    const res = await fetch(`/api/containers/${id}/snapshot`, { method: 'POST' })
+    if (res.ok) {
+      alert(`Snapshot for ${id} created successfully!`)
+    } else {
+      const err = await res.json()
+      alert(`Error creating snapshot: ${err.error || res.statusText}`)
+    }
+  } catch (e) {
+    console.error(e)
+    alert(`Network error: ${e.message}`)
   }
 }
 

@@ -117,9 +117,8 @@ func DeleteBridge(bridgeName string, gatewayIP string) error {
 	}
 
 	exec.Command("ip", "link", "set", bridgeName, "down").Run()
-	if err := exec.Command("ip", "link", "delete", "name", bridgeName, "type", "bridge").Run(); err != nil {
-		return fmt.Errorf("failed to delete bridge %s: %v", bridgeName, err)
-	}
+	// Ignore errors because the bridge might already be deleted or not exist
+	exec.Command("ip", "link", "delete", bridgeName, "type", "bridge").Run()
 
 	ipForwardMu.Lock()
 	ipForwardRefCount--
