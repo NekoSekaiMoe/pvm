@@ -12,10 +12,28 @@ type Manager struct {
 	CgroupRoot string
 }
 
+// defaultCgroupRoot is the production cgroup v2 mount used when no override
+// is provided. It can be overridden via the PVM_CGROUP_ROOT or CGROUP_ROOT
+// environment variables (the latter is kept for compatibility with the
+// integration shell tests), which is required for non-root test runs.
+const defaultCgroupRoot = "/sys/fs/cgroup/uml"
+
 func NewManager() *Manager {
 	return &Manager{
-		CgroupRoot: "/sys/fs/cgroup/uml",
+		CgroupRoot: resolveCgroupRoot(),
 	}
+}
+
+// resolveCgroupRoot picks the cgroup root from the environment when available
+// so tests and the CLI can target a throwaway directory without root.
+func resolveCgroupRoot() string {
+	if v := os.Getenv("PVM_CGROUP_ROOT"); v != "" {
+		return v
+	}
+	if v := os.Getenv("CGROUP_ROOT"); v != "" {
+		return v
+	}
+	return defaultCgroupRoot
 }
 
 func (m *Manager) Setup(containerID string, pid int, memory int64, cpu int) error {
