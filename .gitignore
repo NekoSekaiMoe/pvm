@@ -6,3 +6,4 @@ rootfs.img
 agentpvm
 umlctl
 *.img
+webui/node-modules/
