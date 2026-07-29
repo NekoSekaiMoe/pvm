@@ -26,9 +26,11 @@ cat << 'EOF' | sudo tee mnt_pkg/init.sh
 #!/bin/sh
 mount -t proc proc /proc
 mount -t sysfs sys /sys
-# Assuming eth0 is set up by pvm, we can just bring it up
+# Assuming eth0 is set up by pvm
 ip link set eth0 up || true
-udhcpc -i eth0 || true
+ip addr add 10.0.0.2/24 dev eth0 || true
+ip route add default via 10.0.0.1 || true
+echo "nameserver 8.8.8.8" > /etc/resolv.conf
 
 echo "Attempting to install python3..."
 apk update && apk add python3 && echo "PKG_INSTALL_SUCCESS"
@@ -40,19 +42,33 @@ sudo chmod +x mnt_pkg/init.sh
 trap - EXIT
 sudo umount mnt_pkg
 
+# Setup Host Networking
+sudo ip tuntap add tap_pkg mode tap || true
+sudo ip link set tap_pkg up || true
+sudo ./bin/umlctl network create pvm_br0 || true
+sudo ip link set tap_pkg master pvm_br0 || true
+
 # Run the container
 CONSOLE_LOG=/var/lib/uml-container/containers/pkg-test/logs/console.log
 sudo rm -f "$CONSOLE_LOG"
 
-# Using tap=pvm_tap0 for network if NAT is configured that way
-sudo ./agentpvm run -name pkg-test -rootfs ${IMG_NAME} -kernel ./bin/linux -init /init.sh -vhost=false > pkg_agentpvm.log 2>&1 || true
+# Using tap=tap_pkg for network
+sudo ./agentpvm run -name pkg-test -rootfs ${IMG_NAME} -kernel ./bin/linux -init /init.sh -vhost=false -tap tap_pkg > pkg_agentpvm.log 2>&1 || true
+
+echo "Waiting for container to finish (up to 30s)..."
+for i in {1..30}; do
+    if sudo grep -q "PKG_INSTALL_SUCCESS" "$CONSOLE_LOG" 2>/dev/null; then
+        echo "✅ Package installation test passed."
+        sudo ./bin/umlctl network rm pvm_br0 || true
+        sudo ip link delete tap_pkg || true
+        exit 0
+    fi
+    sleep 1
+done
 
 echo "---- Pkg Test Console Output ----"
 sudo cat "$CONSOLE_LOG" 2>/dev/null || cat pkg_agentpvm.log
-
-if sudo grep -q "PKG_INSTALL_SUCCESS" "$CONSOLE_LOG" 2>/dev/null; then
-    echo "✅ Package installation test passed."
-else
-    echo "❌ Package installation test failed."
-    exit 1
-fi
+echo "❌ Package installation test failed or timed out."
+sudo ./bin/umlctl network rm pvm_br0 || true
+sudo ip link delete tap_pkg || true
+exit 1

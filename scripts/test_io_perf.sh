@@ -76,12 +76,18 @@ sudo rm -f "$CONSOLE_LOG"
 
 sudo ./agentpvm run -name perf-test -rootfs ${IMG_NAME} -kernel ./bin/linux -init /init.sh -vhost=true > agentpvm.log 2>&1 || true
 
+echo "Waiting for container to finish (up to 30s)..."
+for i in {1..30}; do
+    if sudo grep -q "PERF_TEST_COMPLETED" "$CONSOLE_LOG" 2>/dev/null; then
+        echo "---- IO Perf Console Output ----"
+        sudo cat "$CONSOLE_LOG" 2>/dev/null || cat agentpvm.log
+        echo "✅ I/O Performance Test completed successfully!"
+        exit 0
+    fi
+    sleep 1
+done
+
 echo "---- IO Perf Console Output ----"
 sudo cat "$CONSOLE_LOG" 2>/dev/null || cat agentpvm.log
-
-if sudo grep -q "PERF_TEST_COMPLETED" "$CONSOLE_LOG" 2>/dev/null; then
-    echo "✅ I/O Performance Test completed successfully!"
-else
-    echo "❌ I/O Performance Test failed to complete."
-    exit 1
-fi
+echo "❌ I/O Performance Test failed to complete or timed out."
+exit 1
