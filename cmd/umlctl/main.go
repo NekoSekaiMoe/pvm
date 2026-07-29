@@ -7,16 +7,18 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"uml-container/internal/config"
 	"uml-container/internal/container"
 	"uml-container/internal/image"
+	"uml-container/internal/network"
 	"uml-container/internal/state"
 	"uml-container/internal/uml"
 )
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Println("Usage: umlctl [start|stop|create|image|logs|ps]")
+		fmt.Println("Usage: umlctl [start|image|logs|ps|network]")
 		os.Exit(1)
 	}
 	cmd := os.Args[1]
@@ -32,6 +34,9 @@ func main() {
 		netTap := startCmd.String("tap", "", "Network tap device (optional)")
 		initCmd := startCmd.String("init", "/sbin/init", "Init command inside container")
 		overlay := startCmd.Bool("overlay", false, "Use overlayfs (rootfs is base image)")
+		rm := startCmd.Bool("rm", false, "Remove container and state after exit")
+		it := startCmd.Bool("it", false, "Interactive mode (direct shell login, bypass logs)")
+		volume := startCmd.String("volume", "", "Host directory to mount via hostfs (e.g. /host:/container)")
 
 		startCmd.Parse(os.Args[2:])
 
@@ -47,20 +52,47 @@ func main() {
 		}
 
 		if *overlay {
-			// Feature 1: OverlayFS Layer Creation
 			if err := image.CreateLayer(*name); err != nil {
 				fmt.Printf("Failed to create overlay layer: %v\n", err)
-			} else {
-				fmt.Printf("OverlayFS layers prepared in /var/lib/uml-container/containers/%s\n", *name)
 			}
+		}
+		
+		// Handling cleanup
+		if *rm {
+			defer func() {
+				fmt.Println("Cleaning up container state and files (--rm)...")
+				os.RemoveAll(filepath.Join("/var/lib/uml-container/containers", *name))
+			}()
 		}
 
 		manager := container.NewManager(&uml.DefaultLauncher{})
-		fmt.Printf("Starting container %s with virtio=%v\n", *name, *virtio)
-		err := manager.Start(context.Background(), cfg)
+		
+		// If interactive mode, we instruct the manager to not intercept logs
+		// We'll pass it in context or adjust manager interface for MVP
+		ctx := context.Background()
+		if *it {
+			ctx = context.WithValue(ctx, "interactive", true)
+			if *initCmd == "/sbin/init" {
+				cfg.Init = "/bin/sh" // Force shell if interactive and default init
+			}
+		}
+
+		// Support volume via simple hostfs string parsing (Host:Container)
+		if *volume != "" {
+			parts := strings.SplitN(*volume, ":", 2)
+			if len(parts) == 2 {
+				ctx = context.WithValue(ctx, "volume_host", parts[0])
+				ctx = context.WithValue(ctx, "volume_guest", parts[1])
+			}
+		}
+
+		fmt.Printf("Starting container %s...\n", *name)
+		err := manager.Start(ctx, cfg)
 		if err != nil {
-			fmt.Printf("Error starting: %v\n", err)
-			os.Exit(1)
+			fmt.Printf("Container exited with error: %v\n", err)
+			if !*rm {
+				os.Exit(1)
+			}
 		}
 
 	case "image":
@@ -72,14 +104,40 @@ func main() {
 			if len(args) > 1 {
 				baseName = args[1]
 			}
-			fmt.Printf("Pulling image %s...\n", baseName)
+			fmt.Printf("Pulling docker image %s...\n", baseName)
 			if err := image.Pull(baseName); err != nil {
 				fmt.Printf("Failed to pull image: %v\n", err)
 			} else {
 				fmt.Printf("Image %s pulled successfully.\n", baseName)
 			}
 		} else {
-			fmt.Println("Usage: umlctl image pull [name]")
+			fmt.Println("Usage: umlctl image pull <docker-image-name>")
+		}
+
+	case "network":
+		netCmd := flag.NewFlagSet("network", flag.ExitOnError)
+		netCmd.Parse(os.Args[2:])
+		args := netCmd.Args()
+		if len(args) >= 2 {
+			subcmd := args[0]
+			name := args[1]
+			if subcmd == "create" {
+				err := network.SetupBridge(name, "", "10.0.0.1/24")
+				if err != nil {
+					fmt.Printf("Error creating network: %v\n", err)
+				} else {
+					fmt.Printf("Network %s created.\n", name)
+				}
+			} else if subcmd == "rm" {
+				err := network.DeleteBridge(name)
+				if err != nil {
+					fmt.Printf("Error deleting network: %v\n", err)
+				} else {
+					fmt.Printf("Network %s deleted.\n", name)
+				}
+			}
+		} else {
+			fmt.Println("Usage: umlctl network [create|rm] <name>")
 		}
 
 	case "logs":
@@ -114,6 +172,6 @@ func main() {
 		}
 
 	default:
-		fmt.Printf("Command %s not fully implemented yet\n", cmd)
+		fmt.Printf("Command %s not recognized\n", cmd)
 	}
 }

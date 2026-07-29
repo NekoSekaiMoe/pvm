@@ -1,0 +1,5 @@
+ref/
+bin/
+*.log
+rootfs.img
+*.tar.gz
