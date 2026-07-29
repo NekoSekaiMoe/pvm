@@ -70,3 +70,17 @@ jobs:
             ./"$script" || echo "$script failed but continuing..."
           fi
         done
+
+    - name: Dump logs on failure
+      if: failure()
+      run: |
+        set +e
+        echo "===== umlctl output (uml.log) ====="
+        cat uml.log 2>/dev/null || echo "(no uml.log)"
+        echo "===== UML container console logs ====="
+        for f in /var/lib/uml-container/containers/*/logs/console.log; do
+          [ -f "$f" ] || continue
+          echo "----- $f -----"
+          sudo cat "$f"
+        done
+        echo "===== end of logs ====="

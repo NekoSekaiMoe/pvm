@@ -32,11 +32,20 @@ sudo chmod +x mnt/init.sh
 sudo umount mnt
 
 echo "Running UML with custom compiled linux kernel..."
-sudo ./bin/umlctl start --name integration-test --kernel ./bin/linux --rootfs rootfs.img --init /init.sh > uml.log 2>&1 || true
+# umlctl's own stdout/stderr (status line, warnings) goes to uml.log.
+# The UML kernel console is tee'd to a separate file by internal/log.SetupConsoleLog
+# at <RootDir>/<id>/logs/console.log (RootDir defaults to /var/lib/uml-container/containers).
+UMLCTL_LOG=uml.log
+CONSOLE_LOG=/var/lib/uml-container/containers/integration-test/logs/console.log
 
-cat uml.log
+sudo ./bin/umlctl start --name integration-test --kernel ./bin/linux --rootfs rootfs.img --init /init.sh > "$UMLCTL_LOG" 2>&1 || true
 
-if grep -q "HELLO_FROM_UML_CONTAINER" uml.log; then
+echo "---- umlctl output ($UMLCTL_LOG) ----"
+cat "$UMLCTL_LOG"
+echo "---- UML console ($CONSOLE_LOG) ----"
+sudo cat "$CONSOLE_LOG" 2>/dev/null || echo "(no console.log found)"
+
+if grep -q "HELLO_FROM_UML_CONTAINER" "$UMLCTL_LOG" "$CONSOLE_LOG" 2>/dev/null; then
     echo "SUCCESS: UML booted and ran our init script!"
 else
     echo "FAILED: Did not find expected output from UML."
