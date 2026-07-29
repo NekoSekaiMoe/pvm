@@ -2,13 +2,15 @@ module uml-container
 
 go 1.26.5
 
-require github.com/google/go-containerregistry v0.21.7
+require (
+	github.com/google/go-containerregistry v0.21.7
+	github.com/labstack/echo/v4 v4.15.4
+)
 
 require (
 	github.com/docker/cli v29.5.3+incompatible // indirect
 	github.com/docker/docker-credential-helpers v0.9.3 // indirect
 	github.com/klauspost/compress v1.18.6 // indirect
-	github.com/labstack/echo/v4 v4.15.4 // indirect
 	github.com/labstack/gommon v0.5.0 // indirect
 	github.com/mattn/go-colorable v0.1.15 // indirect
 	github.com/mattn/go-isatty v0.0.22 // indirect

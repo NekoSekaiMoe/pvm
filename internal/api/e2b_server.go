@@ -1,9 +1,12 @@
 package api
 
 import (
-	"encoding/json"
 	"fmt"
 	"net/http"
+	"uml-container/webui"
+
+	"github.com/labstack/echo/v4"
+	"github.com/labstack/echo/v4/middleware"
 )
 
 type ExecRequest struct {
@@ -16,17 +19,22 @@ type ExecResponse struct {
 	ExitCode int    `json:"exitCode"`
 }
 
-// StartE2BServer starts a REST API compatible with E2B SDK
+// StartE2BServer starts a REST API compatible with E2B SDK and serves the WebUI
 func StartE2BServer(port int) error {
-	http.HandleFunc("/exec", func(w http.ResponseWriter, r *http.Request) {
+	e := echo.New()
+
+	e.Use(middleware.Logger())
+	e.Use(middleware.Recover())
+	e.Use(middleware.CORS())
+
+	// API Group
+	api := e.Group("/api")
+	api.POST("/exec", func(c echo.Context) error {
 		var req ExecRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
+		if err := c.Bind(&req); err != nil {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
 		}
 
-		// In a full implementation, this sends the command to the UML guest via a serial socket or vsock.
-		// For MVP, we mock the execution response to demonstrate SDK compatibility.
 		fmt.Printf("[API] E2B SDK requested execution: %s\n", req.Command)
 
 		resp := ExecResponse{
@@ -35,11 +43,13 @@ func StartE2BServer(port int) error {
 			ExitCode: 0,
 		}
 		
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(resp)
+		return c.JSON(http.StatusOK, resp)
 	})
 
+	// Serve the embedded Nuxt UI for all other routes
+	e.GET("/*", echo.WrapHandler(http.FileServer(webui.GetPublicFS())))
+
 	addr := fmt.Sprintf(":%d", port)
-	fmt.Printf("E2B-compatible API Server listening on %s\n", addr)
-	return http.ListenAndServe(addr, nil)
+	fmt.Printf("E2B-compatible API & WebUI Server listening on %s\n", addr)
+	return e.Start(addr)
 }

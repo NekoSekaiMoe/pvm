@@ -7,3 +7,5 @@ agentpvm
 umlctl
 *.img
 webui/node-modules/
+webui/.nuxt/
+webui/.output/
