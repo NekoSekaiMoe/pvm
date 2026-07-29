@@ -11,6 +11,14 @@ import (
 	"uml-container/internal/uml"
 )
 
+type ContextKey string
+
+const (
+	KeyInteractive ContextKey = "interactive"
+	KeyVolumeHost  ContextKey = "volume_host"
+	KeyVolumeGuest ContextKey = "volume_guest"
+)
+
 type Manager struct {
 	Launcher uml.Launcher
 }
@@ -29,7 +37,7 @@ func (m *Manager) Start(ctx context.Context, cfg *config.ContainerConfig) error 
 	}
 
 	// Direct shell interactive setup uses con0
-	interactive, _ := ctx.Value("interactive").(bool)
+	interactive, _ := ctx.Value(KeyInteractive).(bool)
 	if interactive {
 		args = append(args, "con0=fd:0,fd:1")
 		args = append(args, "con=null")
@@ -57,8 +65,8 @@ func (m *Manager) Start(ctx context.Context, cfg *config.ContainerConfig) error 
 	}
 
 	// hostfs volume mounting
-	vHost, hasVHost := ctx.Value("volume_host").(string)
-	vGuest, hasVGuest := ctx.Value("volume_guest").(string)
+	vHost, hasVHost := ctx.Value(KeyVolumeHost).(string)
+	vGuest, hasVGuest := ctx.Value(KeyVolumeGuest).(string)
 	if hasVHost && hasVGuest {
 		// Just demonstrate the mount string. To actually mount this inside UML guest at boot without systemd
 		// requires passing custom rootflags or an init script. UML uses hostfs via rootfstype=hostfs.
@@ -78,18 +86,29 @@ func (m *Manager) Start(ctx context.Context, cfg *config.ContainerConfig) error 
 		}
 	}
 
-	state.SaveState(cfg.ID, &state.ContainerState{
-		ID:        cfg.ID,
-		Status:    "starting",
-		StartedAt: time.Now(),
-	})
+	st, err := state.LoadState(cfg.ID)
+	if err != nil {
+		st = &state.ContainerState{
+			ID:        cfg.ID,
+			StartedAt: time.Now(),
+		}
+	}
+	st.Status = "starting"
+	if saveErr := state.SaveState(cfg.ID, st); saveErr != nil {
+		fmt.Printf("Warning: failed to save state: %v\n", saveErr)
+	}
 
-	err := m.Launcher.Launch(ctx, cfg.Kernel, args, logFile)
+	pid, err := m.Launcher.Launch(ctx, cfg.Kernel, args, logFile)
+	st.PID = pid
 
 	if err != nil {
-		state.SaveState(cfg.ID, &state.ContainerState{ID: cfg.ID, Status: "stopped"})
+		st.Status = "exited"
 	} else {
-		state.SaveState(cfg.ID, &state.ContainerState{ID: cfg.ID, Status: "exited"})
+		st.Status = "stopped"
+	}
+
+	if saveErr := state.SaveState(cfg.ID, st); saveErr != nil {
+		fmt.Printf("Warning: failed to save state: %v\n", saveErr)
 	}
 
 	return err

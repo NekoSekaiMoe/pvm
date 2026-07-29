@@ -4,11 +4,12 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"uml-container/internal/state"
 )
 
 // SetupConsoleLog creates the log file for the container console output
 func SetupConsoleLog(containerID string) (*os.File, error) {
-	logDir := filepath.Join("/var/lib/uml-container/containers", containerID, "logs")
+	logDir := filepath.Join(state.ContainerDir(containerID), "logs")
 	if err := os.MkdirAll(logDir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create log dir: %v", err)
 	}

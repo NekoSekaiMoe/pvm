@@ -54,15 +54,9 @@ func main() {
 		if *overlay {
 			if err := image.CreateLayer(*name); err != nil {
 				fmt.Printf("Failed to create overlay layer: %v\n", err)
+				os.Exit(1)
 			}
-		}
-		
-		// Handling cleanup
-		if *rm {
-			defer func() {
-				fmt.Println("Cleaning up container state and files (--rm)...")
-				os.RemoveAll(filepath.Join("/var/lib/uml-container/containers", *name))
-			}()
+			cfg.Rootfs = state.ContainerDir(*name)
 		}
 
 		manager := container.NewManager(&uml.DefaultLauncher{})
@@ -71,7 +65,7 @@ func main() {
 		// We'll pass it in context or adjust manager interface for MVP
 		ctx := context.Background()
 		if *it {
-			ctx = context.WithValue(ctx, "interactive", true)
+			ctx = context.WithValue(ctx, container.KeyInteractive, true)
 			if *initCmd == "/sbin/init" {
 				cfg.Init = "/bin/sh" // Force shell if interactive and default init
 			}
@@ -81,18 +75,22 @@ func main() {
 		if *volume != "" {
 			parts := strings.SplitN(*volume, ":", 2)
 			if len(parts) == 2 {
-				ctx = context.WithValue(ctx, "volume_host", parts[0])
-				ctx = context.WithValue(ctx, "volume_guest", parts[1])
+				ctx = context.WithValue(ctx, container.KeyVolumeHost, parts[0])
+				ctx = context.WithValue(ctx, container.KeyVolumeGuest, parts[1])
 			}
 		}
 
 		fmt.Printf("Starting container %s...\n", *name)
 		err := manager.Start(ctx, cfg)
+		
+		if *rm {
+			fmt.Println("Cleaning up container state and files (--rm)...")
+			os.RemoveAll(state.ContainerDir(*name))
+		}
+
 		if err != nil {
 			fmt.Printf("Container exited with error: %v\n", err)
-			if !*rm {
-				os.Exit(1)
-			}
+			os.Exit(1)
 		}
 
 	case "image":
@@ -135,6 +133,9 @@ func main() {
 				} else {
 					fmt.Printf("Network %s deleted.\n", name)
 				}
+			} else {
+				fmt.Printf("Unknown network subcommand: %s\n", subcmd)
+				fmt.Println("Usage: umlctl network [create|rm] <name>")
 			}
 		} else {
 			fmt.Println("Usage: umlctl network [create|rm] <name>")
@@ -146,7 +147,7 @@ func main() {
 			return
 		}
 		id := os.Args[2]
-		logPath := filepath.Join("/var/lib/uml-container/containers", id, "logs", "console.log")
+		logPath := filepath.Join(state.ContainerDir(id), "logs", "console.log")
 		file, err := os.Open(logPath)
 		if err != nil {
 			fmt.Printf("Failed to open logs for %s: %v\n", id, err)
@@ -156,7 +157,7 @@ func main() {
 		io.Copy(os.Stdout, file)
 
 	case "ps":
-		dirs, err := os.ReadDir("/var/lib/uml-container/containers")
+		dirs, err := os.ReadDir(state.RootDir)
 		if err != nil {
 			fmt.Printf("Failed to read containers directory: %v\n", err)
 			return

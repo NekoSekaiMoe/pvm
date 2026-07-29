@@ -8,12 +8,12 @@ import (
 
 // Launcher defines how to launch a UML kernel.
 type Launcher interface {
-	Launch(ctx context.Context, kernel string, args []string, logFile *os.File) error
+	Launch(ctx context.Context, kernel string, args []string, logFile *os.File) (int, error)
 }
 
 type DefaultLauncher struct{}
 
-func (l *DefaultLauncher) Launch(ctx context.Context, kernel string, args []string, logFile *os.File) error {
+func (l *DefaultLauncher) Launch(ctx context.Context, kernel string, args []string, logFile *os.File) (int, error) {
 	cmd := exec.CommandContext(ctx, kernel, args...)
 	if logFile != nil {
 		cmd.Stdout = logFile
@@ -22,5 +22,9 @@ func (l *DefaultLauncher) Launch(ctx context.Context, kernel string, args []stri
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
 	}
-	return cmd.Run()
+	err := cmd.Run()
+	if cmd.Process != nil {
+		return cmd.Process.Pid, err
+	}
+	return 0, err
 }
