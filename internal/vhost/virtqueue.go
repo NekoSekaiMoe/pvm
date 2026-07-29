@@ -24,7 +24,7 @@ const (
 )
 
 // ProcessRing waits for a kick and processes pending descriptors
-func (vq *VirtQueue) ProcessRing(mem *Memory) {
+func (vq *VirtQueue) ProcessRing(mem *Memory, blk *BlockDevice) {
 	buf := make([]byte, 8) // eventfd counter is 8 bytes
 	for {
 		n, err := syscall.Read(vq.KickFd, buf)
@@ -53,16 +53,102 @@ func (vq *VirtQueue) ProcessRing(mem *Memory) {
 			headIdx := binary.LittleEndian.Uint16(headBytes)
 			
 			// Process descriptor chain starting at headIdx
-			vq.processDescChain(mem, headIdx)
+			vq.processDescChain(mem, headIdx, blk)
 
 			vq.LastAvail++
 		}
 	}
 }
 
-func (vq *VirtQueue) processDescChain(mem *Memory, headIdx uint16) {
-	// Dummy processing. Will implement virtio-blk logic here later.
-	fmt.Printf("[VirtQueue %d] Processing chain head: %d\n", vq.Index, headIdx)
+func (vq *VirtQueue) processDescChain(mem *Memory, headIdx uint16, blk *BlockDevice) {
+	currIdx := headIdx
+	var reqType uint32
+	var sector uint64
+	var written uint32
+
+	// We expect 3 parts: outhdr, data, status.
+	// We'll collect data slices if there are multiple.
+	var dataSlices [][]byte
+	var statusSlice []byte
+	
+	isFirst := true
+	for {
+		descBytes, err := mem.GuestToHost(vq.DescAddr+uint64(currIdx)*16, 16)
+		if err != nil {
+			fmt.Printf("[VirtQueue %d] failed to map desc %d\n", vq.Index, currIdx)
+			return
+		}
+		
+		addr := binary.LittleEndian.Uint64(descBytes[0:8])
+		length := binary.LittleEndian.Uint32(descBytes[8:12])
+		flags := binary.LittleEndian.Uint16(descBytes[12:14])
+		next := binary.LittleEndian.Uint16(descBytes[14:16])
+		
+		buf, err := mem.GuestToHost(addr, uint64(length))
+		if err != nil {
+			fmt.Printf("[VirtQueue %d] failed to map desc buf at 0x%x\n", vq.Index, addr)
+			return
+		}
+
+		if isFirst {
+			// outhdr
+			if length == 16 {
+				reqType = binary.LittleEndian.Uint32(buf[0:4])
+				sector = binary.LittleEndian.Uint64(buf[8:16])
+			}
+			isFirst = false
+		} else {
+			if (flags & VRingDescFNext) == 0 {
+				// Last descriptor is the status byte (1 byte)
+				statusSlice = buf
+			} else {
+				// Intermediate descriptors are data
+				dataSlices = append(dataSlices, buf)
+			}
+		}
+
+		if (flags & VRingDescFNext) == 0 {
+			break
+		}
+		currIdx = next
+	}
+
+	status := byte(VirtioBlkSUnsupp)
+	offset := int64(sector) * 512
+
+	if blk != nil {
+		switch reqType {
+		case VirtioBlkTIn:
+			// Read from disk to guest memory
+			for _, data := range dataSlices {
+				n, err := blk.ReadAt(data, offset)
+				written += uint32(n)
+				offset += int64(n)
+				if err != nil {
+					break
+				}
+			}
+			status = VirtioBlkSOk
+		case VirtioBlkTOut:
+			// Write from guest memory to disk
+			for _, data := range dataSlices {
+				n, err := blk.WriteAt(data, offset)
+				offset += int64(n)
+				if err != nil {
+					break
+				}
+			}
+			status = VirtioBlkSOk
+		case VirtioBlkTFlush:
+			blk.Sync()
+			status = VirtioBlkSOk
+		}
+	}
+
+	if statusSlice != nil && len(statusSlice) >= 1 {
+		statusSlice[0] = status
+		written++ // status byte counts as written
+	}
 	
 	// Write back to Used ring to acknowledge completion
 	// used ring header: flags (2 bytes), idx (2 bytes), ring (num * 8 bytes), avail_event (2 bytes)
@@ -75,7 +161,7 @@ func (vq *VirtQueue) processDescChain(mem *Memory, headIdx uint16) {
 		elemBytes, err := mem.GuestToHost(vq.UsedAddr + elemOffset, 8)
 		if err == nil {
 			binary.LittleEndian.PutUint32(elemBytes[0:4], uint32(headIdx))
-			binary.LittleEndian.PutUint32(elemBytes[4:8], 0) // written len
+			binary.LittleEndian.PutUint32(elemBytes[4:8], written)
 			
 			// increment usedIdx
 			binary.LittleEndian.PutUint16(usedIdxBytes, usedIdx+1)

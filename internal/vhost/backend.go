@@ -23,7 +23,12 @@ func StartNativeDaemon(containerID string, imagePath string) (string, *Server, e
 	}
 	socketPath := filepath.Join(dir, "vhost-blk.sock")
 
-	server := NewServer(socketPath)
+	blk, err := NewBlockDevice(imagePath)
+	if err != nil {
+		return "", nil, fmt.Errorf("failed to open block device %s: %v", imagePath, err)
+	}
+
+	server := NewServer(socketPath, blk)
 	if err := server.Start(); err != nil {
 		return "", nil, fmt.Errorf("native vhost server failed to start: %v", err)
 	}

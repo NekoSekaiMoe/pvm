@@ -13,13 +13,15 @@ type Server struct {
 	listener   *net.UnixListener
 	mem        *Memory
 	queues     []*VirtQueue
+	blk        *BlockDevice
 }
 
-func NewServer(socketPath string) *Server {
+func NewServer(socketPath string, blk *BlockDevice) *Server {
 	return &Server{
 		socketPath: socketPath,
 		mem:        &Memory{},
 		queues:     make([]*VirtQueue, 2),
+		blk:        blk,
 	}
 }
 
@@ -177,7 +179,7 @@ func (s *Server) handleConn(conn *net.UnixConn) {
 				s.queues[idx].KickFd = fds[0]
 				// Virtqueue is ready! Start processing ring in background
 				fmt.Printf("[Vhost-User] Virtqueue %d Kick FD received, starting processor...\n", idx)
-				go s.queues[idx].ProcessRing(s.mem)
+				go s.queues[idx].ProcessRing(s.mem, s.blk)
 			}
 
 		default:
