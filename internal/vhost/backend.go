@@ -14,10 +14,7 @@ import (
 // StartStorageDaemon starts qemu-storage-daemon to provide a vhost-user-blk socket.
 // Requires qemu-storage-daemon installed on the host.
 func StartStorageDaemon(containerID string, imagePath string) (string, *exec.Cmd, error) {
-	dir, err := state.ContainerDir(containerID)
-	if err != nil {
-		return "", nil, fmt.Errorf("invalid container id: %v", err)
-	}
+	dir := state.ContainerDir(containerID)
 	os.MkdirAll(dir, 0755)
 	socketPath := filepath.Join(dir, "vhost-blk.sock")
 	
