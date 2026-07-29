@@ -98,3 +98,33 @@ jobs:
           sudo cat "$f"
         done
         echo "===== end of logs ====="
+
+    - name: Dump cgroup state on failure
+      if: failure()
+      run: |
+        set +e
+        echo "===== whoami / id ====="
+        id
+        echo "===== mount /sys/fs/cgroup ====="
+        mount | grep cgroup || true
+        echo "===== root cgroup.controllers ====="
+        cat /sys/fs/cgroup/cgroup.controllers 2>/dev/null || true
+        echo "===== root cgroup.subtree_control ====="
+        cat /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null || true
+        echo "===== /sys/fs/cgroup/uml ====="
+        ls -la /sys/fs/cgroup/uml 2>&1 || true
+        echo "===== /sys/fs/cgroup/uml/cgroup.controllers ====="
+        cat /sys/fs/cgroup/uml/cgroup.controllers 2>/dev/null || true
+        echo "===== /sys/fs/cgroup/uml/cgroup.subtree_control ====="
+        cat /sys/fs/cgroup/uml/cgroup.subtree_control 2>/dev/null || true
+        for sub in /sys/fs/cgroup/uml/*; do
+          [ -d "$sub" ] || continue
+          echo "----- $sub -----"
+          ls -la "$sub" 2>&1 || true
+          echo "--- $sub/memory.max (cat attempt) ---"
+          sudo cat "$sub/memory.max" 2>&1 || true
+          echo "--- try writing memory.max as root ---"
+          echo "9223372036854771712" | sudo tee "$sub/memory.max" >/dev/null 2>&1 && echo "write OK" || echo "write FAILED"
+        done
+        echo "===== systemd-cgls top ====="
+        systemd-cgls --no-pager 2>/dev/null | head -40 || true

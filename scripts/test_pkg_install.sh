@@ -33,7 +33,11 @@ ip route add default via 10.0.0.1 || true
 echo "nameserver 8.8.8.8" > /etc/resolv.conf
 
 echo "Attempting to install python3..."
-apk update && apk add fastfetch && fastfetch && echo "PKG_INSTALL_SUCCESS"
+# 给每个网络操作加超时，避免 CI 上网络抽风时无限阻塞。
+timeout 60 apk update \
+  && timeout 120 apk add fastfetch \
+  && fastfetch \
+  && echo "PKG_INSTALL_SUCCESS"
 
 poweroff -f
 EOF
@@ -53,7 +57,8 @@ CONSOLE_LOG=/var/lib/uml-container/containers/pkg-test/logs/console.log
 sudo rm -f "$CONSOLE_LOG"
 
 # Using tap=tap_pkg for network
-sudo ./agentpvm run -name pkg-test -rootfs ${IMG_NAME} -kernel ./bin/linux -init /init.sh -vhost=false -net-tap tap_pkg > pkg_agentpvm.log 2>&1 || true
+# 给整个 UML 运行加超时，防止内核或网络卡住时进程无限阻塞。
+sudo timeout 180 ./agentpvm run -name pkg-test -rootfs ${IMG_NAME} -kernel ./bin/linux -init /init.sh -vhost=false -net-tap tap_pkg > pkg_agentpvm.log 2>&1 || true
 
 echo "Waiting for container to finish (up to 60s)..."
 for i in {1..60}; do
