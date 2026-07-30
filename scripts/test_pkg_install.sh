@@ -26,13 +26,23 @@ cat << 'EOF' | sudo tee mnt_pkg/init.sh
 #!/bin/sh
 mount -t proc proc /proc
 mount -t sysfs sys /sys
+# 以读写重挂载，确保能写 resolv.conf / apk 缓存等。
+mount -o remount,rw / 2>/dev/null || true
 # Assuming eth0 is set up by pvm
 ip link set eth0 up || true
 ip addr add 10.0.0.2/24 dev eth0 || true
 ip route add default via 10.0.0.1 || true
 echo "nameserver 8.8.8.8" > /etc/resolv.conf
 
-echo "Attempting to install python3..."
+# ---- 诊断：确认 PATH、apk 与 musl 动态链接器是否存在 ----
+echo "PATH=$PATH"
+command -v apk || echo "command -v apk: NOT FOUND in PATH"
+ls -la /sbin/apk 2>/dev/null || echo "/sbin/apk: missing"
+ls -la /lib/ld-musl-x86_64.so.1 2>/dev/null || echo "/lib/ld-musl-x86_64.so.1: missing"
+mount | grep ' / ' || true
+# ----------------------------------------------------------------
+
+echo "Attempting to install fastfetch..."
 # 给每个网络操作加超时，避免 CI 上网络抽风时无限阻塞。
 timeout 60 apk update \
   && timeout 120 apk add fastfetch \
@@ -57,23 +67,60 @@ CONSOLE_LOG=/var/lib/uml-container/containers/pkg-test/logs/console.log
 sudo rm -f "$CONSOLE_LOG"
 
 # Using tap=tap_pkg for network
-# 给整个 UML 运行加超时，防止内核或网络卡住时进程无限阻塞。
-sudo timeout 180 ./agentpvm run -name pkg-test -rootfs ${IMG_NAME} -kernel ./bin/linux -init /init.sh -vhost=false -net-tap tap_pkg > pkg_agentpvm.log 2>&1 || true
+# 后台运行 agentpvm，同时轮询成功标记；不再先同步等待再轮询。
+# 容器一打出 PKG_INSTALL_SUCCESS 就立即成功退出；agentpvm 提前崩溃也会被
+# 后台等待器感知；超时则由内层 timeout 兜底。
+sudo timeout 180 ./agentpvm run -name pkg-test \
+    -rootfs ${IMG_NAME} -kernel ./bin/linux -init /init.sh \
+    -vhost=false -net-tap tap_pkg > pkg_agentpvm.log 2>&1 &
+PVM_PID=$!
 
-echo "Waiting for container to finish (up to 60s)..."
-for i in {1..60}; do
+cleanup() {
+    # agentpvm 仍在运行则终止它（其子进程 UML 会被一并回收）。
+    kill "$PVM_PID" 2>/dev/null || true
+    wait "$PVM_PID" 2>/dev/null || true
+    # 兜底：杀掉残留的、以本容器名为参数的 UML 内核进程。
+    sudo pkill -f "agentpvm run -name pkg-test" 2>/dev/null || true
+    sudo ./bin/umlctl network rm pvm_br0 || true
+    sudo ip link delete tap_pkg || true
+}
+trap cleanup EXIT
+
+STATUS_FILE=pkg_exit_status
+rm -f "$STATUS_FILE"
+# 后台等待器：agentpvm 退出后把状态落到文件，供主轮询循环感知。
+( wait "$PVM_PID"; echo $? > "$STATUS_FILE" ) &
+
+echo "Waiting for container to finish (up to 180s)..."
+RESULT=timeout
+for _ in $(seq 1 180); do
     if sudo grep -q "PKG_INSTALL_SUCCESS" "$CONSOLE_LOG" 2>/dev/null; then
-        echo "✅ Package installation test passed."
-        sudo ./bin/umlctl network rm pvm_br0 || true
-        sudo ip link delete tap_pkg || true
-        exit 0
+        RESULT=success
+        break
+    fi
+    if [ -f "$STATUS_FILE" ]; then
+        RESULT=exited
+        break
     fi
     sleep 1
 done
 
+echo "---- agentpvm output (pkg_agentpvm.log) ----"
+cat pkg_agentpvm.log 2>/dev/null || echo "(no pkg_agentpvm.log)"
 echo "---- Pkg Test Console Output ----"
-sudo cat "$CONSOLE_LOG" 2>/dev/null || cat pkg_agentpvm.log
-echo "❌ Package installation test failed or timed out."
-sudo ./bin/umlctl network rm pvm_br0 || true
-sudo ip link delete tap_pkg || true
-exit 1
+sudo cat "$CONSOLE_LOG" 2>/dev/null || echo "(no console.log)"
+
+case "$RESULT" in
+    success)
+        echo "✅ Package installation test passed."
+        exit 0
+        ;;
+    exited)
+        echo "❌ Container exited before producing PKG_INSTALL_SUCCESS (status: $(cat "$STATUS_FILE" 2>/dev/null))."
+        exit 1
+        ;;
+    *)
+        echo "❌ Package installation test timed out after 180s."
+        exit 1
+        ;;
+esac

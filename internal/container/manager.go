@@ -51,6 +51,10 @@ func (m *Manager) Start(ctx context.Context, cfg *config.ContainerConfig) error 
 		args = append(args, fmt.Sprintf("ubd0=%s", cfg.Rootfs))
 		args = append(args, "root=/dev/ubda")
 	}
+	// UML 默认以只读方式挂载根文件系统，而容器 init 经常需要写
+	// /etc/resolv.conf、apk 缓存等。显式 rw 让根可写，与 test_integration
+	// 之外所有需要写入的初始化脚本兼容。
+	args = append(args, "rw=1")
 
 	if cfg.NetworkTap != "" {
 		if cfg.VhostNetSocket != "" {
