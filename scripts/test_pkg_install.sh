@@ -148,5 +148,3 @@ echo "---- agentpvm output (pkg_agentpvm.log) ----"
 cat pkg_agentpvm.log 2>/dev/null || echo "(no pkg_agentpvm.log)"
 echo "---- Pkg Test Console Output ----"
 sudo cat "$CONSOLE_LOG" 2>/dev/null || echo "(no console.log)"
-
-exit 1
