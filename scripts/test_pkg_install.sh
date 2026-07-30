@@ -59,6 +59,18 @@ echo "Attempting to install fastfetch..."
 busybox true 2>&1
  echo "BUSYBOX_TRUE rc=$?"
 
+# 3.5) 网络诊断：定位 DNS 失败在哪一层
+echo "--- guest net diag ---"
+ip addr show eth0 2>&1 | grep -E 'inet |state'
+ip route show 2>&1
+echo "ping gateway 10.0.0.1:"
+ping -c 2 -W 3 10.0.0.1 2>&1 || echo "ping gw FAILED rc=$?"
+echo "nslookup 8.8.8.8 -> dl-cdn.alpinelinux.org:"
+nslookup dl-cdn.alpinelinux.org 8.8.8.8 2>&1 || echo "nslookup FAILED rc=$?"
+echo "ping 8.8.8.8 (raw IP, no DNS):"
+ping -c 2 -W 3 8.8.8.8 2>&1 || echo "ping 8.8.8.8 FAILED rc=$?"
+echo "--- end guest net diag ---"
+
 # 4) 真正的安装步骤（保留成功标记）；apk 是动态 ELF，如果上面失败了这里也会失败
 apk update \
   && apk add fastfetch \
@@ -80,6 +92,18 @@ sudo ip tuntap add tap_pkg mode tap || true
 sudo ip link set tap_pkg up || true
 sudo ./bin/umlctl network create pvm_br0 || true
 sudo ip link set tap_pkg master pvm_br0 || true
+
+# ---- 诊断：dump host 侧网络状态，定位 DNS 失败是 host 还是 guest 侧问题 ----
+echo "===== HOST NETWORK STATE ====="
+echo "--- ip link show ---"; sudo ip link show 2>&1 | grep -E 'pvm_br0|tap_pkg|^[0-9]'
+echo "--- ip addr show pvm_br0 ---"; sudo ip addr show pvm_br0 2>&1
+echo "--- bridge link (tap on bridge?) ---"; sudo bridge link 2>&1 || true
+echo "--- iptables -t nat -S (MASQUERADE?) ---"; sudo iptables -t nat -S 2>&1 | grep -i masq || echo "(no MASQUERADE rules)"
+echo "--- sysctl net.ipv4.ip_forward ---"; sysctl net.ipv4.ip_forward 2>&1
+echo "--- default route on host ---"; sudo ip route show default 2>&1
+echo "--- can host resolve? ---"; getent hosts dl-cdn.alpinelinux.org 2>&1 || echo "(host DNS also failing)"
+echo "==============================="
+# --------------------------------------------------------------------------------
 
 # Run the container
 CONSOLE_LOG=/var/lib/uml-container/containers/pkg-test/logs/console.log
