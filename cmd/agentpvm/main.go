@@ -5,6 +5,8 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/exec"
+	"regexp"
 	"uml-container/internal/api"
 	"uml-container/internal/cgroup"
 	"uml-container/internal/config"
@@ -30,27 +32,59 @@ func main() {
 		name := runCmd.String("name", "agent1", "Sandbox name")
 		rootfs := runCmd.String("rootfs", "rootfs.img", "Root filesystem")
 		useVhost := runCmd.Bool("vhost", true, "Use vhost-user-blk for storage")
+		nativeVhost := runCmd.Bool("native-vhost", false, "Use experimental native Go vhost-user backend")
 		kernel := runCmd.String("kernel", "./bin/linux", "Kernel path")
 		initPath := runCmd.String("init", "/init.sh", "Init script path")
 		memory := runCmd.String("memory", "512M", "Container memory")
+		cpu := runCmd.Int("cpu", 0, "CPU limit (0 means no limit)")
+		netTap := runCmd.String("net-tap", "", "Network tap device to use")
+		nativeVhostNet := runCmd.Bool("native-vhost-net", false, "Use native Go vhost-user-net backend for networking")
 
 		runCmd.Parse(os.Args[2:])
 
+		if !regexp.MustCompile(`^[a-zA-Z0-9_-]+$`).MatchString(*name) {
+			fmt.Println("Error: Invalid container name format")
+			os.Exit(1)
+		}
+
+		if *cpu < 0 {
+			fmt.Printf("Error: CPU limit cannot be negative\n")
+			os.Exit(1)
+		}
+		memBytes, err := config.ParseMemory(*memory)
+		if err != nil {
+			fmt.Printf("Error: %v\n", err)
+			os.Exit(1)
+		}
+
 		fmt.Printf("Starting sandbox %s...\n", *name)
 		var sockPath string
+		var vhostProcess *exec.Cmd
 		if *useVhost {
-			fmt.Println("Starting qemu-storage-daemon for vhost-user block device...")
-			sock, daemonCmd, err := vhost.StartStorageDaemon(*name, *rootfs)
-			if err != nil {
-				fmt.Printf("Error starting vhost: %v\n", err)
+			if *nativeVhost {
+				fmt.Println("Starting native vhost-user backend...")
+				sock, _, err := vhost.StartNativeDaemon(*name, *rootfs)
+				if err != nil {
+					fmt.Printf("Error starting native vhost: %v\n", err)
+					os.Exit(1)
+				}
+				sockPath = sock
 			} else {
-				defer daemonCmd.Process.Kill()
+				fmt.Println("Starting qemu-storage-daemon for vhost-user block device...")
+				sock, daemonCmd, err := vhost.StartStorageDaemon(*name, *rootfs)
+				if err != nil {
+					fmt.Printf("Error starting vhost: %v\n", err)
+					os.Exit(1)
+				}
+				vhostProcess = daemonCmd
+				defer vhostProcess.Process.Kill()
 				sockPath = sock
 				fmt.Printf("Vhost socket ready at %s\n", sock)
 			}
 		}
 
 		mgr := container.NewManager(nil)
+
 		cfg := &config.ContainerConfig{
 			ID:              *name,
 			Name:            *name,
@@ -58,9 +92,24 @@ func main() {
 			Kernel:          *kernel,
 			Init:            *initPath,
 			Memory:          *memory,
+			MemoryBytes:     memBytes,
+			CPU:             *cpu,
 			UseVirtio:       *useVhost,
 			VhostUserSocket: sockPath,
+			NetworkTap:      *netTap,
 		}
+
+		if *netTap != "" && *nativeVhostNet {
+			fmt.Println("Starting native vhost-user-net backend...")
+			// Create a default bridge name or assume it's set up
+			netSock, _, err := vhost.StartNativeNetDaemon(*name, *netTap, "")
+			if err != nil {
+				fmt.Printf("Error starting native vhost net: %v\n", err)
+			} else {
+				cfg.VhostNetSocket = netSock
+			}
+		}
+
 		if err := mgr.Start(context.Background(), cfg); err != nil {
 			fmt.Printf("Container start failed: %v\n", err)
 		} else {

@@ -1,5 +1,10 @@
 package config
 
+import (
+	"fmt"
+	"math"
+)
+
 type ContainerConfig struct {
 	ID        string `json:"id"`
 	Name      string `json:"name"`
@@ -13,5 +18,41 @@ type ContainerConfig struct {
 	// virtio and network options
 	UseVirtio       bool   `json:"use_virtio"`
 	VhostUserSocket string `json:"vhost_user_socket"`
+	VhostNetSocket  string `json:"vhost_net_socket"`
 	NetworkTap      string `json:"network_tap"`
+}
+
+// ParseMemory parses strings like "512M", "1G" into bytes
+func ParseMemory(mem string) (int64, error) {
+	if mem == "" {
+		return 0, fmt.Errorf("memory cannot be empty")
+	}
+	var val int64
+	var unit string
+	if _, err := fmt.Sscanf(mem, "%d%s", &val, &unit); err != nil {
+		return 0, fmt.Errorf("invalid memory format: %s", mem)
+	}
+	if val < 0 {
+		return 0, fmt.Errorf("memory cannot be negative")
+	}
+	switch unit {
+	case "K", "k", "KB", "kb":
+		if val > math.MaxInt64/1024 {
+			return 0, fmt.Errorf("memory value overflow")
+		}
+		val = val * 1024
+	case "M", "m", "MB", "mb":
+		if val > math.MaxInt64/(1024*1024) {
+			return 0, fmt.Errorf("memory value overflow")
+		}
+		val = val * 1024 * 1024
+	case "G", "g", "GB", "gb":
+		if val > math.MaxInt64/(1024*1024*1024) {
+			return 0, fmt.Errorf("memory value overflow")
+		}
+		val = val * 1024 * 1024 * 1024
+	default:
+		return 0, fmt.Errorf("unsupported or missing memory unit: %s", unit)
+	}
+	return val, nil
 }

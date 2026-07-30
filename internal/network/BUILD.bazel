@@ -1,0 +1,68 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "network",
+    srcs = [
+        "bpf.go",
+        "bpf_bpfeb.go",
+        "bpf_bpfel.go",
+        "bridge.go",
+        "filter.go",
+        "tap.go",
+    ],
+    embedsrcs = select({
+        "@rules_go//go/platform:386": [
+            "bpf_bpfel.o",
+        ],
+        "@rules_go//go/platform:amd64": [
+            "bpf_bpfel.o",
+        ],
+        "@rules_go//go/platform:arm": [
+            "bpf_bpfel.o",
+        ],
+        "@rules_go//go/platform:arm64": [
+            "bpf_bpfel.o",
+        ],
+        "@rules_go//go/platform:mips": [
+            "bpf_bpfeb.o",
+        ],
+        "@rules_go//go/platform:mips64": [
+            "bpf_bpfeb.o",
+        ],
+        "@rules_go//go/platform:mips64le": [
+            "bpf_bpfel.o",
+        ],
+        "@rules_go//go/platform:mipsle": [
+            "bpf_bpfel.o",
+        ],
+        "@rules_go//go/platform:ppc64": [
+            "bpf_bpfeb.o",
+        ],
+        "@rules_go//go/platform:ppc64le": [
+            "bpf_bpfel.o",
+        ],
+        "@rules_go//go/platform:riscv64": [
+            "bpf_bpfel.o",
+        ],
+        "@rules_go//go/platform:s390x": [
+            "bpf_bpfeb.o",
+        ],
+        "@rules_go//go/platform:wasm": [
+            "bpf_bpfel.o",
+        ],
+        "//conditions:default": [],
+    }),
+    importpath = "uml-container/internal/network",
+    visibility = ["//:__subpackages__"],
+    deps = [
+        "@com_github_cilium_ebpf//:ebpf",
+        "@com_github_vishvananda_netlink//:netlink",
+        "@org_golang_x_sys//unix",
+    ],
+)
+
+go_test(
+    name = "network_test",
+    srcs = ["network_test.go"],
+    embed = [":network"],
+)

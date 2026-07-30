@@ -1,0 +1,11 @@
+load("@rules_go//go:def.bzl", "go_library")
+
+go_library(
+    name = "webui",
+    srcs = ["embed.go"],
+    # 不再枚举带 hash 的 Nuxt 产物：改用 glob，使重新生成 WebUI 后无需手工同步本文件，
+    # 避免出现 "嵌入旧产物 / Bazel 分析失败"。
+    embedsrcs = glob([".output/public/**/*"]),
+    importpath = "uml-container/webui",
+    visibility = ["//visibility:public"],
+)

@@ -9,3 +9,6 @@ umlctl
 webui/node-modules/
 webui/.nuxt/
 webui/.output/
+linux-*.tar.xz
+linux-*/
+pkg_rootfs.img

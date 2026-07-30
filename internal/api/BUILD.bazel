@@ -1,0 +1,25 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "api",
+    srcs = ["e2b_server.go"],
+    importpath = "uml-container/internal/api",
+    visibility = ["//:__subpackages__"],
+    deps = [
+        "//internal/config",
+        "//internal/container",
+        "//internal/image",
+        "//internal/snapshot",
+        "//internal/state",
+        "//webui",
+        "@com_github_labstack_echo_v4//:echo",
+        "@com_github_labstack_echo_v4//middleware",
+    ],
+)
+
+go_test(
+    name = "api_test",
+    srcs = ["e2b_server_test.go"],
+    embed = [":api"],
+    deps = ["//internal/state"],
+)

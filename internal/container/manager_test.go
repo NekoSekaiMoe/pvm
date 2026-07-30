@@ -44,6 +44,14 @@ func TestManager_Start(t *testing.T) {
 	defer os.RemoveAll(tempDir)
 	state.RootDir = tempDir
 
+	cgTempDir, err := os.MkdirTemp("", "uml-cgroup-test")
+	if err != nil {
+		t.Fatalf("failed to create cgroup temp dir: %v", err)
+	}
+	defer os.RemoveAll(cgTempDir)
+	os.Setenv("PVM_CGROUP_ROOT", cgTempDir)
+	defer os.Unsetenv("PVM_CGROUP_ROOT")
+
 	cfg := &config.ContainerConfig{
 		ID:         "1234",
 		Name:       "test",
@@ -79,6 +87,14 @@ func TestManager_Start_Virtio(t *testing.T) {
 	defer os.RemoveAll(tempDir)
 	state.RootDir = tempDir
 
+	cgTempDir, err := os.MkdirTemp("", "uml-cgroup-test-virtio")
+	if err != nil {
+		t.Fatalf("failed to create cgroup temp dir: %v", err)
+	}
+	defer os.RemoveAll(cgTempDir)
+	os.Setenv("PVM_CGROUP_ROOT", cgTempDir)
+	defer os.Unsetenv("PVM_CGROUP_ROOT")
+
 	cfg := &config.ContainerConfig{
 		ID:         "1235",
 		Name:       "test-virtio",
@@ -95,7 +111,7 @@ func TestManager_Start_Virtio(t *testing.T) {
 		t.Fatalf("Start failed: %v", err)
 	}
 
-	expectedArgs := []string{"ubd0=rootfs.img", "root=/dev/ubda", "init=/sbin/init", "mem=512M", "vec0:transport=tap,ifname=tap0"}
+	expectedArgs := []string{"ubd0=rootfs.img", "root=/dev/ubda", "init=/sbin/init", "mem=512M", "vec0:transport=tap,ifname=tap0,vnet=1"}
 	for _, arg := range expectedArgs {
 		if !contains(mock.lastArgs, arg) {
 			t.Errorf("expected arg %s, but missing", arg)

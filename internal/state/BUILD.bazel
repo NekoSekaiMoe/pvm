@@ -1,0 +1,14 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "state",
+    srcs = ["manager.go"],
+    importpath = "uml-container/internal/state",
+    visibility = ["//:__subpackages__"],
+)
+
+go_test(
+    name = "state_test",
+    srcs = ["manager_test.go"],
+    embed = [":state"],
+)

@@ -14,8 +14,11 @@ var (
 	ipForwardMu       sync.Mutex
 )
 
-// SetupBridge creates a NAT bridge
-func SetupBridge(bridgeName string, tapName string, gatewayIP string) error {
+// SetupBridge creates a NAT bridge.
+// 只有在函数返回错误时才回滚已创建的资源；成功路径必须保留 bridge 与
+// ip_forward 状态。早期的 defer 无条件执行 DeleteBridge，会导致成功创建后
+// bridge 被立即删掉（表现为 `ip link set <tap> master <br>` 报 device 不存在）。
+func SetupBridge(bridgeName string, tapName string, gatewayIP string) (err error) {
 	// Track exactly which resources this invocation created/registered so the
 	// deferred cleanup only unwinds what we actually own. A failure before, say,
 	// ip_forward refcount++ must not touch the refcount or tear down another
@@ -23,6 +26,10 @@ func SetupBridge(bridgeName string, tapName string, gatewayIP string) error {
 	bridgeCreated := false
 	ipForwardRegistered := false
 	defer func() {
+		// 仅在失败时回滚；成功返回时保留所有已创建的资源。
+		if err == nil {
+			return
+		}
 		if bridgeCreated {
 			DeleteBridge(bridgeName, gatewayIP)
 		}
@@ -66,9 +73,21 @@ func SetupBridge(bridgeName string, tapName string, gatewayIP string) error {
 	}
 	subnetCIDR := ipnet.String()
 
-	// Setup NAT (iptables) for the subnet
+	// Setup NAT (iptables) for the subnet.
+	// 注意：MASQUERADE 只改源地址（POSTROUTING/nat），但容器包进入 host 后
+	// 首先要经过 filter 表的 FORWARD 链。在 FORWARD policy=DROP 的主机上
+	// （如 GHA runner、大多数云主机），没有显式放行规则时包会被丢弃，
+	// 表现为 “gateway 能 ping 通但外网/DNS 全部 100% loss”。因此必须同时
+	// 配置 FORWARD 链的 ACCEPT 规则。
 	if err := exec.Command("iptables", "-t", "nat", "-A", "POSTROUTING", "-s", subnetCIDR, "!", "-o", bridgeName, "-j", "MASQUERADE").Run(); err != nil {
-		return fmt.Errorf("failed to setup iptables NAT: %v", err)
+		return fmt.Errorf("failed to setup iptables MASQUERADE: %v", err)
+	}
+	// 放行从容器子网出外网的转发包，以及已建立连接的返回包。
+	if err := exec.Command("iptables", "-A", "FORWARD", "-s", subnetCIDR, "-j", "ACCEPT").Run(); err != nil {
+		return fmt.Errorf("failed to setup iptables FORWARD out (src %s): %v", subnetCIDR, err)
+	}
+	if err := exec.Command("iptables", "-A", "FORWARD", "-d", subnetCIDR, "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-j", "ACCEPT").Run(); err != nil {
+		return fmt.Errorf("failed to setup iptables FORWARD return: %v", err)
 	}
 
 	ipForwardMu.Lock()
@@ -112,13 +131,22 @@ func DeleteBridge(bridgeName string, gatewayIP string) error {
 	if gatewayIP != "" {
 		if _, ipnet, err := net.ParseCIDR(gatewayIP); err == nil {
 			subnetCIDR := ipnet.String()
+			// 与 SetupBridge 对称删除：MASQUERADE + FORWARD 入/出规则。
+			// 删除失败不阻断清理（规则可能本来就没加上），使用 -D 静默。
 			exec.Command("iptables", "-t", "nat", "-D", "POSTROUTING", "-s", subnetCIDR, "!", "-o", bridgeName, "-j", "MASQUERADE").Run()
+			exec.Command("iptables", "-D", "FORWARD", "-s", subnetCIDR, "-j", "ACCEPT").Run()
+			exec.Command("iptables", "-D", "FORWARD", "-d", subnetCIDR, "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-j", "ACCEPT").Run()
 		}
 	}
 
 	exec.Command("ip", "link", "set", bridgeName, "down").Run()
-	if err := exec.Command("ip", "link", "delete", "name", bridgeName, "type", "bridge").Run(); err != nil {
-		return fmt.Errorf("failed to delete bridge %s: %v", bridgeName, err)
+	// 仅在网桥确实不存在时忽略错误；权限不足、设备忙、名称错误等其他
+	// 错误必须返回给调用方，否则引用计数和 ip_forward 恢复逻辑会基于
+	// “已删除”的假象继续执行。
+	if err := exec.Command("ip", "link", "delete", bridgeName, "type", "bridge").Run(); err != nil {
+		if !isDeviceNotExist(err) {
+			return fmt.Errorf("failed to delete bridge %s: %v", bridgeName, err)
+		}
 	}
 
 	ipForwardMu.Lock()
@@ -135,4 +163,14 @@ func DeleteBridge(bridgeName string, gatewayIP string) error {
 	ipForwardMu.Unlock()
 
 	return nil
+}
+
+// isDeviceNotExist reports whether err from `ip link delete` indicates the
+// device simply does not exist (the only case where we silently continue).
+func isDeviceNotExist(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "cannot find device") || strings.Contains(msg, "device not found") || strings.Contains(msg, "no such device")
 }

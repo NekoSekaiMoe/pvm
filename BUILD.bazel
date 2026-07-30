@@ -1,0 +1,7 @@
+load("@gazelle//:def.bzl", "gazelle")
+
+# gazelle:prefix uml-container
+# gazelle:exclude webui/node_modules
+# gazelle:exclude mnt_pkg
+# gazelle:exclude ref
+gazelle(name = "gazelle")

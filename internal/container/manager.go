@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"time"
+	"uml-container/internal/cgroup"
 	"uml-container/internal/config"
 	"uml-container/internal/log"
 	"uml-container/internal/state"
@@ -50,10 +51,16 @@ func (m *Manager) Start(ctx context.Context, cfg *config.ContainerConfig) error 
 		args = append(args, fmt.Sprintf("ubd0=%s", cfg.Rootfs))
 		args = append(args, "root=/dev/ubda")
 	}
+	// UML 默认以只读方式挂载根文件系统，而容器 init 经常需要写
+	// /etc/resolv.conf、apk 缓存等。显式 rw 让根可写，与 test_integration
+	// 之外所有需要写入的初始化脚本兼容。
+	args = append(args, "rw=1")
 
 	if cfg.NetworkTap != "" {
-		if cfg.UseVirtio {
-			args = append(args, fmt.Sprintf("vec0:transport=tap,ifname=%s", cfg.NetworkTap))
+		if cfg.VhostNetSocket != "" {
+			args = append(args, fmt.Sprintf("virtio=1,vhost-user,socket=%s", cfg.VhostNetSocket))
+		} else if cfg.UseVirtio {
+			args = append(args, fmt.Sprintf("vec0:transport=tap,ifname=%s,vnet=1", cfg.NetworkTap))
 		} else {
 			args = append(args, fmt.Sprintf("eth0=tuntap,%s", cfg.NetworkTap))
 		}
@@ -100,6 +107,15 @@ func (m *Manager) Start(ctx context.Context, cfg *config.ContainerConfig) error 
 		st.Status = "exited"
 		state.SaveState(cfg.ID, st)
 		return err
+	}
+
+	cg := cgroup.NewManager()
+	if setupErr := cg.Setup(cfg.ID, pid, cfg.MemoryBytes, cfg.CPU); setupErr != nil {
+		// cgroup 是可选的资源约束基础设施，不可用时不阻塞容器启动，
+		// 降级为无限制运行（与 runc/crun 在 cgroup 不可用时的行为一致）。
+		// 213d9d6 曾把这里改成 hard-fail+Kill，导致 CI 上 cgroup 不可写时
+		// 容器一启动就被杀，故恢复为 warning。
+		fmt.Printf("Warning: failed to setup cgroup limits for %s: %v\n", cfg.ID, setupErr)
 	}
 
 	st.Status = "running"

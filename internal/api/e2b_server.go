@@ -1,15 +1,19 @@
 package api
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
+	"strings"
 	"uml-container/internal/config"
 	"uml-container/internal/container"
 	"uml-container/internal/image"
+	"uml-container/internal/snapshot"
 	"uml-container/internal/state"
 	"uml-container/webui"
 
@@ -71,6 +75,7 @@ func StartE2BServer(port int) error {
 			Name   string `json:"name"`
 			Rootfs string `json:"rootfs"`
 			Mem    string `json:"mem"`
+			CPU    int    `json:"cpu"`
 		}
 		var req StartReq
 		if err := c.Bind(&req); err != nil {
@@ -80,18 +85,31 @@ func StartE2BServer(port int) error {
 			req.Name = "web-container"
 		}
 
+		if !regexp.MustCompile(`^[a-zA-Z0-9_-]+$`).MatchString(req.Name) {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "Invalid container ID format"})
+		}
+		if req.CPU < 0 || req.CPU > 1024 {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "CPU limit must be between 0 and 1024"})
+		}
+
 		mgr := container.NewManager(nil)
 		mem := req.Mem
 		if mem == "" {
 			mem = "512M"
 		}
+		memBytes, err := config.ParseMemory(mem)
+		if err != nil {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+		}
 		cfg := &config.ContainerConfig{
-			ID:     req.Name,
-			Name:   req.Name,
-			Rootfs: req.Rootfs,
-			Kernel: "./bin/linux",
-			Init:   "/init.sh",
-			Memory: mem,
+			ID:          req.Name,
+			Name:        req.Name,
+			Rootfs:      req.Rootfs,
+			Kernel:      "./bin/linux",
+			Init:        "/init.sh",
+			Memory:      mem,
+			MemoryBytes: memBytes,
+			CPU:         req.CPU,
 		}
 
 		if err := mgr.Start(context.Background(), cfg); err != nil {
@@ -119,21 +137,63 @@ func StartE2BServer(port int) error {
 		return c.String(http.StatusOK, string(data))
 	})
 
-	// Delete container
+		// Delete container
 	api.DELETE("/containers/:id", func(c echo.Context) error {
 		id := c.Param("id")
 		if !regexp.MustCompile(`^[a-zA-Z0-9_-]+$`).MatchString(id) {
 			return c.String(http.StatusBadRequest, "Invalid container ID")
 		}
+
+		// 终止进程：不能仅凭持久化的 PID 直接 kill，PID 可能已被复用。
+		// 校验进程仍在容器 cgroup 内才终止，并传播 kill 错误。
+		st, err := state.LoadState(id)
+		if err == nil && st.PID > 0 {
+			if proc, err := os.FindProcess(st.PID); err == nil {
+				if belongs, _ := procBelongsToContainer(st.PID, id); belongs {
+					if killErr := proc.Kill(); killErr != nil && killErr.Error() != "os: process already finished" {
+						return c.JSON(http.StatusInternalServerError, map[string]string{"error": fmt.Sprintf("failed to kill process %d: %v", st.PID, killErr)})
+					}
+				}
+			}
+		}
+
 		dir, err := state.ContainerDir(id)
 		if err != nil {
-			return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
 		}
 		if err := os.RemoveAll(dir); err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": fmt.Sprintf("failed to remove container dir: %v", err)})
+		}
+
+		return c.String(http.StatusOK, "Deleted")
+	})
+
+	// Snapshot container
+	api.POST("/containers/:id/snapshot", func(c echo.Context) error {
+		id := c.Param("id")
+		if !regexp.MustCompile(`^[a-zA-Z0-9_-]+$`).MatchString(id) {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "Invalid container ID"})
+		}
+		dest := filepath.Join("/var/lib/uml-container/containers", id+".tgz")
+		if err := snapshot.Export(id, dest); err != nil {
 			return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		}
-		return c.JSON(http.StatusOK, map[string]string{"status": "deleted"})
+		return c.JSON(http.StatusOK, map[string]string{"status": "success", "file": dest})
 	})
+
+	// Restore container
+	api.POST("/containers/:id/restore", func(c echo.Context) error {
+		id := c.Param("id")
+		if !regexp.MustCompile(`^[a-zA-Z0-9_-]+$`).MatchString(id) {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "Invalid container ID"})
+		}
+		src := filepath.Join("/var/lib/uml-container/containers", id+".tgz")
+		if err := snapshot.Import(src, id+"-restored"); err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		}
+		return c.JSON(http.StatusOK, map[string]string{"status": "success", "new_id": id+"-restored"})
+	})
+	// End of restore container
 
 	// Pull image
 	api.POST("/images/pull", func(c echo.Context) error {
@@ -176,3 +236,39 @@ func StartE2BServer(port int) error {
 	fmt.Printf("E2B-compatible API & WebUI Server listening on %s\n", addr)
 	return e.Start(addr)
 }
+
+// procBelongsToContainer reports whether the process with the given pid still
+// belongs to the container's cgroup v2 path. We avoid trusting a persisted PID
+// blindly because PIDs get recycled; a recycled PID could point at an
+// unrelated host process.
+//
+// It returns (true, nil) only when /proc/<pid>/cgroup references the
+// container's cgroup leaf (/<root>/.../<id>). On any parse failure or when the
+// process is gone, it returns (false, nil) so callers err on the side of NOT
+// killing.
+func procBelongsToContainer(pid int, containerID string) (bool, error) {
+	f, err := os.Open(fmt.Sprintf("/proc/%d/cgroup", pid))
+	if err != nil {
+		return false, err
+	}
+	defer f.Close()
+
+	want := "/" + containerID
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := scanner.Text()
+		// cgroup v2 format: 0::/path/to/cgroup
+		fields := strings.SplitN(line, ":", 3)
+		if len(fields) != 3 {
+			continue
+		}
+		path := fields[2]
+		if strings.HasSuffix(path, want) || strings.Contains(path, want+"/") {
+			return true, nil
+		}
+	}
+	return false, scanner.Err()
+}
+
+// itoa is a small helper kept to avoid pulling strconv elsewhere in this file.
+var _ = strconv.Itoa
