@@ -43,13 +43,32 @@ mount | grep ' / ' || true
 # ----------------------------------------------------------------
 
 echo "Attempting to install fastfetch..."
-# 给每个网络操作加超时，避免 CI 上网络抽风时无限阻塞。
-timeout 60 apk update \
-  && timeout 120 apk add fastfetch \
+# 诊断阶段：不加 timeout，直接跑裸 apk，定位 “apk: No such file or directory”
+# 的真实层级。在每个关键点打 marker。失败后显式 poweroff，避免 init 退出后
+# UML 内核挂起被误测为超时。
+
+# 1) 裸 apk——看 execve 本身返回什么
+/sbin/apk --version 2>&1
+ echo "APK_VERSION rc=$?"
+
+# 2) 绕过内核 PT_INTERP，显式用 musl ldso 启动 apk
+/lib/ld-musl-x86_64.so.1 /sbin/apk --version 2>&1
+ echo "LDSO_APK rc=$?"
+
+# 3) busybox 子命令——确认是否所有动态 ELF 都同样失败
+busybox true 2>&1
+ echo "BUSYBOX_TRUE rc=$?"
+
+# 4) 真正的安装步骤（保留成功标记）；apk 是动态 ELF，如果上面失败了这里也会失败
+apk update \
+  && apk add fastfetch \
   && fastfetch \
   && echo "PKG_INSTALL_SUCCESS"
 
-poweroff -f
+echo "INIT_DONE rc=$?"
+# 显式 halt，避免 init 退出后 UML 内核挂起。
+busybox poweroff -f
+
 EOF
 sudo chmod +x mnt_pkg/init.sh
 
@@ -89,7 +108,17 @@ trap cleanup EXIT
 STATUS_FILE=pkg_exit_status
 rm -f "$STATUS_FILE"
 # 后台等待器：agentpvm 退出后把状态落到文件，供主轮询循环感知。
-( wait "$PVM_PID"; echo $? > "$STATUS_FILE" ) &
+# 不用 wait $PVM_PID，因为 sudo/timeout 链可能让 $PVM_PID 不再是本 shell 的
+# 直接子进程（上一轮 CI 日志报 “pid is not a child of this shell”）。
+# 改用 pgrep -f 按命令行匹配存活状态，与 pid 亲缘关系无关，也不会被 sudo
+# 提前返回误导。
+(
+    while pgrep -f "agentpvm run -name pkg-test" >/dev/null 2>&1; do
+        sleep 1
+    done
+    wait "$PVM_PID" 2>/dev/null
+    echo $? > "$STATUS_FILE"
+) &
 
 echo "Waiting for container to finish (up to 180s)..."
 RESULT=timeout
