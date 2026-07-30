@@ -89,9 +89,9 @@ sudo rm -f "$CONSOLE_LOG"
 # 后台运行 agentpvm，同时轮询成功标记；不再先同步等待再轮询。
 # 容器一打出 PKG_INSTALL_SUCCESS 就立即成功退出；agentpvm 提前崩溃也会被
 # 后台等待器感知；超时则由内层 timeout 兜底。
-sudo timeout 180 ./agentpvm run -name pkg-test \
+sudo ./agentpvm run -name pkg-test \
     -rootfs ${IMG_NAME} -kernel ./bin/linux -init /init.sh \
-    -vhost=false -net-tap tap_pkg > pkg_agentpvm.log 2>&1 &
+    -vhost=false -net-tap tap_pkg
 PVM_PID=$!
 
 cleanup() {
@@ -120,36 +120,9 @@ rm -f "$STATUS_FILE"
     echo $? > "$STATUS_FILE"
 ) &
 
-echo "Waiting for container to finish (up to 180s)..."
-RESULT=timeout
-for _ in $(seq 1 180); do
-    if sudo grep -q "PKG_INSTALL_SUCCESS" "$CONSOLE_LOG" 2>/dev/null; then
-        RESULT=success
-        break
-    fi
-    if [ -f "$STATUS_FILE" ]; then
-        RESULT=exited
-        break
-    fi
-    sleep 1
-done
-
 echo "---- agentpvm output (pkg_agentpvm.log) ----"
 cat pkg_agentpvm.log 2>/dev/null || echo "(no pkg_agentpvm.log)"
 echo "---- Pkg Test Console Output ----"
 sudo cat "$CONSOLE_LOG" 2>/dev/null || echo "(no console.log)"
 
-case "$RESULT" in
-    success)
-        echo "✅ Package installation test passed."
-        exit 0
-        ;;
-    exited)
-        echo "❌ Container exited before producing PKG_INSTALL_SUCCESS (status: $(cat "$STATUS_FILE" 2>/dev/null))."
-        exit 1
-        ;;
-    *)
-        echo "❌ Package installation test timed out after 180s."
-        exit 1
-        ;;
-esac
+exit 1
