@@ -14,8 +14,11 @@ var (
 	ipForwardMu       sync.Mutex
 )
 
-// SetupBridge creates a NAT bridge
-func SetupBridge(bridgeName string, tapName string, gatewayIP string) error {
+// SetupBridge creates a NAT bridge.
+// 只有在函数返回错误时才回滚已创建的资源；成功路径必须保留 bridge 与
+// ip_forward 状态。早期的 defer 无条件执行 DeleteBridge，会导致成功创建后
+// bridge 被立即删掉（表现为 `ip link set <tap> master <br>` 报 device 不存在）。
+func SetupBridge(bridgeName string, tapName string, gatewayIP string) (err error) {
 	// Track exactly which resources this invocation created/registered so the
 	// deferred cleanup only unwinds what we actually own. A failure before, say,
 	// ip_forward refcount++ must not touch the refcount or tear down another
@@ -23,6 +26,10 @@ func SetupBridge(bridgeName string, tapName string, gatewayIP string) error {
 	bridgeCreated := false
 	ipForwardRegistered := false
 	defer func() {
+		// 仅在失败时回滚；成功返回时保留所有已创建的资源。
+		if err == nil {
+			return
+		}
 		if bridgeCreated {
 			DeleteBridge(bridgeName, gatewayIP)
 		}
