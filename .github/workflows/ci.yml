@@ -2,9 +2,7 @@ name: CI Pipeline
 
 on:
   push:
-    branches: [ main ]
   pull_request:
-    branches: [ main ]
 
 jobs:
   build-and-test:
@@ -12,14 +10,14 @@ jobs:
     permissions:
       contents: read
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v7
       with:
         persist-credentials: false
 
     - name: Setup Node.js
-      uses: actions/setup-node@v4
+      uses: actions/setup-node@v7
       with:
-        node-version: '20'
+        node-version: '24'
 
     - name: Build WebUI (Nuxt)
       working-directory: ./webui
@@ -29,14 +27,14 @@ jobs:
         npm run generate
 
     - name: Set up Go
-      uses: actions/setup-go@v5
+      uses: actions/setup-go@v7
       with:
         go-version: '1.22'
 
     - name: Install eBPF (C) Dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y clang llvm libbpf-dev linux-libc-dev gcc-multilib clang-tidy
+        sudo apt-get install -y clang llvm libbpf-dev linux-libc-dev gcc-multilib qemu-system-x86 qemu-img clang-tidy
 
     - name: Run clang-tidy
       run: clang-tidy bpf/egress.c -- -I/usr/include -I/usr/include/bpf || true
