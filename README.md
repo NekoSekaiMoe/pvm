@@ -1,4 +1,4 @@
-# PVM (UML Container Manager)
+# PVM
 
 PVM is a lightweight, User-Mode Linux (UML)-based container management system. It provides strong isolation for processes by leveraging virtualized Linux kernels while maintaining a container-like CLI and experience.
 
