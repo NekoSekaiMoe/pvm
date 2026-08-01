@@ -106,8 +106,9 @@ type WorkspaceSpec struct {
 type KernelSpec struct {
 	// Path to the UML kernel binary.
 	Path string `toml:"path"`
-	// Virtio enables virtio_uml devices (block via vhost-user-blk, net via
-	// virtio_uml.device). When false, legacy ubd0/eth0=tuntap is used.
+	// Virtio enables virtio devices: block via vhost-user-blk (see UseVhostBlk),
+	// and net via the vec0 virtio transport over a host TAP. When false, legacy
+	// ubd0/eth0=tuntap is used.
 	Virtio bool `toml:"virtio"`
 	// UseVhostBlk requires qemu-storage-daemon for the block backend. Implies
 	// Virtio. When Virtio is true but UseVhostBlk is false, ubd0 is used even

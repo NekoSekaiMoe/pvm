@@ -341,9 +341,7 @@ func buildLegacyArgs(ctx context.Context, cfg *config.ContainerConfig) []string 
 	}
 	args = append(args, "rw")
 	if cfg.NetworkTap != "" {
-		if cfg.VhostNetSocket != "" {
-			args = append(args, fmt.Sprintf("virtio_uml.device=%s:%d", cfg.VhostNetSocket, vhost.VirtioIDNet))
-		} else if cfg.UseVirtio {
+		if cfg.UseVirtio {
 			args = append(args, fmt.Sprintf("vec0:transport=tap,ifname=%s,vnet=1", cfg.NetworkTap))
 		} else {
 			args = append(args, fmt.Sprintf("eth0=tuntap,%s", cfg.NetworkTap))
