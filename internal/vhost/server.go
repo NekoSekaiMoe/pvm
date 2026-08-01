@@ -2,12 +2,14 @@ package vhost
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"net"
 	"os"
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -175,6 +177,16 @@ func (s *Server) acceptLoop() {
 		if err != nil {
 			break
 		}
+		// Log the peer's pid/uid via SO_PEERCRED so a connection that never
+		// sends a vhost-user request can be attributed to the right process
+		// (it is otherwise ambiguous whether the connecter is UML's
+		// virtio_uml probe, mconsole, or something else). Zero cost when debug
+		// logging is off except the one getsockopt per accept.
+		if pid, uid, ok := peerCred(conn); ok {
+			pkgLog.Infof("accepted new connection (peer pid=%d uid=%d)", pid, uid)
+		} else {
+			pkgLog.Infof("accepted new connection (peer cred unavailable)")
+		}
 		go s.handleConn(conn)
 	}
 }
@@ -222,17 +234,29 @@ func (s *Server) writeAckReply(hdr VhostUserMsgHeader, buf []byte, conn *net.Uni
 
 func (s *Server) handleConn(conn *net.UnixConn) {
 	defer conn.Close()
-	pkgLog.Infof("accepted new connection")
+	// (peer pid/uid is logged in acceptLoop via SO_PEERCRED.)
 
 	b := make([]byte, 4096)
 	oob := make([]byte, 4096)
 
 	for {
+		// Probe for silent peers: set a read deadline so a guest that connects
+		// but never sends (or whose bytes are not delivered) is surfaced in the
+		// log as a timeout rather than vanishing into a blocking read. The
+		// deadline is long enough not to trip on slow senders and is reset each
+		// iteration after the read returns.
+		conn.SetReadDeadline(timeNow().Add(10 * time.Second))
 		n, oobn, _, _, err := conn.ReadMsgUnix(b, oob)
+		conn.SetReadDeadline(time.Time{})
 		if err != nil {
+			if isTimeout(err) {
+				pkgLog.Warnf("no data from peer in 10s (connection may be stale or peer is not a vhost-user client)")
+				continue
+			}
 			pkgLog.Infof("read error: %v", err)
 			break
 		}
+		pkgLog.Debugf("read n=%d oobn=%d", n, oobn)
 
 		if n < 12 {
 			pkgLog.Warnf("short read: %d bytes", n)
@@ -724,4 +748,46 @@ func newEventfd() int {
 		return noFd
 	}
 	return int(r0)
+}
+
+// peerCred returns the (pid, uid, ok) of the process on the other end of a
+// connected AF_UNIX socket via SO_PEERCRED (Linux). ok is false when the fd
+// cannot be introspected (e.g. a non-Linux build path); callers log the
+// ambiguous case rather than failing.
+func peerCred(conn *net.UnixConn) (int, int, bool) {
+	raw, err := conn.SyscallConn()
+	if err != nil {
+		return 0, 0, false
+	}
+	var cred *unix.Ucred
+	if err := raw.Control(func(fd uintptr) {
+		cred, err = unix.GetsockoptUcred(int(fd), unix.SOL_SOCKET, unix.SO_PEERCRED)
+	}); err != nil {
+		return 0, 0, false
+	}
+	if err != nil || cred == nil {
+		return 0, 0, false
+	}
+	return int(cred.Pid), int(cred.Uid), true
+}
+
+// timeNow is the standard time.Now, wrapped so tests can stub it if needed.
+func timeNow() time.Time { return time.Now() }
+
+// isTimeout reports whether err is a net deadline/timeout error, used by the
+// ReadMsgUnix probe to distinguish a silent peer from a real read error.
+func isTimeout(err error) bool {
+	if err == nil {
+		return false
+	}
+	return isTimeoutType(err)
+}
+
+// isTimeoutType unwraps err to a *net.OpError and checks its Timeout flag.
+func isTimeoutType(err error) bool {
+	var ne net.Error
+	if errors.As(err, &ne) {
+		return ne.Timeout()
+	}
+	return false
 }
