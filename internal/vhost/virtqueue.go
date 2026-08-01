@@ -50,6 +50,19 @@ type VirtQueue struct {
 	// Accessed atomically.
 	stopping uint32
 
+	// ioWG tracks in-flight virtio-blk IO goroutines (one per request) so that
+	// SET_MEM_TABLE / Server.Stop can prove none of them still touches a
+	// mmap'd guest region before UnmapAll. Each IO goroutine does Add(1)
+	// before starting and Done() when completeRequest has published; the
+	// Server waits on it after stopping ring processors and before UnmapAll.
+	ioWG sync.WaitGroup
+
+	// ioSem caps concurrent virtio-blk IO goroutines per queue so a flood of
+	// requests (e.g. dd) cannot spawn unbounded goroutines. nil == unlimited
+	// (e.g. before the queue is fully configured); set by Server when the
+	// processor starts.
+	ioSem chan struct{}
+
 	// processorStarted records whether a ring processor goroutine is currently
 	// running for this queue. It prevents a duplicate SET_VRING_KICK from
 	// starting a second processor for the same virtqueue, which would
@@ -295,54 +308,60 @@ func (vq *VirtQueue) processDescChain(mem *Memory, headIdx uint16, blk *BlockDev
 	if blk != nil {
 		switch reqType {
 		case VirtioBlkTIn:
-			// Read from disk into guest memory. Use synchronous pread into each
-			// data slice rather than io_uring Preadv: the iouring-go helper builds
-			// the iovec array as a local that the returned closure does not retain,
-			// so once GC reclaims it the kernel reads a dangling iovec pointer —
-			// under dd load this corrupts/EFAULTs reads and stalls the guest.
-			// Sync pread is correct and fast enough; the slice buffers are guest
-			// mmap pages that stay valid for the syscall duration.
+			// Read from disk into guest memory. Synchronous pread into each data
+			// slice (see readvSync for why not io_uring). Bounded by ioSem and
+			// tracked by ioWG so SET_MEM_TABLE cannot Munmap a region an in-flight
+			// read still writes into.
+			vq.startIO()
 			go func() {
+				defer vq.endIO()
 				st := byte(VirtioBlkSOk)
 				n := readvSync(blk, dataSlices, offset)
 				if n < 0 {
 					st = VirtioBlkSIoErr
 					n = 0
 				}
+				written := uint32(n)
 				if statusSlice != nil && len(statusSlice) >= 1 {
 					statusSlice[0] = st
+					written++ // +1 for the status byte
 				}
-				vq.completeRequest(mem, headIdx, uint32(n)+1) // +1 for the status byte
+				vq.completeRequest(mem, headIdx, written)
 			}()
 			return
 
 		case VirtioBlkTOut:
-			// Write from guest memory to disk. Synchronous pwrite per slice
-			// (see VirtioBlkTIn for why not io_uring).
+			// Write from guest memory to disk. Synchronous pwrite per slice.
+			vq.startIO()
 			go func() {
+				defer vq.endIO()
 				st := byte(VirtioBlkSOk)
 				if writevSync(blk, dataSlices, offset) < 0 {
 					st = VirtioBlkSIoErr
 				}
+				var written uint32
 				if statusSlice != nil && len(statusSlice) >= 1 {
 					statusSlice[0] = st
+					written = 1 // the 1-byte status only
 				}
-				// Write requests consume no host->guest data; the only byte
-				// written back is the 1-byte status. Match the flush path.
-				vq.completeRequest(mem, headIdx, 1)
+				vq.completeRequest(mem, headIdx, written)
 			}()
 			return
 
 		case VirtioBlkTFlush:
+			vq.startIO()
 			go func() {
+				defer vq.endIO()
 				st := byte(VirtioBlkSOk)
 				if err := blk.Sync(); err != nil {
 					st = VirtioBlkSIoErr
 				}
+				var written uint32
 				if statusSlice != nil && len(statusSlice) >= 1 {
 					statusSlice[0] = st
+					written = 1
 				}
-				vq.completeRequest(mem, headIdx, 1)
+				vq.completeRequest(mem, headIdx, written)
 			}()
 			return
 		}
@@ -389,6 +408,35 @@ func writevSync(blk *BlockDevice, bufs [][]byte, offset int64) int {
 		}
 	}
 	return total
+}
+
+// startIO reserves an IO slot (bounded by ioSem if configured) and registers
+// the goroutine on ioWG so the Server can wait for in-flight IO before
+// unmapping guest memory. It must be paired 1:1 with endIO (use defer). If the
+// semaphore is nil (queue not fully configured) the goroutine runs unbounded,
+// which is acceptable for the rare early path.
+func (vq *VirtQueue) startIO() {
+	if vq.ioSem != nil {
+		vq.ioSem <- struct{}{}
+	}
+	vq.ioWG.Add(1)
+}
+
+// endIO releases the IO slot and marks the goroutine done. Always called via
+// defer from the IO handler so both success and error paths release resources.
+func (vq *VirtQueue) endIO() {
+	vq.ioWG.Done()
+	if vq.ioSem != nil {
+		<-vq.ioSem
+	}
+}
+
+// WaitIO blocks until every in-flight virtio-blk IO goroutine for this queue
+// has finished. The Server calls this after stopping the ring processor (so no
+// new IO is dispatched) and before UnmapAll, guaranteeing no goroutine still
+// touches a region that is about to be munmap'd.
+func (vq *VirtQueue) WaitIO() {
+	vq.ioWG.Wait()
 }
 
 // statusLen returns 1 if the status byte descriptor was successfully

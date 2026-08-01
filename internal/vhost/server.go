@@ -163,6 +163,7 @@ func (s *Server) Stop() {
 	for _, ch := range waits {
 		<-ch
 	}
+	s.waitAllIO() // in-flight IO must finish before the Server goes away
 	if s.netDev != nil {
 		s.netDev.Close()
 	}
@@ -363,6 +364,7 @@ func (s *Server) handleConn(conn *net.UnixConn) {
 			// use-after-unmap. Re-negotiation is rare (e.g. migration), so
 			// paying stop+restart here is fine.
 			s.stopAllProcessors()
+			s.waitAllIO() // in-flight IO goroutines must finish before UnmapAll
 			s.mem.UnmapAll() // clean up any regions from a previous negotiation
 			for i := 0; i < int(numRegions); i++ {
 				offset := 8 + i*32
@@ -522,6 +524,9 @@ func (s *Server) handleConn(conn *net.UnixConn) {
 			if start {
 				vq.stopFd = newEventfd()
 				vq.done = make(chan struct{})
+				if vq.ioSem == nil {
+					vq.ioSem = make(chan struct{}, 32) // bound concurrent IO goroutines
+				}
 				vq.processorStarted = true
 				atomic.StoreUint32(&vq.stopping, 0) // reset any prior stop flag
 			}
@@ -615,6 +620,21 @@ func (s *Server) stopAllProcessors() {
 	s.mu.Unlock()
 	for _, ch := range waits {
 		<-ch
+	}
+}
+
+// waitAllIO blocks until every in-flight virtio-blk IO goroutine has finished.
+// Called after stopAllProcessors (so no new IO is dispatched) and before
+// UnmapAll so a completing read/write cannot touch a region that is about to
+// be munmap'd. The per-queue WaitIO is cheap when nothing is in flight.
+func (s *Server) waitAllIO() {
+	s.mu.Lock()
+	queues := append([]*VirtQueue(nil), s.queues...)
+	s.mu.Unlock()
+	for _, vq := range queues {
+		if vq != nil {
+			vq.WaitIO()
+		}
 	}
 }
 

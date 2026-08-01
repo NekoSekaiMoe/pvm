@@ -10,7 +10,7 @@ go build -o agentpvm cmd/agentpvm/main.go
 # an all-zero backing file (the previous dd-only base) always panics with
 # "VFS: Unable to mount root fs" because no filesystem signature is present.
 dd if=/dev/zero of=base.img bs=1M count=10 > /dev/null 2>&1
-mkfs.ext4 -q base.img
+mkfs.ext4 -q -F base.img
 
 # Create CoW qcow2 using our Go CLI (simulating direct call)
 if ! command -v qemu-img &> /dev/null; then

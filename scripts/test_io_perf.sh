@@ -30,7 +30,7 @@ fi
 IMG_NAME="perf_rootfs.img"
 echo "Creating ${IMG_NAME} (300MB)..."
 dd if=/dev/zero of=${IMG_NAME} bs=1M count=300 >/dev/null 2>&1
-mkfs.ext4 -q ${IMG_NAME}
+mkfs.ext4 -q -F ${IMG_NAME}
 
 # Check if alpine minirootfs exists, otherwise download
 if [ ! -f "alpine.tar.gz" ]; then
@@ -103,7 +103,7 @@ run_one() {
     # or crash on failure) ends it early. -debug yields the full vhost protocol
     # log to the agentpvm log on failure.
     sudo timeout 120 ./agentpvm run -name "$name" -rootfs "${IMG_NAME}" \
-        -kernel ./bin/linux -init /init.sh -vhost=true $native_flag -debug \
+        -kernel ./bin/linux -init /init.sh -vhost=true "$native_flag" -debug \
         > "$ap_log" 2>&1 || true
 
     # Ensure no lingering UML process keeps the socket/logs open for the next run.
