@@ -1,0 +1,24 @@
+load("@rules_go//go:def.bzl", "go_test")
+
+# This package has no production code; it exists only to host cross-plane
+# integration tests. All deps are test deps.
+go_test(
+    name = "integrationtest_test",
+    srcs = ["flows_test.go"],
+    deps = [
+        "//internal/approval",
+        "//internal/artifact",
+        "//internal/audit",
+        "//internal/cgroup",
+        "//internal/config",
+        "//internal/container",
+        "//internal/identity",
+        "//internal/incident",
+        "//internal/network/egress",
+        "//internal/policy",
+        "//internal/pool",
+        "//internal/spec",
+        "//internal/state",
+        "//internal/uml",
+    ],
+)

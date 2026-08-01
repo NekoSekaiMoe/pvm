@@ -1,0 +1,105 @@
+# PVM Agent Sandbox — TaskSpec (plan.md §9 control contract)
+#
+# This is the default config consulted by `agentpvm run` when no -config is
+# given. It demonstrates every control plane. The posture here is SAFE defaults:
+# network disabled, tools default-deny, short token TTL, modest budget.
+#
+# umlctl also accepts this file via -config but only consumes the launch fields
+# (runtime/workspace/kernel/network tap) — it ignores the control planes.
+
+version = 1
+caller  = "demo-user"      # WHO authorized this task (required)
+tenant  = "default"        # multi-tenant quota scope
+
+# --- runtime / sandbox shape ---
+[runtime]
+name   = "agent-task"      # also used as the task id
+cpu    = 1000              # millicpu; 1000 = 1 full CPU. 0 = unlimited
+memory = "512M"
+
+[workspace]
+base_image = "rootfs.img"  # read-only backing image, shared by N sandboxes (qcow2 CoW)
+# overlay is auto-derived as <statedir>/rootfs.qcow2 when omitted
+init      = "/sbin/init"
+
+[kernel]
+path          = "./bin/linux"
+virtio        = false      # set true to use virtio_uml devices
+use_vhost_blk = false     # set true to back the block device with qemu-storage-daemon
+
+# --- network egress (plan.md §4) ---
+# Two-layer enforcement: the L7 proxy below + the eBPF TC filter as IP floor.
+[network]
+enabled       = false     # default-deny: no network unless explicitly enabled
+bridge        = "br0"
+gateway_ip    = "10.0.0.1/24"
+tap           = ""        # auto-derived from task name when empty
+max_request_body_bytes = 1048576   # 1 MiB upload cap
+qos_rate      = ""        # e.g. "10mbit"
+
+# Domain allowlist enforced by the L7 CONNECT proxy. HTTPS sees the domain via
+# SNI without TLS MITM. Wildcards supported: "*.github.com".
+egress_allow_domains = [
+    "github.com",
+    "*.githubusercontent.com",
+    "registry.npmjs.org",
+    "pypi.org",
+    "files.pythonhosted.org",
+]
+egress_block_domains = [
+    "169.254.169.254",   # cloud metadata (also blocked by eBPF floor)
+]
+
+# --- tool / policy gateway (plan.md §6) ---
+# First match wins; a default-deny catch-all is auto-appended.
+[[tools]]
+name   = "read_file"
+action = "allow"
+effect = "read"
+
+[[tools]]
+name   = "write_file"
+action = "constrain"
+effect = "write"
+reason = "writes allowed only inside the task workspace branch"
+
+[[tools]]
+name   = "send_email"
+action = "approve"        # pauses for a bound human approval ticket
+effect = "send"
+reason = "external side-effect"
+
+[[tools]]
+name   = "deploy"
+action = "deny"
+effect = "prod"
+reason = "production deploy denied by default"
+
+# --- budget (plan.md §9.2) ---
+[budget]
+max_wall_time  = "15m"    # hard wall-clock cap; on expiry FSM -> Destroy
+max_tokens     = 200000   # LLM token cap; 0 = unlimited
+max_network_mb = 512      # egress byte cap; 0 = unlimited
+max_cost_micro_usd = 0   # spend cap; 0 = unlimited
+
+# --- approval boundary (plan.md §10) ---
+[approval]
+required_for = ["send", "delete", "deploy"]  # which actions pause for a human
+notify       = ""        # reserved: webhook/IM endpoint
+timeout      = "5m"      # auto-deny if no decision within this window
+
+# --- artifacts (plan.md §5.3, §7) ---
+[artifacts]
+declared = [
+    "out/diff.patch",
+    "out/build.log",
+]
+require_tests_passed = true
+block_secrets        = true   # gate fails if a declared artifact diff has a secret
+
+# --- lifecycle (plan.md §8, §11) ---
+[lifecycle]
+paused     = false      # start in Suspended (checkpoint-on-start)
+max_retries = 2         # Failed -> Provisioning attempts
+on_anomaly  = "pause"   # "pause" (default) or "terminate"
+ttl         = "1h"      # overall task lifetime

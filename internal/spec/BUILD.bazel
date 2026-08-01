@@ -1,0 +1,18 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "spec",
+    srcs = ["spec.go"],
+    importpath = "uml-container/internal/spec",
+    visibility = ["//:__subpackages__"],
+    deps = ["@com_github_burntsushi_toml//"],
+)
+
+go_test(
+    name = "spec_test",
+    srcs = [
+        "spec_test.go",
+        "spec_matrix_test.go",
+    ],
+    embed = [":spec"],
+)

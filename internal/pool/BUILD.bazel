@@ -1,0 +1,16 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "pool",
+    srcs = ["manager.go"],
+    importpath = "uml-container/internal/pool",
+    visibility = ["//:__subpackages__"],
+    deps = ["//internal/audit"],
+)
+
+go_test(
+    name = "pool_test",
+    srcs = ["manager_test.go"],
+    embed = [":pool"],
+    deps = ["//internal/audit"],
+)

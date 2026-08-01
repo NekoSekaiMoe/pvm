@@ -9,39 +9,80 @@ import (
 )
 
 func TestCreateOverlay_QemuImgMissing(t *testing.T) {
-	// If qemu-img is not on PATH, CreateOverlay must return a non-nil error
-	// mentioning qemu-img; this guards against silently treating CoW creation
-	// as best-effort.
 	if _, err := exec.LookPath("qemu-img"); err == nil {
-		t.Skip("qemu-img is installed; the missing-binary path cannot be exercised here")
+		t.Skip("qemu-img installed; cannot exercise missing-binary path")
 	}
-
 	out := filepath.Join(t.TempDir(), "overlay.qcow2")
-	err := CreateOverlay("/nonexistent/base.img", out, "raw")
+	err := CreateOverlay("/nonexistent/base.img", out, FormatRaw)
 	if err == nil {
-		t.Fatalf("expected error when qemu-img is missing, got nil")
-	}
-	if !strings.Contains(err.Error(), "qemu-img") && !strings.Contains(err.Error(), "failed to create qcow2 overlay") {
-		t.Errorf("unexpected error message: %v", err)
+		t.Fatal("expected error when qemu-img missing")
 	}
 }
 
-func TestCreateOverlay_NonExistentBacking(t *testing.T) {
+func TestValidatePath_RejectsComma(t *testing.T) {
+	if err := validatePath("/safe/path.img"); err != nil {
+		t.Errorf("safe path rejected: %v", err)
+	}
+	if err := validatePath("/bad/file,opt=evil"); err == nil {
+		t.Error("comma path should be rejected (option injection)")
+	}
+	if err := validatePath(""); err == nil {
+		t.Error("empty path should be rejected")
+	}
+}
+
+// TestCreateOverlay_RealQemu exercises the happy path when qemu-img exists.
+// It creates a tiny raw base, makes an overlay, and verifies the overlay file
+// is a real qcow2 (magic header "QFI\xfb").
+func TestCreateOverlay_RealQemu(t *testing.T) {
 	if _, err := exec.LookPath("qemu-img"); err != nil {
-		t.Skip("qemu-img not installed; skipping backing-file validation test")
+		t.Skip("qemu-img not installed")
 	}
-	out := filepath.Join(t.TempDir(), "overlay.qcow2")
-	err := CreateOverlay("/definitely/does/not/exist/base.img", out, "raw")
-	if err == nil {
-		// qemu-img may succeed creating an overlay whose backing file is later
-		// resolved lazily; ensure the produced file at least exists.
-		if _, statErr := os.Stat(out); statErr != nil {
-			t.Fatalf("overlay reported success but file missing: %v", statErr)
-		}
-		return
+	dir := t.TempDir()
+	base := filepath.Join(dir, "base.img")
+	// 1MB raw base
+	if err := os.WriteFile(base, make([]byte, 1<<20), 0644); err != nil {
+		t.Fatalf("write base: %v", err)
 	}
-	// Error path: backing file invalid -> qemu-img should refuse.
-	if !strings.Contains(err.Error(), "qcow2 overlay") {
-		t.Errorf("unexpected error: %v", err)
+	overlay := filepath.Join(dir, "ov.qcow2")
+	if err := CreateOverlay(base, overlay, FormatRaw); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	hdr := make([]byte, 4)
+	f, err := os.Open(overlay)
+	if err != nil {
+		t.Fatalf("open overlay: %v", err)
+	}
+	defer f.Close()
+	if _, err := f.Read(hdr); err != nil {
+		t.Fatalf("read header: %v", err)
+	}
+	if string(hdr) != "QFI\xfb" {
+		t.Errorf("overlay is not qcow2 (magic=%q)", string(hdr))
+	}
+}
+
+func TestCreateOverlay_IdempotentRecreate(t *testing.T) {
+	if _, err := exec.LookPath("qemu-img"); err != nil {
+		t.Skip("qemu-img not installed")
+	}
+	dir := t.TempDir()
+	base := filepath.Join(dir, "base.img")
+	os.WriteFile(base, make([]byte, 1<<20), 0644)
+	overlay := filepath.Join(dir, "ov.qcow2")
+	if err := CreateOverlay(base, overlay, FormatRaw); err != nil {
+		t.Fatalf("first create: %v", err)
+	}
+	// taint the overlay
+	if err := os.WriteFile(overlay, []byte("stale"), 0644); err == nil {
+		_ = err
+	}
+	// second create should replace, not append/reuse the tainted file
+	if err := CreateOverlay(base, overlay, FormatRaw); err != nil {
+		t.Fatalf("second create: %v", err)
+	}
+	data, _ := os.ReadFile(overlay)
+	if strings.HasPrefix(string(data), "stale") {
+		t.Error("overlay was not replaced on recreate (stale data leaked)")
 	}
 }

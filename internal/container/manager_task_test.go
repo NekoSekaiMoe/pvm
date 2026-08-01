@@ -1,0 +1,137 @@
+package container
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"testing"
+
+	"uml-container/internal/audit"
+	"uml-container/internal/spec"
+	"uml-container/internal/state"
+	"uml-container/internal/uml"
+)
+
+// trackingLauncher records the kernel/args it was started with and never blocks.
+type trackingLauncher struct {
+	kernel string
+	args   []string
+	pid    int
+}
+
+func (t *trackingLauncher) Start(ctx context.Context, kernel string, args []string, logFile *os.File) (int, *uml.Process, error) {
+	t.kernel = kernel
+	t.args = args
+	return 999, &uml.Process{}, nil
+}
+func (t *trackingLauncher) Wait(*uml.Process) error { return nil }
+
+func newTestManager(t *testing.T) (*Manager, *trackingLauncher) {
+	t.Helper()
+	state.RootDir = t.TempDir()
+	audit.LedgerRoot = t.TempDir()
+	os.Setenv("PVM_CGROUP_ROOT", t.TempDir()) // throwaway, no real cgroup writes
+	tl := &trackingLauncher{pid: 999}
+	return &Manager{Launcher: tl}, tl
+}
+
+func minimalSpec() *spec.TaskSpec {
+	return &spec.TaskSpec{
+		Version: 1,
+		Caller:  "alice",
+		Tenant:  "eng",
+		Runtime: spec.RuntimeSpec{Name: "task-x", CPU: 1, Memory: "256M"},
+		Workspace: spec.WorkspaceSpec{BaseImage: "", Init: "/sbin/init"}, // no base => skip overlay
+		Kernel:    spec.KernelSpec{Path: "/usr/lib/uml/linux"},
+		Network:   spec.NetworkSpec{Enabled: false},
+		Lifecycle: spec.LifecycleSpec{OnAnomaly: "pause"},
+	}
+}
+
+func TestStartTask_DrivesFSM(t *testing.T) {
+	m, tl := newTestManager(t)
+	s := minimalSpec()
+
+	if err := m.StartTask(context.Background(), "task-x", s); err != nil {
+		t.Fatalf("starttask: %v", err)
+	}
+	if tl.kernel != "/usr/lib/uml/linux" {
+		t.Errorf("kernel = %s", tl.kernel)
+	}
+	st, err := state.LoadState("task-x")
+	if err != nil {
+		t.Fatalf("load state: %v", err)
+	}
+	// Should have landed in Review (clean exit, awaiting artifact gate).
+	if st.Status != state.StatusReview {
+		t.Errorf("status = %s, want review", st.Status)
+	}
+	// FSM must have recorded the full path Pending->Provisioning->Ready->Running->Review
+	wantSeq := []state.Status{state.StatusProvisioning, state.StatusReady, state.StatusRunning, state.StatusReview}
+	if len(st.Transitions) < len(wantSeq) {
+		t.Fatalf("only %d transitions recorded: %+v", len(st.Transitions), st.Transitions)
+	}
+	for i, want := range wantSequence {
+		if st.Transitions[i].To != want {
+			t.Errorf("transition[%d].To = %s, want %s", i, st.Transitions[i].To, want)
+		}
+	}
+	if st.SpecFP == "" {
+		t.Error("spec fingerprint not recorded on state")
+	}
+}
+
+// wantSequence mirrors the expected FSM path for a clean StartTask run.
+var wantSequence = []state.Status{
+	state.StatusProvisioning,
+	state.StatusReady,
+	state.StatusRunning,
+	state.StatusReview,
+}
+
+func TestStartTask_RecordsAuditAndFingerprint(t *testing.T) {
+	m, _ := newTestManager(t)
+	s := minimalSpec()
+
+	_ = m.StartTask(context.Background(), "task-y", s)
+
+	l, err := audit.Open("task-y")
+	if err != nil {
+		t.Fatalf("open ledger: %v", err)
+	}
+	records, err := l.ReadAll()
+	if err != nil {
+		t.Fatalf("read ledger: %v", err)
+	}
+	if len(records) == 0 {
+		t.Fatal("audit ledger is empty after StartTask")
+	}
+	// phase 02 (SPEC+VERSION) must be recorded.
+	var sawSpec bool
+	for _, r := range records {
+		if r.Phase == audit.PhaseSpec {
+			sawSpec = true
+		}
+	}
+	if !sawSpec {
+		t.Error("expected a PhaseSpec audit record (SPEC+VERSION evidence)")
+	}
+}
+
+func TestStartTask_OverlayFallback(t *testing.T) {
+	// no qemu-img in CI: CreateOverlay fails, code should fall back to base
+	// image and STILL start the sandbox (with an audit record).
+	m, _ := newTestManager(t)
+	dir := t.TempDir()
+	base := filepath.Join(dir, "base.img")
+	os.WriteFile(base, make([]byte, 1024), 0644)
+
+	s := minimalSpec()
+	s.Workspace.BaseImage = base
+	s.Workspace.Overlay = filepath.Join(dir, "ov.qcow2")
+	s.Kernel.UseVhostBlk = false // avoid needing qemu-storage-daemon
+
+	if err := m.StartTask(context.Background(), "task-z", s); err != nil {
+		t.Fatalf("starttask with overlay fallback: %v", err)
+	}
+}

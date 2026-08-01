@@ -1,0 +1,227 @@
+// Package artifact implements the Artifact Gate (plan.md §7).
+//
+// Rule: the producer (the agent) can supply evidence, but cannot be the sole
+// judge. The gate re-verifies the agent's claimed success in an independent
+// context, using only the artifact bundle (diff/build/trace/hash), before any
+// release (merge/deploy/send) is allowed.
+//
+// Four-step verification (plan.md §7.3):
+//  1. Read-only baseline replay   - reproducibility
+//  2. Re-run tests + scan         - correctness + secret scan
+//  3. Sensitive-diff check        - block secrets/PII leakage
+//  4. Bind artifact hash          - fingerprint the release
+//
+// The gate is a FRAMEWORK: each step is a pluggable Verifier. Default verifiers
+// implement hash-binding and a secret-pattern scanner; the replay/test verifiers
+// are injected by the controller (they need a throwaway sandbox to run in).
+package artifact
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"regexp"
+	"strings"
+	"sync"
+
+	"uml-container/internal/audit"
+)
+
+// Bundle is the evidence package the agent submits alongside a success claim.
+type Bundle struct {
+	TaskID    string            `json:"task_id"`
+	Diff      string            `json:"diff"`        // unified diff text
+	BuildLog  string            `json:"build_log"`   // build/run output
+	Trace     []string          `json:"trace"`       // tool-call trace summary
+	Files     map[string][]byte `json:"files"`       // declared output files
+	ClaimedOK bool              `json:"claimed_ok"`  // agent's own claim
+}
+
+// Verdict is the gate's decision.
+type Verdict struct {
+	Passed  bool              `json:"passed"`
+	Hash    string            `json:"hash"`     // sha256 of the canonical bundle
+	Reasons []string          `json:"reasons"`  // why it failed (empty on pass)
+	Step    map[string]string `json:"step"`     // per-step status
+}
+
+// Verifier is one check in the four-step pipeline. Returns ok + a reason
+// (reason is empty on success, populated on failure).
+type Verifier interface {
+	Name() string
+	Verify(b *Bundle) (ok bool, reason string)
+}
+
+// Gate runs the verifier pipeline.
+type Gate struct {
+	verifiers []Verifier
+	ledger    *audit.Ledger
+	mu        sync.Mutex
+}
+
+// NewGate assembles a gate with the default verifiers plus any extras.
+func NewGate(ledger *audit.Ledger, extra ...Verifier) *Gate {
+	g := &Gate{ledger: ledger}
+	// default pipeline order matches plan.md §7.3
+	g.verifiers = append(g.verifiers,
+		&HashVerifier{},        // step 4 (computed first so later steps can cite it)
+		&SecretScanVerifier{},  // step 3
+	)
+	g.verifiers = append(g.verifiers, extra...) // steps 1 & 2 injected here
+	return g
+}
+
+// Verify runs every verifier; the bundle passes only if ALL pass. The verdict
+// (with the bound hash) is recorded in the audit ledger regardless of outcome.
+func (g *Gate) Verify(b *Bundle) *Verdict {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	v := &Verdict{Step: map[string]string{}, Passed: true}
+	v.Hash = hashBundle(b)
+
+	for _, ver := range g.verifiers {
+		ok, reason := ver.Verify(b)
+		if ok {
+			v.Step[ver.Name()] = "pass"
+		} else {
+			v.Step[ver.Name()] = "fail: " + reason
+			v.Passed = false
+			v.Reasons = append(v.Reasons, ver.Name()+": "+reason)
+		}
+	}
+
+	if g.ledger != nil {
+		dec := audit.DecisionAllow
+		if !v.Passed {
+			dec = audit.DecisionDeny
+		}
+		_ = g.ledger.Append(audit.Record{
+			Phase:    audit.PhaseRelease,
+			Subject:  b.TaskID,
+			Action:   "artifact_gate",
+			Params:   map[string]interface{}{"hash": v.Hash, "claimed_ok": b.ClaimedOK, "files": fileNames(b.Files)},
+			Decision: dec,
+			Reason:   strings.Join(v.Reasons, "; "),
+		})
+	}
+	return v
+}
+
+func fileNames(m map[string][]byte) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
+}
+
+// --- default verifiers ---
+
+// HashVerifier computes the canonical hash of the bundle. It always "passes"
+// (it's the binding step, not a pass/fail check) but records the hash on the
+// verdict via the gate. Implemented as a verifier so it participates in the
+// pipeline uniformity.
+type HashVerifier struct{}
+
+func (HashVerifier) Name() string { return "bind_hash" }
+func (HashVerifier) Verify(b *Bundle) (bool, string) {
+	// Always pass; the hash is already on the verdict. This step exists so the
+	// audit row records the hash even when other steps fail.
+	return true, ""
+}
+
+// hashBundle returns the canonical sha256 of a bundle. Map iteration order is
+// normalized by sorting keys.
+func hashBundle(b *Bundle) string {
+	h := sha256.New()
+	fmt.Fprintf(h, "task=%s|claimed=%t|diff=%d|build=%d|trace=%d",
+		b.TaskID, b.ClaimedOK, len(b.Diff), len(b.BuildLog), len(b.Trace))
+	// stable file hashing: sort names
+	names := make([]string, 0, len(b.Files))
+	for n := range b.Files {
+		names = append(names, n)
+	}
+	// insertion order in Go maps is random; sort for determinism
+	sortStrings(names)
+	for _, n := range names {
+		fh := sha256.Sum256(b.Files[n])
+		fmt.Fprintf(h, "|%s=%s", n, hex.EncodeToString(fh[:]))
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// SecretScanVerifier fails the gate if the diff or any file matches known
+// secret patterns (AWS keys, GitHub tokens, private keys, high-entropy secrets).
+// This is step 3 in plan.md §7.3 ("检查敏感差异").
+type SecretScanVerifier struct{}
+
+func (SecretScanVerifier) Name() string { return "secret_scan" }
+
+var secretPatterns = []*regexp.Regexp{
+	// AWS access key id
+	regexp.MustCompile(`AKIA[0-9A-Z]{16}`),
+	// AWS secret (40 chars base64-ish after explicit label)
+	regexp.MustCompile(`(?i)aws_secret_access_key["'\s:=]+[A-Za-z0-9/+=]{40}`),
+	// GitHub personal access token (classic + fine-grained)
+	regexp.MustCompile(`gh[pousr]_[A-Za-z0-9]{36,}`),
+	// Generic private key header
+	regexp.MustCompile(`-----BEGIN (RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----`),
+	// Slack token
+	regexp.MustCompile(`xox[baprs]-[A-Za-z0-9-]{10,}`),
+	// Generic api_key=... assignment with sufficient length
+	regexp.MustCompile(`(?i)(api_key|apikey|secret_key|access_token)["'\s:=]+[A-Za-z0-9_\-]{20,}`),
+}
+
+func (SecretScanVerifier) Verify(b *Bundle) (bool, string) {
+	corpus := b.Diff + "\n" + b.BuildLog
+	for _, p := range secretPatterns {
+		if p.MatchString(corpus) {
+			return false, "secret pattern matched: " + p.String()
+		}
+	}
+	for name, content := range b.Files {
+		// files are bytes; scan as string
+		s := string(content)
+		for _, p := range secretPatterns {
+			if p.MatchString(s) {
+				return false, "secret pattern in file " + name + ": " + p.String()
+			}
+		}
+	}
+	return true, ""
+}
+
+// sortStrings is a tiny dependency-free sort to keep the package lean.
+func sortStrings(s []string) {
+	// insertion sort: file-name slices are small
+	for i := 1; i < len(s); i++ {
+		for j := i; j > 0 && s[j-1] > s[j]; j-- {
+			s[j], s[j-1] = s[j-1], s[j]
+		}
+	}
+}
+
+// ErrRejected is returned by a ReleaseService when the gate rejected the bundle.
+var ErrRejected = errors.New("artifact: gate rejected bundle")
+
+// ReleaseService is the plan.md §7.2 third identity: only accepts gate-passed
+// bundles. The controller wires a real backend (git merge, deploy, send) here.
+type ReleaseService struct {
+	Gate *Gate
+	// Release executes the real-world effect. Only invoked when the gate passes.
+	Release func(b *Bundle, v *Verdict) error
+}
+
+// Submit is the only entry point: gate first, release only on pass.
+func (r *ReleaseService) Submit(b *Bundle) error {
+	v := r.Gate.Verify(b)
+	if !v.Passed {
+		return fmt.Errorf("%w: %s", ErrRejected, strings.Join(v.Reasons, "; "))
+	}
+	if r.Release != nil {
+		return r.Release(b, v)
+	}
+	return nil
+}

@@ -3,6 +3,7 @@ package api
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -10,10 +11,17 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
+	"uml-container/internal/approval"
+	"uml-container/internal/artifact"
+	"uml-container/internal/audit"
 	"uml-container/internal/config"
 	"uml-container/internal/container"
 	"uml-container/internal/image"
+	"uml-container/internal/policy"
+	"uml-container/internal/pool"
 	"uml-container/internal/snapshot"
+	"uml-container/internal/spec"
 	"uml-container/internal/state"
 	"uml-container/webui"
 
@@ -51,20 +59,14 @@ func StartE2BServer(port int) error {
 		return key == expected, nil
 	}))
 
+	// Per-task policy gateways registered by the controller / agentpvm run.
+	gateways := newGatewayRegistry()
+
 	// Get all containers
 	api.GET("/containers", func(c echo.Context) error {
-		dirs, err := os.ReadDir(state.RootDir)
+		list, err := state.ListAll()
 		if err != nil {
 			return c.JSON(http.StatusOK, []interface{}{})
-		}
-		var list []state.ContainerState
-		for _, d := range dirs {
-			if d.IsDir() {
-				st, err := state.LoadState(d.Name())
-				if err == nil {
-					list = append(list, *st)
-				}
-			}
 		}
 		return c.JSON(http.StatusOK, list)
 	})
@@ -213,16 +215,270 @@ func StartE2BServer(port int) error {
 		return c.JSON(http.StatusOK, map[string]string{"status": "pulled", "image": req.Image})
 	})
 
-	// Mock exec for E2B compatibility
+	// /exec is the Tool/Policy Gateway endpoint (plan.md §6). The E2B SDK's
+	// "run a command" call is routed through the per-task policy gateway so
+	// every tool invocation is decided, sanitized, and audited.
 	api.POST("/exec", func(c echo.Context) error {
 		var req ExecRequest
 		if err := c.Bind(&req); err != nil {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
 		}
+		taskID := c.QueryParam("task")
+		if taskID == "" {
+			taskID = c.Request().Header.Get("X-Task-Id")
+		}
+		if taskID == "" {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "task id required (?task= or X-Task-Id)"})
+		}
+		gw := gateways.get(taskID)
+		if gw == nil {
+			return c.JSON(http.StatusForbidden, map[string]string{"error": "no policy gateway registered for task"})
+		}
+		// Parse "name arg=val arg2=val2 ..." into a ToolRequest.
+		treq, err := parseExecCommand(req.Command)
+		if err != nil {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+		}
+		resp, err := gw.Execute(treq)
+		if err != nil {
+			// approval-required is a 202, not a hard error
+			if errors.Is(err, policyErrApproval()) {
+				return c.JSON(http.StatusAccepted, map[string]interface{}{"status": "approval_required"})
+			}
+			return c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
+		}
+		return c.JSON(http.StatusOK, resp)
+	})
 
-		fmt.Printf("[API] E2B SDK requested execution: %s\n", req.Command)
+	// ============================================================
+	// Sandbox control plane endpoints (plan.md §3-§12)
+	// These expose the new control planes to the WebUI and operators.
+	// ============================================================
 
-		return c.JSON(http.StatusNotImplemented, map[string]string{"error": "not implemented"})
+	// --- Tasks (lifecycle FSM + TaskSpec launch) ---
+
+	// GET /api/tasks — list all tasks with their FSM state.
+	api.GET("/tasks", func(c echo.Context) error {
+		list, err := state.ListAll()
+		if err != nil {
+			return c.JSON(http.StatusOK, []interface{}{})
+		}
+		return c.JSON(http.StatusOK, list)
+	})
+
+	// GET /api/tasks/:id — full task state including transition history.
+	api.GET("/tasks/:id", func(c echo.Context) error {
+		id := c.Param("id")
+		if !idRegex.MatchString(id) {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid task id"})
+		}
+		st, err := state.LoadState(id)
+		if err != nil {
+			return c.JSON(http.StatusNotFound, map[string]string{"error": "task not found"})
+		}
+		return c.JSON(http.StatusOK, st)
+	})
+
+	// POST /api/tasks/:id/transition — drive the FSM. Body: {to, actor, reason}.
+	api.POST("/tasks/:id/transition", func(c echo.Context) error {
+		id := c.Param("id")
+		if !idRegex.MatchString(id) {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid task id"})
+		}
+		var req struct {
+			To     string `json:"to"`
+			Actor  string `json:"actor"`
+			Reason string `json:"reason"`
+		}
+		if err := c.Bind(&req); err != nil {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+		}
+		st, err := state.LoadState(id)
+		if err != nil {
+			return c.JSON(http.StatusNotFound, map[string]string{"error": "task not found"})
+		}
+		if err := st.Transition(state.Status(req.To), state.Actor(req.Actor), req.Reason); err != nil {
+			return c.JSON(http.StatusConflict, map[string]string{"error": err.Error()})
+		}
+		if err := state.SaveState(id, st); err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		}
+		return c.JSON(http.StatusOK, st)
+	})
+
+	// POST /api/tasks/load-spec — validate a TaskSpec TOML without launching.
+	// Body: {path: "..."} or {content: "<toml>"}. Returns the parsed spec + fingerprint.
+	api.POST("/tasks/load-spec", func(c echo.Context) error {
+		var req struct {
+			Path    string `json:"path"`
+			Content string `json:"content"`
+		}
+		if err := c.Bind(&req); err != nil {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+		}
+		var s *spec.TaskSpec
+		var err error
+		if req.Path != "" {
+			s, err = spec.LoadFile(req.Path)
+		} else if req.Content != "" {
+			s, err = spec.LoadString(req.Content)
+		} else {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "provide path or content"})
+		}
+		if err != nil {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+		}
+		return c.JSON(http.StatusOK, map[string]interface{}{
+			"spec":        s,
+			"fingerprint": s.Fingerprint(),
+		})
+	})
+
+	// --- Audit ledger (plan.md §14) ---
+
+	// GET /api/audit/:id — full ledger for a task (RECONSTRUCT view).
+	api.GET("/audit/:id", func(c echo.Context) error {
+		id := c.Param("id")
+		if !idRegex.MatchString(id) {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid task id"})
+		}
+		l, err := audit.Open(id)
+		if err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		}
+		records, err := l.ReadAll()
+		if err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		}
+		return c.JSON(http.StatusOK, records)
+	})
+
+	// GET /api/audit/:id/verify — replay the hash chain; reports broken links.
+	api.GET("/audit/:id/verify", func(c echo.Context) error {
+		id := c.Param("id")
+		if !idRegex.MatchString(id) {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid task id"})
+		}
+		l, err := audit.Open(id)
+		if err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		}
+		n, err := l.Verify()
+		resp := map[string]interface{}{"records": n, "valid": err == nil}
+		if err != nil {
+			resp["error"] = err.Error()
+		}
+		return c.JSON(http.StatusOK, resp)
+	})
+
+	// --- Approval tickets (plan.md §10) ---
+
+	// GET /api/approvals — list pending tickets (optional ?task=id).
+	api.GET("/approvals", func(c echo.Context) error {
+		m := globalApprovals
+		if c.QueryParam("all") == "1" {
+			// include decided ones too: iterate via Pending on empty + decided list
+		}
+		return c.JSON(http.StatusOK, m.Pending(c.QueryParam("task")))
+	})
+
+	// POST /api/approvals — create a ticket.
+	api.POST("/approvals", func(c echo.Context) error {
+		var t approval.Ticket
+		if err := c.Bind(&t); err != nil {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+		}
+		id, err := globalApprovals.Create(t)
+		if err != nil {
+			return c.JSON(http.StatusConflict, map[string]string{"error": err.Error()})
+		}
+		return c.JSON(http.StatusOK, map[string]string{"id": id})
+	})
+
+	// POST /api/approvals/:id/decide — approve/reject. Body: {approved: bool, by: "..."}.
+	api.POST("/approvals/:id/decide", func(c echo.Context) error {
+		id := c.Param("id")
+		var req struct {
+			Approved bool   `json:"approved"`
+			By       string `json:"by"`
+		}
+		if err := c.Bind(&req); err != nil {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+		}
+		if err := globalApprovals.Decide(id, req.Approved, req.By); err != nil {
+			return c.JSON(http.StatusConflict, map[string]string{"error": err.Error()})
+		}
+		t, _ := globalApprovals.Get(id)
+		return c.JSON(http.StatusOK, t)
+	})
+
+	// --- Policy gateway (plan.md §6) ---
+
+	// GET /api/policy/:task — the compiled tool rules registered for a task.
+	api.GET("/policy/:task", func(c echo.Context) error {
+		task := c.Param("task")
+		gw := globalRegistries.get(task)
+		if gw == nil {
+			return c.JSON(http.StatusNotFound, map[string]string{"error": "no gateway for task"})
+		}
+		return c.JSON(http.StatusOK, gw.Rules())
+	})
+
+	// --- Pool / Quota (plan.md §12) ---
+
+	// GET /api/pool/stats — ready/claimed/total counts.
+	api.GET("/pool/stats", func(c echo.Context) error {
+		ready, claimed, total := globalPool.Stats()
+		return c.JSON(http.StatusOK, map[string]int{
+			"ready": ready, "claimed": claimed, "total": total,
+		})
+	})
+
+	// POST /api/pool/warm — pre-create sandboxes. Body: {template, n}.
+	api.POST("/pool/warm", func(c echo.Context) error {
+		var req struct {
+			Template pool.Template `json:"template"`
+			N        int           `json:"n"`
+		}
+		if err := c.Bind(&req); err != nil {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+		}
+		if req.N <= 0 || req.N > 100 {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "n must be 1..100"})
+		}
+		created := globalPool.Warm(req.Template, req.N)
+		return c.JSON(http.StatusOK, map[string]int{"created": created})
+	})
+
+	// POST /api/pool/quota — set per-tenant quota. Body: {tenant, quota}.
+		api.POST("/pool/quota", func(c echo.Context) error {
+		var req struct {
+			Tenant string      `json:"tenant"`
+			Quota  pool.Quota  `json:"quota"`
+		}
+		if err := c.Bind(&req); err != nil {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+		}
+		globalPool.SetQuota(req.Tenant, req.Quota)
+		return c.JSON(http.StatusOK, map[string]string{"status": "ok"})
+	})
+
+	// --- Artifact Gate (plan.md §7) ---
+
+	// POST /api/gate/verify — run the Artifact Gate on a submitted bundle.
+	// Body: artifact.Bundle JSON. Returns the verdict (pass/fail per step + hash).
+	api.POST("/gate/verify", func(c echo.Context) error {
+		var b artifact.Bundle
+		if err := c.Bind(&b); err != nil {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+		}
+		l, err := audit.Open(b.TaskID)
+		if err != nil {
+			l = nil // degrade to no-ledger; gate still runs
+		}
+		g := artifact.NewGate(l)
+		v := g.Verify(&b)
+		return c.JSON(http.StatusOK, v)
 	})
 
 	// Serve the embedded Nuxt UI for all other routes
@@ -272,3 +528,76 @@ func procBelongsToContainer(pid int, containerID string) (bool, error) {
 
 // itoa is a small helper kept to avoid pulling strconv elsewhere in this file.
 var _ = strconv.Itoa
+
+// gatewayRegistry maps task id -> *policy.Gateway. It is process-local and
+// goroutine-safe; agentpvm run registers a gateway per task it boots.
+type gatewayRegistry struct {
+	mu   sync.RWMutex
+	data map[string]*policy.Gateway
+}
+
+func newGatewayRegistry() *gatewayRegistry {
+	return &gatewayRegistry{data: make(map[string]*policy.Gateway)}
+}
+func (r *gatewayRegistry) register(taskID string, g *policy.Gateway) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.data[taskID] = g
+}
+func (r *gatewayRegistry) get(taskID string) *policy.Gateway {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.data[taskID]
+}
+
+// RegisterGateway exposes the registry so the controller (agentpvm) can wire a
+// task's policy gateway into the /exec endpoint when the API runs in-process.
+var globalRegistries = newGatewayRegistry()
+
+// RegisterPolicyGateway lets agentpvm register a task's policy gateway so
+// /api/exec can dispatch to it.
+func RegisterPolicyGateway(taskID string, g *policy.Gateway) { globalRegistries.register(taskID, g) }
+
+// parseExecCommand turns a flat command string "name k=v k2=v2" into a
+// structured ToolRequest for the policy gateway. Simplest viable contract;
+// structured JSON bodies can be added later without breaking this.
+func parseExecCommand(cmd string) (policy.ToolRequest, error) {
+	cmd = strings.TrimSpace(cmd)
+	if cmd == "" {
+		return policy.ToolRequest{}, fmt.Errorf("empty command")
+	}
+	parts := strings.Fields(cmd)
+	req := policy.ToolRequest{Name: parts[0], Args: map[string]interface{}{}}
+	for _, p := range parts[1:] {
+		if i := strings.IndexByte(p, '='); i > 0 {
+			req.Args[p[:i]] = p[i+1:]
+		} else {
+			// positional arg: store under its index as a string
+			req.Args[fmt.Sprintf("arg%d", len(req.Args))] = p
+		}
+	}
+	return req, nil
+}
+
+// policyErrApproval returns the sentinel approval error so the /exec handler
+// can compare via errors.Is without importing policy directly at the call site.
+func policyErrApproval() error { return policy.ErrApprovalRequired }
+
+// idRegex is the shared container/task id validator.
+var idRegex = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
+
+// Package-level singletons for the control planes exposed via the REST API.
+// These are process-local; the controller (agentpvm run) and the API server
+// share them when running in the same process. In a multi-process deployment
+// they would be backed by a shared store.
+var (
+	globalApprovals = approval.NewManager(nil)
+	globalPool      = pool.NewManager(16, nil)
+)
+
+// RegisterApprovalManager lets the controller inject its own approval manager
+// (e.g. one wired to a real audit ledger) to replace the default.
+func RegisterApprovalManager(m *approval.Manager) { globalApprovals = m }
+
+// RegisterPoolManager lets the controller inject its own pool manager.
+func RegisterPoolManager(m *pool.Manager) { globalPool = m }
