@@ -50,6 +50,10 @@ cat << 'EOF' | sudo tee mnt/init.sh
 #!/bin/sh
 mount -t proc proc /proc
 mount -t sysfs sys /sys
+# UML mounts root read-only by default; the kernel cmdline `rw=1` is treated as
+# an unknown parameter and ignored. Remount read-write so dd can write its log
+# and /test_write.dat (same pattern as test_pkg_install.sh).
+mount -o remount,rw / 2>/dev/null || true
 echo "=============================="
 echo " Starting IO Performance Test "
 echo "=============================="
