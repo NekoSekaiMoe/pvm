@@ -79,20 +79,18 @@ sudo umount mnt
 
 echo "Running UML with virtio-blk and io_uring..."
 CONSOLE_LOG=/var/lib/uml-container/containers/perf-test/logs/console.log
-STRACE_LOG=/var/lib/uml-container/containers/perf-test/logs/strace.log
 
 # Clean up socket and logs if they exist from a previous run to avoid false positives and conflicts
 sudo rm -f /var/lib/uml-container/containers/perf-test/vhost-blk.sock
-sudo rm -f "$CONSOLE_LOG" "$STRACE_LOG"
+sudo rm -f "$CONSOLE_LOG"
 
-# Run UML under strace (UML_STRACE=1) so that if the guest hangs we capture the
-# exact syscall it is blocked in, instead of guessing from a console.log that
-# may be truncated by pipe buffering at teardown. The strace output lands next
-# to console.log and is dumped by CI on failure.
-# `timeout` bounds the whole run; agentpvm's own exit (poweroff or crash) ends
-# it early on success, so we no longer need a separate poll loop.
-export UML_STRACE=1
-sudo -E timeout 90 ./agentpvm run -name perf-test -rootfs ${IMG_NAME} -kernel ./bin/linux -init /init.sh -vhost=true -native-vhost=true -debug > agentpvm.log 2>&1 || true
+# `timeout` bounds the whole run; agentpvm's own exit (poweroff on success or
+# crash on failure) ends it early, so we no longer poll a marker in a loop.
+# (We previously tried wrapping UML under strace to capture the blocked
+# syscall, but UML itself depends on ptrace for syscall interception, so a
+# ptrace-based tracer makes UML's PTRACE_TRACEME self-check fail with EPERM
+# and aborts boot — strace cannot be used on UML.)
+sudo timeout 90 ./agentpvm run -name perf-test -rootfs ${IMG_NAME} -kernel ./bin/linux -init /init.sh -vhost=true -native-vhost=true -debug > agentpvm.log 2>&1 || true
 
 # Ensure no lingering UML process keeps the socket/logs open for the next run.
 sudo pkill -f "agentpvm run -name perf-test" 2>/dev/null || true
@@ -108,7 +106,5 @@ echo "---- IO Perf Console Output ----"
 sudo cat "$CONSOLE_LOG" 2>/dev/null || cat agentpvm.log
 echo "---- IO Perf agentpvm output (agentpvm.log) ----"
 cat agentpvm.log 2>/dev/null || true
-echo "---- IO Perf strace tail (last 60 lines of $STRACE_LOG) ----"
-sudo tail -n 60 "$STRACE_LOG" 2>/dev/null || echo "(no strace.log; is strace installed?)"
 echo "❌ I/O Performance Test failed to complete or timed out."
 exit 1

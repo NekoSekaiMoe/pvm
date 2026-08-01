@@ -2,11 +2,9 @@ package uml
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"sync"
 )
 
@@ -29,7 +27,7 @@ type Launcher interface {
 type DefaultLauncher struct{}
 
 func (l *DefaultLauncher) Start(ctx context.Context, kernel string, args []string, logFile *os.File) (int, *Process, error) {
-	cmd := l.buildCmd(ctx, kernel, args, logFile)
+	cmd := exec.CommandContext(ctx, kernel, args...)
 	// Use pipes for stdout/stderr to prevent UML epoll_ctl errors on regular files
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -67,29 +65,11 @@ func (l *DefaultLauncher) Start(ctx context.Context, kernel string, args []strin
 	return cmd.Process.Pid, p, nil
 }
 
-// buildCmd assembles the exec.Cmd for the UML kernel. If the UML_STRACE
-// environment variable is set (to any non-empty value) and strace is on PATH,
-// the kernel is launched under `strace -f -o <dir>/strace.log` so a hang can be
-// pinpointed to the exact syscall even when console.log is truncated by
-// buffering/teardown. The strace output lands next to console.log (derived
-// from logFile's directory) so existing CI log-dump logic picks it up. If
-// strace is requested but missing, the launch proceeds without it and a
-// warning is printed so a misconfigured tracer never silently blocks startup.
-func (l *DefaultLauncher) buildCmd(ctx context.Context, kernel string, args []string, logFile *os.File) *exec.Cmd {
-	if os.Getenv("UML_STRACE") != "" {
-		if stracePath, err := exec.LookPath("strace"); err == nil {
-			straceLog := "uml.strace.log"
-			if logFile != nil && logFile.Name() != "" {
-				straceLog = filepath.Join(filepath.Dir(logFile.Name()), "strace.log")
-			}
-			straceArgs := []string{"-f", "-o", straceLog, "-s", "512", "-tt", "--", kernel}
-			straceArgs = append(straceArgs, args...)
-			return exec.CommandContext(ctx, stracePath, straceArgs...)
-		}
-		fmt.Printf("Warning: UML_STRACE set but strace not on PATH; launching without tracer\n")
-	}
-	return exec.CommandContext(ctx, kernel, args...)
-}
+// (buildCmd was previously used to optionally wrap UML under strace for hang
+// diagnosis. That was removed: UML itself relies on ptrace for syscall
+// interception, so running it under a ptrace-based tracer like strace makes
+// UML's self-check fail with PTRACE_TRACEME EPERM and aborts boot before the
+// kernel even prints its version line. Do not re-add strace here.)
 
 func (l *DefaultLauncher) Wait(p *Process) error {
 	// Per os/exec.StdoutPipe docs: wait must happen after reading is complete.

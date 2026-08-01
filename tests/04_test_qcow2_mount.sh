@@ -5,8 +5,12 @@ echo "========== Test 04: qcow2 CoW Direct Mount =========="
 
 go build -o agentpvm cmd/agentpvm/main.go
 
-# Generate a fake backing image
+# Generate a backing image formatted as ext4. The overlay inherits a valid
+# superblock from base.img so the guest's mount_root can actually recognize it;
+# an all-zero backing file (the previous dd-only base) always panics with
+# "VFS: Unable to mount root fs" because no filesystem signature is present.
 dd if=/dev/zero of=base.img bs=1M count=10 > /dev/null 2>&1
+mkfs.ext4 -q base.img
 
 # Create CoW qcow2 using our Go CLI (simulating direct call)
 if ! command -v qemu-img &> /dev/null; then
