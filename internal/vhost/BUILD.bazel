@@ -2,21 +2,10 @@ load("@rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
     name = "vhost",
-    srcs = [
-        "backend.go",
-        "block.go",
-        "memory.go",
-        "net.go",
-        "protocol.go",
-        "server.go",
-        "virtqueue.go",
-    ],
+    srcs = ["backend.go"],
     importpath = "uml-container/internal/vhost",
     visibility = ["//:__subpackages__"],
-    deps = [
-        "//internal/pkg/iouring-go",
-        "//internal/state",
-    ],
+    deps = ["//internal/state"],
 )
 
 go_test(

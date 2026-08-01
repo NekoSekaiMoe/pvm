@@ -65,6 +65,12 @@ func (l *DefaultLauncher) Start(ctx context.Context, kernel string, args []strin
 	return cmd.Process.Pid, p, nil
 }
 
+// (buildCmd was previously used to optionally wrap UML under strace for hang
+// diagnosis. That was removed: UML itself relies on ptrace for syscall
+// interception, so running it under a ptrace-based tracer like strace makes
+// UML's self-check fail with PTRACE_TRACEME EPERM and aborts boot before the
+// kernel even prints its version line. Do not re-add strace here.)
+
 func (l *DefaultLauncher) Wait(p *Process) error {
 	// Per os/exec.StdoutPipe docs: wait must happen after reading is complete.
 	// First drain the copy goroutines (they exit when the pipes close on

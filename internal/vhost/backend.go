@@ -1,3 +1,14 @@
+// Package vhost wires up virtio devices to UML via the vhost-user protocol.
+//
+// Today the only backend is qemu-storage-daemon for virtio-blk: PVM launches it
+// as a subprocess and points UML's virtio_uml.device=<socket>:2 at the unix
+// socket it serves. A native Go vhost-user server previously lived here but
+// was removed — it never reached a working state, and qemu-storage-daemon is
+// the mature reference implementation.
+//
+// VirtioIDNet is still defined so internal/container/manager.go can keep
+// constructing the virtio_uml net command line for future use, even though no
+// vhost-user-net backend is wired up right now.
 package vhost
 
 import (
@@ -12,33 +23,18 @@ import (
 	"uml-container/internal/state"
 )
 
-// StartNativeDaemon starts the experimental native Go vhost-user server
-func StartNativeDaemon(containerID string, imagePath string) (string, *Server, error) {
-	dir, err := state.ContainerDir(containerID)
-	if err != nil {
-		return "", nil, err
-	}
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return "", nil, fmt.Errorf("failed to create dir: %v", err)
-	}
-	socketPath := filepath.Join(dir, "vhost-blk.sock")
+// Virtio device IDs as defined in the kernel's virtio_ids.h. Used by the UML
+// virtio_uml driver command line: virtio_uml.device=<socket>:<virtio_id>.
+const (
+	VirtioIDNet   = 1
+	VirtioIDBlock = 2
+)
 
-	blk, err := NewBlockDevice(imagePath)
-	if err != nil {
-		return "", nil, fmt.Errorf("failed to open block device %s: %v", imagePath, err)
-	}
-
-	server := NewServer(socketPath, blk, nil)
-	if err := server.Start(); err != nil {
-		return "", nil, fmt.Errorf("native vhost server failed to start: %v", err)
-	}
-
-	// For the native server, it runs in goroutines, so it's instantly ready
-	return socketPath, server, nil
-}
-
-// StartStorageDaemon starts qemu-storage-daemon to provide a vhost-user-blk socket.
-// Requires qemu-storage-daemon installed on the host.
+// StartStorageDaemon starts qemu-storage-daemon to provide a vhost-user-blk
+// socket and returns the socket path plus the running daemon process (the
+// caller is responsible for killing it on teardown). Requires
+// qemu-storage-daemon installed on the host; image format is inferred from the
+// path extension (.qcow2 -> qcow2, otherwise raw).
 func StartStorageDaemon(containerID string, imagePath string) (string, *exec.Cmd, error) {
 	dir, err := state.ContainerDir(containerID)
 	if err != nil {
@@ -48,7 +44,7 @@ func StartStorageDaemon(containerID string, imagePath string) (string, *exec.Cmd
 		return "", nil, fmt.Errorf("failed to create dir: %v", err)
 	}
 	socketPath := filepath.Join(dir, "vhost-blk.sock")
-	
+
 	// If it already exists, remove it
 	if err := os.Remove(socketPath); err != nil && !os.IsNotExist(err) {
 		return "", nil, fmt.Errorf("failed to remove socket: %v", err)
@@ -59,6 +55,8 @@ func StartStorageDaemon(containerID string, imagePath string) (string, *exec.Cmd
 		formatDriver = "qcow2"
 	}
 
+	// imagePath is interpolated directly into qemu-storage-daemon args; a comma
+	// would inject a new option, so reject it before exec.
 	if strings.Contains(imagePath, ",") {
 		return "", nil, fmt.Errorf("invalid imagePath: cannot contain comma")
 	}
@@ -73,12 +71,13 @@ func StartStorageDaemon(containerID string, imagePath string) (string, *exec.Cmd
 		"--blockdev", fmt.Sprintf("driver=%s,node-name=format0,file=disk0", formatDriver),
 		"--export", fmt.Sprintf("type=vhost-user-blk,id=export0,node-name=format0,addr.type=unix,addr.path=%s,writable=on", socketPath),
 	)
-	
+
 	if err := cmd.Start(); err != nil {
 		return "", nil, fmt.Errorf("failed to start qemu-storage-daemon: %v", err)
 	}
-	
-	// Wait for socket to be created
+
+	// Wait for socket to be created (the daemon takes a moment to set up the
+	// export). Bail early if the daemon dies before publishing the socket.
 	found := false
 	for i := 0; i < 10; i++ {
 		if _, err := os.Stat(socketPath); err == nil {
@@ -93,7 +92,7 @@ func StartStorageDaemon(containerID string, imagePath string) (string, *exec.Cmd
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	
+
 	if !found {
 		if cmd.Process != nil {
 			cmd.Process.Kill()
@@ -101,34 +100,12 @@ func StartStorageDaemon(containerID string, imagePath string) (string, *exec.Cmd
 		}
 		return "", nil, fmt.Errorf("timeout waiting for socket to be created: %s", socketPath)
 	}
-	
+
 	return socketPath, cmd, nil
 }
 
-// StartNativeNetDaemon starts a native Go vhost-user server for virtio-net
-func StartNativeNetDaemon(containerID string, tapName string, bridgeName string) (string, *Server, error) {
-	dir, err := state.ContainerDir(containerID)
-	if err != nil {
-		return "", nil, err
-	}
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return "", nil, err
-	}
-	socketPath := filepath.Join(dir, "vhost-net.sock")
-
-	netDev, err := NewNetDevice(tapName, bridgeName)
-	if err != nil {
-		return "", nil, fmt.Errorf("failed to init net device: %v", err)
-	}
-
-	server := NewServer(socketPath, nil, netDev)
-	if err := server.Start(); err != nil {
-		return "", nil, fmt.Errorf("native vhost net server failed to start: %v", err)
-	}
-
-	return socketPath, server, nil
-}
-
+// supportsIoUring reports whether the installed qemu-img advertises io_uring
+// support, so StartStorageDaemon can pick the faster AIO backend when present.
 func supportsIoUring() bool {
 	out, _ := exec.Command("qemu-img", "--help").CombinedOutput()
 	return strings.Contains(string(out), "io_uring")

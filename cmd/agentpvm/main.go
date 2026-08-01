@@ -13,6 +13,7 @@ import (
 	"uml-container/internal/container"
 	"uml-container/internal/cow"
 	"uml-container/internal/ebpf"
+	"uml-container/internal/log"
 	"uml-container/internal/network"
 	"uml-container/internal/snapshot"
 	"uml-container/internal/vhost"
@@ -32,15 +33,19 @@ func main() {
 		name := runCmd.String("name", "agent1", "Sandbox name")
 		rootfs := runCmd.String("rootfs", "rootfs.img", "Root filesystem")
 		useVhost := runCmd.Bool("vhost", true, "Use vhost-user-blk for storage")
-		nativeVhost := runCmd.Bool("native-vhost", false, "Use experimental native Go vhost-user backend")
 		kernel := runCmd.String("kernel", "./bin/linux", "Kernel path")
 		initPath := runCmd.String("init", "/init.sh", "Init script path")
 		memory := runCmd.String("memory", "512M", "Container memory")
 		cpu := runCmd.Int("cpu", 0, "CPU limit (0 means no limit)")
 		netTap := runCmd.String("net-tap", "", "Network tap device to use")
-		nativeVhostNet := runCmd.Bool("native-vhost-net", false, "Use native Go vhost-user-net backend for networking")
+		debug := runCmd.Bool("debug", false, "Enable debug logging (verbose vhost-user protocol output)")
 
 		runCmd.Parse(os.Args[2:])
+
+		if *debug {
+			log.Default().SetLevel(log.LevelDebug)
+			log.Default().Infof("debug logging enabled")
+		}
 
 		if !regexp.MustCompile(`^[a-zA-Z0-9_-]+$`).MatchString(*name) {
 			fmt.Println("Error: Invalid container name format")
@@ -61,26 +66,20 @@ func main() {
 		var sockPath string
 		var vhostProcess *exec.Cmd
 		if *useVhost {
-			if *nativeVhost {
-				fmt.Println("Starting native vhost-user backend...")
-				sock, _, err := vhost.StartNativeDaemon(*name, *rootfs)
-				if err != nil {
-					fmt.Printf("Error starting native vhost: %v\n", err)
-					os.Exit(1)
-				}
-				sockPath = sock
-			} else {
-				fmt.Println("Starting qemu-storage-daemon for vhost-user block device...")
-				sock, daemonCmd, err := vhost.StartStorageDaemon(*name, *rootfs)
-				if err != nil {
-					fmt.Printf("Error starting vhost: %v\n", err)
-					os.Exit(1)
-				}
-				vhostProcess = daemonCmd
-				defer vhostProcess.Process.Kill()
-				sockPath = sock
-				fmt.Printf("Vhost socket ready at %s\n", sock)
+			// Block backend: qemu-storage-daemon is the only vhost-user-blk
+			// backend. The experimental native Go backend was removed — it never
+			// reached a working state (guest connected but never sent a byte),
+			// and qemu-storage-daemon is the mature reference implementation.
+			fmt.Println("Starting qemu-storage-daemon for vhost-user block device...")
+			sock, daemonCmd, err := vhost.StartStorageDaemon(*name, *rootfs)
+			if err != nil {
+				fmt.Printf("Error starting vhost: %v\n", err)
+				os.Exit(1)
 			}
+			vhostProcess = daemonCmd
+			defer vhostProcess.Process.Kill()
+			sockPath = sock
+			fmt.Printf("Vhost socket ready at %s\n", sock)
 		}
 
 		mgr := container.NewManager(nil)
@@ -97,17 +96,6 @@ func main() {
 			UseVirtio:       *useVhost,
 			VhostUserSocket: sockPath,
 			NetworkTap:      *netTap,
-		}
-
-		if *netTap != "" && *nativeVhostNet {
-			fmt.Println("Starting native vhost-user-net backend...")
-			// Create a default bridge name or assume it's set up
-			netSock, _, err := vhost.StartNativeNetDaemon(*name, *netTap, "")
-			if err != nil {
-				fmt.Printf("Error starting native vhost net: %v\n", err)
-			} else {
-				cfg.VhostNetSocket = netSock
-			}
 		}
 
 		if err := mgr.Start(context.Background(), cfg); err != nil {

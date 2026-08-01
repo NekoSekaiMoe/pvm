@@ -10,6 +10,7 @@ import (
 	"uml-container/internal/log"
 	"uml-container/internal/state"
 	"uml-container/internal/uml"
+	"uml-container/internal/vhost"
 )
 
 type ContextKey string
@@ -45,20 +46,33 @@ func (m *Manager) Start(ctx context.Context, cfg *config.ContainerConfig) error 
 	}
 
 	if cfg.UseVirtio && cfg.VhostUserSocket != "" {
-		args = append(args, fmt.Sprintf("virtio=0,vhost-user,socket=%s", cfg.VhostUserSocket))
+		// UML virtio_uml 驱动的命令行语法 (见 arch/um/drivers/virtio_uml.c):
+		//   virtio_uml.device=<socket>:<virtio_id>[:<platform_id>]
+		// virtio_id 取自 virtio_ids.h: 1=net, 2=block。
+		// 之前用的 "virtio=0,vhost-user,socket=..." 是无效语法, 内核会
+		// 当成未知参数丢弃, 导致 /dev/vda 永远不会出现、VFS 无法挂载 root。
+		args = append(args, fmt.Sprintf("virtio_uml.device=%s:%d", cfg.VhostUserSocket, vhost.VirtioIDBlock))
 		args = append(args, "root=/dev/vda")
 	} else {
 		args = append(args, fmt.Sprintf("ubd0=%s", cfg.Rootfs))
 		args = append(args, "root=/dev/ubda")
 	}
-	// UML 默认以只读方式挂载根文件系统，而容器 init 经常需要写
-	// /etc/resolv.conf、apk 缓存等。显式 rw 让根可写，与 test_integration
-	// 之外所有需要写入的初始化脚本兼容。
-	args = append(args, "rw=1")
+	// 根文件系统默认只读（init/do_mounts.c 的 root_mountflags 默认含
+	// MS_RDONLY）。UML 同样遵循此默认。显式传裸 "rw" 让根可写——容器
+	// init 经常需要写 /etc/resolv.conf、apk 缓存等。
+	//
+	// 注意：内核对 "rw" 的 __setup 处理是 `if (*str) return 0`，即只要
+	// "rw" 后面跟了 '=' 就拒绝识别。所以 "rw=1" 会被当成未知参数丢弃
+	// （之前 console.log 里就有
+	//   "Unknown kernel command line parameters ... rw=1"
+	// 这一行），root 保持只读，init 必须自己 mount -o remount,rw。用裸
+	// "rw" 让内核直接清除 MS_RDONLY，init 无需 remount。
+	args = append(args, "rw")
 
 	if cfg.NetworkTap != "" {
 		if cfg.VhostNetSocket != "" {
-			args = append(args, fmt.Sprintf("virtio=1,vhost-user,socket=%s", cfg.VhostNetSocket))
+			// 同上: virtio_uml.device=<socket>:<virtio_id>, net 用 VIRTIO_ID_NET。
+			args = append(args, fmt.Sprintf("virtio_uml.device=%s:%d", cfg.VhostNetSocket, vhost.VirtioIDNet))
 		} else if cfg.UseVirtio {
 			args = append(args, fmt.Sprintf("vec0:transport=tap,ifname=%s,vnet=1", cfg.NetworkTap))
 		} else {
