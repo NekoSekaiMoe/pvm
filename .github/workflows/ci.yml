@@ -100,8 +100,8 @@ jobs:
           echo "----- $f -----"
           cat "$f" 2>/dev/null || sudo cat "$f" 2>/dev/null || true
         done
-        echo "===== UML container console logs ====="
-        for f in /var/lib/uml-container/containers/*/logs/console.log; do
+        echo "===== UML container logs (console + strace) ====="
+        for f in /var/lib/uml-container/containers/*/logs/*; do
           [ -f "$f" ] || continue
           echo "----- $f -----"
           sudo cat "$f"

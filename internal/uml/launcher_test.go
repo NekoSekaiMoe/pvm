@@ -67,6 +67,77 @@ func TestDefaultLauncher_StartReportsExecErrors(t *testing.T) {
 	}
 }
 
+// TestBuildCmd_StraceWrapped verifies that setting UML_STRACE launches the
+// kernel under strace writing next to the console log, so a hang can be
+// diagnosed from the syscall trace. It requires strace on PATH (CI has it);
+// otherwise the test is skipped rather than failed.
+func TestBuildCmd_StraceWrapped(t *testing.T) {
+	if _, err := exec.LookPath("strace"); err != nil {
+		t.Skip("strace not on PATH")
+	}
+	logDir := t.TempDir()
+	logFile, err := os.OpenFile(filepath.Join(logDir, "console.log"), os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		t.Fatalf("open log: %v", err)
+	}
+	defer logFile.Close()
+
+	t.Setenv("UML_STRACE", "1")
+	l := &DefaultLauncher{}
+	cmd := l.buildCmd(context.Background(), "/path/to/linux", []string{"init=/init.sh", "mem=512M"}, logFile)
+
+	if len(cmd.Args) == 0 || filepath.Base(cmd.Args[0]) != "strace" {
+		t.Fatalf("expected strace as argv[0], got %#q", cmd.Args)
+	}
+	// -o target must be the strace.log beside console.log.
+	wantOut := filepath.Join(logDir, "strace.log")
+	foundOut := false
+	for i, a := range cmd.Args {
+		if a == "-o" && i+1 < len(cmd.Args) && cmd.Args[i+1] == wantOut {
+			foundOut = true
+		}
+	}
+	if !foundOut {
+		t.Errorf("strace args %#q missing -o %s", cmd.Args, wantOut)
+	}
+	// Must trace all forks (-f) so UML child threads are covered.
+	if !sliceContains(cmd.Args, "-f") {
+		t.Errorf("strace args %#q missing -f (follow forks)", cmd.Args)
+	}
+	// Kernel + its args come after --.
+	sep := -1
+	for i, a := range cmd.Args {
+		if a == "--" {
+			sep = i
+			break
+		}
+	}
+	if sep < 0 || sep+1 >= len(cmd.Args) || cmd.Args[sep+1] != "/path/to/linux" {
+		t.Errorf("strace args %#q do not pass kernel after --", cmd.Args)
+	}
+}
+
+// TestBuildCmd_NoStraceWithoutEnv verifies the default path: without UML_STRACE
+// the kernel is launched directly (no tracer wrapper), so normal startup
+// performance/behavior is unaffected.
+func TestBuildCmd_NoStraceWithoutEnv(t *testing.T) {
+	os.Unsetenv("UML_STRACE")
+	l := &DefaultLauncher{}
+	cmd := l.buildCmd(context.Background(), "/path/to/linux", []string{"mem=512M"}, nil)
+	if cmd.Args[0] != "/path/to/linux" {
+		t.Errorf("expected direct kernel launch, got %#q", cmd.Args)
+	}
+}
+
+func sliceContains(s []string, want string) bool {
+	for _, v := range s {
+		if v == want {
+			return true
+		}
+	}
+	return false
+}
+
 // TestProcess_WaitGroupSafeOnStartFailure ensures Start's WaitGroup won't
 // deadlock Wait if cmd.Start itself fails after pipes were created.
 func TestProcess_WaitGroupSafeOnStartFailure(t *testing.T) {
