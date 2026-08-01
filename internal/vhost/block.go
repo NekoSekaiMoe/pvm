@@ -49,6 +49,17 @@ func (b *BlockDevice) Fd() int {
 	return int(b.file.Fd())
 }
 
+// Size returns the backing file size in bytes. virtio-blk GET_CONFIG needs the
+// total sector count (size/512); without it the guest refuses to probe the
+// device ("Couldn't determine size of device's file").
+func (b *BlockDevice) Size() (int64, error) {
+	fi, err := b.file.Stat()
+	if err != nil {
+		return 0, err
+	}
+	return fi.Size(), nil
+}
+
 func (b *BlockDevice) ReadAt(p []byte, off int64) (n int, err error) {
 	return b.file.ReadAt(p, off)
 }

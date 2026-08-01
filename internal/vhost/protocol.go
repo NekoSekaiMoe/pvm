@@ -5,6 +5,16 @@ import (
 	"fmt"
 )
 
+// Virtio device IDs as defined in the kernel's virtio_ids.h.
+// Used by the UML virtio_uml driver command line:
+//   virtio_uml.device=<socket>:<virtio_id>
+const (
+	VirtioIDNet     = 1
+	VirtioIDBlock   = 2
+	VirtioIDConsole = 3
+	VirtioIDRNG     = 4
+)
+
 // Vhost-user request types
 const (
 	VhostUserNone                = 0
