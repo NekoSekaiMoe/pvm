@@ -1,7 +1,7 @@
 #!/bin/bash
 set -eo pipefail
 
-echo "========== I/O Performance Test (virtio-blk native backend) =========="
+echo "========== I/O Performance Test (virtio-blk) =========="
 
 # Build the agentpvm and umlctl
 go build -o agentpvm cmd/agentpvm/main.go
@@ -12,13 +12,19 @@ if [ ! -f "bin/linux" ]; then
     exit 1
 fi
 
-# The native Go vhost-user backend does not require qemu-storage-daemon;
-# only the fallback (-native-vhost=false) path uses it.
-
+# Two backends are exercised, in this order:
+#   1. qemu-storage-daemon (-native-vhost=false): the mature reference
+#      vhost-user-blk implementation. Run first so a native-backend hang does
+#      not gate the baseline measurement; if this stage fails, the test bails
+#      immediately because even the reference path is broken.
+#   2. native Go backend (-native-vhost=true): the experimental backend whose
+#      virtqueue IO path uses synchronous pread/pwrite (see internal/vhost/
+#      virtqueue.go). Run last so a regression here is reported without
+#      blocking the qemu stage's result.
 if qemu-img --help | grep -q "io_uring"; then
-    echo "AIO Backend: io_uring supported and will be used."
+    echo "AIO Backend: io_uring supported and will be used by qemu-storage-daemon where applicable."
 else
-    echo "AIO Backend: io_uring not supported, will fallback to threads."
+    echo "AIO Backend: io_uring not supported, qemu-storage-daemon will fallback to threads."
 fi
 
 IMG_NAME="perf_rootfs.img"
@@ -75,37 +81,66 @@ sudo chmod +x mnt/init.sh
 trap - EXIT
 sudo umount mnt
 
-echo "Running UML with virtio-blk and io_uring..."
-CONSOLE_LOG=/var/lib/uml-container/containers/perf-test/logs/console.log
+# run_one <name> <native_flag> <agentpvm_log> <console_log>
+# Runs one UML guest under the chosen backend, bounded by timeout, and returns
+# 0 only if PERF_TEST_COMPLETED appears in the console log. It never exits the
+# script itself; the caller decides the overall result so both backends get a
+# chance to run.
+run_one() {
+    local name="$1"
+    local native_flag="$2"
+    local ap_log="$3"
+    local console_log="$4"
 
-# Clean up socket and logs if they exist from a previous run to avoid false positives and conflicts
-sudo rm -f /var/lib/uml-container/containers/perf-test/vhost-blk.sock
-sudo rm -f "$CONSOLE_LOG"
+    echo "---- running backend: $name ($native_flag) ----"
+    sudo rm -f "/var/lib/uml-container/containers/${name}/vhost-blk.sock" "$console_log" "$ap_log"
 
-# Run the UML guest with the native Go vhost-user backend (-native-vhost).
-# The virtqueue IO path now uses synchronous pread/pwrite instead of
-# io_uring Preadv/Pwritev; iouring-go builds the iovec array as a local the
-# SQE only holds a raw pointer to, so under dd load a GC cycle left a
-# dangling iovec and the kernel EFAULTed/corrupted reads, stalling the guest.
-# Sync IO is correct and fast enough for this test. If this regresses, the
-# -debug flag yields the full protocol log in agentpvm.log.
-# `timeout` bounds the whole run; agentpvm's own exit (poweroff on success or
-# crash on failure) ends it early.
-sudo timeout 120 ./agentpvm run -name perf-test -rootfs ${IMG_NAME} -kernel ./bin/linux -init /init.sh -vhost=true -native-vhost=true -debug > agentpvm.log 2>&1 || true
+    # `timeout` bounds the whole run; agentpvm's own exit (poweroff on success
+    # or crash on failure) ends it early. -debug yields the full vhost protocol
+    # log to the agentpvm log on failure.
+    sudo timeout 120 ./agentpvm run -name "$name" -rootfs "${IMG_NAME}" \
+        -kernel ./bin/linux -init /init.sh -vhost=true $native_flag -debug \
+        > "$ap_log" 2>&1 || true
 
-# Ensure no lingering UML process keeps the socket/logs open for the next run.
-sudo pkill -f "agentpvm run -name perf-test" 2>/dev/null || true
+    # Ensure no lingering UML process keeps the socket/logs open for the next run.
+    sudo pkill -f "agentpvm run -name $name" 2>/dev/null || true
 
-if sudo grep -q "PERF_TEST_COMPLETED" "$CONSOLE_LOG" 2>/dev/null; then
-    echo "---- IO Perf Console Output ----"
-    sudo cat "$CONSOLE_LOG" 2>/dev/null || cat agentpvm.log
-    echo "✅ I/O Performance Test completed successfully!"
-    exit 0
+    if sudo grep -q "PERF_TEST_COMPLETED" "$console_log" 2>/dev/null; then
+        echo "✅ $name: I/O perf completed."
+        return 0
+    fi
+    echo "❌ $name: I/O perf failed (no PERF_TEST_COMPLETED)."
+    echo "----- $name console.log -----"
+    sudo cat "$console_log" 2>/dev/null || echo "(no console.log)"
+    echo "----- $name $ap_log -----"
+    cat "$ap_log" 2>/dev/null || true
+    return 1
+}
+
+OVERALL=0
+
+# 1) qemu-storage-daemon (reference). Requires the daemon; skip cleanly if absent.
+QEMU_LOG=agentpvm_qemu.log
+QEMU_CONSOLE=/var/lib/uml-container/containers/perf-test/logs/console.log
+if ! command -v qemu-storage-daemon &> /dev/null; then
+    echo "Skipping qemu-storage-daemon backend: qemu-storage-daemon is not installed."
+elif ! run_one "perf-test" "-native-vhost=false" "$QEMU_LOG" "$QEMU_CONSOLE"; then
+    # The reference path is the baseline; if it fails, the native stage is not
+    # going to diagnose anything new, so bail out.
+    echo "qemu-storage-daemon backend failed; aborting before native stage."
+    exit 1
 fi
 
-echo "---- IO Perf Console Output ----"
-sudo cat "$CONSOLE_LOG" 2>/dev/null || cat agentpvm.log
-echo "---- IO Perf agentpvm output (agentpvm.log) ----"
-cat agentpvm.log 2>/dev/null || true
-echo "❌ I/O Performance Test failed to complete or timed out."
+# 2) native Go backend (synchronous pread/pwrite; see internal/vhost/virtqueue.go).
+NATIVE_LOG=agentpvm_native.log
+NATIVE_CONSOLE=/var/lib/uml-container/containers/perf-test-native/logs/console.log
+if ! run_one "perf-test-native" "-native-vhost=true" "$NATIVE_LOG" "$NATIVE_CONSOLE"; then
+    OVERALL=1
+fi
+
+if [ $OVERALL -eq 0 ]; then
+    echo "✅ I/O Performance Test completed successfully on all backends!"
+    exit 0
+fi
+echo "❌ I/O Performance Test failed on one or more backends."
 exit 1
