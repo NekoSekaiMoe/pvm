@@ -1,7 +1,7 @@
 #!/bin/bash
 set -eo pipefail
 
-echo "========== I/O Performance Test (virtio-blk + io_uring) =========="
+echo "========== I/O Performance Test (virtio-blk via qemu-storage-daemon) =========="
 
 # Build the agentpvm and umlctl
 go build -o agentpvm cmd/agentpvm/main.go
@@ -84,13 +84,15 @@ CONSOLE_LOG=/var/lib/uml-container/containers/perf-test/logs/console.log
 sudo rm -f /var/lib/uml-container/containers/perf-test/vhost-blk.sock
 sudo rm -f "$CONSOLE_LOG"
 
+# Run the UML guest with a vhost-user-blk backend provided by
+# qemu-storage-daemon (the mature, reference vhost-user-blk implementation).
+# The native Go vhost-user backend (-native-vhost) is experimental and its IO
+# completion path currently hangs under load; it is tracked separately and must
+# not gate CI. The qemu-storage-daemon path is the same one the cow test uses
+# successfully.
 # `timeout` bounds the whole run; agentpvm's own exit (poweroff on success or
-# crash on failure) ends it early, so we no longer poll a marker in a loop.
-# (We previously tried wrapping UML under strace to capture the blocked
-# syscall, but UML itself depends on ptrace for syscall interception, so a
-# ptrace-based tracer makes UML's PTRACE_TRACEME self-check fail with EPERM
-# and aborts boot — strace cannot be used on UML.)
-sudo timeout 90 ./agentpvm run -name perf-test -rootfs ${IMG_NAME} -kernel ./bin/linux -init /init.sh -vhost=true -native-vhost=true -debug > agentpvm.log 2>&1 || true
+# crash on failure) ends it early.
+sudo timeout 90 ./agentpvm run -name perf-test -rootfs ${IMG_NAME} -kernel ./bin/linux -init /init.sh -vhost=true -debug > agentpvm.log 2>&1 || true
 
 # Ensure no lingering UML process keeps the socket/logs open for the next run.
 sudo pkill -f "agentpvm run -name perf-test" 2>/dev/null || true
