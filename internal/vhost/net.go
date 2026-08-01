@@ -53,40 +53,42 @@ func NewNetDevice(tapName string, bridgeName string) (*NetDevice, error) {
 	return &NetDevice{tapFile: f}, nil
 }
 
-// StartTX handles Transmit from Guest to Host (Queue 1)
+// StartTX handles Transmit from Guest to Host (Queue 1). It reuses the
+// VirtQueue epoll kick loop so it can be stopped via vq.stopFd.
 func (n *NetDevice) StartTX(vq *VirtQueue, mem *Memory) {
-	buf := make([]byte, 8)
-	for {
-		_, err := syscall.Read(vq.KickFd, buf)
-		if err != nil { break }
-		
-		availBytes, err := mem.GuestToHost(vq.AvailAddr, 4)
-		if err != nil { continue }
-		
-		availIdx := binary.LittleEndian.Uint16(availBytes[2:4])
-		
-		for vq.LastAvail != availIdx {
-			ringOffset := uint64(4 + (vq.LastAvail % uint16(vq.Num)) * 2)
-			headBytes, err := mem.GuestToHost(vq.AvailAddr + ringOffset, 2)
-			if err != nil { break }
-			headIdx := binary.LittleEndian.Uint16(headBytes)
-			
-			// read packet and write to tap
-			written := n.processTXChain(mem, vq, headIdx)
-			vq.completeRequest(mem, headIdx, written)
-			vq.LastAvail++
+	vq.runProcessor(func() bool {
+		n.processTXAvailable(mem, vq)
+		return true
+	}, "NetTX")
+}
+
+// processTXAvailable drains pending TX descriptors for one kick.
+func (n *NetDevice) processTXAvailable(mem *Memory, vq *VirtQueue) {
+	if vq.Num == 0 {
+		return
+	}
+	availBytes, err := mem.GuestToHost(vq.AvailAddr, 4)
+	if err != nil {
+		return
+	}
+	availIdx := binary.LittleEndian.Uint16(availBytes[2:4])
+	for vq.LastAvail != availIdx {
+		ringOffset := uint64(4 + (int(vq.LastAvail)%int(vq.Num))*2)
+		headBytes, err := mem.GuestToHost(vq.AvailAddr+ringOffset, 2)
+		if err != nil {
+			return
 		}
+		headIdx := binary.LittleEndian.Uint16(headBytes)
+		written := n.processTXChain(mem, vq, headIdx)
+		vq.completeRequest(mem, headIdx, written)
+		vq.LastAvail++
 	}
 }
 
 func (n *NetDevice) processTXChain(mem *Memory, vq *VirtQueue, headIdx uint16) uint32 {
 	currIdx := headIdx
 	var written uint32
-	
-	// virtio-net header is 10 or 12 bytes depending on features.
-	// Data immediately follows the header or is in the next descriptor.
-	// We just read all buffers.
-	isFirst := true
+
 	iter := uint32(0)
 	for {
 		if iter >= vq.Num {
@@ -95,17 +97,21 @@ func (n *NetDevice) processTXChain(mem *Memory, vq *VirtQueue, headIdx uint16) u
 		iter++
 
 		descBytes, err := mem.GuestToHost(vq.DescAddr+uint64(currIdx)*16, 16)
-		if err != nil { return written }
-		
+		if err != nil {
+			return written
+		}
+
 		addr := binary.LittleEndian.Uint64(descBytes[0:8])
 		length := binary.LittleEndian.Uint32(descBytes[8:12])
 		flags := binary.LittleEndian.Uint16(descBytes[12:14])
 		next := binary.LittleEndian.Uint16(descBytes[14:16])
-		
-		buf, err := mem.GuestToHost(addr, uint64(length))
-		if err != nil { return written }
 
-		if isFirst {
+		buf, err := mem.GuestToHost(addr, uint64(length))
+		if err != nil {
+			return written
+		}
+
+		if iter == 1 {
 			// virtio-net header (10/12 bytes). Skip it for TAP write.
 			hdrLen := uint32(10)
 			if length > hdrLen {
@@ -113,15 +119,18 @@ func (n *NetDevice) processTXChain(mem *Memory, vq *VirtQueue, headIdx uint16) u
 				if nw > 0 {
 					written += uint32(nw)
 				}
-				if err != nil { return written }
+				if err != nil {
+					return written
+				}
 			}
-			isFirst = false
 		} else {
 			nw, err := n.tapFile.Write(buf)
 			if nw > 0 {
 				written += uint32(nw)
 			}
-			if err != nil { return written }
+			if err != nil {
+				return written
+			}
 		}
 
 		if (flags & VRingDescFNext) == 0 {
@@ -132,44 +141,60 @@ func (n *NetDevice) processTXChain(mem *Memory, vq *VirtQueue, headIdx uint16) u
 	return written
 }
 
-// StartRX handles Receive from Host to Guest (Queue 0)
+// StartRX handles Receive from Host to Guest (Queue 0). It reads packets from
+// the TAP and pushes them into available guest buffers. The loop terminates
+// when the TAP read fails (closed) or when the queue's stopFd fires; the stop
+// fd is checked between packets so shutdown does not stall on a blocking TAP
+// read.
 func (n *NetDevice) StartRX(vq *VirtQueue, mem *Memory) {
 	packetBuf := make([]byte, 65536)
-	
 	for {
-		// Read packet from TAP
+		// Bail out early if the server is shutting this queue down.
+		if vq.isStopping() {
+			return
+		}
+		// Read packet from TAP.
 		plen, err := n.tapFile.Read(packetBuf)
-		if err != nil { break }
-		if plen <= 0 { continue }
-		
-		// Wait for guest to provide an available descriptor buffer
-		availBytes, err := mem.GuestToHost(vq.AvailAddr, 4)
-		if err != nil { continue }
-		
-		availIdx := binary.LittleEndian.Uint16(availBytes[2:4])
-		if vq.LastAvail == availIdx {
-			// Dropping packet if no descriptors available
+		if err != nil {
+			return
+		}
+		if plen <= 0 {
 			continue
 		}
-		
-		ringOffset := uint64(4 + (vq.LastAvail % uint16(vq.Num)) * 2)
-		headBytes, err := mem.GuestToHost(vq.AvailAddr + ringOffset, 2)
-		if err != nil { continue }
-		headIdx := binary.LittleEndian.Uint16(headBytes)
-		
-		// Write to descriptor
-		written := n.processRXChain(mem, vq, headIdx, packetBuf[:plen])
-		vq.completeRequest(mem, headIdx, written)
-		vq.LastAvail++
+		n.processRXAvailable(mem, vq, packetBuf[:plen])
 	}
+}
+
+// processRXAvailable tries to place one packet into available guest buffers.
+func (n *NetDevice) processRXAvailable(mem *Memory, vq *VirtQueue, packet []byte) {
+	if vq.Num == 0 {
+		return
+	}
+	availBytes, err := mem.GuestToHost(vq.AvailAddr, 4)
+	if err != nil {
+		return
+	}
+	availIdx := binary.LittleEndian.Uint16(availBytes[2:4])
+	if vq.LastAvail == availIdx {
+		// No descriptors available; drop the packet.
+		return
+	}
+	ringOffset := uint64(4 + (int(vq.LastAvail)%int(vq.Num))*2)
+	headBytes, err := mem.GuestToHost(vq.AvailAddr+ringOffset, 2)
+	if err != nil {
+		return
+	}
+	headIdx := binary.LittleEndian.Uint16(headBytes)
+	written := n.processRXChain(mem, vq, headIdx, packet)
+	vq.completeRequest(mem, headIdx, written)
+	vq.LastAvail++
 }
 
 func (n *NetDevice) processRXChain(mem *Memory, vq *VirtQueue, headIdx uint16, packet []byte) uint32 {
 	currIdx := headIdx
 	var written uint32
 	pktOffset := uint32(0)
-	
-	isFirst := true
+
 	iter := uint32(0)
 	for {
 		if iter >= vq.Num {
@@ -178,17 +203,21 @@ func (n *NetDevice) processRXChain(mem *Memory, vq *VirtQueue, headIdx uint16, p
 		iter++
 
 		descBytes, err := mem.GuestToHost(vq.DescAddr+uint64(currIdx)*16, 16)
-		if err != nil { return written }
-		
+		if err != nil {
+			return written
+		}
+
 		addr := binary.LittleEndian.Uint64(descBytes[0:8])
 		length := binary.LittleEndian.Uint32(descBytes[8:12])
 		flags := binary.LittleEndian.Uint16(descBytes[12:14])
 		next := binary.LittleEndian.Uint16(descBytes[14:16])
-		
-		buf, err := mem.GuestToHost(addr, uint64(length))
-		if err != nil { return written }
 
-		if isFirst {
+		buf, err := mem.GuestToHost(addr, uint64(length))
+		if err != nil {
+			return written
+		}
+
+		if iter == 1 {
 			// Write dummy 10-byte virtio-net header (all zeros)
 			hdrLen := uint32(10)
 			for i := uint32(0); i < hdrLen && i < length; i++ {
@@ -205,7 +234,6 @@ func (n *NetDevice) processRXChain(mem *Memory, vq *VirtQueue, headIdx uint16, p
 			} else {
 				written += hdrLen
 			}
-			isFirst = false
 		} else {
 			chunk := length
 			if uint32(len(packet))-pktOffset < chunk {
