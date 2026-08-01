@@ -6,7 +6,6 @@ import (
 	"sync/atomic"
 	"syscall"
 
-	"github.com/iceber/iouring-go"
 	"golang.org/x/sys/unix"
 )
 
@@ -296,49 +295,33 @@ func (vq *VirtQueue) processDescChain(mem *Memory, headIdx uint16, blk *BlockDev
 	if blk != nil {
 		switch reqType {
 		case VirtioBlkTIn:
-			// Read from disk into guest memory.
+			// Read from disk into guest memory. Use synchronous pread into each
+			// data slice rather than io_uring Preadv: the iouring-go helper builds
+			// the iovec array as a local that the returned closure does not retain,
+			// so once GC reclaims it the kernel reads a dangling iovec pointer —
+			// under dd load this corrupts/EFAULTs reads and stalls the guest.
+			// Sync pread is correct and fast enough; the slice buffers are guest
+			// mmap pages that stay valid for the syscall duration.
 			go func() {
-				ch := make(chan iouring.Result, 1)
-				_, err := blk.IOUR().SubmitRequest(iouring.Preadv(blk.Fd(), dataSlices, uint64(offset)), ch)
-				if err != nil {
-					if statusSlice != nil && len(statusSlice) >= 1 {
-						statusSlice[0] = VirtioBlkSIoErr
-					}
-					vq.completeRequest(mem, headIdx, vq.statusLen(statusSlice))
-					return
-				}
-				res := <-ch
 				st := byte(VirtioBlkSOk)
-				if res.Err() != nil {
+				n := readvSync(blk, dataSlices, offset)
+				if n < 0 {
 					st = VirtioBlkSIoErr
+					n = 0
 				}
 				if statusSlice != nil && len(statusSlice) >= 1 {
 					statusSlice[0] = st
 				}
-				ret, _ := res.ReturnInt()
-				if ret < 0 {
-					ret = 0
-				}
-				// +1 for the status byte.
-				vq.completeRequest(mem, headIdx, uint32(ret)+1)
+				vq.completeRequest(mem, headIdx, uint32(n)+1) // +1 for the status byte
 			}()
 			return
 
 		case VirtioBlkTOut:
-			// Write from guest memory to disk.
+			// Write from guest memory to disk. Synchronous pwrite per slice
+			// (see VirtioBlkTIn for why not io_uring).
 			go func() {
-				ch := make(chan iouring.Result, 1)
-				_, err := blk.IOUR().SubmitRequest(iouring.Pwritev(blk.Fd(), dataSlices, uint64(offset)), ch)
-				if err != nil {
-					if statusSlice != nil && len(statusSlice) >= 1 {
-						statusSlice[0] = VirtioBlkSIoErr
-					}
-					vq.completeRequest(mem, headIdx, vq.statusLen(statusSlice))
-					return
-				}
-				res := <-ch
 				st := byte(VirtioBlkSOk)
-				if res.Err() != nil {
+				if writevSync(blk, dataSlices, offset) < 0 {
 					st = VirtioBlkSIoErr
 				}
 				if statusSlice != nil && len(statusSlice) >= 1 {
@@ -352,18 +335,12 @@ func (vq *VirtQueue) processDescChain(mem *Memory, headIdx uint16, blk *BlockDev
 
 		case VirtioBlkTFlush:
 			go func() {
-				ch := make(chan iouring.Result, 1)
-				_, err := blk.IOUR().SubmitRequest(iouring.Fsync(blk.Fd()), ch)
-				if err != nil {
-					if statusSlice != nil && len(statusSlice) >= 1 {
-						statusSlice[0] = VirtioBlkSIoErr
-					}
-					vq.completeRequest(mem, headIdx, vq.statusLen(statusSlice))
-					return
+				st := byte(VirtioBlkSOk)
+				if err := blk.Sync(); err != nil {
+					st = VirtioBlkSIoErr
 				}
-				<-ch
 				if statusSlice != nil && len(statusSlice) >= 1 {
-					statusSlice[0] = VirtioBlkSOk
+					statusSlice[0] = st
 				}
 				vq.completeRequest(mem, headIdx, 1)
 			}()
@@ -377,6 +354,41 @@ func (vq *VirtQueue) processDescChain(mem *Memory, headIdx uint16, blk *BlockDev
 		written++ // status byte counts as written
 	}
 	vq.completeRequest(mem, headIdx, written)
+}
+
+// readvSync reads from blk at offset into each data slice in order,
+// emulating preadv with synchronous pread. Returns the total bytes read, or -1
+// on error. We use this instead of io_uring Preadv because iouring-go's Preadv
+// builds the iovec array as a local variable and stores only a raw pointer to
+// it in the SQE; the closure does not retain the slice, so a GC cycle between
+// submit and kernel consumption leaves a dangling iovec pointer. Synchronous
+// pread has no such lifetime hazard and the buffers are stable guest mmap
+// pages for the duration.
+func readvSync(blk *BlockDevice, bufs [][]byte, offset int64) int {
+	total := 0
+	for _, b := range bufs {
+		n, err := blk.ReadAt(b, offset+int64(total))
+		total += n
+		if err != nil {
+			return -1
+		}
+	}
+	return total
+}
+
+// writevSync writes each data slice to blk at offset in order, emulating
+// pwritev with synchronous pwrite. Returns the total bytes written, or -1 on
+// error. See readvSync for why not io_uring.
+func writevSync(blk *BlockDevice, bufs [][]byte, offset int64) int {
+	total := 0
+	for _, b := range bufs {
+		n, err := blk.WriteAt(b, offset+int64(total))
+		total += n
+		if err != nil {
+			return -1
+		}
+	}
+	return total
 }
 
 // statusLen returns 1 if the status byte descriptor was successfully

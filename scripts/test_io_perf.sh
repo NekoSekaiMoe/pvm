@@ -1,7 +1,7 @@
 #!/bin/bash
 set -eo pipefail
 
-echo "========== I/O Performance Test (virtio-blk via qemu-storage-daemon) =========="
+echo "========== I/O Performance Test (virtio-blk native backend) =========="
 
 # Build the agentpvm and umlctl
 go build -o agentpvm cmd/agentpvm/main.go
@@ -12,10 +12,8 @@ if [ ! -f "bin/linux" ]; then
     exit 1
 fi
 
-if ! command -v qemu-storage-daemon &> /dev/null; then
-    echo "Skipping I/O performance test: qemu-storage-daemon is not installed."
-    exit 0
-fi
+# The native Go vhost-user backend does not require qemu-storage-daemon;
+# only the fallback (-native-vhost=false) path uses it.
 
 if qemu-img --help | grep -q "io_uring"; then
     echo "AIO Backend: io_uring supported and will be used."
@@ -84,15 +82,16 @@ CONSOLE_LOG=/var/lib/uml-container/containers/perf-test/logs/console.log
 sudo rm -f /var/lib/uml-container/containers/perf-test/vhost-blk.sock
 sudo rm -f "$CONSOLE_LOG"
 
-# Run the UML guest with a vhost-user-blk backend provided by
-# qemu-storage-daemon (the mature, reference vhost-user-blk implementation).
-# The native Go vhost-user backend (-native-vhost) is experimental and its IO
-# completion path currently hangs under load; it is tracked separately and must
-# not gate CI. The qemu-storage-daemon path is the same one the cow test uses
-# successfully.
+# Run the UML guest with the native Go vhost-user backend (-native-vhost).
+# The virtqueue IO path now uses synchronous pread/pwrite instead of
+# io_uring Preadv/Pwritev; iouring-go builds the iovec array as a local the
+# SQE only holds a raw pointer to, so under dd load a GC cycle left a
+# dangling iovec and the kernel EFAULTed/corrupted reads, stalling the guest.
+# Sync IO is correct and fast enough for this test. If this regresses, the
+# -debug flag yields the full protocol log in agentpvm.log.
 # `timeout` bounds the whole run; agentpvm's own exit (poweroff on success or
 # crash on failure) ends it early.
-sudo timeout 90 ./agentpvm run -name perf-test -rootfs ${IMG_NAME} -kernel ./bin/linux -init /init.sh -vhost=true -debug > agentpvm.log 2>&1 || true
+sudo timeout 120 ./agentpvm run -name perf-test -rootfs ${IMG_NAME} -kernel ./bin/linux -init /init.sh -vhost=true -native-vhost=true -debug > agentpvm.log 2>&1 || true
 
 # Ensure no lingering UML process keeps the socket/logs open for the next run.
 sudo pkill -f "agentpvm run -name perf-test" 2>/dev/null || true
