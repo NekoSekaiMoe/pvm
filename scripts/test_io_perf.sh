@@ -1,7 +1,7 @@
 #!/bin/bash
 set -eo pipefail
 
-echo "========== I/O Performance Test (virtio-blk) =========="
+echo "========== I/O Performance Test (virtio-blk via qemu-storage-daemon) =========="
 
 # Build the agentpvm and umlctl
 go build -o agentpvm cmd/agentpvm/main.go
@@ -12,15 +12,9 @@ if [ ! -f "bin/linux" ]; then
     exit 1
 fi
 
-# Two backends are exercised, in this order:
-#   1. qemu-storage-daemon (-native-vhost=false): the mature reference
-#      vhost-user-blk implementation. Run first so a native-backend hang does
-#      not gate the baseline measurement; if this stage fails, the test bails
-#      immediately because even the reference path is broken.
-#   2. native Go backend (-native-vhost=true): the experimental backend whose
-#      virtqueue IO path uses synchronous pread/pwrite (see internal/vhost/
-#      virtqueue.go). Run last so a regression here is reported without
-#      blocking the qemu stage's result.
+# Block backend: qemu-storage-daemon is the sole vhost-user-blk backend
+# (the experimental native Go backend was removed). The daemon is required.
+
 if qemu-img --help | grep -q "io_uring"; then
     echo "AIO Backend: io_uring supported and will be used by qemu-storage-daemon where applicable."
 else
@@ -85,25 +79,24 @@ sudo chmod +x mnt/init.sh
 trap - EXIT
 sudo umount mnt
 
-# run_one <name> <native_flag> <agentpvm_log> <console_log>
-# Runs one UML guest under the chosen backend, bounded by timeout, and returns
-# 0 only if PERF_TEST_COMPLETED appears in the console log. It never exits the
-# script itself; the caller decides the overall result so both backends get a
-# chance to run.
+# run_one <name> <agentpvm_log> <console_log>
+# Runs one UML guest under the qemu-storage-daemon vhost-user-blk backend,
+# bounded by timeout, and returns 0 only if PERF_TEST_COMPLETED appears in
+# the console log. It never exits the script itself; the caller decides the
+# overall result.
 run_one() {
     local name="$1"
-    local native_flag="$2"
-    local ap_log="$3"
-    local console_log="$4"
+    local ap_log="$2"
+    local console_log="$3"
 
-    echo "---- running backend: $name ($native_flag) ----"
+    echo "---- running qemu-storage-daemon backend: $name ----"
     sudo rm -f "/var/lib/uml-container/containers/${name}/vhost-blk.sock" "$console_log" "$ap_log"
 
     # `timeout` bounds the whole run; agentpvm's own exit (poweroff on success
     # or crash on failure) ends it early. -debug yields the full vhost protocol
     # log to the agentpvm log on failure.
     sudo timeout 120 ./agentpvm run -name "$name" -rootfs "${IMG_NAME}" \
-        -kernel ./bin/linux -init /init.sh -vhost=true "$native_flag" -debug \
+        -kernel ./bin/linux -init /init.sh -vhost=true -debug \
         > "$ap_log" 2>&1 || true
 
     # Ensure no lingering UML process keeps the socket/logs open for the next run.
@@ -121,35 +114,18 @@ run_one() {
     return 1
 }
 
-OVERALL=0
-
-# 1) qemu-storage-daemon (reference). Requires the daemon; skip cleanly if absent.
-QEMU_LOG=agentpvm_qemu.log
-QEMU_CONSOLE=/var/lib/uml-container/containers/perf-test/logs/console.log
+# qemu-storage-daemon is the sole vhost-user-blk backend (the experimental
+# native Go backend was removed). Skip cleanly if the daemon is not installed.
 if ! command -v qemu-storage-daemon &> /dev/null; then
-    echo "Skipping qemu-storage-daemon backend: qemu-storage-daemon is not installed."
-elif ! run_one "perf-test" "-native-vhost=false" "$QEMU_LOG" "$QEMU_CONSOLE"; then
-    # The reference path is the baseline; if it fails, the native stage is not
-    # going to diagnose anything new, so bail out.
-    echo "qemu-storage-daemon backend failed; aborting before native stage."
-    exit 1
-fi
-
-# 2) native Go backend (synchronous pread/pwrite; see internal/vhost/virtqueue.go).
-# This is an experimental, in-progress backend. It is known to fail right now
-# (guest connects but never sends; under investigation) and is run here purely
-# for diagnostics — its result does NOT gate CI. The qemu-storage-daemon stage
-# above is the gate; native will be promoted once it passes reliably.
-NATIVE_LOG=agentpvm_native.log
-NATIVE_CONSOLE=/var/lib/uml-container/containers/perf-test-native/logs/console.log
-if ! run_one "perf-test-native" "-native-vhost=true" "$NATIVE_LOG" "$NATIVE_CONSOLE"; then
-    echo "(native backend failed — non-blocking, see notes above; qemu gate still satisfied)"
-fi
-
-if [ $OVERALL -eq 0 ]; then
-    echo "✅ I/O Performance Test completed successfully on the qemu-storage-daemon gate!"
-    echo "(native backend is non-blocking/experimental; see its section above for status)"
+    echo "Skipping I/O performance test: qemu-storage-daemon is not installed."
     exit 0
 fi
-echo "❌ I/O Performance Test failed on one or more backends."
+
+AP_LOG=agentpvm.log
+CONSOLE_LOG=/var/lib/uml-container/containers/perf-test/logs/console.log
+if run_one "perf-test" "$AP_LOG" "$CONSOLE_LOG"; then
+    echo "✅ I/O Performance Test completed successfully!"
+    exit 0
+fi
+echo "❌ I/O Performance Test failed."
 exit 1
