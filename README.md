@@ -10,6 +10,10 @@ PVM is a lightweight, User-Mode Linux (UML)-based container management system. I
 - **Networking**: Bridge and TAP interface management for UML networking.
 - **Image Management**: Seamless pulling of Docker base images to be used as container rootfs via OverlayFS.
 
+## Dependency
+- x86/x64 device(no limits, arm64 uml is porting)
+- qemu-storage-daemon(for virtio blk)
+
 ## Quick Start
 
 ```bash
