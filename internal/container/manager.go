@@ -57,10 +57,17 @@ func (m *Manager) Start(ctx context.Context, cfg *config.ContainerConfig) error 
 		args = append(args, fmt.Sprintf("ubd0=%s", cfg.Rootfs))
 		args = append(args, "root=/dev/ubda")
 	}
-	// UML 默认以只读方式挂载根文件系统，而容器 init 经常需要写
-	// /etc/resolv.conf、apk 缓存等。显式 rw 让根可写，与 test_integration
-	// 之外所有需要写入的初始化脚本兼容。
-	args = append(args, "rw=1")
+	// 根文件系统默认只读（init/do_mounts.c 的 root_mountflags 默认含
+	// MS_RDONLY）。UML 同样遵循此默认。显式传裸 "rw" 让根可写——容器
+	// init 经常需要写 /etc/resolv.conf、apk 缓存等。
+	//
+	// 注意：内核对 "rw" 的 __setup 处理是 `if (*str) return 0`，即只要
+	// "rw" 后面跟了 '=' 就拒绝识别。所以 "rw=1" 会被当成未知参数丢弃
+	// （之前 console.log 里就有
+	//   "Unknown kernel command line parameters ... rw=1"
+	// 这一行），root 保持只读，init 必须自己 mount -o remount,rw。用裸
+	// "rw" 让内核直接清除 MS_RDONLY，init 无需 remount。
+	args = append(args, "rw")
 
 	if cfg.NetworkTap != "" {
 		if cfg.VhostNetSocket != "" {
