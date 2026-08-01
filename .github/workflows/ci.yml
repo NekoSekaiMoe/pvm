@@ -91,6 +91,15 @@ jobs:
         set +e
         echo "===== umlctl output (uml.log) ====="
         cat uml.log 2>/dev/null || echo "(no uml.log)"
+        echo "===== agentpvm output (agentpvm.log) ====="
+        cat agentpvm.log 2>/dev/null || echo "(no agentpvm.log)"
+        echo "===== any other *.log files ====="
+        for f in *.log; do
+          [ -f "$f" ] || continue
+          case "$f" in uml.log|agentpvm.log) continue;; esac
+          echo "----- $f -----"
+          cat "$f" 2>/dev/null || sudo cat "$f" 2>/dev/null || true
+        done
         echo "===== UML container console logs ====="
         for f in /var/lib/uml-container/containers/*/logs/console.log; do
           [ -f "$f" ] || continue

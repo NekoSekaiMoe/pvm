@@ -2,7 +2,6 @@ package vhost
 
 import (
 	"encoding/binary"
-	"fmt"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -40,6 +39,12 @@ type VirtQueue struct {
 	// read (verified empirically). Owned by Server; -1 until the processor is
 	// started.
 	stopFd int
+
+	// done is closed by the ring processor goroutine when it exits. Server
+	// waits on it in stopProcessor before closing fds or tearing down memory,
+	// so SET_MEM_TABLE can prove no goroutine still touches a region before
+	// UnmapAll. nil until a processor starts.
+	done chan struct{}
 
 	// stopping is set by Server.stopProcessor to signal RX/TX loops that poll
 	// rather than epoll (StartRX blocks on the TAP fd, not KickFd) to exit.
@@ -82,19 +87,20 @@ func (vq *VirtQueue) ProcessRing(mem *Memory, blk *BlockDevice) {
 // Linux, so Server.stopProcessors cannot tear down a processor by closing
 // KickFd. Epoll lets us watch a dedicated stop eventfd alongside KickFd.
 func (vq *VirtQueue) runProcessor(onKick func() bool, tag string) {
+	defer vq.signalDone()
 	if vq.KickFd < 0 {
 		return
 	}
 	epfd, err := unix.EpollCreate1(unix.EPOLL_CLOEXEC)
 	if err != nil {
-		fmt.Printf("[%s %d] EpollCreate1 error: %v\n", tag, vq.Index, err)
+		pkgLog.Warnf("[%s %d] EpollCreate1 error: %v", tag, vq.Index, err)
 		return
 	}
 	defer unix.Close(epfd)
 
 	kickEv := &unix.EpollEvent{Events: unix.EPOLLIN, Fd: int32(vq.KickFd)}
 	if err := unix.EpollCtl(epfd, unix.EPOLL_CTL_ADD, vq.KickFd, kickEv); err != nil {
-		fmt.Printf("[%s %d] EpollCtl add kick: %v\n", tag, vq.Index, err)
+		pkgLog.Warnf("[%s %d] EpollCtl add kick: %v", tag, vq.Index, err)
 		return
 	}
 	if vq.stopFd >= 0 {
@@ -110,7 +116,7 @@ func (vq *VirtQueue) runProcessor(onKick func() bool, tag string) {
 			if err == unix.EINTR || err == unix.EAGAIN {
 				continue
 			}
-			fmt.Printf("[%s %d] EpollWait error: %v\n", tag, vq.Index, err)
+			pkgLog.Warnf("[%s %d] EpollWait error: %v", tag, vq.Index, err)
 			return
 		}
 		stopped := false
@@ -130,13 +136,13 @@ func (vq *VirtQueue) runProcessor(onKick func() bool, tag string) {
 							continue
 						}
 						// fd closed (EOF, EBADF, etc.) — permanent.
-						fmt.Printf("[%s %d] Kick FD read error: %v\n", tag, vq.Index, e)
+						pkgLog.Infof("[%s %d] Kick FD read error: %v", tag, vq.Index, e)
 						return
 					}
 					break
 				}
 				if (events[i].Events & unix.EPOLLHUP) != 0 {
-					fmt.Printf("[%s %d] Kick FD hangup\n", tag, vq.Index)
+					pkgLog.Infof("[%s %d] Kick FD hangup", tag, vq.Index)
 					return
 				}
 				if !onKick() {
@@ -146,6 +152,23 @@ func (vq *VirtQueue) runProcessor(onKick func() bool, tag string) {
 		}
 		if stopped {
 			return
+		}
+	}
+}
+
+// signalDone marks the processor goroutine as finished. It is called via
+// defer from runProcessor and from StartRX so Server.waitProcessor can observe
+// exit without racing the goroutine's teardown. Safe to call when done is nil
+// (e.g. a processor that never started).
+func (vq *VirtQueue) signalDone() {
+	vq.usedMu.Lock()
+	ch := vq.done
+	vq.usedMu.Unlock()
+	if ch != nil {
+		select {
+		case <-ch:
+		default:
+			close(ch)
 		}
 	}
 }
@@ -218,14 +241,14 @@ func (vq *VirtQueue) processDescChain(mem *Memory, headIdx uint16, blk *BlockDev
 			if statusSlice != nil && len(statusSlice) >= 1 {
 				statusSlice[0] = VirtioBlkSIoErr
 			}
-			vq.completeRequest(mem, headIdx, 1)
+			vq.completeRequest(mem, headIdx, vq.statusLen(statusSlice))
 			return
 		}
 		iter++
 
 		descBytes, err := mem.GuestToHost(vq.DescAddr+uint64(currIdx)*VRingDescSize, VRingDescSize)
 		if err != nil {
-			fmt.Printf("[VirtQueue %d] failed to map desc %d\n", vq.Index, currIdx)
+			pkgLog.Warnf("[vq %d] failed to map desc %d", vq.Index, currIdx)
 			return
 		}
 
@@ -236,7 +259,7 @@ func (vq *VirtQueue) processDescChain(mem *Memory, headIdx uint16, blk *BlockDev
 
 		buf, err := mem.GuestToHost(addr, uint64(length))
 		if err != nil {
-			fmt.Printf("[VirtQueue %d] failed to map desc buf at 0x%x\n", vq.Index, addr)
+			pkgLog.Warnf("[vq %d] failed to map desc buf at 0x%x", vq.Index, addr)
 			return
 		}
 
@@ -246,7 +269,7 @@ func (vq *VirtQueue) processDescChain(mem *Memory, headIdx uint16, blk *BlockDev
 				// Malformed request: out-header too short. Fail it instead of
 				// continuing with zero reqType/sector, which would otherwise
 				// be misinterpreted as VirtioBlkTIn (0) from sector 0.
-				vq.completeRequest(mem, headIdx, 1)
+				vq.completeRequest(mem, headIdx, vq.statusLen(statusSlice))
 				return
 			}
 			reqType = binary.LittleEndian.Uint32(buf[0:4])
@@ -281,7 +304,7 @@ func (vq *VirtQueue) processDescChain(mem *Memory, headIdx uint16, blk *BlockDev
 					if statusSlice != nil && len(statusSlice) >= 1 {
 						statusSlice[0] = VirtioBlkSIoErr
 					}
-					vq.completeRequest(mem, headIdx, 1)
+					vq.completeRequest(mem, headIdx, vq.statusLen(statusSlice))
 					return
 				}
 				res := <-ch
@@ -310,7 +333,7 @@ func (vq *VirtQueue) processDescChain(mem *Memory, headIdx uint16, blk *BlockDev
 					if statusSlice != nil && len(statusSlice) >= 1 {
 						statusSlice[0] = VirtioBlkSIoErr
 					}
-					vq.completeRequest(mem, headIdx, 1)
+					vq.completeRequest(mem, headIdx, vq.statusLen(statusSlice))
 					return
 				}
 				res := <-ch
@@ -335,7 +358,7 @@ func (vq *VirtQueue) processDescChain(mem *Memory, headIdx uint16, blk *BlockDev
 					if statusSlice != nil && len(statusSlice) >= 1 {
 						statusSlice[0] = VirtioBlkSIoErr
 					}
-					vq.completeRequest(mem, headIdx, 1)
+					vq.completeRequest(mem, headIdx, vq.statusLen(statusSlice))
 					return
 				}
 				<-ch
@@ -356,6 +379,18 @@ func (vq *VirtQueue) processDescChain(mem *Memory, headIdx uint16, blk *BlockDev
 	vq.completeRequest(mem, headIdx, written)
 }
 
+// statusLen returns 1 if the status byte descriptor was successfully
+// captured (so the completion should report the single status byte as
+// written), else 0. Used by error paths where no data was transferred so the
+// reported used length matches what the guest expects to find in the used
+// element.
+func (vq *VirtQueue) statusLen(statusSlice []byte) uint32 {
+	if statusSlice != nil && len(statusSlice) >= 1 {
+		return 1
+	}
+	return 0
+}
+
 // completeRequest appends a used element and notifies the guest. Concurrent
 // callers (one per in-flight io_uring request) are serialized via usedMu so
 // the used index stays consistent.
@@ -371,11 +406,11 @@ func (vq *VirtQueue) completeRequest(mem *Memory, headIdx uint16, written uint32
 		return
 	}
 	vq.usedMu.Lock()
-	defer vq.usedMu.Unlock()
 
 	// used ring header: flags(2), idx(2), ring(num*8), avail_event(2)
 	usedIdxBytes, err := mem.GuestToHost(vq.UsedAddr+2, 2)
 	if err != nil {
+		vq.usedMu.Unlock()
 		return
 	}
 	usedIdx := binary.LittleEndian.Uint16(usedIdxBytes)
@@ -384,15 +419,21 @@ func (vq *VirtQueue) completeRequest(mem *Memory, headIdx uint16, written uint32
 	elemOffset := uint64(4 + (int(usedIdx)%int(vq.Num))*8)
 	elemBytes, err := mem.GuestToHost(vq.UsedAddr+elemOffset, 8)
 	if err != nil {
+		vq.usedMu.Unlock()
 		return
 	}
 	binary.LittleEndian.PutUint32(elemBytes[0:4], uint32(headIdx))
 	binary.LittleEndian.PutUint32(elemBytes[4:8], written)
 
 	// Publish the used index. Element stores above precede this store in
-	// program order, and usedMu.Unlock() (via the defer above) issues a release
-	// fence, so the guest cannot observe the new index without its element.
+	// program order; the Unlock below issues a release fence so the guest
+	// cannot observe the new index without its element.
 	binary.LittleEndian.PutUint16(usedIdxBytes, usedIdx+1)
+
+	// Release the mutex BEFORE the guest notification: the release fence on
+	// Unlock publishes the element+index writes, and holding the lock across
+	// an eventfd write needlessly blocks other completions.
+	vq.usedMu.Unlock()
 
 	// Notify the guest by writing to CallFd (eventfd counter = 1).
 	if vq.CallFd >= 0 {

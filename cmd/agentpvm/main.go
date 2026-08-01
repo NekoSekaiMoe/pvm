@@ -13,6 +13,7 @@ import (
 	"uml-container/internal/container"
 	"uml-container/internal/cow"
 	"uml-container/internal/ebpf"
+	"uml-container/internal/log"
 	"uml-container/internal/network"
 	"uml-container/internal/snapshot"
 	"uml-container/internal/vhost"
@@ -39,8 +40,14 @@ func main() {
 		cpu := runCmd.Int("cpu", 0, "CPU limit (0 means no limit)")
 		netTap := runCmd.String("net-tap", "", "Network tap device to use")
 		nativeVhostNet := runCmd.Bool("native-vhost-net", false, "Use native Go vhost-user-net backend for networking")
+		debug := runCmd.Bool("debug", false, "Enable debug logging (verbose vhost-user protocol output)")
 
 		runCmd.Parse(os.Args[2:])
+
+		if *debug {
+			log.Default().SetLevel(log.LevelDebug)
+			log.Default().Infof("debug logging enabled")
+		}
 
 		if !regexp.MustCompile(`^[a-zA-Z0-9_-]+$`).MatchString(*name) {
 			fmt.Println("Error: Invalid container name format")

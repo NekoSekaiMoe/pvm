@@ -5,12 +5,19 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"sync"
 	"syscall"
 	"unsafe"
 )
 
 type NetDevice struct {
 	tapFile *os.File
+
+	// tapClosed guards close-against-close on the TAP fd during teardown.
+	// StartRX closes tapFile when it exits; a later Server.Stop must not
+	// double-close (a second close on an recycled fd would close an
+	// unrelated file).
+	tapClosed sync.Once
 }
 
 // ifreq struct for TUNSETIFF
@@ -51,6 +58,22 @@ func NewNetDevice(tapName string, bridgeName string) (*NetDevice, error) {
 	}
 
 	return &NetDevice{tapFile: f}, nil
+}
+
+// closeTapOnce closes the TAP file exactly once. It is safe to call from
+// StartRX's deferred teardown and from Server.Stop's teardown path; the
+// sync.Once makes the two idempotent.
+func (n *NetDevice) closeTapOnce() {
+	n.tapClosed.Do(func() {
+		if n.tapFile != nil {
+			n.tapFile.Close()
+		}
+	})
+}
+
+// Close releases the TAP fd. Safe to call multiple times.
+func (n *NetDevice) Close() {
+	n.closeTapOnce()
 }
 
 // StartTX handles Transmit from Guest to Host (Queue 1). It reuses the
@@ -113,7 +136,7 @@ func (n *NetDevice) processTXChain(mem *Memory, vq *VirtQueue, headIdx uint16) u
 
 		if iter == 1 {
 			// virtio-net header (10/12 bytes). Skip it for TAP write.
-			hdrLen := uint32(10)
+			hdrLen := uint32(headerLenVirtioNet)
 			if length > hdrLen {
 				nw, err := n.tapFile.Write(buf[hdrLen:])
 				if nw > 0 {
@@ -146,7 +169,18 @@ func (n *NetDevice) processTXChain(mem *Memory, vq *VirtQueue, headIdx uint16) u
 // when the TAP read fails (closed) or when the queue's stopFd fires; the stop
 // fd is checked between packets so shutdown does not stall on a blocking TAP
 // read.
+// headerLenVirtioNet is the virtio-net header length this backend assumes.
+// It MUST match what is advertised during feature negotiation: with
+// VIRTIO_NET_F_MRG_RXBUF the header is 12 bytes; without it it is 10. We do
+// not implement mergeable RX, so we must NOT advertise F_MRG_RXBUF, and the
+// header is fixed at 10 bytes. Keeping this as a named constant (instead of
+// the literal 10 scattered across TX/RX) lets a future change flip it in one
+// place once mergeable RX is actually implemented.
+const headerLenVirtioNet = 10
+
 func (n *NetDevice) StartRX(vq *VirtQueue, mem *Memory) {
+	defer vq.signalDone()
+	defer n.closeTapOnce()
 	packetBuf := make([]byte, 65536)
 	for {
 		// Bail out early if the server is shutting this queue down.
@@ -219,7 +253,7 @@ func (n *NetDevice) processRXChain(mem *Memory, vq *VirtQueue, headIdx uint16, p
 
 		if iter == 1 {
 			// Write dummy 10-byte virtio-net header (all zeros)
-			hdrLen := uint32(10)
+			hdrLen := uint32(headerLenVirtioNet)
 			for i := uint32(0); i < hdrLen && i < length; i++ {
 				buf[i] = 0
 			}

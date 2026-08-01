@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/sys/unix"
+
 	"uml-container/internal/state"
 )
 
@@ -71,17 +73,12 @@ func startTestServer(t *testing.T, sizeBytes int64) (*Server, *BlockDevice, net.
 	return srv, blk, client
 }
 
-// send writes a vhost-user request without waiting for a reply.
+// send writes a vhost-user request without waiting for a reply. It reuses
+// encodeMsg for header/payload framing so there is a single source of truth
+// for the on-wire layout.
 func send(t *testing.T, c net.Conn, request uint32, needReply bool, payload []byte) {
 	t.Helper()
-	hdr := VhostUserMsgHeader{Request: request, Size: uint32(len(payload))}
-	if needReply {
-		hdr.Flags |= VhostUserNeedReply
-	}
-	buf := make([]byte, 12+len(payload))
-	hdr.Encode(buf[:12])
-	copy(buf[12:], payload)
-	if _, err := c.Write(buf); err != nil {
+	if _, err := c.Write(encodeMsg(request, needReply, payload)); err != nil {
 		t.Fatalf("write request %d: %v", request, err)
 	}
 }
@@ -191,9 +188,15 @@ func TestSetVringNum_RejectsInvalid(t *testing.T) {
 		negotiateReplyAck(t, c)
 		hdr, body := sendRecv(t, c, VhostUserSetVringNum, true, payload)
 		_ = hdr
-		// With REPLY_ACK negotiated, an invalid size replies with non-zero u64.
-		if len(body) >= 8 && binary.LittleEndian.Uint64(body) == 0 {
-			t.Errorf("invalid num=%d accepted (ack payload said success)", num)
+		// With REPLY_ACK negotiated, an invalid size must reply with exactly an
+		// 8-byte u64 payload whose value is non-zero (1 == error). Reject any
+		// shorter/longer body outright rather than tolerating it.
+		if len(body) != 8 {
+			t.Errorf("invalid num=%d: ack body len = %d, want exactly 8", num, len(body))
+			continue
+		}
+		if v := binary.LittleEndian.Uint64(body); v == 0 {
+			t.Errorf("invalid num=%d accepted (ack payload said success 0)", num)
 		}
 	}
 	srv.mu.Lock()
@@ -263,11 +266,15 @@ func TestGetVringBase_ReplyLayout(t *testing.T) {
 		t.Errorf("reply num (last avail) = %d, want 7", num)
 	}
 	// After GET_VRING_BASE the processor flag must be cleared so a later
-	// SET_VRING_KICK can start fresh.
+	// SET_VRING_KICK can start fresh. Read processorStarted inside the lock
+	// (it is a mutex-protected field).
 	srv.mu.Lock()
-	vq := srv.queues[0]
+	var started bool
+	if vq := srv.queues[0]; vq != nil {
+		started = vq.processorStarted
+	}
 	srv.mu.Unlock()
-	if vq != nil && vq.processorStarted {
+	if started {
 		t.Errorf("processorStarted still true after GET_VRING_BASE stop")
 	}
 }
@@ -332,33 +339,43 @@ func TestReplyAck_NotNegotiated_NoFallback(t *testing.T) {
 }
 
 // TestGetConfig_SlicesByOffsetSize: GET_CONFIG must honor the requested
-// offset and size and return exactly `size` bytes, zero-filled past the
-// exposed config (#9).
+// offset and size. The reply echoes the 12-byte request header (offset,
+// size, flags) and appends `size` bytes of config starting at `offset`,
+// zero-filled past the exposed config (#9).
 func TestGetConfig_SlicesByOffsetSize(t *testing.T) {
 	const imgSize = 8 * 1024 // 8 KiB => 16 sectors
 	_, _, c := startTestServer(t, imgSize)
 
-	// Read capacity (first 8 bytes) at offset 0 size 8.
-	payload := make([]byte, 8)
-	binary.LittleEndian.PutUint32(payload[0:4], 0) // offset
-	binary.LittleEndian.PutUint32(payload[4:8], 8) // size
-	hdr, body := sendRecv(t, c, VhostUserGetConfig, false, payload)
-	_ = hdr
-	if len(body) != 8 {
-		t.Fatalf("GET_CONFIG body len = %d, want 8", len(body))
+	// 12-byte vhost_user_config request: u32 offset, u32 size, u32 flags.
+	mkReq := func(off, sz uint32) []byte {
+		p := make([]byte, 12)
+		binary.LittleEndian.PutUint32(p[0:4], off)
+		binary.LittleEndian.PutUint32(p[4:8], sz)
+		binary.LittleEndian.PutUint32(p[8:12], 0)
+		return p
 	}
-	cap := binary.LittleEndian.Uint64(body)
+
+	// Read capacity (first 8 bytes of config) at offset 0 size 8.
+	hdr, body := sendRecv(t, c, VhostUserGetConfig, false, mkReq(0, 8))
+	_ = hdr
+	// Reply = 12-byte echoed header + 8 bytes config = 20.
+	if len(body) != 12+8 {
+		t.Fatalf("GET_CONFIG body len = %d, want %d (12-byte echo + size)", len(body), 12+8)
+	}
+	cap := binary.LittleEndian.Uint64(body[12:20])
 	if cap != 16 {
 		t.Errorf("capacity = %d sectors, want 16 (8KiB/512)", cap)
 	}
 
 	// Read a window that straddles the end of our config: must be zero-filled,
 	// not short.
-	binary.LittleEndian.PutUint32(payload[0:4], virtioBlkCfgLen-4) // offset near end
-	binary.LittleEndian.PutUint32(payload[4:8], 12)                // size past end
-	_, body = sendRecv(t, c, VhostUserGetConfig, false, payload)
-	if len(body) != 12 {
-		t.Errorf("GET_CONFIG straddle body len = %d, want 12", len(body))
+	_, body = sendRecv(t, c, VhostUserGetConfig, false, mkReq(virtioBlkCfgLen-4, 12))
+	if len(body) != 12+12 {
+		t.Errorf("GET_CONFIG straddle body len = %d, want %d", len(body), 12+12)
+	}
+	// Echoed header must preserve the requested offset/size.
+	if got := binary.LittleEndian.Uint32(body[0:4]); got != virtioBlkCfgLen-4 {
+		t.Errorf("echoed offset = %d, want %d", got, virtioBlkCfgLen-4)
 	}
 }
 
@@ -414,6 +431,14 @@ func TestSetVringCall_ReplacesFd(t *testing.T) {
 	// otherwise the server would be ignoring repeated SET_VRING_CALL.
 	if got2 == got1 {
 		t.Errorf("second SET_VRING_CALL did not replace CallFd (still %d)", got2)
+	}
+	// The first server-installed CallFd must now be CLOSED (the replace path
+	// closes the prior fd). Probe it with fcntl(F_GETFD): on a closed fd it
+	// returns EBADF, which we observe as a non-nil error.
+	if got1 >= 0 {
+		if _, err := unix.FcntlInt(uintptr(got1), unix.F_GETFD, 0); err == nil {
+			t.Errorf("first CallFd %d still open after replacement (expected EBADF)", got1)
+		}
 	}
 	// Clean up the fds now held by the server so they are not left open after
 	// the queue is dropped.

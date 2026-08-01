@@ -30,7 +30,26 @@ func NewBlockDevice(path string) (*BlockDevice, error) {
 	if err != nil {
 		return nil, err
 	}
-	
+
+	// Reject non-block backends up front. A character device or other oddity
+	// would otherwise reach Size() where the BLKGETSIZE64 ioctl is undefined;
+	// limiting the backend to regular files and block devices keeps that ioctl
+	// applied only where it is valid.
+	fi, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	mode := fi.Mode()
+	if mode&os.ModeDevice != 0 && mode&os.ModeCharDevice != 0 {
+		f.Close()
+		return nil, fmt.Errorf("%s is a character device, not a usable block backend", path)
+	}
+	if mode&os.ModeDevice != 0 && mode&os.ModeNamedPipe != 0 {
+		f.Close()
+		return nil, fmt.Errorf("%s is not a block device", path)
+	}
+
 	// Create IOURing with 256 entries
 	iour, err := iouring.New(256)
 	if err != nil {
@@ -69,6 +88,12 @@ func (b *BlockDevice) Size() (int64, error) {
 		var bytes uint64
 		if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, b.file.Fd(), uintptr(unix.BLKGETSIZE64), uintptr(unsafe.Pointer(&bytes))); errno != 0 {
 			return 0, fmt.Errorf("BLKGETSIZE64 on %s: %v", b.file.Name(), errno)
+		}
+		// Guard against a malformed ioctl return producing a negative
+		// capacity (which the guest would interpret as a huge positive
+		// number after truncation).
+		if bytes > uint64(1<<63-1) {
+			return 0, fmt.Errorf("BLKGETSIZE64 on %s returned out-of-range size %d", b.file.Name(), bytes)
 		}
 		return int64(bytes), nil
 	}

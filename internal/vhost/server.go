@@ -42,26 +42,26 @@ const (
 const maxQueues = 8
 
 // virtio-blk config space fields we expose via GET_CONFIG. Layout per virtio
-// 1.x, all little-endian:
+// 1.x (linux/virtio_blk.h), all little-endian:
 //
-//	u64 capacity;   // total 512-byte sectors
-//	u32 size_max;   // max single segment size
-//	u32 seg_max;    // max segments in a request
-//	u16 geometry_cylinders;
-//	u8  geometry_heads;
-//	u8  geometry_sectors;
-//	u32 blk_size;   // only valid if VIRTIO_BLK_F_BLK_SIZE negotiated
-//	u8  physical_block_exp;
-//	u8  alignment_offset;
-//	u16 min_io_size;
-//	u32 opt_io_size;
-//	u8  writeback;
-//	u8  unused[3];
+//	u64 capacity;   // offset 0,  total 512-byte sectors
+//	u32 size_max;   // offset 8,  max single segment size
+//	u32 seg_max;    // offset 12, max segments in a request
+//	u16 cylinders;  // offset 16, geometry
+//	u8  heads;      // offset 18, geometry
+//	u8  sectors;    // offset 19, geometry
+//	u32 blk_size;   // offset 20, only valid if VIRTIO_BLK_F_BLK_SIZE negotiated
+//	u8  physical_block_exp; // offset 24
+//	u8  alignment_offset;   // offset 25
+//	u16 min_io_size;        // offset 26
+//	u32 opt_io_size;        // offset 28
+//	u8  writeback;          // offset 32
+//	u8  unused[3];          // offset 33
 const (
-	virtioBlkCfgLen      = 8 + 4 + 4 + 2 + 1 + 1 + 4 + 1 + 1 + 2 + 4 + 1 + 3
-	virtioBlkCfgSizeMax  = 4096
-	virtioBlkCfgSegMax   = 1
-	virtioBlkCfgBlkSize  = 512
+	virtioBlkCfgLen     = 8 + 4 + 4 + 2 + 1 + 1 + 4 + 1 + 1 + 2 + 4 + 1 + 3
+	virtioBlkCfgSizeMax = 4096
+	virtioBlkCfgSegMax  = 1
+	virtioBlkCfgBlkSize = 512
 )
 
 type Server struct {
@@ -140,15 +140,31 @@ func (s *Server) Stop() {
 	if s.listener != nil {
 		s.listener.Close()
 	}
-	// Stop any running ring processors and release kick/call fds so we do not
-	// leak them (and so a re-created Server on the same path is clean).
+	// Stop any running ring processors and release kick/call/stop fds so we do
+	// not leak them (and so a re-created Server on the same path is clean).
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	var waits []chan struct{}
 	for _, vq := range s.queues {
 		if vq == nil {
 			continue
 		}
-		s.stopProcessorLocked(vq)
+		if ch := s.stopProcessorLocked(vq); ch != nil {
+			waits = append(waits, ch)
+		}
+	}
+	// Close the CallFds that stopProcessorLocked deliberately leaves alone.
+	for _, vq := range s.queues {
+		if vq != nil && vq.CallFd >= 0 {
+			syscall.Close(vq.CallFd)
+			vq.CallFd = noFd
+		}
+	}
+	s.mu.Unlock()
+	for _, ch := range waits {
+		<-ch
+	}
+	if s.netDev != nil {
+		s.netDev.Close()
 	}
 }
 
@@ -171,7 +187,7 @@ func (s *Server) writeU64Reply(hdr VhostUserMsgHeader, buf []byte, val uint64, c
 	hdr.Encode(buf[:12])
 	binary.LittleEndian.PutUint64(buf[12:20], val)
 	if _, err := conn.Write(buf[:20]); err != nil {
-		fmt.Printf("[Vhost-User] writeU64Reply write error: %v\n", err)
+		pkgLog.Warnf("writeU64Reply write error: %v", err)
 	}
 }
 
@@ -184,7 +200,7 @@ func (s *Server) writePayloadReply(hdr VhostUserMsgHeader, payload []byte, conn 
 	hdr.Encode(buf[:12])
 	copy(buf[12:], payload)
 	if _, err := conn.Write(buf); err != nil {
-		fmt.Printf("[Vhost-User] writePayloadReply write error: %v\n", err)
+		pkgLog.Warnf("writePayloadReply write error: %v", err)
 	}
 }
 
@@ -199,13 +215,13 @@ func (s *Server) writeAckReply(hdr VhostUserMsgHeader, buf []byte, conn *net.Uni
 	hdr.Encode(buf[:12])
 	binary.LittleEndian.PutUint64(buf[12:20], 0) // 0 == success
 	if _, err := conn.Write(buf[:20]); err != nil {
-		fmt.Printf("[Vhost-User] writeAckReply write error: %v\n", err)
+		pkgLog.Warnf("writeAckReply write error: %v", err)
 	}
 }
 
 func (s *Server) handleConn(conn *net.UnixConn) {
 	defer conn.Close()
-	fmt.Println("[Vhost-User] Accepted new connection")
+	pkgLog.Infof("accepted new connection")
 
 	b := make([]byte, 4096)
 	oob := make([]byte, 4096)
@@ -213,24 +229,24 @@ func (s *Server) handleConn(conn *net.UnixConn) {
 	for {
 		n, oobn, _, _, err := conn.ReadMsgUnix(b, oob)
 		if err != nil {
-			fmt.Printf("[Vhost-User] Read error: %v\n", err)
+			pkgLog.Infof("read error: %v", err)
 			break
 		}
 
 		if n < 12 {
-			fmt.Println("[Vhost-User] Short read")
+			pkgLog.Warnf("short read: %d bytes", n)
 			continue
 		}
 
 		var hdr VhostUserMsgHeader
 		if err := hdr.Decode(b[:12]); err != nil {
-			fmt.Printf("[Vhost-User] Decode header error: %v\n", err)
+			pkgLog.Warnf("decode header error: %v", err)
 			continue
 		}
 
 		payload := b[12:n]
 		needReply := (hdr.Flags & VhostUserNeedReply) != 0
-		fmt.Printf("[Vhost-User] Received Request: %d, Flags: 0x%x, Size: %d, oob: %d\n", hdr.Request, hdr.Flags, hdr.Size, oobn)
+		pkgLog.Debugf("request=%d (%s) flags=0x%x size=%d oob=%d", hdr.Request, requestName(hdr.Request), hdr.Flags, hdr.Size, oobn)
 
 		var fds []int
 		if oobn > 0 {
@@ -247,17 +263,24 @@ func (s *Server) handleConn(conn *net.UnixConn) {
 		// reply below; it lets the fallback REPLY_ACK path skip requests that
 		// were answered inline (GetFeatures, GetConfig, GetVringBase, ...).
 		replied := false
+		// fdConsumed counts how many of the received fds this request has
+		// transferred to a VirtQueue or Memory object. Any fds beyond that are
+		// stray (e.g. extra fds past numRegions, or fds on a request that takes
+		// none) and MUST be closed so we never leak guest-passed descriptors.
+		fdConsumed := 0
 
 		switch hdr.Request {
 		case VhostUserGetFeatures:
 			var features uint64 = (1 << 32) | (1 << 24) // VIRTIO_F_VERSION_1 | VIRTIO_F_NOTIFY_ON_EMPTY
+			features |= 1 << 30 // VHOST_USER_F_PROTOCOL_FEATURES: advertises we support the protocol-features negotiation step
 			if s.devType == deviceBlk {
 				// VIRTIO_BLK_F_SIZE_MAX(1), F_SEG_MAX(2), F_BLK_SIZE(6), F_FLUSH(9).
 				// F_BLK_SIZE is advertised because we fill blk_size in the config.
 				features |= (1 << 1) | (1 << 2) | (1 << 6) | (1 << 9)
 			} else if s.devType == deviceNet {
 				// VIRTIO_NET_F_MAC(5), F_MRG_RXBUF(15), F_STATUS(16)
-				features |= (1 << 5) | (1 << 15) | (1 << 16)
+				features |= (1 << 5) | (1 << 16)
+			// (F_MRG_RXBUF bit 15 deliberately omitted: see comment above.)
 			}
 			s.writeU64Reply(hdr, replyBuf, features, conn)
 			replied = true
@@ -295,23 +318,32 @@ func (s *Server) handleConn(conn *net.UnixConn) {
 
 		case VhostUserGetConfig:
 			replied = true
-			// GET_CONFIG payload: u32 offset, u32 size, then up to size bytes
-			// of current config (writeable region). We must return exactly
-			// `size` bytes sliced from our config starting at `offset`.
-			if len(payload) < 8 {
+			// vhost_user_config request payload (12 bytes): u32 offset, u32 size,
+			// u32 flags. Reply echoes the 12-byte header and appends `size` bytes
+			// of config starting at `offset`.
+			if len(payload) < 12 {
 				s.writePayloadReply(hdr, []byte{}, conn)
 				break
 			}
 			off := binary.LittleEndian.Uint32(payload[0:4])
 			sz := binary.LittleEndian.Uint32(payload[4:8])
+			// Cap size to avoid a malicious/huge guest value forcing a giant
+			// allocation. The virtio-blk config space is tiny; anything past a
+			// generous bound is treated as protocol garbage (empty reply).
+			const maxConfigRead = 4096
+			if sz > maxConfigRead {
+				pkgLog.Warnf("GET_CONFIG size %d exceeds bound %d", sz, maxConfigRead)
+				s.writePayloadReply(hdr, []byte{}, conn)
+				break
+			}
 
 			cfg := s.buildDeviceConfig()
-			resp := make([]byte, sz)
+			resp := make([]byte, 12+sz)
+			copy(resp[0:12], payload[0:12]) // echo the request header
 			if uint32(len(cfg)) >= off {
-				n := copy(resp, cfg[off:])
-				// Zero-fill the remainder if the requested window extends past
-				// the config we expose (spec: return `size` bytes regardless).
-				for i := n; i < len(resp); i++ {
+				n := copy(resp[12:], cfg[off:])
+				// Zero-fill remainder if the window extends past our config.
+				for i := 12 + n; i < len(resp); i++ {
 					resp[i] = 0
 				}
 			}
@@ -342,11 +374,15 @@ func (s *Server) handleConn(conn *net.UnixConn) {
 				}
 				if i < len(fds) {
 					if err := s.mem.MapRegion(region, fds[i]); err != nil {
-						fmt.Printf("[Vhost-User] Mmap error: %v\n", err)
+						pkgLog.Warnf("mmap region %d: %v", i, err)
 					}
 				}
 			}
-			fmt.Printf("[Vhost-User] Mapped %d memory regions\n", numRegions)
+			pkgLog.Infof("mapped %d memory regions (prev processors stopped)", numRegions)
+			fdConsumed = int(numRegions)
+			if len(fds) < fdConsumed {
+				fdConsumed = len(fds) // do not over-count missing fds
+			}
 
 		case VhostUserSetVringNum:
 			if len(payload) < 8 {
@@ -359,17 +395,17 @@ func (s *Server) handleConn(conn *net.UnixConn) {
 			// exceed the virtio max (queue_merge_size / 2^15-ish; use 32768 as
 			// a sane upper bound), and must be a power of two per the spec.
 			if num == 0 || num > 32768 || (num&(num-1)) != 0 {
-				fmt.Printf("[Vhost-User] Rejecting invalid vring size %d for queue %d\n", num, idx)
-				// Leave vq.Num unchanged; do not ack success if REPLY_ACK is
-				// expected — fall through with a non-zero payload below.
-				if needReply && s.replyAck {
-					hdr.Flags |= VhostUserReplyMask
-					hdr.Size = 8
-					hdr.Encode(replyBuf[:12])
-					binary.LittleEndian.PutUint64(replyBuf[12:20], 1) // 1 == error
-					conn.Write(replyBuf[:20])
-					replied = true
+				pkgLog.Warnf("rejecting invalid vring size %d for queue %d", num, idx)
+				// Leave vq.Num unchanged. Read replyAck under s.mu to avoid racing
+				// VhostUserSetProtocolFeatures, and reuse writeU64Reply so write
+				// errors are surfaced (the previous direct conn.Write dropped it).
+				s.mu.Lock()
+				rak := s.replyAck
+				s.mu.Unlock()
+				if needReply && rak {
+					s.writeU64Reply(hdr, replyBuf, 1, conn) // payload=1 signals error
 				}
+				replied = needReply && rak
 				break
 			}
 			s.mu.Lock()
@@ -451,6 +487,7 @@ func (s *Server) handleConn(conn *net.UnixConn) {
 						syscall.Close(vq.CallFd)
 					}
 					vq.CallFd = fds[0]
+					fdConsumed = 1
 				}
 			}
 			s.mu.Unlock()
@@ -476,6 +513,7 @@ func (s *Server) handleConn(conn *net.UnixConn) {
 					syscall.Close(vq.KickFd)
 				}
 				vq.KickFd = fds[0]
+				fdConsumed = 1
 			}
 			// Start a processor for this queue exactly once. Re-receiving
 			// SET_VRING_KICK without a prior stop would otherwise spawn a
@@ -483,12 +521,13 @@ func (s *Server) handleConn(conn *net.UnixConn) {
 			start := !vq.processorStarted && vq.KickFd >= 0
 			if start {
 				vq.stopFd = newEventfd()
+				vq.done = make(chan struct{})
 				vq.processorStarted = true
 				atomic.StoreUint32(&vq.stopping, 0) // reset any prior stop flag
 			}
 			s.mu.Unlock()
 			if start {
-				fmt.Printf("[Vhost-User] Virtqueue %d Kick FD received, starting processor...\n", idx)
+				pkgLog.Infof("virtqueue %d kick fd received, starting processor", idx)
 				if s.devType == deviceBlk && s.blk != nil {
 					go vq.ProcessRing(s.mem, s.blk)
 				} else if s.devType == deviceNet && s.netDev != nil {
@@ -501,7 +540,16 @@ func (s *Server) handleConn(conn *net.UnixConn) {
 			}
 
 		default:
-			fmt.Printf("[Vhost-User] Unhandled request %d\n", hdr.Request)
+			pkgLog.Debugf("unhandled request %d", hdr.Request)
+		}
+
+		// Close any received fds this request did not claim. Guest-passed fds
+		// are otherwise leaked on every request that carries extras (or that we
+		// do not handle). Ownership of consumed fds moved to a VirtQueue/Memory.
+		for i := fdConsumed; i < len(fds); i++ {
+			if fds[i] >= 0 {
+				syscall.Close(fds[i])
+			}
 		}
 
 		// REPLY_ACK fallback: only when the guest actually negotiated
@@ -529,7 +577,7 @@ func (s *Server) buildDeviceConfig() []byte {
 			// Surface the error rather than silently reporting a zero capacity
 			// disk (the guest would refuse to probe with
 			// "Couldn't determine size of device's file").
-			fmt.Printf("[Vhost-User] blk.Size error in GET_CONFIG: %v\n", err)
+			pkgLog.Warnf("blk.Size error in GET_CONFIG: %v", err)
 		}
 		capacity := uint64(0)
 		if err == nil {
@@ -538,52 +586,113 @@ func (s *Server) buildDeviceConfig() []byte {
 		binary.LittleEndian.PutUint64(cfg[0:8], capacity)
 		binary.LittleEndian.PutUint32(cfg[8:12], virtioBlkCfgSizeMax)
 		binary.LittleEndian.PutUint32(cfg[12:16], virtioBlkCfgSegMax)
-		// cfg[16:20] geometry cylinders = 0
-		// cfg[20]    geometry heads      = 0
-		// cfg[21]    geometry sectors    = 0
-		binary.LittleEndian.PutUint32(cfg[22:26], virtioBlkCfgBlkSize) // F_BLK_SIZE field
+		// cfg[16:18] geometry cylinders (u16) = 0
+		// cfg[18]    geometry heads      (u8) = 0
+		// cfg[19]    geometry sectors    (u8) = 0
+		binary.LittleEndian.PutUint32(cfg[20:24], virtioBlkCfgBlkSize) // F_BLK_SIZE field
 		// remaining fields default to 0
 	}
 	// Net has a MAC config too; we currently return zeros if not set.
 	return cfg
 }
 
-// stopAllProcessors stops every running ring processor. Called before
-// UnmapAll on re-negotiation so processors do not touch regions being torn
-// down.
+// stopAllProcessors stops every running ring processor and waits for all
+// of them to exit before returning. Called before UnmapAll on re-negotiation
+// so processors cannot touch regions being torn down (use-after-unmap). The
+// wait happens outside s.mu to avoid blocking other callers while a slow
+// processor drains.
 func (s *Server) stopAllProcessors() {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	var waits []chan struct{}
 	for _, vq := range s.queues {
 		if vq == nil {
 			continue
 		}
-		s.stopProcessorLocked(vq)
+		if ch := s.stopProcessorLocked(vq); ch != nil {
+			waits = append(waits, ch)
+		}
+	}
+	s.mu.Unlock()
+	for _, ch := range waits {
+		<-ch
 	}
 }
 
-// stopProcessorLocked tears down a single queue's processor: signals stop,
-// closes its kick/call/stop fds, and clears processorStarted so a future
-// SET_VRING_KICK can start a fresh processor. Caller must hold s.mu.
-func (s *Server) stopProcessorLocked(vq *VirtQueue) {
+// stopProcessorLocked signals a single queue's processor to stop and returns
+// its done channel (nil if no processor was running). It closes the
+// processor-owned fds (KickFd, stopFd) but PRESERVES CallFd: the call fd is
+// installed by SET_VRING_CALL and its lifetime belongs to Server.Stop, not to
+// per-queue processor restart. The caller is responsible for waiting on the
+// returned channel OUTSIDE s.mu before assuming the goroutine has exited.
+// Caller must hold s.mu.
+func (s *Server) stopProcessorLocked(vq *VirtQueue) chan struct{} {
 	if vq == nil {
-		return
+		return nil
 	}
+	var done chan struct{}
 	if vq.processorStarted {
 		vq.markStopping()
+		done = vq.done
 	}
-	// Closing the kick fd lets an in-flight epoll_wait return (the fd becomes
-	// unreadable / hangs up) and prevents a re-armed wait. stopFd was already
-	// written by markStopping to wake the epoll promptly.
-	for _, fd := range []int{vq.KickFd, vq.CallFd, vq.stopFd} {
+	// Close only the fds the processor itself owns. KickFd lets an in-flight
+	// epoll_wait observe hangup; stopFd was already written by markStopping.
+	for _, fd := range []int{vq.KickFd, vq.stopFd} {
 		if fd >= 0 {
 			syscall.Close(fd)
 		}
 	}
 	vq.KickFd = noFd
-	vq.CallFd = noFd
 	vq.stopFd = noFd
+	// Leave CallFd untouched; Server.Stop closes it during full teardown.
 	vq.processorStarted = false
+	// done is reset when a new processor starts (see SET_VRING_KICK).
+	return done
+}
+
+// requestName maps a vhost-user request code to a human-readable label for
+// debug logs. Unknown requests fall back to their numeric value.
+func requestName(req uint32) string {
+	switch req {
+	case VhostUserNone:
+		return "NONE"
+	case VhostUserGetFeatures:
+		return "GET_FEATURES"
+	case VhostUserSetFeatures:
+		return "SET_FEATURES"
+	case VhostUserSetOwner:
+		return "SET_OWNER"
+	case VhostUserResetOwner:
+		return "RESET_OWNER"
+	case VhostUserSetMemTable:
+		return "SET_MEM_TABLE"
+	case VhostUserSetVringNum:
+		return "SET_VRING_NUM"
+	case VhostUserSetVringAddr:
+		return "SET_VRING_ADDR"
+	case VhostUserSetVringBase:
+		return "SET_VRING_BASE"
+	case VhostUserGetVringBase:
+		return "GET_VRING_BASE"
+	case VhostUserSetVringKick:
+		return "SET_VRING_KICK"
+	case VhostUserSetVringCall:
+		return "SET_VRING_CALL"
+	case VhostUserSetVringErr:
+		return "SET_VRING_ERR"
+	case VhostUserGetProtocolFeatures:
+		return "GET_PROTO_FEATURES"
+	case VhostUserSetProtocolFeatures:
+		return "SET_PROTO_FEATURES"
+	case VhostUserGetQueueNum:
+		return "GET_QUEUE_NUM"
+	case VhostUserSetVringEnable:
+		return "SET_VRING_ENABLE"
+	case VhostUserGetConfig:
+		return "GET_CONFIG"
+	case VhostUserSetConfig:
+		return "SET_CONFIG"
+	}
+	return fmt.Sprintf("REQ_%d", req)
 }
 
 // newEventfd creates an eventfd used as a stop wakeup, or returns -1 on
@@ -591,7 +700,7 @@ func (s *Server) stopProcessorLocked(vq *VirtQueue) {
 func newEventfd() int {
 	r0, _, errno := syscall.Syscall(syscall.SYS_EVENTFD2, 0, unix.EFD_CLOEXEC|unix.EFD_NONBLOCK, 0)
 	if errno != 0 {
-		fmt.Printf("[Vhost-User] eventfd creation failed: %v\n", errno)
+		pkgLog.Warnf("eventfd creation failed: %v", errno)
 		return noFd
 	}
 	return int(r0)
