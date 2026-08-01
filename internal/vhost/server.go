@@ -183,7 +183,8 @@ func (s *Server) acceptLoop() {
 		// virtio_uml probe, mconsole, or something else). Zero cost when debug
 		// logging is off except the one getsockopt per accept.
 		if pid, uid, ok := peerCred(conn); ok {
-			pkgLog.Infof("accepted new connection (peer pid=%d uid=%d)", pid, uid)
+			pkgLog.Infof("accepted new connection (peer pid=%d uid=%d comm=%q cmdline=%q ppid=%d)",
+				pid, uid, peerComm(pid), peerCmdline(pid), peerPPid(pid))
 		} else {
 			pkgLog.Infof("accepted new connection (peer cred unavailable)")
 		}
@@ -769,6 +770,69 @@ func peerCred(conn *net.UnixConn) (int, int, bool) {
 		return 0, 0, false
 	}
 	return int(cred.Pid), int(cred.Uid), true
+}
+
+// peerComm returns the executable name of pid (Linux /proc/<pid>/comm),
+// truncated and NUL-stripped. Empty on any error (peer gone, permission).
+func peerComm(pid int) string {
+	b, err := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
+	if err != nil {
+		return ""
+	}
+	for i, c := range b {
+		if c == 0 || c == '\n' {
+			return string(b[:i])
+		}
+	}
+	return string(b)
+}
+
+// peerCmdline returns the full argv of pid (Linux /proc/<pid>/cmdline) with
+// NULs turned into spaces, truncated to a reasonable length. Empty on error.
+func peerCmdline(pid int) string {
+	b, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
+	if err != nil {
+		return ""
+	}
+	for i, c := range b {
+		if c == 0 {
+			b[i] = ' '
+		}
+	}
+	const max = 160
+	if len(b) > max {
+		b = b[:max]
+	}
+	return string(b)
+}
+
+// peerPPid returns the parent pid of pid (Linux /proc/<pid>/stat field 4),
+// or 0 on error. Used to tell whether the connecter is the UML guest (ppid =
+// agentpvm) vs a stray daemon.
+func peerPPid(pid int) int {
+	b, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return 0
+	}
+	// field 4 is ppid; fields are space-separated but comm (field 2) may
+	// contain spaces and is wrapped in (). Skip past the closing ')'.
+	s := string(b)
+	if i := lastIndexByte(s, ')'); i >= 0 {
+		s = s[i+1:]
+	}
+	var state byte
+	var ppid int
+	fmt.Sscanf(s, " %c %d", &state, &ppid)
+	return ppid
+}
+
+func lastIndexByte(s string, c byte) int {
+	for i := len(s) - 1; i >= 0; i-- {
+		if s[i] == c {
+			return i
+		}
+	}
+	return -1
 }
 
 // timeNow is the standard time.Now, wrapped so tests can stub it if needed.
