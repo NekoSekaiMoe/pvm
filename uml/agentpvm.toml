@@ -30,7 +30,8 @@ use_vhost_blk = false     # set true to back the block device with qemu-storage-
 # --- network egress (plan.md §4) ---
 # Two-layer enforcement: the L7 proxy below + the eBPF TC filter as IP floor.
 [network]
-enabled       = false     # default-deny: no network unless explicitly enabled
+enabled       = true      # create a NIC for the guest; egress is still gated by the
+                          # L7 proxy allowlist + eBPF IP floor below
 bridge        = "br0"
 gateway_ip    = "10.0.0.1/24"
 tap           = ""        # auto-derived from task name when empty

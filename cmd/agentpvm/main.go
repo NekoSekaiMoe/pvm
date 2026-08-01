@@ -97,11 +97,24 @@ func resolveConfigPath(explicit string) (string, bool) {
 }
 
 // runCmd boots a sandbox from a TaskSpec.
+//
+// In addition to -config (the full TaskSpec TOML), the launch-relevant
+// fields can be overridden on the command line. These mirror umlctl's thin
+// launcher flags so the same kernel/rootfs/init/vhost knobs work on both
+// binaries; CLI flags take precedence over the config file.
 func runCmd(args []string) {
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
 	configPath := fs.String("config", "", "Path to TaskSpec TOML (default: ./uml/agentpvm.toml)")
 	name := fs.String("name", "", "Override task id (default: spec.runtime.name)")
 	debug := fs.Bool("debug", false, "Enable debug logging")
+	// Launch overrides (applied after loading the spec). Empty/zero means
+	// "keep whatever the config file provided".
+	rootfs := fs.String("rootfs", "", "Override workspace.base_image (rootfs / backing image path)")
+	kernel := fs.String("kernel", "", "Override kernel.path (UML kernel binary)")
+	initCmd := fs.String("init", "", "Override workspace.init (in-guest init command)")
+	vhost := fs.Bool("vhost", false, "Use qemu-storage-daemon vhost-user-blk backend (implies virtio)")
+	netEnabled := fs.Bool("net", false, "Enable guest networking (overrides network.enabled)")
+	netTap := fs.String("net-tap", "", "Host TAP device name (overrides network.tap)")
 	fs.Parse(args)
 
 	if *debug {
@@ -121,6 +134,28 @@ func runCmd(args []string) {
 	} else {
 		s = safeDefaultSpec()
 		fmt.Printf("Using built-in safe defaults (caller=%s)\n", s.Caller)
+	}
+
+	// Apply CLI launch overrides (flag > config > default).
+	if *rootfs != "" {
+		s.Workspace.BaseImage = *rootfs
+	}
+	if *kernel != "" {
+		s.Kernel.Path = *kernel
+	}
+	if *initCmd != "" {
+		s.Workspace.Init = *initCmd
+	}
+	if *vhost {
+		s.Kernel.UseVhostBlk = true
+		s.Kernel.Virtio = true // vhost-user-blk requires virtio
+	}
+	if *netEnabled {
+		s.Network.Enabled = true
+	}
+	if *netTap != "" {
+		s.Network.Enabled = true // a TAP name implies the caller wants networking
+		s.Network.TAP = *netTap
 	}
 
 	taskID := *name

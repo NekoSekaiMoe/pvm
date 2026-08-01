@@ -1,7 +1,7 @@
 #!/bin/bash
 set -ex
 
-KERNEL_VERSION="6.6.9"
+KERNEL_VERSION="6.18.36"
 KERNEL_TAR="linux-${KERNEL_VERSION}.tar.xz"
 KERNEL_URL="https://cdn.kernel.org/pub/linux/kernel/v6.x/${KERNEL_TAR}"
 
