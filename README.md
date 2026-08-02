@@ -40,7 +40,7 @@ layer.
 
 ### Three-layer chain
 
-```
+```text
                        host                                      guest
 +----------------------------------------+   +------------------------+
 |  base.qcow2  (shared, read-only)       |   |                        |

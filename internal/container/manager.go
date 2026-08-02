@@ -159,7 +159,17 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 
 	// Load/create lifecycle state early so any subsequent failure can flip it
 	// to Failed consistently (including the spec-evidence append below).
-	st, _ := state.LoadState(taskID)
+	st, loadErr := state.LoadState(taskID)
+	if loadErr != nil {
+		// A non-nil error here means the state file exists but is corrupt or
+		// unreadable, NOT that the task is new (a missing file returns nil,
+		// nil). Discarding it silently would lose the prior transition history
+		// with no trace; log it so an operator can distinguish a fresh task
+		// from a state-loss event. We still proceed with a fresh state because
+		// the task cannot run without one, and the audit ledger is the
+		// tamper-evident record of what actually happened.
+		log.Default().Warnf("container: load existing state for %s failed (starting fresh): %v", taskID, loadErr)
+	}
 	if st == nil {
 		st = &state.ContainerState{ID: taskID, Name: s.Runtime.Name, Tenant: s.Tenant, Caller: s.Caller, StartedAt: time.Now()}
 	}
@@ -449,15 +459,14 @@ func buildTaskArgs(s *spec.TaskSpec, vhostSock, resolvedRootfs, egressAddr strin
 		args = append(args, fmt.Sprintf("virtio_uml.device=%s:%d", vhostSock, vhost.VirtioIDBlock))
 		args = append(args, "root=/dev/vda")
 	} else {
-		// ubd path: resolvedRootfs is the base image mounted directly (no CoW).
-		root := resolvedRootfs
-		if root == "" {
-			root = s.Workspace.Overlay
-			if root == "" {
-				root = s.Workspace.BaseImage
-			}
-		}
-		args = append(args, fmt.Sprintf("ubd0=%s", root))
+		// ubd path: resolvedRootfs is the single source of truth that StartTask
+		// provisioned. StartTask sets it whenever BaseImage != "", so reaching
+		// here with it empty means BaseImage was empty too — there is nothing
+		// valid to fall back to. Don't re-derive from Workspace.Overlay/
+		// BaseImage: that would let an unprovisioned file onto the kernel
+		// command line and break the "cmdline matches what we created"
+		// invariant resolvedRootfs exists to enforce.
+		args = append(args, fmt.Sprintf("ubd0=%s", resolvedRootfs))
 		args = append(args, "root=/dev/ubda")
 	}
 	args = append(args, "rw")
