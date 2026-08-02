@@ -12,21 +12,28 @@ go build -o agentpvm cmd/agentpvm/main.go
 dd if=/dev/zero of=base.img bs=1M count=10 > /dev/null 2>&1
 mkfs.ext4 -q -F base.img
 
-# Create CoW qcow2 using our Go CLI (simulating direct call)
+# The agent path is qcow2-only: agentpvm creates a per-task qcow2 CoW overlay
+# on top of a qcow2 base and serves it via qemu-storage-daemon. Convert the
+# raw ext4 image to qcow2 once; agentpvm builds the overlay itself at start.
 if ! command -v qemu-img &> /dev/null; then
-    echo "qemu-img not found, skipping CoW creation step."
+    echo "qemu-img not found, skipping qcow2 base creation step."
+    exit 0
+fi
+# qemu-storage-daemon is the sole vhost-user-blk backend and is required for
+# the qcow2 overlay path.
+if ! command -v qemu-storage-daemon &> /dev/null; then
+    echo "qemu-storage-daemon not found, skipping (required for qcow2 vhost)."
     exit 0
 fi
 
-echo "Creating qcow2 CoW overlay..."
-qemu-img create -f qcow2 -b base.img -F raw overlay.qcow2 > /dev/null
+echo "Converting raw ext4 base to qcow2..."
+qemu-img convert -p -O qcow2 base.img base.qcow2 > /dev/null
 
-echo "Attempting to launch qemu-storage-daemon with qcow2 driver..."
-# The Go code will automatically detect .qcow2 and parse it instead of raw
-./agentpvm run -name "test-cow" -rootfs overlay.qcow2 -vhost=true &
+echo "Launching agentpvm (qcow2 base -> per-task overlay via qemu-storage-daemon)..."
+./agentpvm run -name "test-cow" -rootfs base.qcow2 -vhost=true &
 PID=$!
 
-trap "kill $PID 2>/dev/null || true; rm -f base.img overlay.qcow2" EXIT
+trap "kill $PID 2>/dev/null || true; rm -f base.img base.qcow2" EXIT
 
 if ! kill -0 $PID 2>/dev/null; then
     echo "❌ agentpvm failed to start"

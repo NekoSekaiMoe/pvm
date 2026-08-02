@@ -181,15 +181,26 @@ func TestRelease_DestroyRecyclesQuota(t *testing.T) {
 }
 
 // TestRelease_DestroyErrorPropagates ensures a failing Destroyer is surfaced
-// to the caller (previously its error was silently dropped).
+// to the caller (previously its error was silently dropped), AND that the
+// quota is still released even when Destroy fails — otherwise a tenant whose
+// destroyer is flaky would permanently leak quota and be unable to claim again.
 func TestRelease_DestroyErrorPropagates(t *testing.T) {
 	m := NewManager(10, tmpLedger(t))
 	m.Destroyer = func(string) error { return errors.New("boom") }
 	tmpl := Template{Name: "x", Memory: "128M", CPU: 1}
+	// Cap concurrency at 1 so the post-destroy re-claim is the real test of
+	// whether quota was released.
+	m.SetQuota("tenant", Quota{MaxConcurrent: 1, MaxCPU: 4, MaxMemoryMB: 512, MaxTasksPerHour: 100})
 	m.Warm(tmpl, 1)
 	id, _ := m.Claim("tenant", tmpl, "task")
 	err := m.Release(id, false)
 	if err == nil || !strings.Contains(err.Error(), "boom") {
 		t.Errorf("expected destroyer error to propagate, got %v", err)
+	}
+	// Quota MUST have been released despite the destroy error, so the same
+	// tenant can claim again once a fresh warm sandbox is available.
+	m.Warm(tmpl, 1)
+	if _, err := m.Claim("tenant", tmpl, "task-2"); err != nil {
+		t.Errorf("claim after destroy failure was denied (quota leaked despite error propagation): %v", err)
 	}
 }

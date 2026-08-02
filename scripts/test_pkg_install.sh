@@ -59,15 +59,21 @@ echo "Attempting to install fastfetch..."
 busybox true 2>&1
  echo "BUSYBOX_TRUE rc=$?"
 
-# 3.5) 网络诊断：定位 DNS 失败在哪一层
-echo "--- guest net diag ---"
-ip addr show eth0 2>&1 | grep -E 'inet |state'
+# 3.5) 网络诊断：打印未过滤的接口/路由表，定位 "Network unreachable"
+# 到底是 eth0 根本不存在、还是存在但没拿到 IP/路由。之前的 grep 过滤会
+# 吞掉 "Device not found" 这类错误，让诊断尖细号丢失。
+echo "--- guest net diag (full, unfiltered) ---"
+echo "### ip addr show"
+ip addr show 2>&1
+echo "### ip route show"
 ip route show 2>&1
-echo "ping gateway 10.0.0.1:"
+echo "### ip link show eth0"
+ip link show eth0 2>&1 || echo "(eth0 does not exist in the guest)"
+echo "### ping gateway 10.0.0.1"
 ping -c 2 -W 3 10.0.0.1 2>&1 || echo "ping gw FAILED rc=$?"
-echo "nslookup 8.8.8.8 -> dl-cdn.alpinelinux.org:"
+echo "### nslookup dl-cdn.alpinelinux.org 8.8.8.8"
 nslookup dl-cdn.alpinelinux.org 8.8.8.8 2>&1 || echo "nslookup FAILED rc=$?"
-echo "ping 8.8.8.8 (raw IP, no DNS):"
+echo "### ping 8.8.8.8 (raw IP, no DNS)"
 ping -c 2 -W 3 8.8.8.8 2>&1 || echo "ping 8.8.8.8 FAILED rc=$?"
 echo "--- end guest net diag ---"
 
@@ -87,11 +93,44 @@ sudo chmod +x mnt_pkg/init.sh
 trap - EXIT
 sudo umount mnt_pkg
 
-# Setup Host Networking
-sudo ip tuntap add tap_pkg mode tap || true
-sudo ip link set tap_pkg up || true
-sudo ./bin/umlctl network create pvm_br0 || true
-sudo ip link set tap_pkg master pvm_br0 || true
+# The agent path is qcow2-only: it creates a per-task qcow2 CoW overlay on
+# top of the base and serves it via qemu-storage-daemon (vhost-user-blk). The
+# ubd backend cannot read qcow2, so a raw base would panic the guest with
+# "VFS: Unable to mount root fs". Convert the raw ext4 image to qcow2 once,
+# then hand the .qcow2 to agentpvm with vhost enabled.
+if ! command -v qemu-img >/dev/null 2>&1; then
+    echo "FATAL: qemu-img is required to build the qcow2 base image."
+    exit 1
+fi
+BASE_QCOW2="pkg_rootfs.qcow2"
+rm -f "${BASE_QCOW2}"
+qemu-img convert -p -O qcow2 "${IMG_NAME}" "${BASE_QCOW2}" >/dev/null
+if ! command -v qemu-storage-daemon >/dev/null 2>&1; then
+    echo "FATAL: qemu-storage-daemon is required for vhost-user-blk (qcow2 CoW)."
+    exit 1
+fi
+
+# Setup Host Networking. Do NOT swallow these errors silently: a missing
+# bridge or a tap that never got mastered leaves the guest with no route,
+# which presents as a vague "Network unreachable" deep in apk. Each step logs
+# its outcome so a CI failure points at the broken layer.
+echo "===== HOST NETWORK SETUP ====="
+sudo ip tuntap add tap_pkg mode tap 2>&1 || echo "[net] tap_pkg already exists or failed to add"
+sudo ip link set tap_pkg up 2>&1 || echo "[net] WARN: tap_pkg up failed"
+sudo ./bin/umlctl network create pvm_br0 2>&1 || echo "[net] WARN: pvm_br0 create returned non-zero (may already exist)"
+sudo ip link set tap_pkg master pvm_br0 2>&1 || echo "[net] ERROR: could not master tap_pkg onto pvm_br0 (bridge missing?)"
+
+# Fail fast if the bridge or the tap-mastering actually failed: there is no
+# point booting a guest that cannot reach the gateway. These checks turn the
+# silent ||true failures above into an explicit, diagnosable exit.
+if ! sudo ip link show pvm_br0 >/dev/null 2>&1; then
+    echo "[net] FATAL: pvm_br0 does not exist after setup; aborting before guest boot."
+    exit 1
+fi
+if ! sudo bridge link 2>/dev/null | grep -q tap_pkg; then
+    echo "[net] FATAL: tap_pkg is not attached to pvm_br0; guest would have no L2 path. Aborting."
+    exit 1
+fi
 
 # ---- 诊断：dump host 侧网络状态，定位 DNS 失败是 host 还是 guest 侧问题 ----
 echo "===== HOST NETWORK STATE ====="
@@ -114,8 +153,8 @@ sudo rm -f "$CONSOLE_LOG"
 # 容器一打出 PKG_INSTALL_SUCCESS 就立即成功退出；agentpvm 提前崩溃也会被
 # 后台等待器感知；超时则由内层 timeout 兜底。
 sudo ./agentpvm run -name pkg-test \
-    -rootfs ${IMG_NAME} -kernel ./bin/linux -init /init.sh \
-    -vhost=false -net-tap tap_pkg
+    -rootfs ${BASE_QCOW2} -kernel ./bin/linux -init /init.sh \
+    -vhost=true -net-tap tap_pkg
 PVM_PID=$!
 
 cleanup() {

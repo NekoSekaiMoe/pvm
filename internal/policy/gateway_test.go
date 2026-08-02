@@ -132,7 +132,9 @@ func TestStringContains(t *testing.T) {
 
 // TestDecide_EffectGatesMatch covers the PAY/PROD default-deny guarantee
 // (plan.md §6.2): a rule authorizing a tool only for read must NOT satisfy a
-// request with effect="pay". Before the fix, Decide ignored Effect entirely.
+// request with effect="pay". Before the fix, Decide ignored Effect entirely;
+// a later fix only handled the case where BOTH rule and request carried an
+// Effect, so an effect-less request still matched a scoped rule.
 func TestDecide_EffectGatesMatch(t *testing.T) {
 	g := NewGateway([]Rule{
 		{Name: "git", Action: ActionAllow, Effect: "read"},
@@ -147,6 +149,13 @@ func TestDecide_EffectGatesMatch(t *testing.T) {
 	act, _, _ := g.Decide(ToolRequest{Name: "git", Effect: "pay"})
 	if act == ActionAllow {
 		t.Errorf("pay effect: rule {Effect:read} satisfied a pay request (effect ignored)")
+	}
+	// EMPTY request Effect must NOT satisfy a scoped allow rule either: it
+	// falls through to the pay-scoped deny (or the catch-all), never allow.
+	// This is the regression the second fix closed.
+	actEmpty, _, _ := g.Decide(ToolRequest{Name: "git"})
+	if actEmpty == ActionAllow {
+		t.Errorf("empty effect: scoped allow rule {Effect:read} satisfied an effect-less request")
 	}
 }
 
@@ -166,25 +175,54 @@ func TestSanitize_RecursivelyDropsNestedSecrets(t *testing.T) {
 	}}
 	out := sanitize(in)
 	top := out.Result
+	if top == nil {
+		t.Fatalf("sanitize dropped the whole Result map")
+	}
 	if _, leak := top["token"]; leak {
 		t.Error("top-level token survived")
 	}
-	meta, _ := top["meta"].(map[string]interface{})
+	meta, ok := top["meta"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("meta is not a map after sanitize: %T", top["meta"])
+	}
 	if _, leak := meta["token"]; leak {
 		t.Error("nested map token survived (sanitize is not recursive)")
 	}
-	headers, _ := meta["headers"].(map[string]interface{})
+	headers, ok := meta["headers"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("headers is not a map after sanitize: %T", meta["headers"])
+	}
 	if _, leak := headers["Authorization"]; leak {
 		t.Error("doubly-nested Authorization survived (sanitize is not recursive)")
 	}
-	items, _ := top["items"].([]interface{})
-	first, _ := items[0].(map[string]interface{})
+	items, ok := top["items"].([]interface{})
+	if !ok || len(items) != 2 {
+		t.Fatalf("items missing or wrong length after sanitize: %v", top["items"])
+	}
+	first, ok := items[0].(map[string]interface{})
+	if !ok {
+		t.Fatalf("items[0] is not a map after sanitize: %T", items[0])
+	}
 	if _, leak := first["password"]; leak {
 		t.Error("nested slice element password survived")
 	}
-	second, _ := items[1].(map[string]interface{})
-	if second["size"] != 1 {
-		t.Error("safe nested field was dropped")
+	second, ok := items[1].(map[string]interface{})
+	if !ok {
+		t.Fatalf("items[1] is not a map after sanitize: %T", items[1])
+	}
+	// JSON decoding produces float64 for numbers, but this test builds the
+	// map from a Go int literal, so accept any numeric kind with value 1.
+	switch s := second["size"].(type) {
+	case float64:
+		if s != 1 {
+			t.Errorf("safe nested field 'size' altered: %v", second["size"])
+		}
+	case int:
+		if s != 1 {
+			t.Errorf("safe nested field 'size' altered: %v", second["size"])
+		}
+	default:
+		t.Errorf("safe nested field 'size' was dropped or wrong type: %T %v", second["size"], second["size"])
 	}
 }
 

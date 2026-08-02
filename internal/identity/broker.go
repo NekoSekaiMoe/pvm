@@ -57,6 +57,11 @@ type Broker struct {
 	// live. Maintained so RevokeAllForTask can enumerate and revoke without
 	// relying on ID prefix matching.
 	activeByTask map[string]map[string]struct{}
+	// taskByToken is the reverse index of activeByTask: token ID -> task id.
+	// Kept in sync on every insert/remove so expiry cleanup (which knows only
+	// the token id from the JWT payload) can locate the owning task in O(1)
+	// instead of scanning every task's token set.
+	taskByToken  map[string]string
 	ledger       *audit.Ledger
 	store        SecretStore
 	defaultTTL   time.Duration
@@ -95,6 +100,7 @@ func NewBroker(key []byte, store SecretStore, ledger *audit.Ledger, defaultTTL t
 		signingKey:   key,
 		revoked:      make(map[string]struct{}),
 		activeByTask: make(map[string]map[string]struct{}),
+		taskByToken:  make(map[string]string),
 		ledger:       ledger,
 		store:        store,
 		defaultTTL:   defaultTTL,
@@ -135,6 +141,7 @@ func (b *Broker) Mint(caller, tenant, taskID string, scope []string, ttl time.Du
 		b.activeByTask[taskID] = make(map[string]struct{})
 	}
 	b.activeByTask[taskID][id] = struct{}{}
+	b.taskByToken[id] = taskID
 	b.mu.Unlock()
 
 	if b.ledger != nil {
@@ -150,6 +157,7 @@ func (b *Broker) Mint(caller, tenant, taskID string, scope []string, ttl time.Du
 			// back the live index and refuse to hand out the token.
 			b.mu.Lock()
 			delete(b.activeByTask[taskID], id)
+			delete(b.taskByToken, id)
 			b.mu.Unlock()
 			return "", fmt.Errorf("identity: mint audit failed: %w", err)
 		}
@@ -181,15 +189,22 @@ func (b *Broker) Validate(tokStr string) (*Token, error) {
 		return nil, ErrRevoked
 	}
 	if time.Now().After(tok.Exp) {
-		// Lazily drop expired ids from the live index so the active set stays
-		// bounded; this is purely bookkeeping hygiene.
+		// Lazily drop the expired id from the live index so the active set
+		// stays bounded. With the reverse index we locate the owning task in
+		// O(1); we also clear it from the revoked set so a later mint that
+		// happens to reuse the id (vanishingly unlikely given the entropy) is
+		// not permanently denied.
 		b.mu.Lock()
-		for task, ids := range b.activeByTask {
-			delete(ids, tok.ID)
-			if len(ids) == 0 {
-				delete(b.activeByTask, task)
+		if task, ok := b.taskByToken[tok.ID]; ok {
+			if ids, ok := b.activeByTask[task]; ok {
+				delete(ids, tok.ID)
+				if len(ids) == 0 {
+					delete(b.activeByTask, task)
+				}
 			}
+			delete(b.taskByToken, tok.ID)
 		}
+		delete(b.revoked, tok.ID)
 		b.mu.Unlock()
 		return nil, ErrExpired
 	}
@@ -219,6 +234,15 @@ func (b *Broker) RequireScope(tokStr string, required ...string) (*Token, error)
 func (b *Broker) Revoke(tokenID string) {
 	b.mu.Lock()
 	b.revoked[tokenID] = struct{}{}
+	if task, ok := b.taskByToken[tokenID]; ok {
+		if ids, ok := b.activeByTask[task]; ok {
+			delete(ids, tokenID)
+			if len(ids) == 0 {
+				delete(b.activeByTask, task)
+			}
+		}
+		delete(b.taskByToken, tokenID)
+	}
 	b.mu.Unlock()
 	if b.ledger != nil {
 		if err := b.ledger.Append(audit.Record{
@@ -244,6 +268,7 @@ func (b *Broker) RevokeAllForTask(taskID string) int {
 	for id := range b.activeByTask[taskID] {
 		ids = append(ids, id)
 		b.revoked[id] = struct{}{}
+		delete(b.taskByToken, id)
 	}
 	// Drop the task's live set; remaining ids are now only in `revoked`.
 	delete(b.activeByTask, taskID)

@@ -104,10 +104,16 @@ func (g *Gateway) Decide(req ToolRequest) (Action, Rule, error) {
 	for _, r := range g.rules {
 		if r.Name == req.Name || r.Name == "*" {
 			// first match wins; but a rule with a non-empty Effect constrains the
-			// match: the request's Effect must equal the rule's Effect. This is
-			// the PAY/PROD default-deny guarantee (plan.md §6.2): a rule that
-			// only authorizes "read" must not satisfy a "pay" request.
-			if r.Effect != "" && req.Effect != "" && r.Effect != req.Effect {
+			// match: a scoped rule authorizes ONLY that Effect. This is the
+			// PAY/PROD default-deny guarantee (plan.md §6.2): a rule that only
+			// authorizes "read" must not satisfy a "pay" request, and a request
+			// that carries no Effect must not be satisfied by a scoped rule at
+			// all (it falls through to later rules or the default denial).
+			//
+			// The earlier condition "r.Effect != "" && req.Effect != "" && ..."
+			// was wrong: when req.Effect was empty it short-circuited the
+			// inequality check, so scoped rules matched effect-less requests.
+			if r.Effect != "" && r.Effect != req.Effect {
 				continue
 			}
 			return r.Action, r, nil
@@ -190,7 +196,8 @@ func sanitize(r ToolResponse) ToolResponse {
 
 // scrubValue recursively scrubs a value: maps have secret-named keys dropped
 // (and their values recursively scrubbed), slices are element-wise scrubbed,
-// everything else passes through unchanged.
+// strings are passed through redactSecrets so a credential pattern in a value
+// is masked even when the key name is benign (e.g. {"url": "...token=ghp_..."}).
 func scrubValue(v interface{}) interface{} {
 	switch x := v.(type) {
 	case map[string]interface{}:
@@ -207,6 +214,8 @@ func scrubValue(v interface{}) interface{} {
 			out[i] = scrubValue(vv)
 		}
 		return out
+	case string:
+		return redactSecrets(x)
 	}
 	return v
 }

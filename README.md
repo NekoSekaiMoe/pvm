@@ -8,7 +8,7 @@ PVM is a lightweight, User-Mode Linux (UML)-based container management system. I
 - **REST API**: Built-in HTTP server (`internal/api`) for remote orchestration, compatible with E2B SDK patterns.
 - **Modern WebUI**: An embedded, glassmorphism-designed WebUI (built with Nuxt 3) for visually managing containers, images, and logs.
 - **Networking**: Bridge and TAP interface management for UML networking.
-- **Image Management**: Seamless pulling of Docker base images to be used as container rootfs via OverlayFS.
+- **Image Management**: Seamless pulling of Docker base images to be used as container rootfs via qcow2 CoW overlays served by qemu-storage-daemon over vhost-user-blk.
 
 ## Dependency
 - x86/x64 device(no limits, arm64 uml is porting)

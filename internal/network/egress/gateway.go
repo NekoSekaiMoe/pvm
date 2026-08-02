@@ -93,7 +93,11 @@ func NewGateway() *Gateway {
 // so unit tests can route to httptest.NewServer (which binds 127.0.0.1) without
 // being blocked by the floor. Production callers MUST NOT use it; the SSRF
 // floor is a load-bearing security control.
-func (g *Gateway) EnableSSRFBypassForTest() { g.ssrfBypass = true }
+func (g *Gateway) EnableSSRFBypassForTest() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.ssrfBypass = true
+}
 
 // SetPolicy installs/updates the egress policy for a task.
 func (g *Gateway) SetPolicy(task string, p *Policy) {
@@ -105,7 +109,11 @@ func (g *Gateway) SetPolicy(task string, p *Policy) {
 // AttachLedger wires a fallback audit ledger so every egress decision is
 // recorded. For gateways that serve multiple tasks, prefer AttachTaskLedger
 // so each task's traffic lands in its own ledger.
-func (g *Gateway) AttachLedger(l *audit.Ledger) { g.ledger = l }
+func (g *Gateway) AttachLedger(l *audit.Ledger) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.ledger = l
+}
 
 // AttachTaskLedger wires a task-specific ledger. When present, it takes
 // precedence over the gateway-wide ledger for that task's records, so a
@@ -118,12 +126,17 @@ func (g *Gateway) AttachTaskLedger(task string, l *audit.Ledger) {
 }
 
 // Listen starts the proxy on addr (e.g. "127.0.0.1:0" for ephemeral). Returns
-// the actual address once bound.
+// the actual address once bound. The shared listener attributes traffic via
+// the guest-supplied X-Task-Id header, which is appropriate for tests and
+// single-tenant setups but is NOT a trustworthy attribution source in
+// production (a malicious guest can forge it). Production callers should use
+// ListenForTask instead, which binds the task id by closure.
 func (g *Gateway) Listen(ctx context.Context, addr string) (string, error) {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return "", err
 	}
+	g.mu.Lock()
 	g.listener = ln
 	g.server = &http.Server{
 		Handler: http.HandlerFunc(g.handle),
@@ -135,8 +148,77 @@ func (g *Gateway) Listen(ctx context.Context, addr string) (string, error) {
 		WriteTimeout:      60 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
+	g.mu.Unlock()
 	go g.server.Serve(ln)
 	return ln.Addr().String(), nil
+}
+
+// taskListener is a per-task egress listener. Its handler binds the task id
+// by closure, so attribution comes from which listener the traffic arrived on
+// (a host-side, unforgeable fact) rather than any guest-supplied identifier.
+// Closing it stops that task's proxy without affecting other tasks.
+type taskListener struct {
+	taskID   string
+	addr     string
+	server   *http.Server
+	listener net.Listener
+	gateway  *Gateway
+}
+
+// Addr returns the host:port clients should dial.
+func (t *taskListener) Addr() string { return t.addr }
+
+// Close stops the per-task listener.
+func (t *taskListener) Close() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return t.server.Shutdown(ctx)
+}
+
+// ListenForTask opens a DEDICATED listener for one task. Traffic arriving on
+// the returned listener is attributed to taskID by construction — the guest
+// is handed this listener's host:port as its proxy and dials ONLY it, so the
+// task id is fixed at the network layer and cannot be forged by the guest
+// (unlike the X-Task-Id header on the shared listener). The guest never sees
+// the task id string. The listener is owned by the caller, which must Close
+// it when the task exits.
+func (g *Gateway) ListenForTask(ctx context.Context, taskID string) (*taskListener, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	addr := "127.0.0.1:0"
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = deadline // currently informational; the listener has no dial timeout
+	}
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+	tl := &taskListener{
+		taskID:   taskID,
+		addr:     ln.Addr().String(),
+		listener: ln,
+		gateway:  g,
+	}
+	// Bound the task to this listener so the handler resolves the policy even
+	// before any request arrives (and so ListenForTask is self-contained).
+	if g.policy(taskID) == nil {
+		g.SetPolicy(taskID, &Policy{})
+	}
+	tl.server = &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Authoritative attribution: the task id is bound by closure to
+			// this listener, so we overwrite any guest-supplied X-Task-Id.
+			r.Header.Set("X-Task-Id", taskID)
+			g.handle(w, r)
+		}),
+		ReadTimeout:       60 * time.Second,
+		ReadHeaderTimeout: 10 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+	go tl.server.Serve(ln)
+	return tl, nil
 }
 
 // Shutdown stops the proxy.
@@ -307,10 +389,22 @@ func (g *Gateway) handleHTTP(w http.ResponseWriter, r *http.Request, task string
 // dialCheckedTransport returns an http.RoundTripper whose DialContext rejects
 // private/loopback/link-local destination IPs. When g.ssrfBypass is set (test
 // only), the DialContext is the standard one so loopback upstreams work.
+//
+// Every transport constructed here disables keep-alives: handleHTTP creates a
+// fresh transport PER request (so it can scope DialContext to that request's
+// SSRF check), and a transport that is discarded while holding idle connections
+// leaks them (and their goroutines) until GC. DisableKeepAlives=true makes each
+// round-trip open+close its own connection, so discarding the transport has no
+// dangling state.
 func (g *Gateway) dialCheckedTransport() *http.Transport {
-	if g.ssrfBypass {
+	g.mu.RLock()
+	bypass := g.ssrfBypass
+	g.mu.RUnlock()
+	if bypass {
 		return &http.Transport{
 			ResponseHeaderTimeout: 30 * time.Second,
+			DisableKeepAlives:     true,
+			IdleConnTimeout:       1 * time.Second,
 		}
 	}
 	return &http.Transport{
@@ -327,6 +421,8 @@ func (g *Gateway) dialCheckedTransport() *http.Transport {
 			return conn, nil
 		},
 		ResponseHeaderTimeout: 30 * time.Second,
+		DisableKeepAlives:     true,
+		IdleConnTimeout:       1 * time.Second,
 	}
 }
 

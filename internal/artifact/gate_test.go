@@ -153,11 +153,20 @@ func TestHash_BindsContentNotLength(t *testing.T) {
 }
 
 // TestHash_BindsEachTraceElement ensures multiple trace elements each
-// contribute independently to the digest.
+// contribute independently to the digest, including the boundary between
+// one element and two elements whose concatenation is identical: a single
+// "ab" must hash differently than two elements "a"+"b" (otherwise an
+// attacker could split/merge trace entries to collide digests).
 func TestHash_BindsEachTraceElement(t *testing.T) {
 	b1 := &Bundle{TaskID: "t", Trace: []string{"a", "b"}}
 	b2 := &Bundle{TaskID: "t", Trace: []string{"a", "c"}}
 	if hashBundle(b1) == hashBundle(b2) {
 		t.Error("changing a trace element did not change the hash")
+	}
+	// Element-boundary regression: ["ab"] must not collide with ["a","b"].
+	merged := &Bundle{TaskID: "t", Trace: []string{"ab"}}
+	split := &Bundle{TaskID: "t", Trace: []string{"a", "b"}}
+	if hashBundle(merged) == hashBundle(split) {
+		t.Error("trace element boundary is not bound: [\"ab\"] collided with [\"a\",\"b\"]")
 	}
 }

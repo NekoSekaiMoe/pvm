@@ -127,6 +127,7 @@ func TestServer_ExecHitsRegisteredGateway(t *testing.T) {
 		{Name: "read_file", Action: policy.ActionAllow},
 	}, nil)
 	RegisterPolicyGateway("tk-exec", gw)
+	t.Cleanup(func() { UnregisterPolicyGateway("tk-exec") })
 
 	req, _ := http.NewRequest(http.MethodPost, base+"/api/exec?task=tk-exec", strings.NewReader(`{"cmd":"read_file"}`))
 	req.Header.Set("Authorization", "Bearer secret")

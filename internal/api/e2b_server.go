@@ -90,7 +90,7 @@ func StartE2BServer(port int) error {
 			req.Name = "web-container"
 		}
 
-		if !regexp.MustCompile(`^[a-zA-Z0-9_-]+$`).MatchString(req.Name) {
+		if !idRegex.MatchString(req.Name) {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": "Invalid container ID format"})
 		}
 		if req.CPU < 0 || req.CPU > 1024 {
@@ -127,7 +127,7 @@ func StartE2BServer(port int) error {
 	// Get logs
 	api.GET("/containers/:id/logs", func(c echo.Context) error {
 		id := c.Param("id")
-		if !regexp.MustCompile(`^[a-zA-Z0-9_-]+$`).MatchString(id) {
+		if !idRegex.MatchString(id) {
 			return c.String(http.StatusBadRequest, "Invalid container ID")
 		}
 		dir, err := state.ContainerDir(id)
@@ -142,10 +142,10 @@ func StartE2BServer(port int) error {
 		return c.String(http.StatusOK, string(data))
 	})
 
-		// Delete container
+	// Delete container
 	api.DELETE("/containers/:id", func(c echo.Context) error {
 		id := c.Param("id")
-		if !regexp.MustCompile(`^[a-zA-Z0-9_-]+$`).MatchString(id) {
+		if !idRegex.MatchString(id) {
 			return c.String(http.StatusBadRequest, "Invalid container ID")
 		}
 
@@ -176,7 +176,7 @@ func StartE2BServer(port int) error {
 	// Snapshot container
 	api.POST("/containers/:id/snapshot", func(c echo.Context) error {
 		id := c.Param("id")
-		if !regexp.MustCompile(`^[a-zA-Z0-9_-]+$`).MatchString(id) {
+		if !idRegex.MatchString(id) {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": "Invalid container ID"})
 		}
 		dest := filepath.Join("/var/lib/uml-container/containers", id+".tgz")
@@ -189,14 +189,14 @@ func StartE2BServer(port int) error {
 	// Restore container
 	api.POST("/containers/:id/restore", func(c echo.Context) error {
 		id := c.Param("id")
-		if !regexp.MustCompile(`^[a-zA-Z0-9_-]+$`).MatchString(id) {
+		if !idRegex.MatchString(id) {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": "Invalid container ID"})
 		}
 		src := filepath.Join("/var/lib/uml-container/containers", id+".tgz")
 		if err := snapshot.Import(src, id+"-restored"); err != nil {
 			return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		}
-		return c.JSON(http.StatusOK, map[string]string{"status": "success", "new_id": id+"-restored"})
+		return c.JSON(http.StatusOK, map[string]string{"status": "success", "new_id": id + "-restored"})
 	})
 	// End of restore container
 
@@ -460,10 +460,10 @@ func StartE2BServer(port int) error {
 	})
 
 	// POST /api/pool/quota — set per-tenant quota. Body: {tenant, quota}.
-		api.POST("/pool/quota", func(c echo.Context) error {
+	api.POST("/pool/quota", func(c echo.Context) error {
 		var req struct {
-			Tenant string      `json:"tenant"`
-			Quota  pool.Quota  `json:"quota"`
+			Tenant string     `json:"tenant"`
+			Quota  pool.Quota `json:"quota"`
 		}
 		if err := c.Bind(&req); err != nil {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
@@ -553,6 +553,11 @@ func (r *gatewayRegistry) register(taskID string, g *policy.Gateway) {
 	defer r.mu.Unlock()
 	r.data[taskID] = g
 }
+func (r *gatewayRegistry) unregister(taskID string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.data, taskID)
+}
 func (r *gatewayRegistry) get(taskID string) *policy.Gateway {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -566,6 +571,11 @@ var globalRegistries = newGatewayRegistry()
 // RegisterPolicyGateway lets agentpvm register a task's policy gateway so
 // /api/exec can dispatch to it.
 func RegisterPolicyGateway(taskID string, g *policy.Gateway) { globalRegistries.register(taskID, g) }
+
+// UnregisterPolicyGateway removes a task's gateway from the process-local
+// registry. Tests use it via t.Cleanup so a registered task does not leak
+// across test runs (the registry is a package-level singleton).
+func UnregisterPolicyGateway(taskID string) { globalRegistries.unregister(taskID) }
 
 // parseExecCommand turns a flat command string "name k=v k2=v2" into a
 // structured ToolRequest for the policy gateway. Simplest viable contract;

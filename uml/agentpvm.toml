@@ -21,14 +21,16 @@ cpu    = 1000              # millicpu; 1000 = 1 full CPU. 0 = unlimited
 memory = "512M"
 
 [workspace]
-base_image = "rootfs.img"  # read-only backing image, shared by N sandboxes (qcow2 CoW)
+base_image = "rootfs.qcow2"  # read-only qcow2 backing image, shared by N sandboxes (qcow2 CoW)
 # overlay is auto-derived as <statedir>/rootfs.qcow2 when omitted
+# NOTE: base_image MUST be qcow2 (not raw). Convert a raw image once with
+# `qemu-img convert -O qcow2 raw.img rootfs.qcow2` before pointing a task at it.
 init      = "/sbin/init"
 
 [kernel]
 path          = "./bin/linux"
-virtio        = false      # set true to use virtio_uml devices
-use_vhost_blk = false     # set true to back the block device with qemu-storage-daemon
+virtio        = true       # vhost-user-blk requires virtio_uml devices
+use_vhost_blk = true       # back the block device with qemu-storage-daemon (REQUIRED for qcow2 CoW; ubd cannot read qcow2)
 
 # --- network egress (plan.md §4) ---
 # DEVELOPMENT profile: networking is ENABLED here so a demo agent can reach

@@ -156,19 +156,9 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 	if err != nil {
 		return fmt.Errorf("container: open audit ledger: %w", err)
 	}
-	// Record the SPEC+VERSION evidence (plan.md §14.2 phase 02).
-	if err := ledger.Append(audit.Record{
-		Phase:    audit.PhaseSpec,
-		Subject:  s.Caller,
-		Action:   "taskspec",
-		Params:   map[string]interface{}{"fingerprint": s.Fingerprint(), "version": s.Version},
-		Decision: audit.DecisionAllow,
-		Reason:   "taskspec loaded",
-	}); err != nil {
-		log.Default().Warnf("container: audit taskspec for %s: %v", taskID, err)
-	}
 
-	// Load/create lifecycle state and drive the FSM.
+	// Load/create lifecycle state early so any subsequent failure can flip it
+	// to Failed consistently (including the spec-evidence append below).
 	st, _ := state.LoadState(taskID)
 	if st == nil {
 		st = &state.ContainerState{ID: taskID, Name: s.Runtime.Name, Tenant: s.Tenant, Caller: s.Caller, StartedAt: time.Now()}
@@ -180,13 +170,48 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 	st.Status = state.StatusPending
 	state.SaveState(taskID, st)
 
+	// Record the SPEC+VERSION evidence (plan.md §14.2 phase 02). This is
+	// authorization evidence: a task MUST NOT start without it on disk. A
+	// warn-and-continue path here would let a sandbox run with no auditable
+	// spec trail, so fail fast (matching the audit.Open failure above).
+	if err := ledger.Append(audit.Record{
+		Phase:    audit.PhaseSpec,
+		Subject:  s.Caller,
+		Action:   "taskspec",
+		Params:   map[string]interface{}{"fingerprint": s.Fingerprint(), "version": s.Version},
+		Decision: audit.DecisionAllow,
+		Reason:   "taskspec loaded",
+	}); err != nil {
+		_ = st.Transition(state.StatusFailed, state.ActorController, "audit spec append failed: "+err.Error())
+		state.SaveState(taskID, st)
+		return fmt.Errorf("container: audit taskspec for %s: %w", taskID, err)
+	}
+
 	// Provisioning: create overlay, start vhost daemon, set up network+policy.
 	if err := st.Transition(state.StatusProvisioning, state.ActorController, "start task"); err != nil {
 		return err
 	}
 	state.SaveState(taskID, st)
 
-	// qcow2 overlay over the shared base image (plan.md §5.2).
+	// Provision the qcow2 overlay + vhost-user-blk backend (plan.md §5.2).
+	//
+	// The agent path is qcow2-ONLY: the per-task overlay is a qcow2 file
+	// served to the guest by qemu-storage-daemon over vhost-user-blk, which is
+	// the only UML block backend that understands qcow2. Two hard requirements
+	// follow, both enforced as fail-closed configuration errors (NOT as a
+	// degrade-to-raw fallback, which would lose CoW isolation and let one task
+	// mutate the shared base every other sandbox depends on):
+	//   - BaseImage MUST be qcow2. cow.CreateOverlay sniffs the magic and rejects
+	//     a raw base with a clear error. Callers convert raw images once with
+	//     `qemu-img convert -O qcow2` before pointing a TaskSpec at them.
+	//   - Kernel.UseVhostBlk MUST be true. The ubd backend cannot read qcow2;
+	//     a misconfigured run that disabled vhost while keeping a qcow2 base
+	//     would panic the guest with "VFS: Unable to mount root fs".
+	if s.Workspace.BaseImage != "" && !s.Kernel.UseVhostBlk {
+		_ = st.Transition(state.StatusFailed, state.ActorController, "agent path requires vhost-user-blk (ubd cannot read qcow2)")
+		state.SaveState(taskID, st)
+		return fmt.Errorf("container: BaseImage set but kernel.use_vhost_blk=false; the agent path is qcow2-only and requires vhost-user-blk (ubd cannot mount qcow2)")
+	}
 	dir, err := state.ContainerDir(taskID)
 	if err != nil {
 		return fmt.Errorf("container: container dir: %w", err)
@@ -200,20 +225,18 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 	// line and the overlay we actually created cannot drift apart.
 	resolvedRootfs := overlayPath
 	if s.Workspace.BaseImage != "" {
-		if err := cow.CreateOverlay(ctx, s.Workspace.BaseImage, overlayPath, cow.FormatRaw); err != nil {
-			// overlay creation needs qemu-img; degrade to the flat rootfs if
-			// we can't do CoW (with an explicit audit record).
-			if laErr := ledger.Append(audit.Record{Phase: audit.PhaseExec, Subject: taskID, Action: "overlay", Decision: audit.DecisionConstrain, Reason: "qcow2 overlay failed: " + err.Error()}); laErr != nil {
-				log.Default().Warnf("container: audit overlay fallback for %s: %v", taskID, laErr)
-			}
-			overlayPath = s.Workspace.BaseImage // fall back to read-only base
-			resolvedRootfs = s.Workspace.BaseImage
+		if err := cow.CreateOverlay(ctx, s.Workspace.BaseImage, overlayPath); err != nil {
+			_ = ledger.Append(audit.Record{Phase: audit.PhaseExec, Subject: taskID, Action: "overlay", Decision: audit.DecisionDeny, Reason: "qcow2 overlay failed: " + err.Error()})
+			_ = st.Transition(state.StatusFailed, state.ActorController, "overlay creation failed: "+err.Error())
+			state.SaveState(taskID, st)
+			return fmt.Errorf("container: create qcow2 overlay for %s: %w", taskID, err)
 		}
 	}
 
 	// vhost-user-blk backend over the overlay.
 	var sockPath string
 	var vhostProc *os.Process
+	var egressAddr string // host:port of this task's dedicated egress listener
 	if s.Kernel.UseVhostBlk && s.Workspace.BaseImage != "" {
 		sock, daemonCmd, err := vhost.StartStorageDaemon(taskID, resolvedRootfs)
 		if err != nil {
@@ -231,8 +254,12 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 	}
 
 	// Egress gateway policy (plan.md §4). The gateway is shared across tasks;
-	// we register this task's allowlist. The sandbox gets HTTP_PROXY pointing
-	// at it via the init contract (env injection is the caller's job).
+	// we register this task's allowlist. When an egress gateway is configured
+	// we also open a per-task listener whose handler binds the task id by
+	// closure, so attribution does NOT depend on the guest-supplied X-Task-Id
+	// header (which the guest can forge). The listener port is forwarded into
+	// the guest as the proxy address it must dial; the task id never crosses
+	// the trust boundary.
 	if m.Egress != nil && s.Network.Enabled {
 		pol := &egress.Policy{
 			AllowDomains:   s.Network.EgressAllowDomains,
@@ -240,6 +267,16 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 			MaxRequestBody:  s.Network.MaxRequestBodyBytes,
 		}
 		m.Egress.SetPolicy(taskID, pol)
+		if lp, err := m.Egress.ListenForTask(ctx, taskID); err == nil {
+			defer lp.Close()
+			egressAddr = lp.Addr()
+		} else {
+			// Without a per-task listener we cannot safely attribute traffic,
+			// so fail closed rather than falling back to the forgeable header.
+			_ = st.Transition(state.StatusFailed, state.ActorController, "egress listener failed: "+err.Error())
+			state.SaveState(taskID, st)
+			return fmt.Errorf("container: egress listener for %s: %w", taskID, err)
+		}
 	}
 
 	// Identity: mint a short-lived token carrying the spec's scope. The token
@@ -265,8 +302,10 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 	}
 
 	// Build kernel args from the TaskSpec. Pass the resolved rootfs so the
-	// kernel command line matches what we actually provisioned.
-	args := buildTaskArgs(s, sockPath, dir, resolvedRootfs, taskID)
+	// kernel command line matches what we actually provisioned. egressAddr is
+	// the host:port of this task's dedicated egress listener (authoritative
+	// attribution source); the task id is NOT exposed to the guest.
+	args := buildTaskArgs(s, sockPath, resolvedRootfs, egressAddr)
 
 	// Non-interactive (agent sandbox) => log to file under the task dir.
 	logFile, _ := log.SetupConsoleLog(taskID)
@@ -315,7 +354,12 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 		Params:   map[string]interface{}{"pid": pid, "has_token": tokenStr != ""},
 		Decision: audit.DecisionAllow, Reason: "sandbox running",
 	}); err != nil {
-		log.Default().Warnf("container: audit task:start for %s: %v", taskID, err)
+		// task:start is the execution-phase authorization evidence. A sandbox
+		// running without it is the same integrity gap as a missing spec row,
+		// so fail closed (we already transitioned to Running; flip to Failed).
+		_ = st.Transition(state.StatusFailed, state.ActorController, "audit task:start append failed: "+err.Error())
+		state.SaveState(taskID, st)
+		return fmt.Errorf("container: audit task:start for %s: %w", taskID, err)
 	}
 
 	if m.OnProvisioned != nil {
@@ -390,11 +434,13 @@ func buildLegacyArgs(ctx context.Context, cfg *config.ContainerConfig) []string 
 
 // buildTaskArgs builds the UML command-line from a TaskSpec. Mirrors the legacy
 // path but reads everything from the validated spec. resolvedRootfs is the
-// block path the kernel must mount (the overlay, or the base image on fallback)
-// and is the single source of truth — the caller already created it. taskID
-// is exposed to the guest so the egress proxy can attribute traffic via the
-// X-Task-Id header; it MUST match the id used to register the egress policy.
-func buildTaskArgs(s *spec.TaskSpec, vhostSock, dir, resolvedRootfs, taskID string) []string {
+// block path the kernel must mount (the overlay) and is the single source of
+// truth — the caller already created it. egressAddr, when non-empty, is the
+// host:port of this task's dedicated egress listener; it is forwarded to the
+// guest so the guest dials it as its HTTP proxy. The task id is deliberately
+// NOT passed: the guest cannot be trusted with its own attribution id, and
+// the per-task listener binds the id by closure on the host side instead.
+func buildTaskArgs(s *spec.TaskSpec, vhostSock, resolvedRootfs, egressAddr string) []string {
 	args := []string{
 		fmt.Sprintf("init=%s", s.Workspace.Init),
 		fmt.Sprintf("mem=%s", s.Runtime.Memory),
@@ -403,12 +449,14 @@ func buildTaskArgs(s *spec.TaskSpec, vhostSock, dir, resolvedRootfs, taskID stri
 		args = append(args, fmt.Sprintf("virtio_uml.device=%s:%d", vhostSock, vhost.VirtioIDBlock))
 		args = append(args, "root=/dev/vda")
 	} else {
+		// Agent path is qcow2-only and StartTask rejects BaseImage without
+		// vhost before reaching here, so resolvedRootfs is always the overlay
+		// when this branch runs (only when vhostSock is empty despite
+		// UseVhostBlk). Fall back to the synthesized overlay path rather than
+		// to BaseImage, which would break the qcow2-only invariant.
 		root := resolvedRootfs
 		if root == "" {
 			root = s.Workspace.Overlay
-			if root == "" {
-				root = s.Workspace.BaseImage
-			}
 		}
 		args = append(args, fmt.Sprintf("ubd0=%s", root))
 		args = append(args, "root=/dev/ubda")
@@ -421,11 +469,13 @@ func buildTaskArgs(s *spec.TaskSpec, vhostSock, dir, resolvedRootfs, taskID stri
 			args = append(args, fmt.Sprintf("eth0=tuntap,%s", s.Network.TAP))
 		}
 	}
-	// Expose the EXTERNAL task id to the guest so the egress gateway can
-	// attribute traffic via X-Task-Id. This must match the id used at
-	// Egress.SetPolicy(taskID, ...), otherwise the gateway cannot find the
-	// policy and denies all traffic.
-	args = append(args, fmt.Sprintf("task_id=%s", taskID))
+	// Forward the task's DEDICATED egress listener address (host:port) into the
+	// guest so it can dial it as its HTTP proxy. Attribution is established by
+	// which listener the traffic arrives on (a host-side closure over taskID),
+	// not by any id the guest could forge. See StartTask for the lifecycle.
+	if egressAddr != "" {
+		args = append(args, fmt.Sprintf("egress_proxy=%s", egressAddr))
+	}
 	return args
 }
 

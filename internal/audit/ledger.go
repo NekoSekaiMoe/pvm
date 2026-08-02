@@ -19,6 +19,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"syscall"
 	"time"
@@ -135,21 +136,11 @@ func (l *Ledger) Append(r Record) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	// Re-read the tail in case another process appended since loadTail/Open.
-	// This is what makes the chain correct under multi-writer.
-	if err := l.refreshTailLocked(); err != nil {
-		return fmt.Errorf("audit: refresh tail: %w", err)
-	}
-
-	l.seq++
-	r.Seq = l.seq
-	r.Task = l.task
-	if r.At.IsZero() {
-		r.At = time.Now().UTC()
-	}
-	r.PrevHash = l.lastHash
-	r.ThisHash = hashRecord(r, l.lastHash)
-
+	// Open the file first and acquire the cross-process lock BEFORE computing
+	// seq/hash. The single lock-protected refresh below is the authoritative
+	// seed for seq/lastHash. A prior version also refreshed + seq++ here
+	// (pre-lock) and then again under the lock, which ran seq++ twice and made
+	// the first record of an empty ledger seq=2 instead of seq=1.
 	f, err := os.OpenFile(l.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		return err
@@ -161,13 +152,17 @@ func (l *Ledger) Append(r Record) error {
 		return fmt.Errorf("audit: lock ledger: %w", err)
 	}
 	defer syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
-	// Re-read tail AGAIN under the lock: a peer may have appended between our
-	// first refresh and acquiring the lock.
+	// Re-read tail under the lock: a peer may have appended since Open. This
+	// single refresh drives seq/lastHash; no second increment happens.
 	if err := l.refreshTailLocked(); err != nil {
 		return fmt.Errorf("audit: refresh tail under lock: %w", err)
 	}
 	l.seq++
 	r.Seq = l.seq
+	r.Task = l.task
+	if r.At.IsZero() {
+		r.At = time.Now().UTC()
+	}
 	r.PrevHash = l.lastHash
 	r.ThisHash = hashRecord(r, l.lastHash)
 
@@ -186,18 +181,36 @@ func (l *Ledger) Append(r Record) error {
 // disk therefore breaks Verify. Params is encoded via json.Marshal, which
 // sorts keys for map values (struct/slice order is the caller's responsibility
 // — we freeze those via the concrete Record type).
+//
+// Every field is length-prefixed so adjacent values cannot collide regardless
+// of content: without framing, concatenating "%s|%s" lets an attacker move a
+// '|' between fields and forge a different field split that still hashes the
+// same. The frame is "<label>=<len>:<bytes>"; ThisHash is excluded by
+// construction (the caller passes prev, and Verify recomputes from the stored
+// fields, never reading ThisHash back into the digest).
 func hashRecord(r Record, prev string) string {
 	h := sha256.New()
-	h.Write([]byte(prev))
-	h.Write([]byte("|"))
-	// Structural fields first, in declaration order, with explicit separators
-	// so adjacent numbers can't collide.
-	fmt.Fprintf(h, "seq=%d|at=%s|task=%s|tenant=%s", r.Seq, r.At.UTC().Format(time.RFC3339Nano), r.Task, r.Tenant)
-	h.Write([]byte("|"))
-	enc, _ := json.Marshal(r.Params)
-	h.Write(enc)
-	h.Write([]byte("|"))
-	fmt.Fprintf(h, "%s|%s|%s|%s|%s", r.Phase, r.Subject, r.Action, r.Decision, r.Reason)
+	writeFramed := func(label string, b []byte) {
+		fmt.Fprintf(h, "%s=%d:", label, len(b))
+		h.Write(b)
+	}
+	writeStr := func(label, s string) { writeFramed(label, []byte(s)) }
+
+	writeStr("prev", prev)
+	writeStr("seq", strconv.FormatInt(r.Seq, 10))
+	writeStr("at", r.At.UTC().Format(time.RFC3339Nano))
+	writeStr("task", r.Task)
+	writeStr("tenant", r.Tenant)
+	writeStr("phase", string(r.Phase))
+	writeStr("subject", r.Subject)
+	writeStr("action", r.Action)
+	// Params is interface{}; json.Marshal sorts map keys for stable encoding.
+	// A marshal error yields nil, framed as an empty field so the chain still
+	// verifies — the caller is responsible for only storing serializable params.
+	paramsEnc, _ := json.Marshal(r.Params)
+	writeFramed("params", paramsEnc)
+	writeStr("decision", string(r.Decision))
+	writeStr("reason", r.Reason)
 	return hex.EncodeToString(h.Sum(nil))
 }
 

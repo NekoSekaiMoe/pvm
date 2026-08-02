@@ -178,6 +178,7 @@ func TestAPI_Policy_List(t *testing.T) {
 		{Name: "deploy", Action: policy.ActionDeny, Reason: "prod protected"},
 	}, nil)
 	RegisterPolicyGateway("tk4", gw)
+	t.Cleanup(func() { UnregisterPolicyGateway("tk4") })
 
 	// policy returns a bare JSON array, so parse it directly.
 	req, _ := http.NewRequest("GET", base+"/api/policy/tk4", nil)

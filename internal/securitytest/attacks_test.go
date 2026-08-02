@@ -160,15 +160,17 @@ func TestAttack_SecretNotInToken(t *testing.T) {
 }
 
 // =====================================================================
-// ATTACK 5: DNS rebinding — a domain the proxy allowlists resolves to a
-// private IP. The SSRF floor must block the dial regardless. This version
-// starts a REAL local listener and asserts the proxy returns 403, not 502 —
-// the previous variant pointed at a dead port, so a connection-refused 502
-// masqueraded as "SSRF blocked" and the test passed even though handleHTTP
-// had no SSRF check at all.
+// ATTACK 5: private/loopback allowlist bypass. The proxy allowlists a
+// loopback host (127.0.0.1/localhost) and we point it at a REAL local upstream
+// that would answer 200 if reached. The SSRF floor must block the dial
+// regardless of the allowlist, because 127.0.0.1 is private/loopback.
+//
+// This is NOT a DNS-rebinding / DNS-resolution-TOCTOU test: we use a literal
+// loopback IP, not a hostname that flips between public and private A records.
+// The previous name overclaimed that coverage.
 // =====================================================================
 
-func TestAttack_DNSRebindingToPrivateIP(t *testing.T) {
+func TestAttack_AllowlistedLoopbackBlockedBySSRFFloor(t *testing.T) {
 	setupRoots(t)
 	ledger, _ := audit.Open("sec-ssrf")
 	g := egress.NewGateway()
@@ -183,7 +185,10 @@ func TestAttack_DNSRebindingToPrivateIP(t *testing.T) {
 	// Allowlist the loopback host so the domain check passes; the SSRF floor
 	// must still refuse the dial because 127.0.0.1 is private.
 	g.SetPolicy("t", &egress.Policy{AllowDomains: []string{"127.0.0.1", "localhost"}})
-	addr, _ := g.Listen(context.Background(), "127.0.0.1:0")
+	addr, err := g.Listen(context.Background(), "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
 	defer g.Shutdown(context.Background())
 
 	tr := &http.Transport{Proxy: func(*http.Request) (*url.URL, error) {

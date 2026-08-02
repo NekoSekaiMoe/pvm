@@ -18,6 +18,12 @@ import (
 	"uml-container/internal/uml"
 )
 
+// idRegex validates task/container ids: ^[-_A-Za-z0-9]+$. Precompiled once
+// at package load and shared by every subcommand. Same shape as the id
+// validators in internal/{api,state,cgroup,snapshot,container}; each package
+// keeps its own precompiled symbol to avoid an import cycle via a shared helper.
+var idRegex = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
+
 // loadLaunchConfig loads a TaskSpec TOML but returns only the launch-relevant
 // subset. umlctl is a thin UML launcher: it deliberately ignores the control
 // planes (identity/egress/tools/approval/artifacts/lifecycle) which belong to
@@ -91,7 +97,7 @@ func main() {
 			}
 		}
 
-		if !regexp.MustCompile(`^[a-zA-Z0-9_-]+$`).MatchString(*name) {
+		if !idRegex.MatchString(*name) {
 			fmt.Println("Error: Invalid container name format")
 			os.Exit(1)
 		}
@@ -227,7 +233,7 @@ func main() {
 			return
 		}
 		id := os.Args[2]
-		if !regexp.MustCompile(`^[a-zA-Z0-9_-]+$`).MatchString(id) {
+		if !idRegex.MatchString(id) {
 			fmt.Printf("Invalid container ID: %s\n", id)
 			return
 		}

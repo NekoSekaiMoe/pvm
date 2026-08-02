@@ -73,8 +73,41 @@ echo "$HTTP" | grep -qi "forbidden\|comma\|failed" || { echo "❌ comma path not
 echo "   comma rejected ✓"
 
 # --- 6. pool stats subcommand ---
+# pool stats talks to a running controller over HTTP. Start a stub server that
+# serves /api/pool/stats and requires the same bearer secret the CLI sends, so
+# the subcommand's full path (HTTP + auth + JSON decode) is exercised rather
+# than its no-API error branch.
 echo "--- pool stats subcommand"
-OUT=$("$TMP/agentpvm" pool stats 2>&1 || true)
+export API_SECRET="ci-stub-secret"
+python3 - "$TMP/pool_stub.log" <<'PYEOF' &
+import http.server, json, sys, os
+secret = os.environ["API_SECRET"]
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path != "/api/pool/stats":
+            self.send_response(404); self.end_headers(); return
+        if self.headers.get("Authorization") != "Bearer "+secret:
+            self.send_response(401); self.end_headers(); return
+        body = json.dumps({"ready": 2, "claimed": 1, "total": 3}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *a):
+        pass
+httpd = http.server.HTTPServer(("127.0.0.1", 8080), H)
+httpd.serve_forever()
+PYEOF
+STUB_PID=$!
+# wait for the stub to bind 8080
+for i in $(seq 1 40); do
+    if (exec 3<>/dev/tcp/127.0.0.1/8080) 2>/dev/null; then exec 3>&- 3<&-; break; fi
+    sleep 0.1
+done
+OUT=$(PVM_API="http://127.0.0.1:8080" "$TMP/agentpvm" pool stats 2>&1 || true)
+kill "$STUB_PID" 2>/dev/null || true
+wait "$STUB_PID" 2>/dev/null || true
 echo "$OUT" | grep -q "ready=" || { echo "❌ pool stats: $OUT"; exit 1; }
 echo "   pool stats ✓"
 

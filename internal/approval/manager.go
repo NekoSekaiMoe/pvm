@@ -35,19 +35,19 @@ const (
 // Ticket is a bound approval request (plan.md §10.3). Every field except State
 // is immutable once created; only the state machine advances.
 type Ticket struct {
-	ID       string            `json:"id"`
-	TaskID   string            `json:"task_id"`
-	Target   string            `json:"target"`    // e.g. "payments-service / production"
-	Tool     string            `json:"tool"`      // which tool wants to act
-	Params   map[string]interface{} `json:"params"`   // bound params (PR #, file, ...)
-	Evidence string            `json:"evidence"`  // 18 tests · diff 42 lines · scan passed
-	Why      string            `json:"why"`       // 修复重复入账 · 预计 3min
-	Rollback string            `json:"rollback"`  // revert commit + feature flag
-	CreatedAt time.Time        `json:"created_at"`
-	Deadline  time.Time        `json:"deadline"`
-	State     State            `json:"state"`
-	DecidedBy string           `json:"decided_by,omitempty"`
-	DecidedAt time.Time        `json:"decided_at,omitempty"`
+	ID        string                 `json:"id"`
+	TaskID    string                 `json:"task_id"`
+	Target    string                 `json:"target"`   // e.g. "payments-service / production"
+	Tool      string                 `json:"tool"`     // which tool wants to act
+	Params    map[string]interface{} `json:"params"`   // bound params (PR #, file, ...)
+	Evidence  string                 `json:"evidence"` // 18 tests · diff 42 lines · scan passed
+	Why       string                 `json:"why"`      // 修复重复入账 · 预计 3min
+	Rollback  string                 `json:"rollback"` // revert commit + feature flag
+	CreatedAt time.Time              `json:"created_at"`
+	Deadline  time.Time              `json:"deadline"`
+	State     State                  `json:"state"`
+	DecidedBy string                 `json:"decided_by,omitempty"`
+	DecidedAt time.Time              `json:"decided_at,omitempty"`
 }
 
 // Manager is the in-memory ticket store. (MVP: process-local. A real deployment

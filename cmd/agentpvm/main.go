@@ -14,6 +14,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"net/http"
@@ -21,6 +22,7 @@ import (
 	"os/exec"
 	"regexp"
 	"strings"
+	"time"
 
 	"uml-container/internal/api"
 	"uml-container/internal/approval"
@@ -165,7 +167,7 @@ func runCmd(args []string) {
 	if taskID == "" {
 		taskID = "agent-task"
 	}
-	if !regexp.MustCompile(`^[a-zA-Z0-9_-]+$`).MatchString(taskID) {
+	if !idRegex.MatchString(taskID) {
 		fmt.Fprintln(os.Stderr, "Error: Invalid task id format")
 		os.Exit(1)
 	}
@@ -238,10 +240,10 @@ func safeDefaultSpec() *spec.TaskSpec {
 		Tenant:  "default",
 		Runtime: spec.RuntimeSpec{Name: "agent-task", CPU: 1, Memory: "512M"},
 		Workspace: spec.WorkspaceSpec{
-			BaseImage: "rootfs.img",
+			BaseImage: "rootfs.qcow2",
 			Init:      "/sbin/init",
 		},
-		Kernel: spec.KernelSpec{Path: "./bin/linux", Virtio: false},
+		Kernel: spec.KernelSpec{Path: "./bin/linux", Virtio: true, UseVhostBlk: true},
 		Network: spec.NetworkSpec{Enabled: false}, // default deny
 		Lifecycle: spec.LifecycleSpec{OnAnomaly: "pause", TTL: "1h"},
 	}
@@ -295,15 +297,14 @@ func webuiCmd(args []string) {
 
 func cowCmd(args []string) {
 	fs := flag.NewFlagSet("cow", flag.ExitOnError)
-	backing := fs.String("backing", "", "Backing (base) image path")
+	backing := fs.String("backing", "", "Backing (base) qcow2 image path")
 	overlay := fs.String("overlay", "", "Output qcow2 overlay path")
-	backingFormat := fs.String("backing-format", "raw", "Backing file format (raw/qcow2)")
 	fs.Parse(args)
 	if *backing == "" || *overlay == "" {
-		fmt.Println("Usage: agentpvm cow -backing <base.img> -overlay <overlay.qcow2> [-backing-format raw]")
+		fmt.Println("Usage: agentpvm cow -backing <base.qcow2> -overlay <overlay.qcow2>")
 		os.Exit(1)
 	}
-	if err := cow.CreateOverlay(context.Background(), *backing, *overlay, cow.BackingFormat(*backingFormat)); err != nil {
+	if err := cow.CreateOverlay(context.Background(), *backing, *overlay); err != nil {
 		fmt.Printf("CoW overlay creation failed: %v\n", err)
 		os.Exit(1)
 	}
@@ -419,6 +420,21 @@ func gateCmd(args []string) {
 // approvalCmd lists/decides approval tickets by talking to the running API.
 // It reads API_SECRET from the environment and hits /api/approvals so the
 // state it shows is the live state of the controller, not an ephemeral store.
+//
+// API_SECRET is REQUIRED: there is no hardcoded fallback. A missing secret is
+// a configuration error (we never want to silently authenticate as "secret").
+// All HTTP calls go through a client with a finite timeout so a wedged API
+// cannot hang the CLI indefinitely.
+var cliHTTPClient = &http.Client{Timeout: 10 * time.Second}
+
+func resolveAPISecret() (string, error) {
+	secret := os.Getenv("API_SECRET")
+	if secret == "" {
+		return "", errors.New("API_SECRET environment variable is required (set it to the controller's PVM_API_SECRET)")
+	}
+	return secret, nil
+}
+
 func approvalCmd(args []string) {
 	if len(args) == 0 {
 		fmt.Println("Usage: agentpvm approval [list]   (operates against $PVM_API / $API_SECRET)")
@@ -428,15 +444,16 @@ func approvalCmd(args []string) {
 	if base == "" {
 		base = "http://127.0.0.1:8080"
 	}
-	secret := os.Getenv("API_SECRET")
-	if secret == "" {
-		secret = "secret"
+	secret, err := resolveAPISecret()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "approval: %v\n", err)
+		os.Exit(1)
 	}
 	switch args[0] {
 	case "list":
 		req, _ := http.NewRequest("GET", base+"/api/approvals", nil)
 		req.Header.Set("Authorization", "Bearer "+secret)
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := cliHTTPClient.Do(req)
 		if err != nil {
 			fmt.Printf("approval list: %v (is the API running at %s?)\n", err, base)
 			return
@@ -467,15 +484,16 @@ func poolCmd(args []string) {
 	if base == "" {
 		base = "http://127.0.0.1:8080"
 	}
-	secret := os.Getenv("API_SECRET")
-	if secret == "" {
-		secret = "secret"
+	secret, err := resolveAPISecret()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "pool: %v\n", err)
+		os.Exit(1)
 	}
 	switch args[0] {
 	case "stats":
 		req, _ := http.NewRequest("GET", base+"/api/pool/stats", nil)
 		req.Header.Set("Authorization", "Bearer "+secret)
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := cliHTTPClient.Do(req)
 		if err != nil {
 			fmt.Printf("pool stats: %v (is the API running at %s?)\n", err, base)
 			return
@@ -503,3 +521,9 @@ var (
 	_ = policy.NewGateway
 	_ = spec.SpecVersion
 )
+
+// idRegex validates task/container ids: same shape as every other package
+// (^[-_A-Za-z0-9]+$). Kept package-local rather than shared to avoid an extra
+// import; the inline regexp.MustCompile that used to live in runCmd now
+// reuses this single precompiled value.
+var idRegex = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)

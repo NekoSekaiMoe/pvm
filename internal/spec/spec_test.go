@@ -194,19 +194,27 @@ func TestFingerprint_CoversControlFields(t *testing.T) {
 	_ = base.Validate()
 	h0 := base.Fingerprint()
 
-	variants := []*TaskSpec{
-		{Version: 1, Caller: "x", Tenant: "t", Identity: Identity{Scope: []string{"repo:read"}}},
-		{Version: 1, Caller: "x", Tenant: "t", Network: NetworkSpec{Bridge: "br9"}},
-		{Version: 1, Caller: "x", Tenant: "t", Network: NetworkSpec{QoSRate: "10mbit"}},
-		{Version: 1, Caller: "x", Tenant: "t", Kernel: KernelSpec{Path: "./other/linux"}},
-		{Version: 1, Caller: "x", Tenant: "t", Lifecycle: LifecycleSpec{MaxRetries: 9}},
-		{Version: 1, Caller: "x", Tenant: "t", Approval: ApprovalSpec{Notify: "webhook"}},
-		{Version: 1, Caller: "x", Tenant: "t", Workspace: WorkspaceSpec{Overlay: "x.qcow2"}},
+	// Each variant is named for the control field it mutates, so a failure
+	// points directly at the field whose binding regressed instead of an index.
+	variants := []struct {
+		name string
+		spec *TaskSpec
+	}{
+		{"identity.scope", &TaskSpec{Version: 1, Caller: "x", Tenant: "t", Identity: Identity{Scope: []string{"repo:read"}}}},
+		{"network.bridge", &TaskSpec{Version: 1, Caller: "x", Tenant: "t", Network: NetworkSpec{Bridge: "br9"}}},
+		{"network.qos_rate", &TaskSpec{Version: 1, Caller: "x", Tenant: "t", Network: NetworkSpec{QoSRate: "10mbit"}}},
+		{"kernel.path", &TaskSpec{Version: 1, Caller: "x", Tenant: "t", Kernel: KernelSpec{Path: "./other/linux"}}},
+		{"lifecycle.max_retries", &TaskSpec{Version: 1, Caller: "x", Tenant: "t", Lifecycle: LifecycleSpec{MaxRetries: 9}}},
+		{"approval.notify", &TaskSpec{Version: 1, Caller: "x", Tenant: "t", Approval: ApprovalSpec{Notify: "webhook"}}},
+		{"workspace.overlay", &TaskSpec{Version: 1, Caller: "x", Tenant: "t", Workspace: WorkspaceSpec{Overlay: "x.qcow2"}}},
 	}
-	for i, v := range variants {
-		_ = v.Validate()
-		if v.Fingerprint() == h0 {
-			t.Errorf("variant %d produced same fingerprint as base (control field not bound)", i)
-		}
+	for _, v := range variants {
+		v := v
+		t.Run(v.name, func(t *testing.T) {
+			_ = v.spec.Validate()
+			if v.spec.Fingerprint() == h0 {
+				t.Errorf("changing %s produced the same fingerprint as base (control field not bound)", v.name)
+			}
+		})
 	}
 }

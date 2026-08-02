@@ -104,12 +104,12 @@ func TestSameParams_NestedMapDoesNotPanic(t *testing.T) {
 		}
 	}()
 	a := map[string]interface{}{
-		"to": "x@y.com",
+		"to":   "x@y.com",
 		"opts": map[string]interface{}{"cc": []interface{}{"a@b.com"}},
 		"tags": []interface{}{1, 2, 3},
 	}
 	b := map[string]interface{}{
-		"to": "x@y.com",
+		"to":   "x@y.com",
 		"opts": map[string]interface{}{"cc": []interface{}{"a@b.com"}},
 		"tags": []interface{}{1, 2, 3},
 	}

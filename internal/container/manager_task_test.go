@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"uml-container/internal/audit"
@@ -118,20 +119,64 @@ func TestStartTask_RecordsAuditAndFingerprint(t *testing.T) {
 	}
 }
 
-func TestStartTask_OverlayFallback(t *testing.T) {
-	// no qemu-img in CI: CreateOverlay fails, code should fall back to base
-	// image and STILL start the sandbox (with an audit record).
+// TestStartTask_BaseImageRequiresVhost locks in the qcow2-only agent path:
+// setting Workspace.BaseImage without Kernel.UseVhostBlk is a hard error
+// (ubd cannot read qcow2), and the manager MUST fail closed with a clear
+// message rather than silently degrading to a raw mount or a broken overlay.
+// This is the regression for the test_pkg_install.sh "VFS: Unable to mount
+// root fs" panic: that run had BaseImage set + vhost disabled.
+func TestStartTask_BaseImageRequiresVhost(t *testing.T) {
 	m, _ := newTestManager(t)
 	dir := t.TempDir()
-	base := filepath.Join(dir, "base.img")
-	os.WriteFile(base, make([]byte, 1024), 0644)
+	base := filepath.Join(dir, "base.qcow2")
+	if err := os.WriteFile(base, append([]byte("QFI\xfb"), make([]byte, 1024)...), 0644); err != nil {
+		t.Fatalf("write base: %v", err)
+	}
+
+	s := minimalSpec()
+	s.Workspace.BaseImage = base
+	s.Kernel.UseVhostBlk = false // misconfiguration: qcow2 base without vhost
+
+	err := m.StartTask(context.Background(), "task-novhost", s)
+	if err == nil {
+		t.Fatal("expected StartTask to reject BaseImage without UseVhostBlk")
+	}
+	if !strings.Contains(err.Error(), "vhost") {
+		t.Errorf("expected error to mention vhost, got: %v", err)
+	}
+	st, ferr := state.LoadState("task-novhost")
+	if ferr != nil {
+		t.Fatalf("load state: %v", ferr)
+	}
+	if st.Status != state.StatusFailed {
+		t.Errorf("status = %s, want failed", st.Status)
+	}
+}
+
+// TestStartTask_OverlayFailureFailsClosed verifies that when BaseImage IS
+// qcow2 and vhost IS enabled, an overlay-creation failure still fails closed
+// rather than degrading to a writable mount of the shared base. We force the
+// failure with a backing path that passes validatePath but not os.Stat; no
+// qemu-img / qemu-storage-daemon needed.
+func TestStartTask_OverlayFailureFailsClosed(t *testing.T) {
+	m, _ := newTestManager(t)
+	dir := t.TempDir()
+	base := filepath.Join(dir, "does-not-exist.qcow2") // absent: os.Stat fails
 
 	s := minimalSpec()
 	s.Workspace.BaseImage = base
 	s.Workspace.Overlay = filepath.Join(dir, "ov.qcow2")
-	s.Kernel.UseVhostBlk = false // avoid needing qemu-storage-daemon
+	s.Kernel.UseVhostBlk = true // correct config; only the backing file is missing
 
-	if err := m.StartTask(context.Background(), "task-z", s); err != nil {
-		t.Fatalf("starttask with overlay fallback: %v", err)
+	err := m.StartTask(context.Background(), "task-z", s)
+	if err == nil {
+		t.Fatal("expected StartTask to fail when qcow2 overlay creation fails")
+	}
+	st, ferr := state.LoadState("task-z")
+	if ferr != nil {
+		t.Fatalf("load state: %v", ferr)
+	}
+	if st.Status != state.StatusFailed {
+		t.Errorf("status = %s, want failed (unsafe fallback would leave it running)", st.Status)
 	}
 }
