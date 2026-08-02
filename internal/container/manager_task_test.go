@@ -120,7 +120,7 @@ func TestStartTask_RecordsAuditAndFingerprint(t *testing.T) {
 
 // TestStartTask_RawBaseUbdDirectMount verifies the ubd path (UseVhostBlk=false):
 // the raw BaseImage is mounted directly as ubd0=<base> with no qcow2 CoW layer.
-// This is the verified-working configuration for networking — eth0=tuntap
+// This is the verified-working configuration for networking — vec0 (the
 // coexists with ubd0 but not with virtio_uml block (see the TODO in
 // buildTaskArgs). The kernel cmdline must reference the base file verbatim.
 func TestStartTask_RawBaseUbdDirectMount(t *testing.T) {

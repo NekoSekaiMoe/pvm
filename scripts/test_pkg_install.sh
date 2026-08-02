@@ -21,16 +21,17 @@ sudo mount -o loop ${IMG_NAME} mnt_pkg
 trap 'sudo umount mnt_pkg 2>/dev/null || true' EXIT
 sudo tar -xzf alpine.tar.gz -C mnt_pkg/
 
-# Set up an init script that configures network via eth0 (NAT) and installs python3
+# Set up an init script that configures network via vec0 (NAT) and installs python3
 cat << 'EOF' | sudo tee mnt_pkg/init.sh
 #!/bin/sh
 mount -t proc proc /proc
 mount -t sysfs sys /sys
 # 以读写重挂载，确保能写 resolv.conf / apk 缓存等。
 mount -o remount,rw / 2>/dev/null || true
-# Assuming eth0 is set up by pvm
-ip link set eth0 up || true
-ip addr add 10.0.0.2/24 dev eth0 || true
+# Assuming vec0 is set up by pvm (UML vector transport; legacy eth0=tuntap
+# was removed in Linux 6.16).
+ip link set vec0 up || true
+ip addr add 10.0.0.2/24 dev vec0 || true
 ip route add default via 10.0.0.1 || true
 echo "nameserver 8.8.8.8" > /etc/resolv.conf
 
@@ -67,8 +68,8 @@ echo "### ip addr show"
 ip addr show 2>&1
 echo "### ip route show"
 ip route show 2>&1
-echo "### ip link show eth0"
-ip link show eth0 2>&1 || echo "(eth0 does not exist in the guest)"
+echo "### ip link show vec0"
+ip link show vec0 2>&1 || echo "(vec0 does not exist in the guest)"
 echo "### ping gateway 10.0.0.1"
 ping -c 2 -W 3 10.0.0.1 2>&1 || echo "ping gw FAILED rc=$?"
 echo "### nslookup dl-cdn.alpinelinux.org 8.8.8.8"
@@ -94,7 +95,8 @@ trap - EXIT
 sudo umount mnt_pkg
 
 # Block backend: use the ubd path (raw base mounted directly, no qcow2 CoW).
-# This is the verified-working configuration for networking: eth0=tuntap
+# This is the verified-working configuration for networking: vec0 (the only
+# UML net transport left in Linux >= 6.16) over the ubd block backend.
 # coexists with ubd0 but NOT with virtio_uml block (see the TODO in
 # internal/container/manager.go buildTaskArgs). The vhost path (qcow2 + CoW)
 # is left for a follow-up that moves networking onto vhost-user-net.
@@ -180,7 +182,7 @@ sudo cat "$CONSOLE_LOG" 2>/dev/null || echo "(no console.log)"
 
 # ---- Result assertion ----
 # The run succeeds ONLY if the guest printed PKG_INSTALL_SUCCESS. Everything
-# else (guest booted but eth0 missing, apk failed, console.log empty, timeout)
+# else (guest booted but vec0 missing, apk failed, console.log empty, timeout)
 # is a failure. Earlier versions of this script just `cat`-ed the log and
 # exited 0 unconditionally, so a totally broken run (no networking, no apk)
 # reported SUCCESS and CI stayed green. This block makes the outcome explicit
@@ -195,8 +197,8 @@ echo ""
 echo "--- DIAG: UML kernel command line (proves which block/net transports were passed) ---"
 sudo grep -E "Kernel command line:" "$CONSOLE_LOG" 2>/dev/null | tail -1 || echo "   (no 'Kernel command line' line — UML did not finish early boot)"
 echo ""
-echo "--- DIAG: UML network driver init (eth0/vec registration, or why it failed) ---"
-sudo grep -Ei "eth0|netdevice|tun/tap|tuntap|vec[0-9]|network device|choosing a random ethernet|uml_net|netfront|virtio.*net" "$CONSOLE_LOG" 2>/dev/null | head -20 || echo "   (no UML net-driver lines — kernel may predate net init, or net transport never parsed)"
+echo "--- DIAG: UML network driver init (vec/eth registration, or why it failed) ---"
+sudo grep -Ei "eth0|vec[0-9]|netdevice|tun/tap|tuntap|network device|choosing a random ethernet|uml_net|netfront|virtio.*net" "$CONSOLE_LOG" 2>/dev/null | head -20 || echo "   (no UML net-driver lines — kernel may predate net init, or net transport never parsed)"
 echo ""
 echo "--- DIAG: guest-side failure markers ---"
 sudo grep -E "PING |FAILED|Network unreachable|INIT_DONE|PKG_INSTALL_SUCCESS|No such|not found|panic" "$CONSOLE_LOG" 2>/dev/null | tail -20 || echo "   (no console.log at all — agentpvm likely crashed before boot)"

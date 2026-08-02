@@ -68,7 +68,7 @@ func TestManager_Start(t *testing.T) {
 		t.Fatalf("Start failed: %v", err)
 	}
 
-	expectedArgs := []string{"ubd0=rootfs.img", "root=/dev/ubda", "init=/sbin/init", "mem=512M", "eth0=tuntap,tap0"}
+	expectedArgs := []string{"ubd0=rootfs.img", "root=/dev/ubda", "init=/sbin/init", "mem=512M", "vec0:transport=tap,ifname=tap0,depth=128,gro=1"}
 	for _, arg := range expectedArgs {
 		if !contains(mock.lastArgs, arg) {
 			t.Errorf("expected arg %s, but missing", arg)
@@ -111,7 +111,7 @@ func TestManager_Start_Virtio(t *testing.T) {
 		t.Fatalf("Start failed: %v", err)
 	}
 
-	expectedArgs := []string{"ubd0=rootfs.img", "root=/dev/ubda", "init=/sbin/init", "mem=512M", "eth0=tuntap,tap0"}
+	expectedArgs := []string{"ubd0=rootfs.img", "root=/dev/ubda", "init=/sbin/init", "mem=512M", "vec0:transport=tap,ifname=tap0,depth=128,gro=1"}
 	for _, arg := range expectedArgs {
 		if !contains(mock.lastArgs, arg) {
 			t.Errorf("expected arg %s, but missing", arg)

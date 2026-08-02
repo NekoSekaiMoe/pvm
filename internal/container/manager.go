@@ -201,10 +201,9 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 	//     vhost-user-blk (virtio_uml.device). This is the CoW-isolated path.
 	//     The base backing may be raw or qcow2 (sniffed by cow.CreateOverlay).
 	//   - ubd path (UseVhostBlk=false): mount the BaseImage directly as
-	//     ubd0=<base>. No CoW, no vhost. This is the universally-supported UML
-	//     block path and the only one that works when the guest's networking
-	//     needs eth0=tuntap, until the kernel is rebuilt with CONFIG_UML_NET
-	//     (see todo.md) and the vhost path's networking is re-verified.
+	//     ubd0=<base>. No CoW, no vhost. Both paths use the vec0 network
+	//     transport (the only UML net transport in Linux >= 6.16, see todo.md);
+	//     which block backend you pick no longer affects networking.
 	dir, err := state.ContainerDir(taskID)
 	if err != nil {
 		return fmt.Errorf("container: container dir: %w", err)
@@ -420,10 +419,10 @@ func buildLegacyArgs(ctx context.Context, cfg *config.ContainerConfig) []string 
 		args = append(args, "root=/dev/ubda")
 	}
 	args = append(args, "rw")
-	// Network device: always eth0=tuntap (see buildTaskArgs for the rationale:
-	// virtio-block != virtio-net, vec0 has never worked here).
+	// Network device: vec0 (see buildTaskArgs — legacy eth0=tuntap is gone in
+	// Linux >= 6.16, only the vector transport remains).
 	if cfg.NetworkTap != "" {
-		args = append(args, fmt.Sprintf("eth0=tuntap,%s", cfg.NetworkTap))
+		args = append(args, fmt.Sprintf("vec0:transport=tap,ifname=%s,depth=128,gro=1", cfg.NetworkTap))
 	}
 	vHost, hasVHost := ctx.Value(KeyVolumeHost).(string)
 	vGuest, hasVGuest := ctx.Value(KeyVolumeGuest).(string)
@@ -462,14 +461,17 @@ func buildTaskArgs(s *spec.TaskSpec, vhostSock, resolvedRootfs, egressAddr strin
 		args = append(args, "root=/dev/ubda")
 	}
 	args = append(args, "rw")
-	// Network device: eth0=tuntap. NOTE: this only produces a NIC if the UML
-	// kernel was built with CONFIG_UML_NET + CONFIG_UML_NET_TUNTAP (see
-	// scripts/build_kernel.sh and todo.md). Without those, UML reports
-	// 'eth0=tuntap,...' as an unknown command-line parameter and the guest
-	// gets no NIC. The parameter syntax here is correct; the kernel build is
-	// the other half.
+	// Network device: vec0 (vector tap transport). Since Linux 6.16 the legacy
+	// UML net transports (CONFIG_UML_NET + eth0=tuntap/slip/daemon/...) are
+	// GONE — only CONFIG_UML_NET_VECTOR remains, so the kernel only parses
+	// 'vecN:transport=...' parameters. 'eth0=tuntap,<tap>' is reported as an
+	// unknown command-line parameter and the guest gets no NIC. The vec tap
+	// transport requires the host tap to exist and be UP (the caller's job:
+	// `ip tuntap add` + `ip link set up`) and root or CAP_NET_ADMIN.
+	// Parameters per Documentation/virt/uml/user_mode_linux_howto_v2.rst:
+	//   transport=tap, ifname=<host tap>, depth=128 (queue depth), gro=1.
 	if s.Network.Enabled && s.Network.TAP != "" {
-		args = append(args, fmt.Sprintf("eth0=tuntap,%s", s.Network.TAP))
+		args = append(args, fmt.Sprintf("vec0:transport=tap,ifname=%s,depth=128,gro=1", s.Network.TAP))
 	}
 	// Forward the task's DEDICATED egress listener address (host:port) into the
 	// guest so it can dial it as its HTTP proxy. Attribution is established by

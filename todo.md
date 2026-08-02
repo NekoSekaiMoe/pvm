@@ -1,72 +1,68 @@
 # TODO
 
-## Networking: kernel defconfig missing CONFIG_UML_NET (root cause found)
+## Networking: use the vec transport (legacy eth0=tuntap was removed in 6.16)
 
-**Status**: root cause identified; fix is in `scripts/build_kernel.sh` but
-requires a kernel rebuild to take effect.
+**Status**: fix in place (vec0 + CONFIG_UML_NET_VECTOR); needs a kernel
+rebuild + re-run to confirm the guest actually gets a NIC.
 
-### Symptom
+### What was actually wrong
 
-The guest boots, mounts root, but has no `eth0`:
+Every previous round of "networking is broken" was chasing the wrong thing.
+The real root cause (confirmed in the kernel source and the commit log):
+
+- **2019-12** commit `40814b98a570` "um: Mark non-vector net transports as
+  obsolete": all non-vector UML net drivers (tuntap, slip, daemon, mcast,
+  ethertap, pcap, vde) flagged obsolete.
+- **2025-05** commit `e619e18ed462` "um: Remove legacy network transport
+  infrastructure": those drivers were **deleted entirely**. Landed in 6.16.
+
+`scripts/build_kernel.sh` builds `6.18.36`, so `CONFIG_UML_NET`,
+`CONFIG_UML_NET_TUNTAP`, etc. **do not exist** in this kernel. The only UML
+net transport left is `CONFIG_UML_NET_VECTOR`. That's why the boot log
+showed:
 
 ```
-### ip link show eth0
-ip: can't find device 'eth0'
-### ping 10.0.0.1
-ping: sendto: Network unreachable
+Kernel command line: ... eth0=tuntap,tap_pkg ...
+Unknown kernel command line parameters "eth0=tuntap,tap_pkg ...",
+will be passed to user space.
 ```
 
-### Root cause (CONFIRMED, not a hypothesis)
-
-The UML kernel build drops `eth0=tuntap,tap_pkg` on the floor:
-
-```
-Kernel command line: init=/init.sh ubd0=pkg_rootfs.img root=/dev/ubda rw eth0=tuntap,tap_pkg ...
-Unknown kernel command line parameters "eth0=tuntap,tap_pkg ...", will be passed to user space.
-```
-
-`scripts/build_kernel.sh` enabled `CONFIG_VIRTIO_NET` (the generic virtio net
-driver) and `CONFIG_NET_NS`, but never enabled the **UML network transport
-layer**:
-
-- `CONFIG_UML_NET` — the framework that parses `eth<n>=<transport>,...`
-- `CONFIG_UML_NET_TUNTAP` — the tuntap transport PVM uses
-- `CONFIG_UML_NET_VECTOR` — the newer/faster vec transport
-
-Without `CONFIG_UML_NET` the kernel has no parser for the `eth<n>=` syntax, so
-the parameter is reported as unknown and discarded, and no NIC is ever created.
-`NET: Registered PF_INET / PF_PACKET` in the boot log is just the generic
-Linux networking stack — it is NOT the UML virtual NIC driver. The dmesg shows
-no `Netdevice 0` / `Choosing a random ethernet address` / `TUN/TAP backend`
-lines precisely because the UML net driver was never compiled in.
-
-This is independent of the block backend (ubd vs vhost) and independent of
-the backing image format (raw vs qcow2). Earlier theories about
-`virtio_uml.device` conflicting with `eth0=tuntap` were wrong.
+No `eth0` driver exists to parse the parameter, so it was dropped and the
+guest got no NIC. This was independent of ubd vs vhost block backend and
+independent of raw vs qcow2 — those red herrings cost several rounds.
 
 ### Fix
 
-`scripts/build_kernel.sh` now enables:
+1. `scripts/build_kernel.sh`: enable `CONFIG_UML_NET_VECTOR` + `CONFIG_TUN`
+   (the host-side tun module). The `CONFIG_UML_NET` / `CONFIG_UML_NET_TUNTAP`
+   lines an earlier attempt added are no-ops (symbols don't exist in 6.18)
+   and have been removed.
+2. `internal/container/manager.go` `buildTaskArgs` + `buildLegacyArgs`:
+   emit `vec0:transport=tap,ifname=<tap>,depth=128,gro=1` instead of
+   `eth0=tuntap,<tap>`. Parameters per
+   `Documentation/virt/uml/user_mode_linux_howto_v2.rst`.
+3. `scripts/test_pkg_install.sh` init.sh: configure `vec0` inside the guest
+   (not `eth0`); the in-guest interface name matches the kernel parameter.
 
-```
-CONFIG_UML_NET
-CONFIG_UML_NET_TUNTAP
-CONFIG_UML_NET_VECTOR
-CONFIG_TUN
-```
+The vec tap transport requires the host tap to exist and be UP (the caller
+already does `ip tuntap add` + `ip link set up`) and root or CAP_NET_ADMIN
+(PVM runs the sandbox under sudo, so this is satisfied).
 
-**Requires rebuilding the kernel** (`scripts/build_kernel.sh`) before the guest
-gets a NIC. No PVM code change needed — `eth0=tuntap,<tap>` is the correct
-parameter syntax and the code already emits it.
+### Re-validate after the kernel rebuild
 
-### Follow-ups (after the kernel rebuild confirms networking works)
+- Confirm the guest gets a `vec0` interface and can reach the gateway.
+- Re-check whether the qcow2+vhost path (CoW isolation) also works with vec
+  networking. The earlier "virtio_uml block conflicts with eth0=tuntap"
+  theory was never the bug — it was CONFIG_UML_NET_VECTOR missing — so the
+  vhost+vec combination may now Just Work. If so, flip
+  `uml/agentpvm.toml` `use_vhost_blk` back to `true` for CoW by default.
 
-- Revisit whether to switch networking to the vec transport for performance
-  (UML docs say vec with tap does > 8 Gbit/s vs tuntap's much lower ceiling).
-  That would change `buildTaskArgs` to emit `vec0:transport=tap,ifname=...`
-  with the correct parameters (depth=128,gro=1; the old `vnet=1` was wrong).
-- Once networking works on the ubd path, re-evaluate whether the qcow2+vhost
-  path (CoW isolation) also works with networking, or still needs the network
-  moved onto virtio_uml (vhost-user-net export from qemu-storage-daemon).
-  The previous "virtio_uml block conflicts with eth0=tuntap" theory needs
-  re-validation now that we know the kernel was missing UML_NET entirely.
+### Reference
+
+- Commit `e619e18ed462bded8e8f12672a37053d39451404` — "um: Remove legacy
+  network transport infrastructure".
+- `arch/um/drivers/Kconfig` (6.18): only `UML_NET_VECTOR` under
+  "UML Network Devices".
+- `Documentation/virt/uml/user_mode_linux_howto_v2.rst` — "tap transport":
+  `vecX:transport=tap,ifname=tap0,depth=128,gro=1`, "tap0 must already
+  exist and UP".

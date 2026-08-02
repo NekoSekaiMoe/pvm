@@ -32,9 +32,10 @@ virtio        = false      # legacy field, no effect (block backend is selected 
 #   false (default): ubd0=<base> raw mount. CoW-free.
 #   true:            qcow2 overlay served by qemu-storage-daemon over
 #                    vhost-user-blk. CoW isolation.
-# Networking (eth0=tuntap) requires the UML kernel to be built with
-# CONFIG_UML_NET + CONFIG_UML_NET_TUNTAP (see scripts/build_kernel.sh and
-# todo.md); it is independent of this switch.
+# Networking uses the vec0 transport (the only UML net transport in
+# Linux >= 6.16; legacy eth0=tuntap was removed). Requires the kernel to be
+# built with CONFIG_UML_NET_VECTOR (see scripts/build_kernel.sh + todo.md);
+# independent of this switch.
 use_vhost_blk = false
 
 # --- network egress (plan.md §4) ---

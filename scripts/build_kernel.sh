@@ -54,16 +54,13 @@ make ARCH=um defconfig
 ./scripts/config --enable CONFIG_VIRTIO_NET
 ./scripts/config --enable CONFIG_VIRTIO_CONSOLE
 
-# UML networking transports. Without CONFIG_UML_NET the kernel has no parser
-# for the 'eth<n>=<transport>,...' command-line syntax, so PVM's
-# 'eth0=tuntap,<tap>' is silently dropped as an unknown parameter and the
-# guest boots with no NIC at all (every connection fails with
-# 'Network unreachable'). defconfig does NOT pull these in, so enable them
-# explicitly. TUNTAP is the legacy transport PVM uses today; VECTOR is the
-# newer/faster one we may switch to later. SLIP/ETHERNG/DAEMON/MCAST are kept
-# off (unused, smaller kernel).
-./scripts/config --enable CONFIG_UML_NET
-./scripts/config --enable CONFIG_UML_NET_TUNTAP
+# UML networking. Since Linux 6.16 (commit e619e18 "um: Remove legacy network
+# transport infrastructure") the ONLY in-tree UML net transport is the vector
+# driver — CONFIG_UML_NET, CONFIG_UML_NET_TUNTAP and the other legacy
+# symbols no longer exist, so 'eth0=tuntap,<tap>' is reported as an unknown
+# command-line parameter and the guest gets no NIC. Enable the vector driver;
+# PVM emits 'vec0:transport=tap,ifname=<tap>,depth=128,gro=1' for it. The
+# generic TUN module is needed on the host side too.
 ./scripts/config --enable CONFIG_UML_NET_VECTOR
 ./scripts/config --enable CONFIG_TUN
 
