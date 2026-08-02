@@ -191,6 +191,13 @@ if sudo grep -q "PKG_INSTALL_SUCCESS" "$CONSOLE_LOG" 2>/dev/null; then
     exit 0
 fi
 echo "❌ pkg-test FAIL: PKG_INSTALL_SUCCESS NOT observed in console.log"
-echo "   Failure detail (last markers seen):"
+echo ""
+echo "--- DIAG: UML kernel command line (proves which block/net transports were passed) ---"
+sudo grep -E "Kernel command line:" "$CONSOLE_LOG" 2>/dev/null | tail -1 || echo "   (no 'Kernel command line' line — UML did not finish early boot)"
+echo ""
+echo "--- DIAG: UML network driver init (eth0/vec registration, or why it failed) ---"
+sudo grep -Ei "eth0|netdevice|tun/tap|tuntap|vec[0-9]|network device|choosing a random ethernet|uml_net|netfront|virtio.*net" "$CONSOLE_LOG" 2>/dev/null | head -20 || echo "   (no UML net-driver lines — kernel may predate net init, or net transport never parsed)"
+echo ""
+echo "--- DIAG: guest-side failure markers ---"
 sudo grep -E "PING |FAILED|Network unreachable|INIT_DONE|PKG_INSTALL_SUCCESS|No such|not found|panic" "$CONSOLE_LOG" 2>/dev/null | tail -20 || echo "   (no console.log at all — agentpvm likely crashed before boot)"
 exit 1
