@@ -116,13 +116,18 @@ type WorkspaceSpec struct {
 type KernelSpec struct {
 	// Path to the UML kernel binary.
 	Path string `toml:"path"`
-	// Virtio enables virtio devices: block via vhost-user-blk (see UseVhostBlk),
-	// and net via the vec0 virtio transport over a host TAP. When false, legacy
-	// ubd0/eth0=tuntap is used.
+	// Virtio is retained for TOML compatibility but no longer selects the
+	// network transport. Historically it was a single switch that wired BOTH
+	// the block device (virtio_uml / vhost-user-blk) AND the network device
+	// (the vec0 virtio-net transport). Those are independent concerns: the
+	// block backend is selected by UseVhostBlk, and the network device is
+	// ALWAYS eth0=tuntap (vec0 was never exercised and broke networking on
+	// kernels without CONFIG_VIRTIO_UML vector support). New code should use
+	// UseVhostBlk directly; this field has no effect on networking.
 	Virtio bool `toml:"virtio"`
-	// UseVhostBlk requires qemu-storage-daemon for the block backend. Implies
-	// Virtio. When Virtio is true but UseVhostBlk is false, ubd0 is used even
-	// for virtio kernels (debug fallback).
+	// UseVhostBlk requires qemu-storage-daemon for the block backend (qcow2
+	// overlay served over vhost-user-blk). The agent path is qcow2-only, so
+	// this MUST be true for `agentpvm run`.
 	UseVhostBlk bool `toml:"use_vhost_blk"`
 }
 

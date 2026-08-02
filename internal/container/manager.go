@@ -417,12 +417,10 @@ func buildLegacyArgs(ctx context.Context, cfg *config.ContainerConfig) []string 
 		args = append(args, "root=/dev/ubda")
 	}
 	args = append(args, "rw")
+	// Network device: always eth0=tuntap (see buildTaskArgs for the rationale:
+	// virtio-block != virtio-net, vec0 has never worked here).
 	if cfg.NetworkTap != "" {
-		if cfg.UseVirtio {
-			args = append(args, fmt.Sprintf("vec0:transport=tap,ifname=%s,vnet=1", cfg.NetworkTap))
-		} else {
-			args = append(args, fmt.Sprintf("eth0=tuntap,%s", cfg.NetworkTap))
-		}
+		args = append(args, fmt.Sprintf("eth0=tuntap,%s", cfg.NetworkTap))
 	}
 	vHost, hasVHost := ctx.Value(KeyVolumeHost).(string)
 	vGuest, hasVGuest := ctx.Value(KeyVolumeGuest).(string)
@@ -462,12 +460,14 @@ func buildTaskArgs(s *spec.TaskSpec, vhostSock, resolvedRootfs, egressAddr strin
 		args = append(args, "root=/dev/ubda")
 	}
 	args = append(args, "rw")
+	// Network device: always eth0=tuntap. UML's vec0 (virtio-net) transport is
+	// a separate concern from the virtio_uml BLOCK device above — wiring the
+	// network to vec0 just because the block backend is vhost-user-blk (which
+	// is what Kernel.Virtio used to imply) breaks networking on kernels
+	// without CONFIG_VIRTIO_UML vector support and has never been exercised
+	// in this project. eth0=tuntap is the universally-supported UML net path.
 	if s.Network.Enabled && s.Network.TAP != "" {
-		if s.Kernel.Virtio {
-			args = append(args, fmt.Sprintf("vec0:transport=tap,ifname=%s,vnet=1", s.Network.TAP))
-		} else {
-			args = append(args, fmt.Sprintf("eth0=tuntap,%s", s.Network.TAP))
-		}
+		args = append(args, fmt.Sprintf("eth0=tuntap,%s", s.Network.TAP))
 	}
 	// Forward the task's DEDICATED egress listener address (host:port) into the
 	// guest so it can dial it as its HTTP proxy. Attribution is established by

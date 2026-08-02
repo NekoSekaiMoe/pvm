@@ -36,7 +36,7 @@ EOF
 OUT=$("$TMP/agentpvm" run -config "$TMP/spec.toml" 2>&1 || true)
 echo "$OUT" | grep -q "Loaded TaskSpec" || { echo "❌ config not loaded: $OUT"; exit 1; }
 echo "$OUT" | grep -q "fingerprint"     || { echo "❌ no fingerprint: $OUT"; exit 1; }
-echo "$OUT" | grep -q "Egress gateway"  || { echo "❌ egress not started: $OUT"; exit 1; }
+echo "$OUT" | grep -q "Starting sandbox" || { echo "❌ control planes did not wire up (never reached StartTask): $OUT"; exit 1; }
 # launch fails because kernel doesn't exist; that's expected. The state file
 # must record the failure with a FSM reason.
 echo "   config + egress + fingerprint ✓"

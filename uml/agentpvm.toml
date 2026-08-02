@@ -29,7 +29,7 @@ init      = "/sbin/init"
 
 [kernel]
 path          = "./bin/linux"
-virtio        = true       # vhost-user-blk requires virtio_uml devices
+virtio        = false      # legacy field, no longer selects the network transport (always eth0=tuntap); block backend is controlled by use_vhost_blk
 use_vhost_blk = true       # back the block device with qemu-storage-daemon (REQUIRED for qcow2 CoW; ubd cannot read qcow2)
 
 # --- network egress (plan.md §4) ---

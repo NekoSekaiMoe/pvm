@@ -150,7 +150,13 @@ func runCmd(args []string) {
 	}
 	if *vhost {
 		s.Kernel.UseVhostBlk = true
-		s.Kernel.Virtio = true // vhost-user-blk requires virtio
+		// NOTE: do NOT set s.Kernel.Virtio here. Virtio used to be a single
+		// switch that wired BOTH the block device (virtio_uml/vhost-user-blk)
+		// AND the network device (vec0 virtio-net). The two are independent:
+		// buildTaskArgs now keys the block backend off UseVhostBlk alone and
+		// always uses eth0=tuntap for networking (vec0 has never worked in
+		// this project). Setting Virtio=true here would be a no-op now, but
+		// we leave the field alone to avoid muddying the spec semantics.
 	}
 	if *netEnabled {
 		s.Network.Enabled = true
@@ -185,12 +191,13 @@ func runCmd(args []string) {
 	}
 	eg := egress.NewGateway()
 	eg.AttachLedger(ledger)
-	addr, err := eg.Listen(context.Background(), "127.0.0.1:0")
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "egress: %v\n", err)
-		os.Exit(1)
-	}
-	fmt.Printf("Egress gateway listening on %s\n", addr)
+	// NOTE: we intentionally do NOT open a shared eg.Listen() listener here.
+	// Manager.StartTask opens a per-task listener via ListenForTask, whose
+	// handler binds the task id by closure (unforgeable attribution) and
+	// injects its host:port into the guest as egress_proxy=. The old shared
+	// listener used the forgeable X-Task-Id header; keeping it around would
+	// both leak a useless port and print a misleading "Egress gateway
+	// listening on" line that no traffic actually flows through.
 
 	incidentCtl := incident.NewController(ledger, broker, incident.Hooks{
 		FreezeRuntime: func(id string) error {
@@ -243,7 +250,7 @@ func safeDefaultSpec() *spec.TaskSpec {
 			BaseImage: "rootfs.qcow2",
 			Init:      "/sbin/init",
 		},
-		Kernel: spec.KernelSpec{Path: "./bin/linux", Virtio: true, UseVhostBlk: true},
+		Kernel: spec.KernelSpec{Path: "./bin/linux", UseVhostBlk: true},
 		Network: spec.NetworkSpec{Enabled: false}, // default deny
 		Lifecycle: spec.LifecycleSpec{OnAnomaly: "pause", TTL: "1h"},
 	}
