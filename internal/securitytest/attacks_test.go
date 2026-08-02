@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -128,8 +129,8 @@ func TestAttack_LedgerTruncationThenForgeFails(t *testing.T) {
 func TestAttack_ForgedToken(t *testing.T) {
 	setupRoots(t)
 	ledger, _ := audit.Open("sec-id")
-	broker := identity.NewBroker([]byte("real-secret-key"), nil, ledger, time.Hour)
-	real, _ := broker.Mint("alice", "eng", []string{"repo:read"}, time.Hour)
+	broker, _ := identity.NewBroker([]byte("real-secret-key"), nil, ledger, time.Hour)
+	real, _ := broker.Mint("alice", "eng", "sec-id", []string{"repo:read"}, time.Hour)
 
 	// attacker flips the last char of the signature
 	forged := real[:len(real)-1]
@@ -151,8 +152,8 @@ func TestAttack_ForgedToken(t *testing.T) {
 func TestAttack_SecretNotInToken(t *testing.T) {
 	setupRoots(t)
 	ledger, _ := audit.Open("sec-leak")
-	broker := identity.NewBroker(nil, identity.StaticStore{"repo:read": "ULTRA-SECRET-12345"}, ledger, time.Hour)
-	tok, _ := broker.Mint("alice", "eng", []string{"repo:read"}, time.Hour)
+	broker, _ := identity.NewBroker(nil, identity.StaticStore{"repo:read": "ULTRA-SECRET-12345"}, ledger, time.Hour)
+	tok, _ := broker.Mint("alice", "eng", "sec-leak", []string{"repo:read"}, time.Hour)
 	if strings.Contains(tok, "ULTRA-SECRET-12345") {
 		t.Fatal("SECURITY: long-lived secret leaked into the token string")
 	}
@@ -160,7 +161,11 @@ func TestAttack_SecretNotInToken(t *testing.T) {
 
 // =====================================================================
 // ATTACK 5: DNS rebinding — a domain the proxy allowlists resolves to a
-// private IP. The SSRF floor must block the dial regardless.
+// private IP. The SSRF floor must block the dial regardless. This version
+// starts a REAL local listener and asserts the proxy returns 403, not 502 —
+// the previous variant pointed at a dead port, so a connection-refused 502
+// masqueraded as "SSRF blocked" and the test passed even though handleHTTP
+// had no SSRF check at all.
 // =====================================================================
 
 func TestAttack_DNSRebindingToPrivateIP(t *testing.T) {
@@ -168,9 +173,16 @@ func TestAttack_DNSRebindingToPrivateIP(t *testing.T) {
 	ledger, _ := audit.Open("sec-ssrf")
 	g := egress.NewGateway()
 	g.AttachLedger(ledger)
-	// allowlist "localhost" — the proxy will allow the domain, but the dial
-	// must be refused because 127.0.0.1 is private.
-	g.SetPolicy("t", &egress.Policy{AllowDomains: []string{"localhost", "127.0.0.1"}})
+	// Start a real upstream that WOULD answer 200 if reached. If the SSRF floor
+	// is missing, the proxy forwards to it and we get 200 -> test fails.
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("UPSTREAM-REACHED"))
+	}))
+	defer upstream.Close()
+	// Allowlist the loopback host so the domain check passes; the SSRF floor
+	// must still refuse the dial because 127.0.0.1 is private.
+	g.SetPolicy("t", &egress.Policy{AllowDomains: []string{"127.0.0.1", "localhost"}})
 	addr, _ := g.Listen(context.Background(), "127.0.0.1:0")
 	defer g.Shutdown(context.Background())
 
@@ -178,16 +190,23 @@ func TestAttack_DNSRebindingToPrivateIP(t *testing.T) {
 		return url.Parse("http://" + addr)
 	}}
 	c := &http.Client{Transport: tr, Timeout: 3 * time.Second}
-	req, _ := http.NewRequest("GET", "http://127.0.0.1:1/", nil)
+	// Point at the real upstream URL so the only thing that can fail is the
+	// gateway's SSRF floor (not a dead port).
+	req, _ := http.NewRequest("GET", upstream.URL+"/", nil)
 	req.Header.Set("X-Task-Id", "t")
 	resp, err := c.Do(req)
-	if err == nil {
-		// must NOT be 200 OK to the private target
-		if resp.StatusCode == http.StatusOK {
-			resp.Body.Close()
-			t.Fatal("SECURITY: CONNECT tunneled to a private (loopback) IP")
-		}
-		resp.Body.Close()
+	if err != nil {
+		t.Fatalf("unexpected transport error: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusOK {
+		t.Fatalf("SECURITY: proxy forwarded to a private (loopback) upstream; got 200")
+	}
+	// The SSRF floor returns 403; 502 means the proxy tried to forward and the
+	// connection was refused by something else (the broken state the old test
+	// masked). Either way, NOT 200 — but we specifically want 403.
+	if resp.StatusCode != http.StatusForbidden {
+		t.Errorf("expected 403 from SSRF floor, got %d", resp.StatusCode)
 	}
 }
 

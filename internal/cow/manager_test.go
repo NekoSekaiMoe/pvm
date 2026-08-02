@@ -1,6 +1,7 @@
 package cow
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -13,7 +14,7 @@ func TestCreateOverlay_QemuImgMissing(t *testing.T) {
 		t.Skip("qemu-img installed; cannot exercise missing-binary path")
 	}
 	out := filepath.Join(t.TempDir(), "overlay.qcow2")
-	err := CreateOverlay("/nonexistent/base.img", out, FormatRaw)
+	err := CreateOverlay(context.Background(), "/nonexistent/base.img", out, FormatRaw)
 	if err == nil {
 		t.Fatal("expected error when qemu-img missing")
 	}
@@ -45,7 +46,7 @@ func TestCreateOverlay_RealQemu(t *testing.T) {
 		t.Fatalf("write base: %v", err)
 	}
 	overlay := filepath.Join(dir, "ov.qcow2")
-	if err := CreateOverlay(base, overlay, FormatRaw); err != nil {
+	if err := CreateOverlay(context.Background(), base, overlay, FormatRaw); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 	hdr := make([]byte, 4)
@@ -70,7 +71,7 @@ func TestCreateOverlay_IdempotentRecreate(t *testing.T) {
 	base := filepath.Join(dir, "base.img")
 	os.WriteFile(base, make([]byte, 1<<20), 0644)
 	overlay := filepath.Join(dir, "ov.qcow2")
-	if err := CreateOverlay(base, overlay, FormatRaw); err != nil {
+	if err := CreateOverlay(context.Background(), base, overlay, FormatRaw); err != nil {
 		t.Fatalf("first create: %v", err)
 	}
 	// taint the overlay
@@ -78,11 +79,36 @@ func TestCreateOverlay_IdempotentRecreate(t *testing.T) {
 		_ = err
 	}
 	// second create should replace, not append/reuse the tainted file
-	if err := CreateOverlay(base, overlay, FormatRaw); err != nil {
+	if err := CreateOverlay(context.Background(), base, overlay, FormatRaw); err != nil {
 		t.Fatalf("second create: %v", err)
 	}
 	data, _ := os.ReadFile(overlay)
 	if strings.HasPrefix(string(data), "stale") {
 		t.Error("overlay was not replaced on recreate (stale data leaked)")
+	}
+}
+
+// TestValidatePath_RejectsLeadingDash covers the option-injection vector: a
+// filename starting with '-' would be parsed by qemu-img as a flag if it
+// reached the argv. validatePath must reject it before that.
+func TestValidatePath_RejectsLeadingDash(t *testing.T) {
+	cases := []struct {
+		path string
+		want bool // true = should be rejected
+	}{
+		{"/safe/path.img", false},
+		{"./relative.img", false},
+		{"-flag", true},
+		{"--output=evil", true},
+		{"/safe/-flag", false},  // leading '-' only on a non-first element is fine
+	}
+	for _, c := range cases {
+		err := validatePath(c.path)
+		if c.want && err == nil {
+			t.Errorf("validatePath(%q) = nil; want rejection (option injection)", c.path)
+		}
+		if !c.want && err != nil {
+			t.Errorf("validatePath(%q) = %v; want accept", c.path, err)
+		}
 	}
 }

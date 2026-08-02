@@ -64,22 +64,36 @@ func (d Decision) String() string {
 
 // Gateway is the HTTP CONNECT proxy that enforces a Policy per task.
 type Gateway struct {
-	policies    map[string]*Policy // keyed by task id
-	mu          sync.RWMutex
-	ledger      *audit.Ledger // shared ledger; tasks separated by their own ledger
-	bytesOut    map[string]*int64
-	bytesOutMu  sync.Mutex
-	server      *http.Server
-	listener    net.Listener
+	policies   map[string]*Policy // keyed by task id
+	mu         sync.RWMutex
+	ledger     *audit.Ledger            // default ledger (single-task or legacy)
+	ledgers    map[string]*audit.Ledger // per-task ledgers (take precedence)
+	bytesOut   map[string]*int64
+	bytesOutMu sync.Mutex
+	server     *http.Server
+	listener   net.Listener
+
+	// ssrfBypass is a test-only escape hatch that disables the SSRF IP-floor
+	// on handleHTTP so unit tests can point at httptest's 127.0.0.1 backends.
+	// Production code MUST NOT set this; it's unexported and only written via
+	// EnableSSRFBypassForTest.
+	ssrfBypass bool
 }
 
 // NewGateway constructs an empty gateway. Register policies with SetPolicy.
 func NewGateway() *Gateway {
 	return &Gateway{
 		policies: make(map[string]*Policy),
+		ledgers:  make(map[string]*audit.Ledger),
 		bytesOut: make(map[string]*int64),
 	}
 }
+
+// EnableSSRFBypassForTest disables the SSRF IP-floor on handleHTTP. It exists
+// so unit tests can route to httptest.NewServer (which binds 127.0.0.1) without
+// being blocked by the floor. Production callers MUST NOT use it; the SSRF
+// floor is a load-bearing security control.
+func (g *Gateway) EnableSSRFBypassForTest() { g.ssrfBypass = true }
 
 // SetPolicy installs/updates the egress policy for a task.
 func (g *Gateway) SetPolicy(task string, p *Policy) {
@@ -88,8 +102,20 @@ func (g *Gateway) SetPolicy(task string, p *Policy) {
 	g.policies[task] = p
 }
 
-// AttachLedger wires an audit ledger so every egress decision is recorded.
+// AttachLedger wires a fallback audit ledger so every egress decision is
+// recorded. For gateways that serve multiple tasks, prefer AttachTaskLedger
+// so each task's traffic lands in its own ledger.
 func (g *Gateway) AttachLedger(l *audit.Ledger) { g.ledger = l }
+
+// AttachTaskLedger wires a task-specific ledger. When present, it takes
+// precedence over the gateway-wide ledger for that task's records, so a
+// shared gateway doesn't misattribute traffic to the controller process's
+// default task.
+func (g *Gateway) AttachTaskLedger(task string, l *audit.Ledger) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.ledgers[task] = l
+}
 
 // Listen starts the proxy on addr (e.g. "127.0.0.1:0" for ephemeral). Returns
 // the actual address once bound.
@@ -102,7 +128,11 @@ func (g *Gateway) Listen(ctx context.Context, addr string) (string, error) {
 	g.server = &http.Server{
 		Handler: http.HandlerFunc(g.handle),
 		// Tight timeouts: a sandbox should not hold a proxy idle for long.
+		// ReadHeaderTimeout bounds the headers; ReadTimeout bounds the whole
+		// request (incl. body) so a slow-body attacker can't pin a goroutine.
+		ReadTimeout:       60 * time.Second,
 		ReadHeaderTimeout: 10 * time.Second,
+		WriteTimeout:      60 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
 	go g.server.Serve(ln)
@@ -191,6 +221,9 @@ func (g *Gateway) handleConnect(w http.ResponseWriter, r *http.Request, task str
 }
 
 // handleHTTP handles plain HTTP requests (body visible, method/size enforced).
+// It applies the SAME SSRF IP-floor check as handleConnect (via a custom
+// DialContext) so a domain that resolves to an internal IP is refused here
+// too — not only on CONNECT.
 func (g *Gateway) handleHTTP(w http.ResponseWriter, r *http.Request, task string, pol *Policy) {
 	host := anonymousPort(r.Host)
 	d := g.decideDomain(host, pol)
@@ -205,25 +238,56 @@ func (g *Gateway) handleHTTP(w http.ResponseWriter, r *http.Request, task string
 		http.Error(w, "egress: method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	// size cap on request body
-	if pol.MaxRequestBody > 0 && r.ContentLength > pol.MaxRequestBody {
-		g.record(task, r, DecisionBlock, fmt.Sprintf("request body %d > %d", r.ContentLength, pol.MaxRequestBody))
-		http.Error(w, "egress: request too large", http.StatusRequestEntityTooLarge)
-		return
+	// Size cap on request body. r.ContentLength is -1 for chunked transfers,
+	// so also wrap r.Body in a LimitReader: a chunked sender can't bypass the
+	// cap by omitting Content-Length.
+	var bodyReader io.Reader = r.Body
+	if pol.MaxRequestBody > 0 {
+		if r.ContentLength > pol.MaxRequestBody {
+			g.record(task, r, DecisionBlock, fmt.Sprintf("request body %d > %d", r.ContentLength, pol.MaxRequestBody))
+			http.Error(w, "egress: request too large", http.StatusRequestEntityTooLarge)
+			return
+		}
+		bodyReader = &io.LimitedReader{R: r.Body, N: pol.MaxRequestBody + 1}
 	}
-	outReq, err := http.NewRequest(r.Method, r.URL.String(), r.Body)
+	outReq, err := http.NewRequest(r.Method, r.URL.String(), bodyReader)
 	if err != nil {
 		http.Error(w, "egress: bad request", http.StatusBadRequest)
 		return
 	}
-	outReq.Header = r.Header.Clone()
-	resp, err := http.DefaultTransport.RoundTrip(outReq)
+	// Strip internal + hop-by-hop headers before forwarding. X-Task-Id is an
+	// internal routing/audit identifier and must not leak to third parties;
+	// hop-by-hop headers per RFC 7230 §6.1 are connection-scoped.
+	outReq.Header = stripInternalHeaders(r.Header.Clone())
+	// SSRF floor: dial through a custom transport whose DialContext rejects
+	// any IP that resolves to a private/loopback/link-local range. This mirrors
+	// the isPrivate() check on handleConnect's established connection. Tests
+	// that need to hit a loopback upstream bypass it via EnableSSRFBypassForTest.
+	transport := g.dialCheckedTransport()
+	resp, err := transport.RoundTrip(outReq)
 	if err != nil {
-		g.record(task, r, DecisionBlock, "upstream error: "+err.Error())
-		http.Error(w, "egress: upstream error", http.StatusBadGateway)
+		reason := "upstream error: " + err.Error()
+		if isSSRFDialError(err) {
+			reason = "target resolved to private IP (SSRF floor)"
+		}
+		g.record(task, r, DecisionBlock, reason)
+		code := http.StatusBadGateway
+		if isSSRFDialError(err) {
+			code = http.StatusForbidden
+		}
+		http.Error(w, "egress: "+reason, code)
 		return
 	}
 	defer resp.Body.Close()
+	// Detect if the client exceeded the request-body cap; if so, we cannot
+	// trust the upstream's response and abort with 413 instead.
+	if pol.MaxRequestBody > 0 {
+		if lr, ok := bodyReader.(*io.LimitedReader); ok && lr.N <= 0 {
+			g.record(task, r, DecisionBlock, "chunked request body exceeded cap")
+			http.Error(w, "egress: request too large", http.StatusRequestEntityTooLarge)
+			return
+		}
+	}
 	// size cap on response
 	var src io.Reader = resp.Body
 	if pol.MaxResponseBody > 0 {
@@ -238,6 +302,58 @@ func (g *Gateway) handleHTTP(w http.ResponseWriter, r *http.Request, task string
 	n, _ := io.Copy(w, src)
 	g.addBytes(task, n)
 	g.record(task, r, DecisionAllow, fmt.Sprintf("%s %s -> %d (%dB)", r.Method, host, resp.StatusCode, n))
+}
+
+// dialCheckedTransport returns an http.RoundTripper whose DialContext rejects
+// private/loopback/link-local destination IPs. When g.ssrfBypass is set (test
+// only), the DialContext is the standard one so loopback upstreams work.
+func (g *Gateway) dialCheckedTransport() *http.Transport {
+	if g.ssrfBypass {
+		return &http.Transport{
+			ResponseHeaderTimeout: 30 * time.Second,
+		}
+	}
+	return &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			d := net.Dialer{Timeout: 10 * time.Second}
+			conn, err := d.DialContext(ctx, network, addr)
+			if err != nil {
+				return nil, err
+			}
+			if isPrivate(conn.RemoteAddr()) {
+				conn.Close()
+				return nil, errPrivateIPBlocked
+			}
+			return conn, nil
+		},
+		ResponseHeaderTimeout: 30 * time.Second,
+	}
+}
+
+// errPrivateIPBlocked is returned by dialCheckedTransport when the dial lands
+// on a private/loopback/link-local IP. isSSRFDialError recognizes it.
+var errPrivateIPBlocked = errors.New("egress: dialed address is private/loopback")
+
+// isSSRFDialError reports whether err is the SSRF-floor rejection.
+func isSSRFDialError(err error) bool { return errors.Is(err, errPrivateIPBlocked) }
+
+// hopByHopHeaders are connection-scoped headers per RFC 7230 §6.1 that must
+// not be forwarded by a proxy.
+var hopByHopHeaders = []string{
+	"Connection", "Proxy-Connection", "Keep-Alive", "Proxy-Authenticate",
+	"Proxy-Authorization", "Te", "Trailer", "Transfer-Encoding", "Upgrade",
+}
+
+// stripInternalHeaders returns a copy of hdr with X-Task-Id and all
+// hop-by-hop headers removed. The clone is defensive so we never mutate the
+// inbound request's header map.
+func stripInternalHeaders(hdr http.Header) http.Header {
+	out := hdr.Clone()
+	out.Del("X-Task-Id")
+	for _, h := range hopByHopHeaders {
+		out.Del(h)
+	}
+	return out
 }
 
 // decideDomain applies block-over-allow with wildcard suffix matching.
@@ -336,17 +452,30 @@ func (g *Gateway) policy(task string) *Policy {
 }
 
 func (g *Gateway) record(task string, r *http.Request, d Decision, reason string) {
-	if g.ledger == nil {
+	// Pick the task-specific ledger when one is registered, falling back to
+	// the gateway-wide ledger. This keeps multi-task traffic attributed to
+	// the right task instead of the controller's default.
+	l := g.ledger
+	g.mu.RLock()
+	if tl, ok := g.ledgers[task]; ok && tl != nil {
+		l = tl
+	}
+	g.mu.RUnlock()
+	if l == nil {
 		return
 	}
-	_ = g.ledger.Append(audit.Record{
+	if err := l.Append(audit.Record{
 		Phase:    audit.PhaseExec,
 		Subject:  r.RemoteAddr,
 		Action:   r.Method + " " + stripPort(r.Host),
 		Params:   map[string]interface{}{"task": task, "bytes": r.ContentLength},
 		Decision: audit.Decision(d.String()),
 		Reason:   reason,
-	})
+	}); err != nil {
+		// Don't swallow: a missing audit row for an allow/block decision is a
+		// real integrity gap and should be visible to operators.
+		log.Printf("egress: audit append failed for task %s: %v", task, err)
+	}
 }
 
 // --- helpers ---

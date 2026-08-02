@@ -147,13 +147,16 @@ func TestLedger_DeterministicHashSameRecord(t *testing.T) {
 	}
 }
 
-// TestLedger_DifferentLedgerIndependent: two ledgers with identical contents
-// hash identically record-for-record (cross-ledger hash determinism), but their
-// on-disk state never bleeds between tasks.
+// TestLedger_DifferentLedgerIndependent: two ledgers with identical record
+// CONTENT hash identically when the content includes the SAME task. Because
+// hashRecord now binds the Task field into the digest (per the security
+// review), records that differ only in their task id correctly hash
+// differently — so this test uses a shared task id to exercise the
+// cross-ledger determinism property, then separately checks file isolation.
 func TestLedger_DifferentLedgerIndependent(t *testing.T) {
 	LedgerRoot = t.TempDir()
-	a, _ := Open("task-a")
-	b, _ := Open("task-b")
+	a, _ := Open("shared-task")
+	b, _ := Open("shared-task")
 	a.Append(Record{Phase: PhaseExec, Subject: "x", Action: "a", Decision: DecisionAllow})
 	b.Append(Record{Phase: PhaseExec, Subject: "x", Action: "a", Decision: DecisionAllow})
 
@@ -162,24 +165,47 @@ func TestLedger_DifferentLedgerIndependent(t *testing.T) {
 	if la[0].ThisHash != lb[0].ThisHash {
 		t.Error("identical records should hash identically across ledgers")
 	}
-	// but file isolation
-	if _, err := os.Stat(filepath.Join(LedgerRoot, "task-a", "ledger.jsonl")); err != nil {
-		t.Error("task-a ledger missing")
+	// Different task ids MUST now hash differently (Task is part of the digest).
+	x, _ := Open("task-x")
+	y, _ := Open("task-y")
+	x.Append(Record{Phase: PhaseExec, Subject: "s", Action: "a", Decision: DecisionAllow})
+	y.Append(Record{Phase: PhaseExec, Subject: "s", Action: "a", Decision: DecisionAllow})
+	rx, _ := x.ReadAll()
+	ry, _ := y.ReadAll()
+	if rx[0].ThisHash == ry[0].ThisHash {
+		t.Error("records with different task ids must hash differently (Task is bound)")
+	}
+	// File isolation: each task's ledger lives under its own dir.
+	if _, err := os.Stat(filepath.Join(LedgerRoot, "task-x", "ledger.jsonl")); err != nil {
+		t.Error("task-x ledger missing")
+	}
+	if _, err := os.Stat(filepath.Join(LedgerRoot, "task-y", "ledger.jsonl")); err != nil {
+		t.Error("task-y ledger missing")
 	}
 }
 
-// TestLedger_HashDependsOnAllFields ensures removing the Reason alone changes
-// the hash (proves no field is silently ignored in the canonical form).
+// TestLedger_HashDependsOnAllFields ensures removing/changing ANY single
+// field changes the hash. After the security review, Seq/At/Task/Tenant are
+// part of the digest too, so this test now covers variants for each of them.
 func TestLedger_HashDependsOnAllFields(t *testing.T) {
-	base := Record{Phase: PhaseExec, Subject: "s", Action: "a", Decision: DecisionAllow, Reason: "r", PrevHash: "p"}
+	base := Record{
+		Seq: 7, At: time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC),
+		Task: "task", Tenant: "tenant",
+		Phase: PhaseExec, Subject: "s", Action: "a",
+		Decision: DecisionAllow, Reason: "r", PrevHash: "p",
+	}
 	h0 := hashRecord(base, "p")
 	variants := []Record{
-		{Phase: PhaseGoalAuth, Subject: "s", Action: "a", Decision: DecisionAllow, Reason: "r", PrevHash: "p"},
-		{Phase: PhaseExec, Subject: "other", Action: "a", Decision: DecisionAllow, Reason: "r", PrevHash: "p"},
-		{Phase: PhaseExec, Subject: "s", Action: "other", Decision: DecisionAllow, Reason: "r", PrevHash: "p"},
-		{Phase: PhaseExec, Subject: "s", Action: "a", Decision: DecisionDeny, Reason: "r", PrevHash: "p"},
-		{Phase: PhaseExec, Subject: "s", Action: "a", Decision: DecisionAllow, Reason: "changed", PrevHash: "p"},
-		{Phase: PhaseExec, Subject: "s", Action: "a", Decision: DecisionAllow, Reason: "r", PrevHash: "p2"},
+		{Seq: 8, At: base.At, Task: base.Task, Tenant: base.Tenant, Phase: base.Phase, Subject: base.Subject, Action: base.Action, Decision: base.Decision, Reason: base.Reason, PrevHash: base.PrevHash},
+		{Seq: base.Seq, At: base.At.Add(time.Second), Task: base.Task, Tenant: base.Tenant, Phase: base.Phase, Subject: base.Subject, Action: base.Action, Decision: base.Decision, Reason: base.Reason, PrevHash: base.PrevHash},
+		{Seq: base.Seq, At: base.At, Task: "other-task", Tenant: base.Tenant, Phase: base.Phase, Subject: base.Subject, Action: base.Action, Decision: base.Decision, Reason: base.Reason, PrevHash: base.PrevHash},
+		{Seq: base.Seq, At: base.At, Task: base.Task, Tenant: "other-tenant", Phase: base.Phase, Subject: base.Subject, Action: base.Action, Decision: base.Decision, Reason: base.Reason, PrevHash: base.PrevHash},
+		{Seq: base.Seq, At: base.At, Task: base.Task, Tenant: base.Tenant, Phase: PhaseGoalAuth, Subject: base.Subject, Action: base.Action, Decision: base.Decision, Reason: base.Reason, PrevHash: base.PrevHash},
+		{Seq: base.Seq, At: base.At, Task: base.Task, Tenant: base.Tenant, Phase: base.Phase, Subject: "other", Action: base.Action, Decision: base.Decision, Reason: base.Reason, PrevHash: base.PrevHash},
+		{Seq: base.Seq, At: base.At, Task: base.Task, Tenant: base.Tenant, Phase: base.Phase, Subject: base.Subject, Action: "other", Decision: base.Decision, Reason: base.Reason, PrevHash: base.PrevHash},
+		{Seq: base.Seq, At: base.At, Task: base.Task, Tenant: base.Tenant, Phase: base.Phase, Subject: base.Subject, Action: base.Action, Decision: DecisionDeny, Reason: base.Reason, PrevHash: base.PrevHash},
+		{Seq: base.Seq, At: base.At, Task: base.Task, Tenant: base.Tenant, Phase: base.Phase, Subject: base.Subject, Action: base.Action, Decision: base.Decision, Reason: "changed", PrevHash: base.PrevHash},
+		{Seq: base.Seq, At: base.At, Task: base.Task, Tenant: base.Tenant, Phase: base.Phase, Subject: base.Subject, Action: base.Action, Decision: base.Decision, Reason: base.Reason, PrevHash: "p2"},
 	}
 	for i, v := range variants {
 		if hashRecord(v, v.PrevHash) == h0 {

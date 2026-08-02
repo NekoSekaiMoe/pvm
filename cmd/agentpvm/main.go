@@ -13,11 +13,12 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"regexp"
 	"strings"
 
@@ -36,7 +37,6 @@ import (
 	"uml-container/internal/network"
 	"uml-container/internal/network/egress"
 	"uml-container/internal/policy"
-	"uml-container/internal/pool"
 	"uml-container/internal/snapshot"
 	"uml-container/internal/spec"
 	"uml-container/internal/state"
@@ -176,7 +176,11 @@ func runCmd(args []string) {
 		fmt.Fprintf(os.Stderr, "audit: %v\n", err)
 		os.Exit(1)
 	}
-	broker := identity.NewBroker(nil, identity.StaticStore{}, ledger, 0)
+	broker, err := identity.NewBroker(nil, identity.StaticStore{}, ledger, 0)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "identity: %v\n", err)
+		os.Exit(1)
+	}
 	eg := egress.NewGateway()
 	eg.AttachLedger(ledger)
 	addr, err := eg.Listen(context.Background(), "127.0.0.1:0")
@@ -201,10 +205,20 @@ func runCmd(args []string) {
 		},
 	})
 
+	// Attach the task-specific ledger so this task's egress audit rows are
+	// attributed to it, not to the controller's default ledger task.
+	eg.AttachTaskLedger(taskID, ledger)
+
 	mgr := container.NewManager(nil)
 	mgr.Broker = broker
 	mgr.Egress = eg
 	mgr.IncidentHandler = &incidentAdapter{ctl: incidentCtl}
+	// Register the task's policy gateway with the API's /exec dispatcher.
+	// Without this, /api/exec always returns 403 even though /api/policy/:task
+	// shows the rules (the two used to read from different registries).
+	api.RegisterPolicyGateway(taskID, policy.NewGateway(policy.CompileRules(
+		rulesFromSpec(s.Tools),
+	), ledger))
 
 	fmt.Printf("Starting sandbox %s...\n", taskID)
 	if err := mgr.StartTask(context.Background(), taskID, s); err != nil {
@@ -245,6 +259,20 @@ func (a *incidentAdapter) OnBudgetExceeded(taskID string) {
 	})
 }
 
+// rulesFromSpec converts the TaskSpec's tool rules into the {Name,Action,
+// Effect,Reason} shape policy.CompileRules expects. Kept here so agentpvm
+// owns the spec->policy translation and cmd/agentpvm does not reach into
+// policy internals for every launch.
+func rulesFromSpec(in []spec.ToolRule) []struct{ Name, Action, Effect, Reason string } {
+	out := make([]struct{ Name, Action, Effect, Reason string }, 0, len(in))
+	for _, r := range in {
+		out = append(out, struct{ Name, Action, Effect, Reason string }{
+			Name: r.Name, Action: r.Action, Effect: r.Effect, Reason: r.Reason,
+		})
+	}
+	return out
+}
+
 // apiCmd / webuiCmd start the management API.
 func apiCmd(args []string) {
 	fs := flag.NewFlagSet("api", flag.ExitOnError)
@@ -275,7 +303,7 @@ func cowCmd(args []string) {
 		fmt.Println("Usage: agentpvm cow -backing <base.img> -overlay <overlay.qcow2> [-backing-format raw]")
 		os.Exit(1)
 	}
-	if err := cow.CreateOverlay(*backing, *overlay, cow.BackingFormat(*backingFormat)); err != nil {
+	if err := cow.CreateOverlay(context.Background(), *backing, *overlay, cow.BackingFormat(*backingFormat)); err != nil {
 		fmt.Printf("CoW overlay creation failed: %v\n", err)
 		os.Exit(1)
 	}
@@ -343,7 +371,11 @@ func cgroupCmd(args []string) {
 	}
 }
 
-// gateCmd runs the Artifact Gate standalone on a bundle.
+// gateCmd runs the Artifact Gate standalone on a bundle and reports the
+// verdict. The bundle is read from the file pointed to by -bundle and verified
+// against the default verifiers; the per-step result and overall pass/fail are
+// printed. The ledger root is scoped to the bundle's directory so the audit
+// row lands next to the bundle.
 func gateCmd(args []string) {
 	fs := flag.NewFlagSet("gate", flag.ExitOnError)
 	bundlePath := fs.String("bundle", "", "Artifact bundle JSON file")
@@ -352,47 +384,112 @@ func gateCmd(args []string) {
 		fmt.Println("Usage: agentpvm gate -bundle <bundle.json>")
 		os.Exit(1)
 	}
-	// minimal: open a ledger-less gate and report verdict.
-	dir := filepath.Dir(*bundlePath)
-	audit.LedgerRoot = dir
-	ledger, _ := audit.Open(filepath.Base(dir))
+	data, err := os.ReadFile(*bundlePath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "gate: read bundle %s: %v\n", *bundlePath, err)
+		os.Exit(1)
+	}
+	var b artifact.Bundle
+	if err := json.Unmarshal(data, &b); err != nil {
+		fmt.Fprintf(os.Stderr, "gate: parse bundle: %v\n", err)
+		os.Exit(1)
+	}
+	// Scope the audit ledger to the bundle's task id; fall back to no-ledger
+	// if the bundle doesn't carry one or the path is not writable.
+	var ledger *audit.Ledger
+	if b.TaskID != "" {
+		l, lerr := audit.Open(b.TaskID)
+		if lerr == nil {
+			ledger = l
+		}
+	}
 	g := artifact.NewGate(ledger)
-	// In a real run the bundle is produced by the sandbox; here we just verify
-	// the gate compiles and is callable. A full driver is out of scope.
-	_ = g
-	fmt.Printf("Artifact gate ready (bundle=%s).\n", *bundlePath)
-}
-
-// approvalCmd lists/decides approval tickets.
-func approvalCmd(args []string) {
-	if len(args) == 0 {
-		fmt.Println("Usage: agentpvm approval [list|approve <id>|reject <id>]")
+	v := g.Verify(&b)
+	if v.Passed {
+		fmt.Printf("PASS (hash=%s)\n", v.Hash)
 		return
 	}
-	m := approval.NewManager(nil) // ephemeral; MVP has no persistence
+	fmt.Printf("FAIL (hash=%s):\n", v.Hash)
+	for step, status := range v.Step {
+		fmt.Printf("  %s: %s\n", step, status)
+	}
+	os.Exit(1)
+}
+
+// approvalCmd lists/decides approval tickets by talking to the running API.
+// It reads API_SECRET from the environment and hits /api/approvals so the
+// state it shows is the live state of the controller, not an ephemeral store.
+func approvalCmd(args []string) {
+	if len(args) == 0 {
+		fmt.Println("Usage: agentpvm approval [list]   (operates against $PVM_API / $API_SECRET)")
+		return
+	}
+	base := os.Getenv("PVM_API")
+	if base == "" {
+		base = "http://127.0.0.1:8080"
+	}
+	secret := os.Getenv("API_SECRET")
+	if secret == "" {
+		secret = "secret"
+	}
 	switch args[0] {
 	case "list":
-		for _, t := range m.Pending("") {
-			fmt.Printf("%s\t%s\t%s\n", t.ID, t.Tool, t.Target)
+		req, _ := http.NewRequest("GET", base+"/api/approvals", nil)
+		req.Header.Set("Authorization", "Bearer "+secret)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			fmt.Printf("approval list: %v (is the API running at %s?)\n", err, base)
+			return
+		}
+		defer resp.Body.Close()
+		var tickets []approval.Ticket
+		_ = json.NewDecoder(resp.Body).Decode(&tickets)
+		if len(tickets) == 0 {
+			fmt.Println("(no pending tickets)")
+			return
+		}
+		for _, t := range tickets {
+			fmt.Printf("%s\t%s\t%s\t%s\n", t.ID, t.Tool, t.Target, t.Why)
 		}
 	default:
 		fmt.Println("unknown subcommand:", args[0])
 	}
 }
 
-// poolCmd inspects or warms the sandbox pool.
+// poolCmd inspects or warms the sandbox pool by talking to the running API.
+// As with approvalCmd, it operates against the live controller state.
 func poolCmd(args []string) {
 	if len(args) == 0 {
-		fmt.Println("Usage: agentpvm pool [stats|warm <template> <n>]")
+		fmt.Println("Usage: agentpvm pool [stats|warm <template> <n>]   (operates against $PVM_API / $API_SECRET)")
 		return
 	}
-	m := pool.NewManager(10, nil)
+	base := os.Getenv("PVM_API")
+	if base == "" {
+		base = "http://127.0.0.1:8080"
+	}
+	secret := os.Getenv("API_SECRET")
+	if secret == "" {
+		secret = "secret"
+	}
 	switch args[0] {
 	case "stats":
-		ready, claimed, total := m.Stats()
-		fmt.Printf("ready=%d claimed=%d total=%d\n", ready, claimed, total)
+		req, _ := http.NewRequest("GET", base+"/api/pool/stats", nil)
+		req.Header.Set("Authorization", "Bearer "+secret)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			fmt.Printf("pool stats: %v (is the API running at %s?)\n", err, base)
+			return
+		}
+		defer resp.Body.Close()
+		var st struct {
+			Ready   int `json:"ready"`
+			Claimed int `json:"claimed"`
+			Total   int `json:"total"`
+		}
+		_ = json.NewDecoder(resp.Body).Decode(&st)
+		fmt.Printf("ready=%d claimed=%d total=%d\n", st.Ready, st.Claimed, st.Total)
 	default:
-		fmt.Println("unknown subcommand:", args[0])
+		fmt.Println("unknown subcommand:", args[0], "(warm is not yet implemented over HTTP)")
 	}
 }
 

@@ -112,25 +112,40 @@ func TestExecute_ConstrainExecutorEnforced(t *testing.T) {
 }
 
 // TestExecute_NestedSecretKeyDropped: even when an executor returns nested
-// structures, the secret-named keys at the top level are stripped.
+// structures, secret-named keys at EVERY level are stripped (sanitize is now
+// recursive), not just at the top level.
 func TestExecute_NestedSecretKeyDropped(t *testing.T) {
 	l := tmpLedger2(t)
 	g := NewGateway([]Rule{{Name: "r", Action: ActionAllow}}, l)
 	g.Executor = func(req ToolRequest) (ToolResponse, error) {
 		return ToolResponse{OK: true, Result: map[string]interface{}{
 			"path":   "/ok",
-			"token":  "LEAK",
+			"token":  "LEAK", // top-level secret: must drop
 			"cookie": "session=xyz",
+			"nested": map[string]interface{}{
+				"token": "LEAK", // nested secret: must ALSO drop (the bug)
+			},
 		}}, nil
 	}
 	resp, _ := g.Execute(ToolRequest{Name: "r"})
 	if _, leak := resp.Result["token"]; leak {
-		t.Error("token leaked through executor result")
+		t.Error("top-level token leaked through executor result")
 	}
 	if _, leak := resp.Result["cookie"]; leak {
 		t.Error("cookie leaked")
 	}
 	if resp.Result["path"] != "/ok" {
 		t.Error("safe field dropped")
+	}
+	// The recursive-scrub regression assertion: nested.token must be gone too.
+	nested, ok := resp.Result["nested"].(map[string]interface{})
+	if !ok {
+		t.Fatal("nested map dropped entirely (should have been scrubbed, not removed)")
+	}
+	if _, leak := nested["token"]; leak {
+		t.Error("nested token leaked (sanitize is not recursive)")
+	}
+	if _, leak := resp.Result["nested"]; !leak {
+		t.Error("nested map missing")
 	}
 }

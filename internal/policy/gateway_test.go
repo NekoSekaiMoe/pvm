@@ -2,6 +2,7 @@ package policy
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	"uml-container/internal/audit"
@@ -126,5 +127,79 @@ func TestStringContains(t *testing.T) {
 	}
 	if !isSafeSummaryKey("bytes") {
 		t.Error("'bytes' is safe and should pass")
+	}
+}
+
+// TestDecide_EffectGatesMatch covers the PAY/PROD default-deny guarantee
+// (plan.md §6.2): a rule authorizing a tool only for read must NOT satisfy a
+// request with effect="pay". Before the fix, Decide ignored Effect entirely.
+func TestDecide_EffectGatesMatch(t *testing.T) {
+	g := NewGateway([]Rule{
+		{Name: "git", Action: ActionAllow, Effect: "read"},
+		{Name: "git", Action: ActionDeny, Effect: "pay"}, // explicit deny for pay
+	}, nil)
+	// read effect -> matches the allow rule.
+	if act, _, _ := g.Decide(ToolRequest{Name: "git", Effect: "read"}); act != ActionAllow {
+		t.Errorf("read effect: expected allow, got %s", act)
+	}
+	// pay effect -> the read-scoped rule must NOT match; we fall through to the
+	// pay-scoped deny rule (then the catch-all). Either way, NOT allow.
+	act, _, _ := g.Decide(ToolRequest{Name: "git", Effect: "pay"})
+	if act == ActionAllow {
+		t.Errorf("pay effect: rule {Effect:read} satisfied a pay request (effect ignored)")
+	}
+}
+
+// TestSanitize_RecursivelyDropsNestedSecrets ensures sanitize walks into
+// nested maps/slices so a token buried one level down is still stripped.
+func TestSanitize_RecursivelyDropsNestedSecrets(t *testing.T) {
+	in := ToolResponse{Result: map[string]interface{}{
+		"path": "/ok",
+		"meta": map[string]interface{}{
+			"token":   "LEAK",
+			"headers": map[string]interface{}{"Authorization": "Bearer x"},
+		},
+		"items": []interface{}{
+			map[string]interface{}{"password": "p"},
+			map[string]interface{}{"size": 1},
+		},
+	}}
+	out := sanitize(in)
+	top := out.Result
+	if _, leak := top["token"]; leak {
+		t.Error("top-level token survived")
+	}
+	meta, _ := top["meta"].(map[string]interface{})
+	if _, leak := meta["token"]; leak {
+		t.Error("nested map token survived (sanitize is not recursive)")
+	}
+	headers, _ := meta["headers"].(map[string]interface{})
+	if _, leak := headers["Authorization"]; leak {
+		t.Error("doubly-nested Authorization survived (sanitize is not recursive)")
+	}
+	items, _ := top["items"].([]interface{})
+	first, _ := items[0].(map[string]interface{})
+	if _, leak := first["password"]; leak {
+		t.Error("nested slice element password survived")
+	}
+	second, _ := items[1].(map[string]interface{})
+	if second["size"] != 1 {
+		t.Error("safe nested field was dropped")
+	}
+}
+
+// TestSanitize_RedactsSummaryProse verifies a token echoed into Summary/Reason
+// prose gets masked, not just struct keys.
+func TestSanitize_RedactsSummaryProse(t *testing.T) {
+	in := ToolResponse{
+		Summary: "pushed with ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890abcd",
+		Reason:  "auth: Bearer abcdef0123456789abcdef0123456789",
+	}
+	out := sanitize(in)
+	if strings.Contains(out.Summary, "ghp_") {
+		t.Errorf("github token not redacted in summary: %s", out.Summary)
+	}
+	if strings.Contains(out.Reason, "Bearer abcdef") {
+		t.Errorf("bearer token not redacted in reason: %s", out.Reason)
 	}
 }

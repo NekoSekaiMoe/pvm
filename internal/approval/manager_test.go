@@ -92,3 +92,50 @@ func TestPending_ExpiryLazy(t *testing.T) {
 }
 
 var baseTime = time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC)
+
+// TestSameParams_NestedMapDoesNotPanic is the regression test for the
+// comparing-uncomparable panic: Params comes from JSON decoding and routinely
+// contains nested maps/slices. The old ==-based comparison panicked at
+// runtime on such inputs; the JSON-based one must not.
+func TestSameParams_NestedMapDoesNotPanic(t *testing.T) {
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("sameParams panicked on nested map: %v", r)
+		}
+	}()
+	a := map[string]interface{}{
+		"to": "x@y.com",
+		"opts": map[string]interface{}{"cc": []interface{}{"a@b.com"}},
+		"tags": []interface{}{1, 2, 3},
+	}
+	b := map[string]interface{}{
+		"to": "x@y.com",
+		"opts": map[string]interface{}{"cc": []interface{}{"a@b.com"}},
+		"tags": []interface{}{1, 2, 3},
+	}
+	if !sameParams(a, b) {
+		t.Error("expected nested maps to compare equal")
+	}
+	// A different nested value must compare unequal, not panic.
+	c := map[string]interface{}{"opts": map[string]interface{}{"cc": []interface{}{"other"}}}
+	if sameParams(a, c) {
+		t.Error("expected nested-differing params to compare unequal")
+	}
+}
+
+// TestCreate_DedupNestedParams exercises the same path through Create: a
+// duplicate ticket with nested params must be deduped (ErrAlreadyPending),
+// not crash the manager.
+func TestCreate_DedupNestedParams(t *testing.T) {
+	m := NewManager(nil)
+	params := map[string]interface{}{
+		"target": "prod",
+		"env":    map[string]interface{}{"region": "us-east-1"},
+	}
+	if _, err := m.Create(Ticket{TaskID: "t", Tool: "deploy", Params: params}); err != nil {
+		t.Fatalf("first create: %v", err)
+	}
+	if _, err := m.Create(Ticket{TaskID: "t", Tool: "deploy", Params: params}); err != ErrAlreadyPending {
+		t.Errorf("expected ErrAlreadyPending, got %v", err)
+	}
+}

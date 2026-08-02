@@ -79,7 +79,13 @@ func main() {
 				if s.Network.TAP != "" {
 					*netTap = s.Network.TAP
 				}
-				*virtio = s.Kernel.Virtio
+				// Only FLIP virtio ON from the spec, never off: a zero-value
+				// s.Kernel.Virtio must not silently disable a -virtio the caller
+				// explicitly passed on the command line (consistent with the
+				// "config augments flags" rule used by every other field above).
+				if s.Kernel.Virtio {
+					*virtio = true
+				}
 			} else {
 				fmt.Printf("Warning: -config %s load failed: %v\n", *configPath, err)
 			}

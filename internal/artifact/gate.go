@@ -74,10 +74,9 @@ func NewGate(ledger *audit.Ledger, extra ...Verifier) *Gate {
 
 // Verify runs every verifier; the bundle passes only if ALL pass. The verdict
 // (with the bound hash) is recorded in the audit ledger regardless of outcome.
+// Verifiers don't share state, so they run WITHOUT the gate lock; only the
+// ledger write takes g.mu (and even that is bounded by the ledger's own lock).
 func (g *Gate) Verify(b *Bundle) *Verdict {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-
 	v := &Verdict{Step: map[string]string{}, Passed: true}
 	v.Hash = hashBundle(b)
 
@@ -92,19 +91,28 @@ func (g *Gate) Verify(b *Bundle) *Verdict {
 		}
 	}
 
-	if g.ledger != nil {
+	g.mu.Lock()
+	ledger := g.ledger
+	g.mu.Unlock()
+	if ledger != nil {
 		dec := audit.DecisionAllow
 		if !v.Passed {
 			dec = audit.DecisionDeny
 		}
-		_ = g.ledger.Append(audit.Record{
+		if err := ledger.Append(audit.Record{
 			Phase:    audit.PhaseRelease,
 			Subject:  b.TaskID,
 			Action:   "artifact_gate",
 			Params:   map[string]interface{}{"hash": v.Hash, "claimed_ok": b.ClaimedOK, "files": fileNames(b.Files)},
 			Decision: dec,
 			Reason:   strings.Join(v.Reasons, "; "),
-		})
+		}); err != nil {
+			// A release decision without an audit trail is unsafe: surface the
+			// failure by failing the verdict and recording the reason.
+			v.Passed = false
+			v.Reasons = append(v.Reasons, "audit_ledger: "+err.Error())
+			v.Step["audit_ledger"] = "fail: " + err.Error()
+		}
 	}
 	return v
 }
@@ -132,18 +140,30 @@ func (HashVerifier) Verify(b *Bundle) (bool, string) {
 	return true, ""
 }
 
-// hashBundle returns the canonical sha256 of a bundle. Map iteration order is
-// normalized by sorting keys.
+// hashBundle returns the canonical sha256 of a bundle. The digest covers the
+// ACTUAL CONTENT of every evidence field (Diff, BuildLog, each Trace element,
+// each File), not just lengths, so replacing a diff with a same-length forgery
+// is detected. Map iteration order is normalized by sorting file names.
 func hashBundle(b *Bundle) string {
 	h := sha256.New()
-	fmt.Fprintf(h, "task=%s|claimed=%t|diff=%d|build=%d|trace=%d",
-		b.TaskID, b.ClaimedOK, len(b.Diff), len(b.BuildLog), len(b.Trace))
-	// stable file hashing: sort names
+	// Per-field content hashes: each field contributes its own digest, so a
+	// change in any one cascades into the bundle hash.
+	fmt.Fprintf(h, "task=%s|claimed=%t", b.TaskID, b.ClaimedOK)
+
+	writeFieldHash := func(label, content string) {
+		fh := sha256.Sum256([]byte(content))
+		fmt.Fprintf(h, "|%s=%s", label, hex.EncodeToString(fh[:]))
+	}
+	writeFieldHash("diff", b.Diff)
+	writeFieldHash("build", b.BuildLog)
+	for _, t := range b.Trace {
+		writeFieldHash("trace", t)
+	}
+
 	names := make([]string, 0, len(b.Files))
 	for n := range b.Files {
 		names = append(names, n)
 	}
-	// insertion order in Go maps is random; sort for determinism
 	sortStrings(names)
 	for _, n := range names {
 		fh := sha256.Sum256(b.Files[n])
@@ -175,7 +195,12 @@ var secretPatterns = []*regexp.Regexp{
 }
 
 func (SecretScanVerifier) Verify(b *Bundle) (bool, string) {
+	// Corpus must include Trace: tool-call summaries can carry secrets too
+	// (e.g. a tool arg containing an API key echoed into the trace).
 	corpus := b.Diff + "\n" + b.BuildLog
+	for _, t := range b.Trace {
+		corpus += "\n" + t
+	}
 	for _, p := range secretPatterns {
 		if p.MatchString(corpus) {
 			return false, "secret pattern matched: " + p.String()

@@ -6,6 +6,7 @@ package integrationtest
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/url"
 	"os"
@@ -104,8 +105,8 @@ func TestFlow_SpecToTaskToAudit(t *testing.T) {
 func TestFlow_IncidentRevokesAndAudits(t *testing.T) {
 	setupIsolatedRoots(t)
 	ledger, _ := audit.Open("flow2")
-	broker := identity.NewBroker(nil, identity.StaticStore{}, ledger, time.Hour)
-	tok, _ := broker.Mint("alice", "eng", []string{"repo:read"}, time.Hour)
+	broker, _ := identity.NewBroker(nil, identity.StaticStore{}, ledger, time.Hour)
+	tok, _ := broker.Mint("alice", "eng", "flow2", []string{"repo:read"}, time.Hour)
 
 	// confirm token valid before incident
 	if _, err := broker.Validate(tok); err != nil {
@@ -196,7 +197,7 @@ func TestFlow_PolicyApprovalIntegration(t *testing.T) {
 		Name: "send_email",
 		Args: map[string]interface{}{"to": "x@y.com"},
 	})
-	if !errors_is(err, policy.ErrApprovalRequired) {
+	if !errors.Is(err, policy.ErrApprovalRequired) {
 		t.Fatalf("expected ErrApprovalRequired, got %v", err)
 	}
 
@@ -240,7 +241,7 @@ func TestFlow_ArtifactGateBlocksRelease(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected rejection")
 	}
-	if !errors_is(err, artifact.ErrRejected) {
+	if !errors.Is(err, artifact.ErrRejected) {
 		t.Errorf("expected ErrRejected, got %v", err)
 	}
 }
@@ -286,27 +287,6 @@ func TestFlow_EgressPolicyEnforced(t *testing.T) {
 	recs, _ := ledger.ReadAll()
 	if len(recs) < 2 {
 		t.Errorf("expected >=2 egress audit records, got %d", len(recs))
-	}
-}
-
-// errors_is avoids importing "errors" in the helper section ambiguity.
-func errors_is(err, target error) bool {
-	if err == nil {
-		return false
-	}
-	for {
-		if err == target {
-			return true
-		}
-		type unwrapper interface{ Unwrap() error }
-		u, ok := err.(unwrapper)
-		if !ok {
-			return false
-		}
-		err = u.Unwrap()
-		if err == nil {
-			return false
-		}
 	}
 }
 

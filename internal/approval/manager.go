@@ -12,7 +12,10 @@
 package approval
 
 import (
+	"encoding/json"
 	"errors"
+	"fmt"
+	"log"
 	"sync"
 	"time"
 
@@ -93,14 +96,16 @@ func (m *Manager) Create(t Ticket) (string, error) {
 	m.tickets[id] = &t
 
 	if m.ledger != nil {
-		_ = m.ledger.Append(audit.Record{
+		if err := m.ledger.Append(audit.Record{
 			Phase:    audit.PhaseExec,
 			Subject:  t.TaskID,
 			Action:   "approval:create:" + t.Tool,
 			Params:   t.Params,
 			Decision: audit.DecisionApprove, // "approval requested" semantically
 			Reason:   t.Why,
-		})
+		}); err != nil {
+			log.Printf("approval: audit create failed for task %s: %v", t.TaskID, err)
+		}
 	}
 	return id, nil
 }
@@ -133,14 +138,16 @@ func (m *Manager) Decide(id string, approved bool, by string) error {
 		if !approved {
 			dec = audit.DecisionDeny
 		}
-		_ = m.ledger.Append(audit.Record{
+		if err := m.ledger.Append(audit.Record{
 			Phase:    audit.PhaseExec,
 			Subject:  by,
 			Action:   "approval:decide:" + t.Tool,
 			Params:   map[string]interface{}{"ticket": id, "target": t.Target},
 			Decision: dec,
 			Reason:   t.Why,
-		})
+		}); err != nil {
+			log.Printf("approval: audit decide failed for ticket %s: %v", id, err)
+		}
 	}
 	return nil
 }
@@ -201,22 +208,31 @@ var (
 	ErrExpired        = errors.New("approval: ticket expired")
 )
 
-// sameParams is a shallow equality over the param maps. Values must be
-// comparable (strings/numbers/bools); nested maps compare by identity.
+// sameParams reports whether two param maps are logically equal. It compares
+// via canonical JSON encoding rather than ==, because Params is decoded from
+// untrusted JSON and may contain nested maps/slices — comparing those with ==
+// panics at runtime ("comparing uncomparable type map[string]interface{}").
+// encoding/json sorts map keys, so the same logical value encodes identically.
 func sameParams(a, b map[string]interface{}) bool {
-	if len(a) != len(b) {
+	aj, err := json.Marshal(a)
+	if err != nil {
 		return false
 	}
-	for k, av := range a {
-		bv, ok := b[k]
-		if !ok || av != bv {
-			return false
-		}
+	bj, err := json.Marshal(b)
+	if err != nil {
+		return false
 	}
-	return true
+	return string(aj) == string(bj)
 }
 
 // randID is a 12-byte url-safe id.
 func randID() string {
-	return time.Now().UTC().Format("20060102T150405Z") + "-" + randomString(8)
+	rs, err := randomString(8)
+	if err != nil {
+		// Fallback: timestamp-only id. randomString only fails when the
+		// CSPRNG is unavailable, which is exceptional; we still need a unique
+		// id so the ticket can be addressed.
+		rs = fmt.Sprintf("%x", time.Now().UnixNano())
+	}
+	return time.Now().UTC().Format("20060102T150405Z") + "-" + rs
 }

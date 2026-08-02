@@ -122,3 +122,42 @@ func containsAny(haystack []string, needle string) bool {
 	}
 	return false
 }
+
+// TestSecretScan_BlocksSecretInTrace is the regression test for the
+// missed-corpus bug: Trace used to be excluded from the scan entirely, so an
+// API key echoed into a tool-call summary would pass the gate. Now Trace is
+// part of the corpus.
+func TestSecretScan_BlocksSecretInTrace(t *testing.T) {
+	v := SecretScanVerifier{}
+	b := &Bundle{
+		Trace: []string{"ran gh tool with ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890abcd"},
+	}
+	ok, reason := v.Verify(b)
+	if ok {
+		t.Fatalf("expected secret in Trace to fail the scan; reason=%q", reason)
+	}
+	if !strings.Contains(reason, "secret pattern") {
+		t.Errorf("unexpected reason: %q", reason)
+	}
+}
+
+// TestHash_BindsContentNotLength verifies that replacing a diff with a
+// same-length forgery changes the hash. Pre-fix, hashBundle only wrote
+// len(Diff)/len(BuildLog)/len(Trace) — a same-length swap was undetectable.
+func TestHash_BindsContentNotLength(t *testing.T) {
+	b1 := &Bundle{TaskID: "t", Diff: "AAAA", BuildLog: "BBBB", Trace: []string{"CCCC"}}
+	b2 := &Bundle{TaskID: "t", Diff: "XXXX", BuildLog: "YYYY", Trace: []string{"ZZZZ"}} // same lengths
+	if hashBundle(b1) == hashBundle(b2) {
+		t.Error("same-length different content produced identical hash (content not bound)")
+	}
+}
+
+// TestHash_BindsEachTraceElement ensures multiple trace elements each
+// contribute independently to the digest.
+func TestHash_BindsEachTraceElement(t *testing.T) {
+	b1 := &Bundle{TaskID: "t", Trace: []string{"a", "b"}}
+	b2 := &Bundle{TaskID: "t", Trace: []string{"a", "c"}}
+	if hashBundle(b1) == hashBundle(b2) {
+		t.Error("changing a trace element did not change the hash")
+	}
+}

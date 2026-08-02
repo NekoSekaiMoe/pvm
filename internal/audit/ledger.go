@@ -20,6 +20,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -117,12 +118,28 @@ func (l *Ledger) loadTail() error {
 	return nil
 }
 
-// Append writes a record and advances the hash chain. It is process-locked via
-// fcntl-style O_APPEND + the mu mutex; cross-process safety relies on the OS
-// guaranteeing append writes up to PIPE_BUF are atomic for local files.
+// refreshTailLocked re-reads the tail from disk so an Append issued after
+// another process wrote to the ledger picks up the new lastHash/seq. Caller
+// MUST hold l.mu (and, for a true cross-writer update, an flock on the file).
+func (l *Ledger) refreshTailLocked() error {
+	return l.loadTail()
+}
+
+// Append writes a record and advances the hash chain. It holds an in-process
+// mutex AND an exclusive flock on the ledger file so that multiple processes
+// appending to the same task's ledger serialize correctly: each Append reads
+// the current tail under the lock, advances seq/lastHash, and writes. Without
+// the flock, two processes could both read the same tail and emit records
+// sharing PrevHash/Seq, breaking Verify under concurrency.
 func (l *Ledger) Append(r Record) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+
+	// Re-read the tail in case another process appended since loadTail/Open.
+	// This is what makes the chain correct under multi-writer.
+	if err := l.refreshTailLocked(); err != nil {
+		return fmt.Errorf("audit: refresh tail: %w", err)
+	}
 
 	l.seq++
 	r.Seq = l.seq
@@ -138,6 +155,22 @@ func (l *Ledger) Append(r Record) error {
 		return err
 	}
 	defer f.Close()
+	// Cross-process mutex: hold an exclusive lock for the duration of the
+	// append so concurrent writers serialize on the OS, not just in-process.
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		return fmt.Errorf("audit: lock ledger: %w", err)
+	}
+	defer syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+	// Re-read tail AGAIN under the lock: a peer may have appended between our
+	// first refresh and acquiring the lock.
+	if err := l.refreshTailLocked(); err != nil {
+		return fmt.Errorf("audit: refresh tail under lock: %w", err)
+	}
+	l.seq++
+	r.Seq = l.seq
+	r.PrevHash = l.lastHash
+	r.ThisHash = hashRecord(r, l.lastHash)
+
 	enc := json.NewEncoder(f)
 	enc.SetEscapeHTML(false)
 	if err := enc.Encode(&r); err != nil {
@@ -147,12 +180,19 @@ func (l *Ledger) Append(r Record) error {
 	return nil
 }
 
-// hashRecord computes the chained hash: sha256(prev_hash || canonical-json).
-// Params is encoded canonically (sorted keys) so structurally identical
-// records hash identically regardless of map iteration order.
+// hashRecord computes the chained hash. The digest covers EVERY field that
+// participates in the audit semantics: prev_hash, Seq, At, Task, Tenant,
+// Phase, Subject, Action, Params, Decision, Reason. Modifying any of them on
+// disk therefore breaks Verify. Params is encoded via json.Marshal, which
+// sorts keys for map values (struct/slice order is the caller's responsibility
+// — we freeze those via the concrete Record type).
 func hashRecord(r Record, prev string) string {
 	h := sha256.New()
 	h.Write([]byte(prev))
+	h.Write([]byte("|"))
+	// Structural fields first, in declaration order, with explicit separators
+	// so adjacent numbers can't collide.
+	fmt.Fprintf(h, "seq=%d|at=%s|task=%s|tenant=%s", r.Seq, r.At.UTC().Format(time.RFC3339Nano), r.Task, r.Tenant)
 	h.Write([]byte("|"))
 	enc, _ := json.Marshal(r.Params)
 	h.Write(enc)

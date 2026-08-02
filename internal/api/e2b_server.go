@@ -60,7 +60,10 @@ func StartE2BServer(port int) error {
 	}))
 
 	// Per-task policy gateways registered by the controller / agentpvm run.
-	gateways := newGatewayRegistry()
+	// /api/exec and /api/policy/:task both read from the SAME global registry
+	// (RegisterPolicyGateway writes here too), so a gateway registered by
+	// agentpvm run is visible to /api/exec without an extra wiring step.
+	gateways := globalRegistries
 
 	// Get all containers
 	api.GET("/containers", func(c echo.Context) error {
@@ -293,6 +296,11 @@ func StartE2BServer(port int) error {
 		if err := c.Bind(&req); err != nil {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
 		}
+		// Hold the per-task mutex across Load -> Transition -> Save so concurrent
+		// transitions on the SAME task serialize instead of clobbering each other.
+		mu := taskLock(id)
+		mu.Lock()
+		defer mu.Unlock()
 		st, err := state.LoadState(id)
 		if err != nil {
 			return c.JSON(http.StatusNotFound, map[string]string{"error": "task not found"})
@@ -375,7 +383,7 @@ func StartE2BServer(port int) error {
 
 	// GET /api/approvals — list pending tickets (optional ?task=id).
 	api.GET("/approvals", func(c echo.Context) error {
-		m := globalApprovals
+		m := currentApprovals()
 		if c.QueryParam("all") == "1" {
 			// include decided ones too: iterate via Pending on empty + decided list
 		}
@@ -388,7 +396,7 @@ func StartE2BServer(port int) error {
 		if err := c.Bind(&t); err != nil {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
 		}
-		id, err := globalApprovals.Create(t)
+		id, err := currentApprovals().Create(t)
 		if err != nil {
 			return c.JSON(http.StatusConflict, map[string]string{"error": err.Error()})
 		}
@@ -405,10 +413,11 @@ func StartE2BServer(port int) error {
 		if err := c.Bind(&req); err != nil {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
 		}
-		if err := globalApprovals.Decide(id, req.Approved, req.By); err != nil {
+		m := currentApprovals()
+		if err := m.Decide(id, req.Approved, req.By); err != nil {
 			return c.JSON(http.StatusConflict, map[string]string{"error": err.Error()})
 		}
-		t, _ := globalApprovals.Get(id)
+		t, _ := m.Get(id)
 		return c.JSON(http.StatusOK, t)
 	})
 
@@ -428,7 +437,7 @@ func StartE2BServer(port int) error {
 
 	// GET /api/pool/stats — ready/claimed/total counts.
 	api.GET("/pool/stats", func(c echo.Context) error {
-		ready, claimed, total := globalPool.Stats()
+		ready, claimed, total := currentPool().Stats()
 		return c.JSON(http.StatusOK, map[string]int{
 			"ready": ready, "claimed": claimed, "total": total,
 		})
@@ -446,7 +455,7 @@ func StartE2BServer(port int) error {
 		if req.N <= 0 || req.N > 100 {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": "n must be 1..100"})
 		}
-		created := globalPool.Warm(req.Template, req.N)
+		created := currentPool().Warm(req.Template, req.N)
 		return c.JSON(http.StatusOK, map[string]int{"created": created})
 	})
 
@@ -459,7 +468,7 @@ func StartE2BServer(port int) error {
 		if err := c.Bind(&req); err != nil {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
 		}
-		globalPool.SetQuota(req.Tenant, req.Quota)
+		currentPool().SetQuota(req.Tenant, req.Quota)
 		return c.JSON(http.StatusOK, map[string]string{"status": "ok"})
 	})
 
@@ -561,6 +570,8 @@ func RegisterPolicyGateway(taskID string, g *policy.Gateway) { globalRegistries.
 // parseExecCommand turns a flat command string "name k=v k2=v2" into a
 // structured ToolRequest for the policy gateway. Simplest viable contract;
 // structured JSON bodies can be added later without breaking this.
+// Positional arguments are keyed arg0/arg1/... by a DEDICATED counter so
+// earlier key=value params don't shift the positional index.
 func parseExecCommand(cmd string) (policy.ToolRequest, error) {
 	cmd = strings.TrimSpace(cmd)
 	if cmd == "" {
@@ -568,12 +579,13 @@ func parseExecCommand(cmd string) (policy.ToolRequest, error) {
 	}
 	parts := strings.Fields(cmd)
 	req := policy.ToolRequest{Name: parts[0], Args: map[string]interface{}{}}
+	positional := 0
 	for _, p := range parts[1:] {
 		if i := strings.IndexByte(p, '='); i > 0 {
 			req.Args[p[:i]] = p[i+1:]
 		} else {
-			// positional arg: store under its index as a string
-			req.Args[fmt.Sprintf("arg%d", len(req.Args))] = p
+			req.Args[fmt.Sprintf("arg%d", positional)] = p
+			positional++
 		}
 	}
 	return req, nil
@@ -586,18 +598,67 @@ func policyErrApproval() error { return policy.ErrApprovalRequired }
 // idRegex is the shared container/task id validator.
 var idRegex = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 
+// taskTransitionMu gives per-task mutual exclusion for the /transition
+// endpoint (and any other handler that does LoadState -> mutate -> SaveState).
+// Without it, two concurrent transitions on the same task each load the same
+// stale state and the second SaveState silently clobbers the first's
+// transition. Different tasks still proceed in parallel.
+var (
+	taskTransitionMu    sync.Mutex
+	taskTransitionLocks = map[string]*sync.Mutex{}
+)
+
+// taskLock returns the mutex guarding transitions for id, creating it on
+// first use. The outer mutex is held only briefly to look up/create the
+// per-task mutex.
+func taskLock(id string) *sync.Mutex {
+	taskTransitionMu.Lock()
+	defer taskTransitionMu.Unlock()
+	mu, ok := taskTransitionLocks[id]
+	if !ok {
+		mu = &sync.Mutex{}
+		taskTransitionLocks[id] = mu
+	}
+	return mu
+}
+
 // Package-level singletons for the control planes exposed via the REST API.
 // These are process-local; the controller (agentpvm run) and the API server
 // share them when running in the same process. In a multi-process deployment
-// they would be backed by a shared store.
+// they would be backed by a shared store. All reads/writes go through
+// planesMu so concurrent Register* calls (e.g. from a live controller and a
+// test setup) don't race.
 var (
 	globalApprovals = approval.NewManager(nil)
 	globalPool      = pool.NewManager(16, nil)
+	planesMu        sync.RWMutex
 )
 
 // RegisterApprovalManager lets the controller inject its own approval manager
 // (e.g. one wired to a real audit ledger) to replace the default.
-func RegisterApprovalManager(m *approval.Manager) { globalApprovals = m }
+func RegisterApprovalManager(m *approval.Manager) {
+	planesMu.Lock()
+	globalApprovals = m
+	planesMu.Unlock()
+}
 
 // RegisterPoolManager lets the controller inject its own pool manager.
-func RegisterPoolManager(m *pool.Manager) { globalPool = m }
+func RegisterPoolManager(m *pool.Manager) {
+	planesMu.Lock()
+	globalPool = m
+	planesMu.Unlock()
+}
+
+// currentApprovals returns the registered approval manager under planesMu.
+func currentApprovals() *approval.Manager {
+	planesMu.RLock()
+	defer planesMu.RUnlock()
+	return globalApprovals
+}
+
+// currentPool returns the registered pool manager under planesMu.
+func currentPool() *pool.Manager {
+	planesMu.RLock()
+	defer planesMu.RUnlock()
+	return globalPool
+}

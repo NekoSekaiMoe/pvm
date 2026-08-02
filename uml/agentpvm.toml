@@ -1,19 +1,22 @@
 # PVM Agent Sandbox — TaskSpec (plan.md §9 control contract)
 #
-# This is the default config consulted by `agentpvm run` when no -config is
-# given. It demonstrates every control plane. The posture here is SAFE defaults:
-# network disabled, tools default-deny, short token TTL, modest budget.
+# This is the EXAMPLE config consulted by `agentpvm run` when no -config is
+# given. It demonstrates every control plane. Unlike a hardened production
+# baseline, this file is a DEVELOPMENT/DEMO profile: networking is enabled and
+# a broad package-registry allowlist is configured so an agent can fetch deps.
+# `agentpvm run -name <unique-id>` (or an explicit -config) should be used in
+# multi-tenant or production settings; see plan.md §9 for the safe defaults.
 #
 # umlctl also accepts this file via -config but only consumes the launch fields
 # (runtime/workspace/kernel/network tap) — it ignores the control planes.
 
 version = 1
-caller  = "demo-user"      # WHO authorized this task (required)
-tenant  = "default"        # multi-tenant quota scope
+caller  = "demo-user"      # WHO authorized this task (required; override per invocation)
+tenant  = "default"        # multi-tenant quota scope (override per invocation)
 
 # --- runtime / sandbox shape ---
 [runtime]
-name   = "agent-task"      # also used as the task id
+name   = "agent-task"      # also used as the task id; override with -name per invocation
 cpu    = 1000              # millicpu; 1000 = 1 full CPU. 0 = unlimited
 memory = "512M"
 
@@ -28,10 +31,11 @@ virtio        = false      # set true to use virtio_uml devices
 use_vhost_blk = false     # set true to back the block device with qemu-storage-daemon
 
 # --- network egress (plan.md §4) ---
-# Two-layer enforcement: the L7 proxy below + the eBPF TC filter as IP floor.
+# DEVELOPMENT profile: networking is ENABLED here so a demo agent can reach
+# package registries. The L7 proxy allowlist + eBPF IP floor below still apply.
+# For a network-isolated task, set `enabled = false` (the safeDefaultSpec path).
 [network]
-enabled       = true      # create a NIC for the guest; egress is still gated by the
-                          # L7 proxy allowlist + eBPF IP floor below
+enabled       = true      # DEVELOPMENT: NIC created; egress still gated below
 bridge        = "br0"
 gateway_ip    = "10.0.0.1/24"
 tap           = ""        # auto-derived from task name when empty

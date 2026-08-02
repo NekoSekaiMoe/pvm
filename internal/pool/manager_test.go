@@ -2,6 +2,7 @@ package pool
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	"uml-container/internal/audit"
@@ -122,5 +123,73 @@ func TestParseMemMB(t *testing.T) {
 		if got := parseMemMB(in); got != want {
 			t.Errorf("parseMemMB(%q) = %d, want %d", in, got, want)
 		}
+	}
+}
+
+// TestRelease_RecyclesQuota is the regression test for the quota-leak bug:
+// before the fix, Release decremented m.running[taskID] (not the real tenant)
+// and never decremented cpu/memMB at all, so a tenant that claimed+released
+// repeatedly hit ErrQuotaExceeded forever. We claim to the MaxConcurrent cap,
+// release, and confirm a subsequent claim on the same quota succeeds.
+func TestRelease_RecyclesQuota(t *testing.T) {
+	m := NewManager(10, tmpLedger(t))
+	m.SetQuota("tenant", Quota{MaxConcurrent: 1, MaxCPU: 4, MaxMemoryMB: 512, MaxTasksPerHour: 100})
+	tmpl := Template{Name: "x", Memory: "128M", CPU: 1}
+	// Pre-warm one sandbox so Claim has something to hand out.
+	m.Warm(tmpl, 1)
+
+	// First claim fills the MaxConcurrent: 1 quota.
+	id1, err := m.Claim("tenant", tmpl, "task-1")
+	if err != nil {
+		t.Fatalf("first claim: %v", err)
+	}
+	// A second concurrent claim for the same tenant must be denied.
+	if _, err := m.Claim("tenant", tmpl, "task-1b"); !errors.Is(err, ErrQuotaExceeded) {
+		t.Fatalf("expected quota denial on second claim, got %v", err)
+	}
+	// Recycle the first sandbox: this MUST release the quota counters.
+	if err := m.Release(id1, true); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	// Now the same tenant must be able to claim again. Pre-fix this failed
+	// permanently because running/cpu/memMB never got decremented.
+	if _, err := m.Claim("tenant", tmpl, "task-2"); err != nil {
+		t.Fatalf("claim after release failed (quota leaked): %v", err)
+	}
+}
+
+// TestRelease_DestroyRecyclesQuota is the destroy-path sibling of the above.
+func TestRelease_DestroyRecyclesQuota(t *testing.T) {
+	m := NewManager(10, tmpLedger(t))
+	m.SetQuota("tenant", Quota{MaxConcurrent: 1, MaxCPU: 4, MaxMemoryMB: 512, MaxTasksPerHour: 100})
+	m.Destroyer = func(string) error { return nil }
+	tmpl := Template{Name: "x", Memory: "128M", CPU: 1}
+	m.Warm(tmpl, 1)
+
+	id1, err := m.Claim("tenant", tmpl, "task-1")
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if err := m.Release(id1, false); err != nil {
+		t.Fatalf("release destroy: %v", err)
+	}
+	// Need a fresh warm sandbox to claim against (the previous one was destroyed).
+	m.Warm(tmpl, 1)
+	if _, err := m.Claim("tenant", tmpl, "task-2"); err != nil {
+		t.Fatalf("claim after destroy failed (quota leaked): %v", err)
+	}
+}
+
+// TestRelease_DestroyErrorPropagates ensures a failing Destroyer is surfaced
+// to the caller (previously its error was silently dropped).
+func TestRelease_DestroyErrorPropagates(t *testing.T) {
+	m := NewManager(10, tmpLedger(t))
+	m.Destroyer = func(string) error { return errors.New("boom") }
+	tmpl := Template{Name: "x", Memory: "128M", CPU: 1}
+	m.Warm(tmpl, 1)
+	id, _ := m.Claim("tenant", tmpl, "task")
+	err := m.Release(id, false)
+	if err == nil || !strings.Contains(err.Error(), "boom") {
+		t.Errorf("expected destroyer error to propagate, got %v", err)
 	}
 }

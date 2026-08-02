@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"regexp"
 	"time"
 	"uml-container/internal/audit"
 	"uml-container/internal/cgroup"
@@ -37,13 +38,15 @@ type Manager struct {
 
 	// Control planes (optional; nil = that plane is a no-op). Wired by the
 	// controller for StartTask. The legacy Start path ignores these.
-	Broker     *identity.Broker
-	Egress     *egress.Gateway
+	Broker          *identity.Broker
+	Egress          *egress.Gateway
 	IncidentHandler IncidentHooks
 
-	// OnProvisioned is called once the sandbox process is up, with the task id
-	// and pid. Used by the controller to register task->pid for incident hooks.
-	OnProvisioned func(taskID string, pid int)
+	// OnProvisioned is called once the sandbox process is up, with the task id,
+	// pid and the host-side identity token (if any). Used by the controller to
+	// register task->pid for incident hooks and to deliver the token into the
+	// sandbox via its init contract.
+	OnProvisioned func(taskID string, pid int, token string)
 }
 
 // IncidentHooks is the subset of the incident controller the manager needs to
@@ -110,7 +113,7 @@ func (m *Manager) Start(ctx context.Context, cfg *config.ContainerConfig) error 
 	state.SaveState(cfg.ID, st)
 
 	if m.OnProvisioned != nil {
-		m.OnProvisioned(cfg.ID, pid)
+		m.OnProvisioned(cfg.ID, pid, "")
 	}
 
 	err = m.Launcher.Wait(p)
@@ -140,6 +143,13 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 	if taskID == "" {
 		return fmt.Errorf("container: no task id (spec.runtime.name empty and no id given)")
 	}
+	// Defense in depth: validate taskID before it reaches the filesystem. The
+	// caller (agentpvm) already enforces this, but StartTask is a public entry
+	// point and must not trust its input for path-derivation (audit.Open and
+	// state.ContainerDir both join taskID into host paths).
+	if !idRegexp.MatchString(taskID) {
+		return fmt.Errorf("container: invalid task id %q (must match %s)", taskID, idRegexp.String())
+	}
 
 	// Open the audit ledger for this task. Lives OUTSIDE the sandbox dir.
 	ledger, err := audit.Open(taskID)
@@ -147,14 +157,16 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 		return fmt.Errorf("container: open audit ledger: %w", err)
 	}
 	// Record the SPEC+VERSION evidence (plan.md §14.2 phase 02).
-	_ = ledger.Append(audit.Record{
+	if err := ledger.Append(audit.Record{
 		Phase:    audit.PhaseSpec,
 		Subject:  s.Caller,
 		Action:   "taskspec",
 		Params:   map[string]interface{}{"fingerprint": s.Fingerprint(), "version": s.Version},
 		Decision: audit.DecisionAllow,
 		Reason:   "taskspec loaded",
-	})
+	}); err != nil {
+		log.Default().Warnf("container: audit taskspec for %s: %v", taskID, err)
+	}
 
 	// Load/create lifecycle state and drive the FSM.
 	st, _ := state.LoadState(taskID)
@@ -175,17 +187,27 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 	state.SaveState(taskID, st)
 
 	// qcow2 overlay over the shared base image (plan.md §5.2).
-	dir, _ := state.ContainerDir(taskID)
+	dir, err := state.ContainerDir(taskID)
+	if err != nil {
+		return fmt.Errorf("container: container dir: %w", err)
+	}
 	overlayPath := s.Workspace.Overlay
 	if overlayPath == "" {
 		overlayPath = fmt.Sprintf("%s/rootfs.qcow2", dir)
 	}
+	// resolvedRootfs is the single source of truth for the block device the
+	// kernel mounts. It is forwarded into buildTaskArgs so the kernel command
+	// line and the overlay we actually created cannot drift apart.
+	resolvedRootfs := overlayPath
 	if s.Workspace.BaseImage != "" {
-		if err := cow.CreateOverlay(s.Workspace.BaseImage, overlayPath, cow.FormatRaw); err != nil {
+		if err := cow.CreateOverlay(ctx, s.Workspace.BaseImage, overlayPath, cow.FormatRaw); err != nil {
 			// overlay creation needs qemu-img; degrade to the flat rootfs if
 			// we can't do CoW (with an explicit audit record).
-			_ = ledger.Append(audit.Record{Phase: audit.PhaseExec, Subject: taskID, Action: "overlay", Decision: audit.DecisionConstrain, Reason: "qcow2 overlay failed: " + err.Error()})
+			if laErr := ledger.Append(audit.Record{Phase: audit.PhaseExec, Subject: taskID, Action: "overlay", Decision: audit.DecisionConstrain, Reason: "qcow2 overlay failed: " + err.Error()}); laErr != nil {
+				log.Default().Warnf("container: audit overlay fallback for %s: %v", taskID, laErr)
+			}
 			overlayPath = s.Workspace.BaseImage // fall back to read-only base
+			resolvedRootfs = s.Workspace.BaseImage
 		}
 	}
 
@@ -193,7 +215,7 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 	var sockPath string
 	var vhostProc *os.Process
 	if s.Kernel.UseVhostBlk && s.Workspace.BaseImage != "" {
-		sock, daemonCmd, err := vhost.StartStorageDaemon(taskID, overlayPath)
+		sock, daemonCmd, err := vhost.StartStorageDaemon(taskID, resolvedRootfs)
 		if err != nil {
 			_ = st.Transition(state.StatusFailed, state.ActorController, "vhost daemon failed: "+err.Error())
 			state.SaveState(taskID, st)
@@ -221,8 +243,10 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 	}
 
 	// Identity: mint a short-lived token carrying the spec's scope. The token
-	// string is returned to the caller via OnProvisioned context; long-lived
-	// secrets stay host-side.
+	// string is returned to the caller via OnProvisioned so the controller can
+	// inject it into the sandbox's init contract; long-lived secrets stay
+	// host-side. A mint failure now propagates (the identity plane is not
+	// optional once a Broker is wired).
 	var tokenStr string
 	if m.Broker != nil {
 		ttl := spec.DefaultTokenTTL
@@ -231,11 +255,18 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 				ttl = d
 			}
 		}
-		tokenStr, _ = m.Broker.Mint(s.Caller, s.Tenant, s.Identity.Scope, ttl)
+		tok, err := m.Broker.Mint(s.Caller, s.Tenant, taskID, s.Identity.Scope, ttl)
+		if err != nil {
+			_ = st.Transition(state.StatusFailed, state.ActorController, "identity mint failed: "+err.Error())
+			state.SaveState(taskID, st)
+			return fmt.Errorf("container: mint identity token: %w", err)
+		}
+		tokenStr = tok
 	}
 
-	// Build kernel args from the TaskSpec.
-	args := buildTaskArgs(s, sockPath, dir)
+	// Build kernel args from the TaskSpec. Pass the resolved rootfs so the
+	// kernel command line matches what we actually provisioned.
+	args := buildTaskArgs(s, sockPath, dir, resolvedRootfs, taskID)
 
 	// Non-interactive (agent sandbox) => log to file under the task dir.
 	logFile, _ := log.SetupConsoleLog(taskID)
@@ -279,14 +310,16 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 	_ = st.Transition(state.StatusRunning, state.ActorController, "agent loop started")
 	state.SaveState(taskID, st)
 
-	_ = ledger.Append(audit.Record{
+	if err := ledger.Append(audit.Record{
 		Phase: audit.PhaseExec, Subject: s.Caller, Action: "task:start",
 		Params:   map[string]interface{}{"pid": pid, "has_token": tokenStr != ""},
 		Decision: audit.DecisionAllow, Reason: "sandbox running",
-	})
+	}); err != nil {
+		log.Default().Warnf("container: audit task:start for %s: %v", taskID, err)
+	}
 
 	if m.OnProvisioned != nil {
-		m.OnProvisioned(taskID, pid)
+		m.OnProvisioned(taskID, pid, tokenStr)
 	}
 
 	// Block until the kernel exits.
@@ -356,8 +389,12 @@ func buildLegacyArgs(ctx context.Context, cfg *config.ContainerConfig) []string 
 }
 
 // buildTaskArgs builds the UML command-line from a TaskSpec. Mirrors the legacy
-// path but reads everything from the validated spec.
-func buildTaskArgs(s *spec.TaskSpec, vhostSock, dir string) []string {
+// path but reads everything from the validated spec. resolvedRootfs is the
+// block path the kernel must mount (the overlay, or the base image on fallback)
+// and is the single source of truth — the caller already created it. taskID
+// is exposed to the guest so the egress proxy can attribute traffic via the
+// X-Task-Id header; it MUST match the id used to register the egress policy.
+func buildTaskArgs(s *spec.TaskSpec, vhostSock, dir, resolvedRootfs, taskID string) []string {
 	args := []string{
 		fmt.Sprintf("init=%s", s.Workspace.Init),
 		fmt.Sprintf("mem=%s", s.Runtime.Memory),
@@ -366,10 +403,12 @@ func buildTaskArgs(s *spec.TaskSpec, vhostSock, dir string) []string {
 		args = append(args, fmt.Sprintf("virtio_uml.device=%s:%d", vhostSock, vhost.VirtioIDBlock))
 		args = append(args, "root=/dev/vda")
 	} else {
-		// legacy ubd over the overlay (or base image if overlay fell back)
-		root := s.Workspace.Overlay
+		root := resolvedRootfs
 		if root == "" {
-			root = s.Workspace.BaseImage
+			root = s.Workspace.Overlay
+			if root == "" {
+				root = s.Workspace.BaseImage
+			}
 		}
 		args = append(args, fmt.Sprintf("ubd0=%s", root))
 		args = append(args, "root=/dev/ubda")
@@ -382,8 +421,14 @@ func buildTaskArgs(s *spec.TaskSpec, vhostSock, dir string) []string {
 			args = append(args, fmt.Sprintf("eth0=tuntap,%s", s.Network.TAP))
 		}
 	}
-	// task id is exposed to the guest so the egress proxy can attribute traffic
-	// via the X-Task-Id header (set in the sandbox's HTTP_PROXY env).
-	args = append(args, fmt.Sprintf("task_id=%s", s.Runtime.Name))
+	// Expose the EXTERNAL task id to the guest so the egress gateway can
+	// attribute traffic via X-Task-Id. This must match the id used at
+	// Egress.SetPolicy(taskID, ...), otherwise the gateway cannot find the
+	// policy and denies all traffic.
+	args = append(args, fmt.Sprintf("task_id=%s", taskID))
 	return args
 }
+
+// idRegexp is the task id format used by StartTask's defense-in-depth check.
+// Mirrors the regex used by state.ContainerDir / the CLI.
+var idRegexp = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)

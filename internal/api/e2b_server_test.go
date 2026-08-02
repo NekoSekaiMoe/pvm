@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"uml-container/internal/policy"
 	"uml-container/internal/state"
 )
 
@@ -111,6 +112,33 @@ func TestServer_ExecNoGatewayReturns403(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusForbidden {
 		t.Errorf("expected 403 (no gateway), got %d", resp.StatusCode)
+	}
+}
+
+// TestServer_ExecHitsRegisteredGateway is the regression test for the split
+// registry bug: before the fix, /api/exec read from a LOCAL registry that was
+// never written to by RegisterPolicyGateway, so /api/exec ALWAYS returned 403
+// even when a gateway was registered. Now both share globalRegistries, so a
+// registered gateway must let /api/exec dispatch and return 200.
+func TestServer_ExecHitsRegisteredGateway(t *testing.T) {
+	base := bootServer(t)
+	// Register a gateway that allows a read-only tool.
+	gw := policy.NewGateway([]policy.Rule{
+		{Name: "read_file", Action: policy.ActionAllow},
+	}, nil)
+	RegisterPolicyGateway("tk-exec", gw)
+
+	req, _ := http.NewRequest(http.MethodPost, base+"/api/exec?task=tk-exec", strings.NewReader(`{"cmd":"read_file"}`))
+	req.Header.Set("Authorization", "Bearer secret")
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200 with a registered gateway, got %d: %s", resp.StatusCode, body)
 	}
 }
 

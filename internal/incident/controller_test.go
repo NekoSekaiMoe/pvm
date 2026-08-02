@@ -1,6 +1,8 @@
 package incident
 
 import (
+	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -99,5 +101,53 @@ func TestHandle_NoHooksDoesNotPanic(t *testing.T) {
 	}
 	if act != ActionTerminate {
 		t.Errorf("action = %s", act)
+	}
+}
+
+// TestHandle_HookErrorPropagates verifies that a failing hook is reported via
+// the returned error (and an audit deny row), instead of being silently
+// swallowed. Pre-fix, applyRevoke/applyBlock/applyPause discarded the error
+// and Handle always returned nil, so incident response could silently no-op.
+func TestHandle_HookErrorPropagates(t *testing.T) {
+	blockErr := errors.New("netns swap failed")
+	c := NewController(tmpLedger(t), nil, Hooks{
+		BlockNetwork: func(string) error { return blockErr },
+	})
+	// SeverityLow -> ActionBlock, which calls applyBlock -> BlockNetwork.
+	_, err := c.Handle(nil, Anomaly{TaskID: "t", Severity: SeverityLow, Signal: "weird"})
+	if !errors.Is(err, blockErr) {
+		t.Errorf("expected hook error to propagate, got %v", err)
+	}
+	// And the failure must be recorded as DecisionDeny in the audit ledger so
+	// operators can see the response didn't take effect.
+	recs, _ := c.ledger.ReadAll()
+	foundDeny := false
+	for _, r := range recs {
+		if r.Decision == audit.DecisionDeny && strings.Contains(r.Reason, "block hook failed") {
+			foundDeny = true
+		}
+	}
+	if !foundDeny {
+		t.Errorf("expected a DecisionDeny audit row for the failed hook; got %+v", recs)
+	}
+}
+
+// TestHandle_StillAppliesRemainingActionsOnPartialFailure ensures that even
+// when one hook fails, the other containment actions still run. Incident
+// response should be best-effort: a failed revoke doesn't mean we skip block.
+func TestHandle_StillAppliesRemainingActionsOnPartialFailure(t *testing.T) {
+	blockCalled := false
+	pauseCalled := false
+	c := NewController(tmpLedger(t), nil, Hooks{
+		BlockNetwork:  func(string) error { blockCalled = true; return nil },
+		FreezeRuntime: func(string) error { pauseCalled = true; return errors.New("cgroup busy") },
+	})
+	// Critical -> Quarantine-class sequence: revoke+block+pause+preserve.
+	_, _ = c.Handle(nil, Anomaly{TaskID: "t", Severity: SeverityCritical})
+	if !blockCalled {
+		t.Error("block skipped after a pause hook failure")
+	}
+	if !pauseCalled {
+		t.Error("pause hook not invoked")
 	}
 }

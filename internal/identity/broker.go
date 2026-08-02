@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"strings"
 	"sync"
 	"time"
@@ -49,12 +50,16 @@ type Token struct {
 // Broker mints and validates short-lived tokens. It owns the signing key and
 // the revocation set; the long-lived secret store is injected via SecretStore.
 type Broker struct {
-	signingKey  []byte
-	mu          sync.RWMutex
-	revoked     map[string]struct{} // keyed by token ID
-	ledger      *audit.Ledger
-	store       SecretStore
-	defaultTTL  time.Duration
+	signingKey []byte
+	mu         sync.RWMutex
+	revoked    map[string]struct{} // keyed by token ID
+	// activeByTask maps a task id -> set of minted token IDs that are still
+	// live. Maintained so RevokeAllForTask can enumerate and revoke without
+	// relying on ID prefix matching.
+	activeByTask map[string]map[string]struct{}
+	ledger       *audit.Ledger
+	store        SecretStore
+	defaultTTL   time.Duration
 }
 
 // SecretStore maps a capability string (e.g. "repo:read") to the actual
@@ -74,31 +79,40 @@ func (s StaticStore) Lookup(cap string) (string, bool) {
 
 // NewBroker constructs a broker with the given signing key and store. If key
 // is empty, a random one is generated (tokens won't survive a process restart,
-// which is the desired posture for an MVP — no durable secret on disk).
-func NewBroker(key []byte, store SecretStore, ledger *audit.Ledger, defaultTTL time.Duration) *Broker {
+// which is the desired posture for an MVP — no durable secret on disk). It
+// returns an error if the signing key cannot be generated securely.
+func NewBroker(key []byte, store SecretStore, ledger *audit.Ledger, defaultTTL time.Duration) (*Broker, error) {
 	if len(key) == 0 {
 		key = make([]byte, 32)
-		rand.Read(key)
+		if _, err := rand.Read(key); err != nil {
+			return nil, fmt.Errorf("identity: generate signing key: %w", err)
+		}
 	}
 	if defaultTTL == 0 {
 		defaultTTL = 15 * time.Minute
 	}
 	return &Broker{
-		signingKey: key,
-		revoked:    make(map[string]struct{}),
-		ledger:     ledger,
-		store:      store,
-		defaultTTL: defaultTTL,
-	}
+		signingKey:   key,
+		revoked:      make(map[string]struct{}),
+		activeByTask: make(map[string]map[string]struct{}),
+		ledger:       ledger,
+		store:        store,
+		defaultTTL:   defaultTTL,
+	}, nil
 }
 
 // Mint issues a token for (caller, tenant) carrying exactly the scopes the
 // TaskSpec's Identity.Scope permitted. ttl overrides the broker default if >0.
-func (b *Broker) Mint(caller, tenant string, scope []string, ttl time.Duration) (string, error) {
+// taskID associates the minted token with a task so RevokeAllForTask can
+// enumerate it; pass the task id of the sandbox that will use this token.
+func (b *Broker) Mint(caller, tenant, taskID string, scope []string, ttl time.Duration) (string, error) {
 	if ttl <= 0 {
 		ttl = b.defaultTTL
 	}
-	id := randID()
+	id, err := randID()
+	if err != nil {
+		return "", fmt.Errorf("identity: generate token id: %w", err)
+	}
 	tok := Token{
 		ID:     id,
 		Caller: caller,
@@ -112,15 +126,33 @@ func (b *Broker) Mint(caller, tenant string, scope []string, ttl time.Duration) 
 	}
 	sig := b.sign(payload)
 	tokStr := encode(payload) + "." + sig
+
+	// Track the live token so RevokeAllForTask can find it by task. This index
+	// is best-effort state; failing to record it only weakens bulk revocation,
+	// it never affects per-token Validate/Revoke paths.
+	b.mu.Lock()
+	if b.activeByTask[taskID] == nil {
+		b.activeByTask[taskID] = make(map[string]struct{})
+	}
+	b.activeByTask[taskID][id] = struct{}{}
+	b.mu.Unlock()
+
 	if b.ledger != nil {
-		_ = b.ledger.Append(audit.Record{
+		if err := b.ledger.Append(audit.Record{
 			Phase:    audit.PhaseGoalAuth,
 			Subject:  caller,
 			Action:   "mint",
-			Params:   map[string]interface{}{"token_id": id, "tenant": tenant, "scope": scope, "ttl": ttl.String()},
+			Params:   map[string]interface{}{"token_id": id, "tenant": tenant, "task": taskID, "scope": scope, "ttl": ttl.String()},
 			Decision: audit.DecisionAllow,
 			Reason:   "credential broker mint",
-		})
+		}); err != nil {
+			// Fail closed: a minted credential MUST have an audit trail. Roll
+			// back the live index and refuse to hand out the token.
+			b.mu.Lock()
+			delete(b.activeByTask[taskID], id)
+			b.mu.Unlock()
+			return "", fmt.Errorf("identity: mint audit failed: %w", err)
+		}
 	}
 	return tokStr, nil
 }
@@ -149,6 +181,16 @@ func (b *Broker) Validate(tokStr string) (*Token, error) {
 		return nil, ErrRevoked
 	}
 	if time.Now().After(tok.Exp) {
+		// Lazily drop expired ids from the live index so the active set stays
+		// bounded; this is purely bookkeeping hygiene.
+		b.mu.Lock()
+		for task, ids := range b.activeByTask {
+			delete(ids, tok.ID)
+			if len(ids) == 0 {
+				delete(b.activeByTask, task)
+			}
+		}
+		b.mu.Unlock()
 		return nil, ErrExpired
 	}
 	return &tok, nil
@@ -179,34 +221,47 @@ func (b *Broker) Revoke(tokenID string) {
 	b.revoked[tokenID] = struct{}{}
 	b.mu.Unlock()
 	if b.ledger != nil {
-		_ = b.ledger.Append(audit.Record{
+		if err := b.ledger.Append(audit.Record{
 			Phase:    audit.PhaseExec,
 			Subject:  tokenID,
 			Action:   "revoke",
 			Decision: audit.DecisionRevoke,
 			Reason:   "credential broker revoke",
-		})
+		}); err != nil {
+			log.Printf("identity: failed to audit token revoke %s: %v", tokenID, err)
+		}
 	}
 }
 
-// RevokeAllForTask revokes every token whose ID starts with the task prefix
-// (Mint prefixes token IDs with the caller). This is the bulk-revoke path the
-// incident controller uses to "切断所有权限" in one shot.
-func (b *Broker) RevokeAllForTask(prefix string) int {
-	// We don't keep a forward index (by design: less PII to leak); instead we
-	// walk the ledger for this task's mints. The prefix-based ID scheme means
-	// any caller-matching id is caught. In the MVP we just record intent; full
-	// enumeration requires the ledger, which is optional here.
+// RevokeAllForTask revokes every token minted for taskID in one shot. This is
+// the bulk-revoke path the incident controller uses to "切断所有权限"
+// (plan.md §11). It walks the in-memory live-token index populated at Mint
+// time and moves each id into the revocation set; Validate() will then reject
+// all of them with ErrRevoked. Returns the number of tokens revoked.
+func (b *Broker) RevokeAllForTask(taskID string) int {
+	b.mu.Lock()
+	ids := make([]string, 0, len(b.activeByTask[taskID]))
+	for id := range b.activeByTask[taskID] {
+		ids = append(ids, id)
+		b.revoked[id] = struct{}{}
+	}
+	// Drop the task's live set; remaining ids are now only in `revoked`.
+	delete(b.activeByTask, taskID)
+	b.mu.Unlock()
+
 	if b.ledger != nil {
-		_ = b.ledger.Append(audit.Record{
+		if err := b.ledger.Append(audit.Record{
 			Phase:    audit.PhaseExec,
-			Subject:  prefix,
+			Subject:  taskID,
 			Action:   "revoke_all",
+			Params:   map[string]interface{}{"revoked": len(ids)},
 			Decision: audit.DecisionRevoke,
 			Reason:   "bulk revoke for task",
-		})
+		}); err != nil {
+			log.Printf("identity: failed to audit bulk revoke for task %s: %v", taskID, err)
+		}
 	}
-	return 0
+	return len(ids)
 }
 
 // LookupSecret exposes the long-lived material for a capability to a HOST-side
@@ -232,9 +287,11 @@ func decode(s string) ([]byte, error) {
 }
 
 // randID is a 12-byte random url-safe id; prefixed with a timestamp for loose
-// ordering, which also makes RevokeAllForTask's prefix walk meaningful.
-func randID() string {
+// ordering. The randomness comes from crypto/rand so the id is unpredictable.
+func randID() (string, error) {
 	var b [12]byte
-	rand.Read(b[:])
-	return fmt.Sprintf("%d-%s", time.Now().UnixNano(), base64.RawURLEncoding.EncodeToString(b[:]))
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%d-%s", time.Now().UnixNano(), base64.RawURLEncoding.EncodeToString(b[:])), nil
 }

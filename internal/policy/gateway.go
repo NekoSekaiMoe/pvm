@@ -16,6 +16,7 @@ package policy
 import (
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 
 	"uml-container/internal/audit"
@@ -102,9 +103,13 @@ func CompileRules(raw []struct{ Name, Action, Effect, Reason string }) []Rule {
 func (g *Gateway) Decide(req ToolRequest) (Action, Rule, error) {
 	for _, r := range g.rules {
 		if r.Name == req.Name || r.Name == "*" {
-			// first match wins; but skip a catch-all if a more specific rule
-			// exists later. We already append catch-all last, so first match
-			// is the most specific.
+			// first match wins; but a rule with a non-empty Effect constrains the
+			// match: the request's Effect must equal the rule's Effect. This is
+			// the PAY/PROD default-deny guarantee (plan.md §6.2): a rule that
+			// only authorizes "read" must not satisfy a "pay" request.
+			if r.Effect != "" && req.Effect != "" && r.Effect != req.Effect {
+				continue
+			}
 			return r.Action, r, nil
 		}
 	}
@@ -167,19 +172,43 @@ func (g *Gateway) Execute(req ToolRequest) (ToolResponse, error) {
 
 // sanitize strips fields known to carry raw secrets before returning to the
 // agent. We deny-by-default on field names: only an allowlist of summary keys
-// passes through. This is the "标准化 Observation 返回模型" (plan.md §6.3).
+// passes through, and the scrub is applied RECURSIVELY so nested maps/slices
+// cannot smuggle a secret-named field past the top level. This is the
+// "标准化 Observation 返回模型" (plan.md §6.3).
 func sanitize(r ToolResponse) ToolResponse {
+	// Summary/Reason are free-text; the executor may accidentally echo a
+	// secret into them. Always apply the regex-based redactor, even when the
+	// Result map is nil, so prose can't leak a token.
+	r.Summary = redactSecrets(r.Summary)
+	r.Reason = redactSecrets(r.Reason)
 	if r.Result == nil {
 		return r
 	}
-	safe := map[string]interface{}{}
-	for k, v := range r.Result {
-		if isSafeSummaryKey(k) {
-			safe[k] = v
-		}
-	}
-	r.Result = safe
+	r.Result = scrubValue(r.Result).(map[string]interface{})
 	return r
+}
+
+// scrubValue recursively scrubs a value: maps have secret-named keys dropped
+// (and their values recursively scrubbed), slices are element-wise scrubbed,
+// everything else passes through unchanged.
+func scrubValue(v interface{}) interface{} {
+	switch x := v.(type) {
+	case map[string]interface{}:
+		out := make(map[string]interface{}, len(x))
+		for k, vv := range x {
+			if isSafeSummaryKey(k) {
+				out[k] = scrubValue(vv)
+			}
+		}
+		return out
+	case []interface{}:
+		out := make([]interface{}, len(x))
+		for i, vv := range x {
+			out[i] = scrubValue(vv)
+		}
+		return out
+	}
+	return v
 }
 
 // isSafeSummaryKey returns true for keys that may legitimately appear in an
@@ -198,14 +227,36 @@ func (g *Gateway) audit(req ToolRequest, dec audit.Decision, reason string) {
 	if g.ledger == nil {
 		return
 	}
+	// Redact before persisting: tool args and error text often carry tokens,
+	// and the ledger is append-only on disk. ScrubValue recursively drops
+	// secret-named keys and redactSecrets masks pattern hits in prose.
+	safeArgs := scrubValue(req.Args)
 	_ = g.ledger.Append(audit.Record{
 		Phase:    audit.PhaseExec,
 		Subject:  "agent",
 		Action:   "tool:" + req.Name,
-		Params:   req.Args,
+		Params:   safeArgs,
 		Decision: dec,
-		Reason:   reason,
+		Reason:   redactSecrets(reason),
 	})
+}
+
+// secretRedactionPatterns matches high-signal credential shapes in prose so
+// an executor that echoes a token into a Summary/Reason/error string still
+// gets masked before the value reaches the agent or the audit ledger.
+var secretRedactionPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`gh[pousr]_[A-Za-z0-9]{36,}`),
+	regexp.MustCompile(`AKIA[0-9A-Z]{16}`),
+	regexp.MustCompile(`xox[baprs]-[A-Za-z0-9-]{10,}`),
+	regexp.MustCompile(`(?i)Bearer\s+[A-Za-z0-9\-._~+]{20,}`),
+}
+
+// redactSecrets masks credential-looking substrings in s with "[REDACTED]".
+func redactSecrets(s string) string {
+	for _, p := range secretRedactionPatterns {
+		s = p.ReplaceAllString(s, "[REDACTED]")
+	}
+	return s
 }
 
 // ErrDenied is returned when a tool call is denied by policy.

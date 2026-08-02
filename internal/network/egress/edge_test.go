@@ -34,6 +34,7 @@ func startGatewayWithPolicy(t *testing.T, pol *Policy) *Gateway {
 	audit.LedgerRoot = dir
 	l, _ := audit.Open("egress-edge")
 	g := NewGateway()
+	g.EnableSSRFBypassForTest() // tests route to httptest backends on 127.0.0.1
 	g.SetPolicy("t1", pol)
 	g.AttachLedger(l)
 	if _, err := g.Listen(nil, "127.0.0.1:0"); err != nil {
@@ -91,16 +92,41 @@ func TestDomainMatch_WildcardBoundary(t *testing.T) {
 // --- SSRF floor: proxy must refuse to CONNECT to a private IP even if the
 // domain itself is allowlisted (defense against DNS rebinding). ---
 
+// TestSSRF_PrivateIPBlocked verifies the handleHTTP SSRF floor: even when a
+// domain is allowlisted, a dial that resolves to a loopback/private IP must be
+// refused with 403. Unlike the old variant, this points at a REAL httptest
+// upstream on 127.0.0.1 — if the floor is missing, the proxy forwards and we
+// get 200, failing the test. (securitytest.TestAttack_DNSRebindingToPrivateIP
+// covers the same property end-to-end.)
 func TestSSRF_PrivateIPBlocked(t *testing.T) {
-	// allowlist a name that resolves to a loopback; the proxy's isPrivate
-	// check must still block the dial.
-	pol := &Policy{AllowDomains: []string{"localhost", "127.0.0.1"}}
-	g := startGatewayWithPolicy(t, pol)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	pol := &Policy{AllowDomains: []string{"127.0.0.1"}}
+	// Build the gateway WITHOUT EnableSSRFBypassForTest so the floor is active.
+	dir := t.TempDir()
+	audit.LedgerRoot = dir
+	l, _ := audit.Open("ssrf-floor")
+	g := NewGateway()
+	g.SetPolicy("ssrf", pol)
+	g.AttachLedger(l)
+	if _, err := g.Listen(nil, "127.0.0.1:0"); err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { g.Shutdown(nil) })
 	c := clientVia(g)
 
-	resp := do(c, "GET", "http://127.0.0.1:1/nope", "")
-	if resp.StatusCode != 0 && resp.StatusCode != http.StatusForbidden && resp.StatusCode != http.StatusBadGateway {
-		t.Errorf("expected block on private IP, got %d", resp.StatusCode)
+	req, _ := http.NewRequest("GET", upstream.URL+"/nope", nil)
+	req.Header.Set("X-Task-Id", "ssrf")
+	resp, err := c.Do(req)
+	if err != nil {
+		t.Fatalf("unexpected transport error: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Errorf("expected 403 from SSRF floor, got %d", resp.StatusCode)
 	}
 }
 

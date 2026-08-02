@@ -17,6 +17,7 @@ package incident
 import (
 	"context"
 	"fmt"
+	"log"
 	"sync"
 	"time"
 
@@ -113,7 +114,10 @@ func Classify(a Anomaly) Action {
 // the order the chosen Action implies (terminating actions do all of them),
 // then records the decision and updates the task's lifecycle state.
 //
-// stateMgr and broker may be nil; the controller degrades to audit-only.
+// stateMgr and broker may be nil; the controller degrades to audit-only. If a
+// hook returns an error, Handle records a DecisionDeny audit row with the
+// failure reason and returns the error so the caller knows the response did
+// not fully take effect.
 func (c *Controller) Handle(ctx context.Context, a Anomaly) (Action, error) {
 	c.mu.Lock()
 	c.handled[a.TaskID]++
@@ -128,21 +132,43 @@ func (c *Controller) Handle(ctx context.Context, a Anomaly) (Action, error) {
 
 	c.audit(a, act, "classified")
 
+	// Collect hook failures without aborting the whole response: incident
+	// response should apply as much containment as it can, then report what
+	// failed. The first error is returned to the caller.
+	var firstErr error
+	recordFailure := func(stage string, err error) {
+		if err == nil {
+			return
+		}
+		if firstErr == nil {
+			firstErr = err
+		}
+		if c.ledger != nil {
+			_ = c.ledger.Append(audit.Record{
+				Phase:    audit.PhaseExec,
+				Subject:  a.TaskID,
+				Action:   "incident:" + stage,
+				Decision: audit.DecisionDeny,
+				Reason:   stage + " hook failed: " + err.Error(),
+			})
+		}
+	}
+
 	// The plan.md §11.2 sequence: REVOKE -> BLOCK -> PAUSE -> PRESERVE, then
 	// the branch decision. We apply the prefix relevant to the action.
 	switch act {
 	case ActionQuarantine, ActionTerminate:
-		c.applyRevoke(a.TaskID)
-		c.applyBlock(a.TaskID)
-		c.applyPause(a.TaskID)
-		c.applyPreserve(a.TaskID)
+		recordFailure("revoke", c.applyRevoke(a.TaskID))
+		recordFailure("block", c.applyBlock(a.TaskID))
+		recordFailure("pause", c.applyPause(a.TaskID))
+		recordFailure("preserve", c.applyPreserve(a.TaskID))
 	case ActionPause:
-		c.applyPause(a.TaskID)
-		c.applyPreserve(a.TaskID)
+		recordFailure("pause", c.applyPause(a.TaskID))
+		recordFailure("preserve", c.applyPreserve(a.TaskID))
 	case ActionBlock:
-		c.applyBlock(a.TaskID)
+		recordFailure("block", c.applyBlock(a.TaskID))
 	case ActionRevoke:
-		c.applyRevoke(a.TaskID)
+		recordFailure("revoke", c.applyRevoke(a.TaskID))
 	case ActionNone:
 		// nothing
 	}
@@ -153,64 +179,78 @@ func (c *Controller) Handle(ctx context.Context, a Anomaly) (Action, error) {
 			return act, err
 		}
 	}
-	return act, nil
+	return act, firstErr
 }
 
-func (c *Controller) applyRevoke(task string) {
+func (c *Controller) applyRevoke(task string) error {
 	if c.broker != nil {
 		c.broker.RevokeAllForTask(task)
 	}
 	if c.hooks.RevokeIdentities != nil {
-		c.hooks.RevokeIdentities(task)
+		if err := c.hooks.RevokeIdentities(task); err != nil {
+			return err
+		}
 	}
 	c.auditRaw(task, "revoke", audit.DecisionRevoke, "incident response")
+	return nil
 }
 
-func (c *Controller) applyBlock(task string) {
+func (c *Controller) applyBlock(task string) error {
 	if c.hooks.BlockNetwork != nil {
-		c.hooks.BlockNetwork(task)
+		if err := c.hooks.BlockNetwork(task); err != nil {
+			return err
+		}
 	}
 	c.auditRaw(task, "block", audit.DecisionBlock, "incident response")
+	return nil
 }
 
-func (c *Controller) applyPause(task string) {
+func (c *Controller) applyPause(task string) error {
 	if c.hooks.FreezeRuntime != nil {
-		c.hooks.FreezeRuntime(task)
+		if err := c.hooks.FreezeRuntime(task); err != nil {
+			return err
+		}
 	}
 	c.auditRaw(task, "pause", audit.DecisionConstrain, "incident response")
+	return nil
 }
 
-func (c *Controller) applyPreserve(task string) {
+func (c *Controller) applyPreserve(task string) error {
 	if c.hooks.Preserve != nil {
-		c.hooks.Preserve(task)
+		return c.hooks.Preserve(task)
 	}
+	return nil
 }
 
 func (c *Controller) audit(a Anomaly, act Action, reason string) {
 	if c.ledger == nil {
 		return
 	}
-	_ = c.ledger.Append(audit.Record{
+	if err := c.ledger.Append(audit.Record{
 		Phase:    audit.PhaseExec,
 		Subject:  a.TaskID,
 		Action:   "incident:" + string(act),
 		Params:   map[string]interface{}{"signal": a.Signal, "severity": a.Severity, "detail": a.Detail},
 		Decision: audit.DecisionBlock,
 		Reason:   reason,
-	})
+	}); err != nil {
+		log.Printf("incident: audit failed for task %s: %v", a.TaskID, err)
+	}
 }
 
 func (c *Controller) auditRaw(task, action string, dec audit.Decision, reason string) {
 	if c.ledger == nil {
 		return
 	}
-	_ = c.ledger.Append(audit.Record{
+	if err := c.ledger.Append(audit.Record{
 		Phase:    audit.PhaseExec,
 		Subject:  task,
 		Action:   action,
 		Decision: dec,
 		Reason:   reason,
-	})
+	}); err != nil {
+		log.Printf("incident: audit (%s) failed for task %s: %v", action, task, err)
+	}
 }
 
 // MoveToQuarantine transitions the task's FSM to Quarantined. Used after a

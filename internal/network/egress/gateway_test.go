@@ -28,6 +28,7 @@ func tmpLedger(t *testing.T) *audit.Ledger {
 func startGateway(t *testing.T, pol *Policy) *Gateway {
 	t.Helper()
 	g := NewGateway()
+	g.EnableSSRFBypassForTest() // tests route to httptest backends on 127.0.0.1
 	g.SetPolicy("t1", pol)
 	g.AttachLedger(tmpLedger(t))
 	addr, err := g.Listen(nil, "127.0.0.1:0")

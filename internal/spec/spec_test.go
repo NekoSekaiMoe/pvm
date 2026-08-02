@@ -146,3 +146,67 @@ func TestValidate_DefaultsOnAnomaly(t *testing.T) {
 		t.Errorf("on_anomaly default not applied: %s", s.Lifecycle.OnAnomaly)
 	}
 }
+
+// TestValidate_AppliesDefaults ensures the DefaultXxx constants actually get
+// filled in (they used to be dead code). Validate MUST populate the omitted
+// budget/lifecycle/identity/approval fields so downstream consumers don't see
+// empty strings.
+func TestValidate_AppliesDefaults(t *testing.T) {
+	s := &TaskSpec{Version: 1, Caller: "x"}
+	if err := s.Validate(); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	if s.Budget.MaxWallTime != DefaultWallTimeout.String() {
+		t.Errorf("max_wall_time default not applied: %q", s.Budget.MaxWallTime)
+	}
+	if s.Identity.TTL != DefaultTokenTTL.String() {
+		t.Errorf("identity.ttl default not applied: %q", s.Identity.TTL)
+	}
+	if s.Lifecycle.TTL != DefaultLifecycleTTL.String() {
+		t.Errorf("lifecycle.ttl default not applied: %q", s.Lifecycle.TTL)
+	}
+	if s.Lifecycle.MaxRetries != DefaultMaxRetries {
+		t.Errorf("lifecycle.max_retries default not applied: %d", s.Lifecycle.MaxRetries)
+	}
+	if s.Approval.Timeout != DefaultApprovalTimeout.String() {
+		t.Errorf("approval.timeout default not applied: %q", s.Approval.Timeout)
+	}
+}
+
+// TestValidate_RejectsNegativeMemory: parseMem accepts "%d" so "-512M" parses
+// to -512. Validate MUST reject negative memory at the spec layer so it can't
+// reach the cgroup/CoW startup path.
+func TestValidate_RejectsNegativeMemory(t *testing.T) {
+	s := &TaskSpec{Version: 1, Caller: "x", Runtime: RuntimeSpec{Memory: "-512M"}}
+	err := s.Validate()
+	if err == nil {
+		t.Fatal("expected error for negative memory, got nil")
+	}
+}
+
+// TestFingerprint_CoversControlFields verifies that changing ANY control-plane
+// field the fingerprint claims to bind changes the digest. Pre-fix, the
+// fingerprint only covered a hand-picked subset and silently ignored
+// Identity.Scope, Network.Bridge/GatewayIP/TAP/MaxRequestBodyBytes/QoSRate,
+// Kernel.*, Lifecycle.Paused/MaxRetries/TTL, Approval.Notify/Timeout, etc.
+func TestFingerprint_CoversControlFields(t *testing.T) {
+	base := &TaskSpec{Version: 1, Caller: "x", Tenant: "t"}
+	_ = base.Validate()
+	h0 := base.Fingerprint()
+
+	variants := []*TaskSpec{
+		{Version: 1, Caller: "x", Tenant: "t", Identity: Identity{Scope: []string{"repo:read"}}},
+		{Version: 1, Caller: "x", Tenant: "t", Network: NetworkSpec{Bridge: "br9"}},
+		{Version: 1, Caller: "x", Tenant: "t", Network: NetworkSpec{QoSRate: "10mbit"}},
+		{Version: 1, Caller: "x", Tenant: "t", Kernel: KernelSpec{Path: "./other/linux"}},
+		{Version: 1, Caller: "x", Tenant: "t", Lifecycle: LifecycleSpec{MaxRetries: 9}},
+		{Version: 1, Caller: "x", Tenant: "t", Approval: ApprovalSpec{Notify: "webhook"}},
+		{Version: 1, Caller: "x", Tenant: "t", Workspace: WorkspaceSpec{Overlay: "x.qcow2"}},
+	}
+	for i, v := range variants {
+		_ = v.Validate()
+		if v.Fingerprint() == h0 {
+			t.Errorf("variant %d produced same fingerprint as base (control field not bound)", i)
+		}
+	}
+}

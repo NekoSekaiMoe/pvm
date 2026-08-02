@@ -11,6 +11,7 @@ package spec
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -25,13 +26,22 @@ const SpecVersion = 1
 
 // Defaults for optional budget/lifecycle fields when the TOML omits them.
 const (
-	DefaultCPUMax       = 0 // 0 = no cgroup limit
-	DefaultWallTimeout  = 30 * time.Minute
-	DefaultTokenBudget  = 0 // 0 = unlimited
-	DefaultNetBudgetMB  = 0 // 0 = unlimited
-	DefaultCostBudgetUSC = 0 // 0 = unlimited
+	DefaultCPUMax        = 0 // 0 = no cgroup limit
+	DefaultWallTimeout   = 30 * time.Minute
+	DefaultTokenBudget   = 0 // 0 = unlimited
+	DefaultNetBudgetMB   = 0 // 0 = unlimited
+	DefaultCostBudgetUSD = 0 // 0 = unlimited (US Dollars, micro-US cents at the ledger)
 	DefaultTokenTTL      = 15 * time.Minute
 )
+
+// DefaultApprovalTimeout bounds how long an approval ticket may pend.
+const DefaultApprovalTimeout = 5 * time.Minute
+
+// DefaultLifecycleTTL is the overall task lifetime when TTL is omitted.
+const DefaultLifecycleTTL = 1 * time.Hour
+
+// DefaultMaxRetries is the FSM retry cap when omitted.
+const DefaultMaxRetries = 2
 
 // TaskSpec is the full control contract (plan.md §9.2).
 //
@@ -262,14 +272,19 @@ func (s *TaskSpec) Validate() error {
 		errs = append(errs, fmt.Errorf("spec: runtime.cpu must be <= 1024"))
 	}
 	if s.Runtime.Memory != "" {
-		if _, err := parseMem(s.Runtime.Memory); err != nil {
+		memBytes, err := parseMem(s.Runtime.Memory)
+		if err != nil {
 			errs = append(errs, fmt.Errorf("spec: runtime.memory: %w", err))
+		} else if memBytes < 0 {
+			errs = append(errs, fmt.Errorf("spec: runtime.memory must be >= 0"))
 		}
 	}
 	if s.Identity.TTL != "" {
 		if _, err := time.ParseDuration(s.Identity.TTL); err != nil {
 			errs = append(errs, fmt.Errorf("spec: identity.ttl: %w", err))
 		}
+	} else {
+		s.Identity.TTL = DefaultTokenTTL.String()
 	}
 	for i := range s.Tools {
 		switch s.Tools[i].Action {
@@ -282,11 +297,18 @@ func (s *TaskSpec) Validate() error {
 		if _, err := time.ParseDuration(s.Budget.MaxWallTime); err != nil {
 			errs = append(errs, fmt.Errorf("spec: budget.max_wall_time: %w", err))
 		}
+	} else {
+		s.Budget.MaxWallTime = DefaultWallTimeout.String()
 	}
 	if s.Lifecycle.TTL != "" {
 		if _, err := time.ParseDuration(s.Lifecycle.TTL); err != nil {
 			errs = append(errs, fmt.Errorf("spec: lifecycle.ttl: %w", err))
 		}
+	} else {
+		s.Lifecycle.TTL = DefaultLifecycleTTL.String()
+	}
+	if s.Lifecycle.MaxRetries == 0 {
+		s.Lifecycle.MaxRetries = DefaultMaxRetries
 	}
 	if s.Lifecycle.OnAnomaly == "" {
 		s.Lifecycle.OnAnomaly = "pause"
@@ -300,6 +322,8 @@ func (s *TaskSpec) Validate() error {
 		if _, err := time.ParseDuration(s.Approval.Timeout); err != nil {
 			errs = append(errs, fmt.Errorf("spec: approval.timeout: %w", err))
 		}
+	} else {
+		s.Approval.Timeout = DefaultApprovalTimeout.String()
 	}
 	// the artifact gate's block-secrets flag is meaningful only if there are
 	// declared outputs; warn (not fail) so an empty declared list is allowed.
@@ -312,28 +336,43 @@ func (s *TaskSpec) Validate() error {
 // Fingerprint returns a stable hex SHA-256 of the validated spec. This is the
 // "SPEC + VERSION" evidence record (plan.md §14.2 phase 02): two tasks with
 // the same fingerprint ran under identical control contracts.
+//
+// The hash is computed over a normalized JSON serialization of the full
+// TaskSpec so that ANY control-plane field contributes to the fingerprint.
+// Adding a new field therefore cannot silently slip out of the evidence record.
+// JSON map keys are sorted by encoding/json, and array order is preserved as
+// declared (tools / allow_domains are treated as significant — reordering them
+// changes the contract).
 func (s *TaskSpec) Fingerprint() string {
+	// Clear runtime-only / non-contract fields before hashing. Caller, Tenant,
+	// Version and every control plane stays in — they ARE the contract.
+	snapshot := *s // shallow copy; we only nil out non-contract extras here
+	// (No fields are currently excluded; the whole struct is the contract.)
+	enc, err := json.Marshal(snapshot)
+	if err != nil {
+		// Marshal of a struct without channels/funcs cannot fail; fall back to
+		// a stable textual form so Fingerprint never returns empty.
+		h := sha256.New()
+		fmt.Fprintf(h, "%+v", snapshot)
+		return hex.EncodeToString(h.Sum(nil))
+	}
 	h := sha256.New()
-	// Canonical textual form of the control contract. Order is fixed; %v on
-	// slices/structs gives stable output for the fingerprint's purpose
-	// (same contract -> same hash; this is not a security-sensitive canonicalization).
-	fmt.Fprintf(h, "v=%d\n", s.Version)
-	fmt.Fprintf(h, "caller=%s\ntenant=%s\n", s.Caller, s.Tenant)
-	fmt.Fprintf(h, "cpu=%d\nmem=%s\nbase=%s\ninit=%s\n", s.Runtime.CPU, s.Runtime.Memory, s.Workspace.BaseImage, s.Workspace.Init)
-	fmt.Fprintf(h, "net=%t\nallow=%v\nblock=%v\n", s.Network.Enabled, s.Network.EgressAllowDomains, s.Network.EgressBlockDomains)
-	fmt.Fprintf(h, "tools=%v\nbudget=%v\napproval=%v\n", s.Tools, s.Budget, s.Approval.RequiredFor)
-	fmt.Fprintf(h, "artifacts=%v\nonanomaly=%s\n", s.Artifacts.Declared, s.Lifecycle.OnAnomaly)
+	h.Write(enc)
 	return hex.EncodeToString(h.Sum(nil))
 }
 
 // parseMem is a local byte-parser to avoid an import cycle with internal/config
-// (which has ParseMemory). Accepts 512M/2G/etc.
+// (which has ParseMemory). Accepts 512M/2G/etc. Returns an error on negative
+// values or unsupported units.
 func parseMem(s string) (int64, error) {
 	var v int64
 	var unit string
 	n, err := fmt.Sscanf(s, "%d%s", &v, &unit)
 	if err != nil || n == 0 {
 		return 0, fmt.Errorf("invalid memory %q", s)
+	}
+	if v < 0 {
+		return 0, fmt.Errorf("negative memory %q", s)
 	}
 	switch unit {
 	case "K", "k", "KB", "kb":

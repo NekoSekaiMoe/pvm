@@ -13,6 +13,11 @@ export function apiKey() {
   return 'secret'
 }
 
+// apiFetch normalizes the response. 202 (Accepted) is a business-level
+// "request received" (e.g. /api/exec returning approval_required) and is
+// returned as JSON. 409 (Conflict) is a hard failure (duplicate ticket,
+// already-decided, invalid state) and is thrown with the server's reason so
+// the caller can surface it instead of silently treating it as success.
 export async function apiFetch(path, opts = {}) {
   const headers = { Authorization: `Bearer ${apiKey()}`, ...(opts.headers || {}) }
   if (opts.body && typeof opts.body === 'object') {
@@ -20,10 +25,12 @@ export async function apiFetch(path, opts = {}) {
     opts.body = JSON.stringify(opts.body)
   }
   const res = await fetch(path, { ...opts, headers })
-  if (!res.ok && res.status !== 202 && res.status !== 409) {
+  if (!res.ok && res.status !== 202) {
     let msg = res.statusText
     try { const j = await res.json(); msg = j.error || msg } catch (e) {}
-    throw new Error(msg)
+    const err = new Error(msg)
+    err.status = res.status
+    throw err
   }
   const ct = res.headers.get('content-type') || ''
   if (ct.includes('application/json')) return res.json()

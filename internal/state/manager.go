@@ -121,15 +121,19 @@ type ContainerState struct {
 }
 
 // transitions is the allowed FSM edge table. Anything not listed is rejected.
+// Quarantined is reachable from EVERY non-terminal state so the incident
+// controller can isolate an anomalous task no matter where it is in its
+// lifecycle. Suspended/Resuming also have a Failed edge so a failed
+// checkpoint/restore isn't forced through Destroy.
 var allowed = map[Status][]Status{
-	StatusPending:      {StatusProvisioning, StatusDestroy, StatusFailed},
+	StatusPending:      {StatusProvisioning, StatusDestroy, StatusFailed, StatusQuarantined},
 	StatusProvisioning: {StatusReady, StatusFailed, StatusQuarantined, StatusDestroy},
-	StatusReady:        {StatusRunning, StatusSuspended, StatusFailed, StatusDestroy},
+	StatusReady:        {StatusRunning, StatusSuspended, StatusFailed, StatusQuarantined, StatusDestroy},
 	StatusRunning:      {StatusSuspended, StatusReview, StatusFailed, StatusQuarantined, StatusDestroy},
-	StatusSuspended:    {StatusResuming, StatusReview, StatusDestroy},
-	StatusResuming:     {StatusRunning, StatusFailed, StatusDestroy},
-	StatusReview:       {StatusCompleted, StatusFailed, StatusDestroy},
-	StatusFailed:       {StatusProvisioning, StatusDestroy, StatusQuarantined},
+	StatusSuspended:    {StatusResuming, StatusReview, StatusFailed, StatusQuarantined, StatusDestroy},
+	StatusResuming:     {StatusRunning, StatusFailed, StatusQuarantined, StatusDestroy},
+	StatusReview:       {StatusCompleted, StatusFailed, StatusQuarantined, StatusDestroy},
+	StatusFailed:       {StatusProvisioning, StatusQuarantined, StatusDestroy},
 	StatusQuarantined:  {StatusFailed, StatusDestroy},
 	StatusCompleted:    {StatusDestroy},
 }
@@ -181,7 +185,11 @@ var ErrTerminal = errors.New("state: terminal state")
 // the allowed table (but the source state is not terminal).
 var ErrInvalidTransition = errors.New("state: invalid transition")
 
-// SaveState persists state atomically: write to temp, fsync, rename.
+// SaveState persists state atomically: write to temp, fsync, rename. It takes
+// a read-side snapshot of the slices/maps under the container lock so that a
+// concurrent Transition (which appends to s.Transitions under the same lock)
+// cannot race with this encoder — the persisted JSON is always a consistent
+// point-in-time view.
 func SaveState(id string, st *ContainerState) error {
 	dir, err := ContainerDir(id)
 	if err != nil {
@@ -190,6 +198,10 @@ func SaveState(id string, st *ContainerState) error {
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return err
 	}
+	// Snapshot the mutable fields under the lock so json.Encode below reads a
+	// stable value even if another goroutine calls Transition concurrently.
+	snapshot := st.snapshotLocked()
+
 	tmp, err := os.CreateTemp(dir, ".state-*.json.tmp")
 	if err != nil {
 		return err
@@ -197,7 +209,7 @@ func SaveState(id string, st *ContainerState) error {
 	tmpName := tmp.Name()
 	enc := json.NewEncoder(tmp)
 	enc.SetIndent("", "  ")
-	if err := enc.Encode(st); err != nil {
+	if err := enc.Encode(snapshot); err != nil {
 		tmp.Close()
 		os.Remove(tmpName)
 		return err
@@ -209,6 +221,34 @@ func SaveState(id string, st *ContainerState) error {
 	}
 	tmp.Close()
 	return os.Rename(tmpName, filepath.Join(dir, "state.json"))
+}
+
+// snapshotLocked returns a deep copy of the fields json.Marshal would serialize,
+// taken under the container lock. Callers don't need to hold the lock — this
+// method acquires it. The copy is safe to hand to an encoder off-lock.
+func (s *ContainerState) snapshotLocked() *ContainerState {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cp := &ContainerState{
+		ID:          s.ID,
+		Name:        s.Name,
+		Tenant:      s.Tenant,
+		Caller:      s.Caller,
+		Status:      s.Status,
+		PID:         s.PID,
+		StartedAt:   s.StartedAt,
+		EndedAt:     s.EndedAt,
+		SpecFP:      s.SpecFP,
+		Retries:     s.Retries,
+		Deadline:    s.Deadline,
+		NetworkTap:  s.NetworkTap,
+		Bridge:      s.Bridge,
+		GatewayIP:   s.GatewayIP,
+	}
+	if len(s.Transitions) > 0 {
+		cp.Transitions = append([]Transition(nil), s.Transitions...)
+	}
+	return cp
 }
 
 // LoadState reads the persisted state.json for a task. Returns an error if the
