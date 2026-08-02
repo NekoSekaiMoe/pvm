@@ -17,7 +17,7 @@ While unit tests in Go are typically placed alongside the code they test (e.g., 
 | `07_test_gate_snapshot_cli.sh` | **no** | `agentpvm gate`: PASS/FAIL verdicts + exit codes, secret scan in diff and in declared files, missing/malformed bundle, audit allow/deny rows; `agentpvm snapshot`: export/import round trip, invalid-id and existing-id rejection |
 | `08_test_approval_pool_cli.sh` | **no** | `agentpvm approval`/`pool` subcommands against a live API: mandatory `API_SECRET`, empty/pending/decided ticket listing, pool stats reflecting REST-driven warm, documented `pool warm` CLI gap |
 
-Suites `05`–`08` are **CI-safe** (no kernel, no root needed beyond `go build`). Run all of them serially:
+Suites `05`–`08` are **CI-safe** (no kernel, no root needed beyond `go build`). They require `curl`, `jq` and a POSIX `base64` on `PATH` (all preinstalled on GitHub `ubuntu-latest` runners; on macOS install jq via `brew install jq`). Run all of them serially:
 
 ```bash
 for s in tests/*.sh; do ./"$s"; done

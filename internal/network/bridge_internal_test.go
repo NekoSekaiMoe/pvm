@@ -2,6 +2,7 @@ package network
 
 import (
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -34,14 +35,16 @@ func TestIsDeviceNotExist(t *testing.T) {
 	}
 }
 
-// TestDeleteBridge_InvalidCIDRStillAttemptsTeardown documents the contract
-// that an unparseable gatewayIP is skipped for the iptables cleanup but does
-// not abort the bridge teardown itself. Without root/iproute2 the underlying
-// `ip` calls fail, so we only assert the function returns rather than hangs
-// or panics — and that it never surfaces the CIDR parse error.
+// TestDeleteBridge_InvalidCIDRSkipped pins down the contract that an
+// unparseable gatewayIP is skipped for the iptables cleanup but does not
+// abort the bridge teardown itself. Without root/iproute2 the underlying
+// `ip` calls fail, so we accept any teardown error — but it must never be
+// the CIDR parse error, which DeleteBridge is required to swallow.
 func TestDeleteBridge_InvalidCIDRSkipped(t *testing.T) {
-	// A syntactically invalid gatewayIP must not cause a panic or a CIDR
-	// error; the function proceeds to `ip link` teardown (which may itself
-	// fail in unprivileged CI — both outcomes are acceptable here).
-	_ = DeleteBridge("pvmtest-nonexistent-bridge-!@#", "not-a-cidr")
+	// The interface name is syntactically valid so that an `ip` argument
+	// validation error cannot masquerade as the behavior under test.
+	err := DeleteBridge("pvmtest-nonexistent0", "not-a-cidr")
+	if err != nil && strings.Contains(err.Error(), "CIDR") {
+		t.Errorf("DeleteBridge surfaced the CIDR parse error, want it skipped: %v", err)
+	}
 }

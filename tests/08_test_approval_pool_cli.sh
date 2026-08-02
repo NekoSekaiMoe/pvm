@@ -10,7 +10,10 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 TMP="$(mktemp -d)"
-trap 'kill "$SRV" 2>/dev/null || true; rm -rf "$TMP"' EXIT
+# SRV must exist before the trap fires: under `set -u` an unbound expansion
+# aborts the trap and leaks TMP if the script fails before the server starts.
+SRV=""
+trap 'if [ -n "$SRV" ]; then kill "$SRV" 2>/dev/null || true; fi; rm -rf "$TMP"' EXIT
 
 export PVM_STATE_ROOT="$TMP/state"
 export PVM_AUDIT_ROOT="$TMP/audit"

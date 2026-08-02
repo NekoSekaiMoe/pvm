@@ -6,6 +6,7 @@ package main
 // translation, and the built-in safe-default TaskSpec.
 
 import (
+	"encoding/hex"
 	"os"
 	"path/filepath"
 	"testing"
@@ -101,8 +102,12 @@ func TestSafeDefaultSpec(t *testing.T) {
 	if s.Runtime.Name == "" || s.Runtime.Memory == "" || s.Kernel.Path == "" {
 		t.Errorf("safe default must still be launch-shaped, got %+v", s)
 	}
-	if fp := s.Fingerprint(); len(fp) != 64 {
+	fp := s.Fingerprint()
+	if len(fp) != 64 {
 		t.Errorf("fingerprint = %q (len %d), want 64 hex chars", fp, len(fp))
+	}
+	if _, err := hex.DecodeString(fp); err != nil {
+		t.Errorf("fingerprint = %q is not valid hexadecimal: %v", fp, err)
 	}
 	if err := s.Validate(); err != nil {
 		t.Errorf("safe default spec must validate cleanly: %v", err)

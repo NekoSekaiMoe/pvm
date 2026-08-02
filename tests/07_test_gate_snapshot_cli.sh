@@ -70,7 +70,8 @@ echo "   FAIL + secret_scan reason + audit deny row ✓"
 
 # --- 3. secret hidden in a declared file is also caught ---
 echo "--- gate: secret inside files map is blocked"
-SECRET_B64=$(printf 'token = "ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"' | base64 -w0)
+# base64 without line wrapping; `-w0` is GNU-only, so use `tr` for BSD/macOS compat.
+SECRET_B64=$(printf 'token = "ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"' | base64 | tr -d '\n')
 cat > "$TMP/bundle-filesecret.json" <<EOF
 {"task_id": "gate-filesecret", "diff": "", "build_log": "", "trace": [],
  "files": {"config.env": "$SECRET_B64"}, "claimed_ok": true}
