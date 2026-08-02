@@ -152,11 +152,12 @@ func runCmd(args []string) {
 		s.Kernel.UseVhostBlk = true
 		// NOTE: do NOT set s.Kernel.Virtio here. Virtio used to be a single
 		// switch that wired BOTH the block device (virtio_uml/vhost-user-blk)
-		// AND the network device (vec0 virtio-net). The two are independent:
-		// buildTaskArgs now keys the block backend off UseVhostBlk alone and
-		// always uses eth0=tuntap for networking (vec0 has never worked in
-		// this project). Setting Virtio=true here would be a no-op now, but
-		// we leave the field alone to avoid muddying the spec semantics.
+		// AND the network device. The two are independent: buildTaskArgs now
+		// keys the block backend off UseVhostBlk alone and always uses the
+		// vec0 vector transport for networking (the only UML net transport
+		// left in Linux >= 6.16; verified working in CI on the ubd block
+		// backend). Setting Virtio=true here would be a no-op now, but we
+		// leave the field alone to avoid muddying the spec semantics.
 	}
 	if *netEnabled {
 		s.Network.Enabled = true
