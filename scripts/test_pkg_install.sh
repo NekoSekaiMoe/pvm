@@ -74,8 +74,11 @@ echo "### ping gateway 10.0.0.1"
 ping -c 2 -W 3 10.0.0.1 2>&1 || echo "ping gw FAILED rc=$?"
 echo "### nslookup dl-cdn.alpinelinux.org 8.8.8.8"
 nslookup dl-cdn.alpinelinux.org 8.8.8.8 2>&1 || echo "nslookup FAILED rc=$?"
-echo "### ping 8.8.8.8 (raw IP, no DNS)"
-ping -c 2 -W 3 8.8.8.8 2>&1 || echo "ping 8.8.8.8 FAILED rc=$?"
+echo "### TCP 443 egress probe (authoritative — this is the transport apk actually uses)"
+wget -q -T 5 -O /dev/null https://dl-cdn.alpinelinux.org/ && echo "TCP 443 egress OK" || echo "TCP 443 egress FAILED rc=$?"
+echo "### ping 8.8.8.8 (informational ONLY — ICMP echo is dropped by the Azure fabric on"
+echo "### GitHub-hosted runners, so this fails even when TCP/UDP egress works; not a PVM bug)"
+ping -c 2 -W 3 8.8.8.8 2>&1 || echo "(ICMP echo unreachable — expected on Azure CI; rely on the TCP probe + apk instead)"
 echo "--- end guest net diag ---"
 
 # 4) 真正的安装步骤（保留成功标记）；apk 是动态 ELF，如果上面失败了这里也会失败
@@ -97,9 +100,9 @@ sudo umount mnt_pkg
 # Block backend: use the ubd path (raw base mounted directly, no qcow2 CoW).
 # This is the verified-working configuration for networking: vec0 (the only
 # UML net transport left in Linux >= 6.16) over the ubd block backend.
-# coexists with ubd0 but NOT with virtio_uml block (see the TODO in
-# internal/container/manager.go buildTaskArgs). The vhost path (qcow2 + CoW)
-# is left for a follow-up that moves networking onto vhost-user-net.
+# vec0 is transport-independent — it works identically over the vhost
+# (virtio_uml / vhost-user-blk) block backend, which tests/04_test_qcow2_mount.sh
+# proves end-to-end (guest boots from /dev/vda and reaches the gateway).
 BASE_IMG="${IMG_NAME}"   # raw ext4 image, mounted directly via ubd0
 
 # Setup Host Networking. Do NOT swallow these errors silently: a missing

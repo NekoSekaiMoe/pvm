@@ -27,7 +27,7 @@ init      = "/sbin/init"
 
 [kernel]
 path          = "./bin/linux"
-virtio        = false      # legacy field, no effect (block backend is selected by use_vhost_blk; network is always eth0=tuntap)
+virtio        = false      # legacy field, no effect (block backend is selected by use_vhost_blk; network is always vec0 — the only UML net transport in Linux >= 6.16)
 # use_vhost_blk selects the block backend AND whether CoW is in play:
 #   false (default): ubd0=<base> raw mount. CoW-free.
 #   true:            qcow2 overlay served by qemu-storage-daemon over

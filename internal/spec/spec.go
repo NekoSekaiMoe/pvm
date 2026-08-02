@@ -118,12 +118,12 @@ type KernelSpec struct {
 	Path string `toml:"path"`
 	// Virtio is retained for TOML compatibility but no longer selects the
 	// network transport. Historically it was a single switch that wired BOTH
-	// the block device (virtio_uml / vhost-user-blk) AND the network device
-	// (the vec0 virtio-net transport). Those are independent concerns: the
-	// block backend is selected by UseVhostBlk, and the network device is
-	// ALWAYS eth0=tuntap (vec0 was never exercised and broke networking on
-	// kernels without CONFIG_VIRTIO_UML vector support). New code should use
-	// UseVhostBlk directly; this field has no effect on networking.
+	// the block device (virtio_uml / vhost-user-blk) AND the network device.
+	// Those are independent concerns: the block backend is selected by
+	// UseVhostBlk, and the network device is ALWAYS vec0 (the vector
+	// transport — the only UML net transport left in Linux >= 6.16; legacy
+	// eth0=tuntap was removed upstream). New code should use UseVhostBlk
+	// directly; this field has no effect on networking.
 	Virtio bool `toml:"virtio"`
 	// UseVhostBlk requires qemu-storage-daemon for the block backend (qcow2
 	// overlay served over vhost-user-blk). The agent path is qcow2-only, so

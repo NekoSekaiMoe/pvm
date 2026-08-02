@@ -1,14 +1,10 @@
 # TODO
 
-## Networking: use the vec transport (legacy eth0=tuntap was removed in 6.16)
+## Networking: vec transport (legacy eth0=tuntap was removed in 6.16)
 
-**Status**: fix in place (vec0 + CONFIG_UML_NET_VECTOR); needs a kernel
-rebuild + re-run to confirm the guest actually gets a NIC.
+**Status**: ✅ DONE — verified working in CI (run 83361317845, main @ 2026-08-02).
 
-### What was actually wrong
-
-Every previous round of "networking is broken" was chasing the wrong thing.
-The real root cause (confirmed in the kernel source and the commit log):
+### Root cause (kept for posterity)
 
 - **2019-12** commit `40814b98a570` "um: Mark non-vector net transports as
   obsolete": all non-vector UML net drivers (tuntap, slip, daemon, mcast,
@@ -17,45 +13,71 @@ The real root cause (confirmed in the kernel source and the commit log):
   infrastructure": those drivers were **deleted entirely**. Landed in 6.16.
 
 `scripts/build_kernel.sh` builds `6.18.36`, so `CONFIG_UML_NET`,
-`CONFIG_UML_NET_TUNTAP`, etc. **do not exist** in this kernel. The only UML
-net transport left is `CONFIG_UML_NET_VECTOR`. That's why the boot log
-showed:
+`CONFIG_UML_NET_TUNTAP`, etc. **do not exist**. The only UML net transport
+left is `CONFIG_UML_NET_VECTOR`, which parses `vecN:transport=...` params.
+`eth0=tuntap,<tap>` was reported as an unknown kernel parameter and the guest
+got no NIC.
 
-```
-Kernel command line: ... eth0=tuntap,tap_pkg ...
-Unknown kernel command line parameters "eth0=tuntap,tap_pkg ...",
-will be passed to user space.
-```
+### Fix (verified)
 
-No `eth0` driver exists to parse the parameter, so it was dropped and the
-guest got no NIC. This was independent of ubd vs vhost block backend and
-independent of raw vs qcow2 — those red herrings cost several rounds.
+1. `scripts/build_kernel.sh`: `CONFIG_UML_NET_VECTOR` + `CONFIG_TUN` enabled.
+2. `internal/container/manager.go` (`buildTaskArgs` + `buildLegacyArgs`):
+   emits `vec0:transport=tap,ifname=<tap>,depth=128,gro=1`.
+3. `scripts/test_pkg_install.sh` init.sh: configures `vec0` in the guest.
+
+CI evidence (test_pkg_install.sh): guest got `vec0` from the uml-vector
+driver, `inet 10.0.0.2/24`, default route via 10.0.0.1, ping gateway 0% loss,
+apk installed fastfetch, `PKG_INSTALL_SUCCESS` observed.
+
+### Note: ICMP vs TCP/UDP egress on CI
+
+`ping 8.8.8.8` from the guest fails with 100% loss on GitHub-hosted runners —
+the Azure fabric drops ICMP echo even though UDP (DNS to 8.8.8.8:53) and TCP
+(HTTPS to the apk CDN) work fine. Not a PVM bug. The guest diag in
+test_pkg_install.sh now uses a TCP 443 probe as the authoritative egress
+check; the ping is kept as informational-only.
+
+## vhost (qcow2 CoW) path: validate vhost+vec, then flip the default
+
+**Status**: root cause of the CI "SIGABRT" identified; test rewritten to
+validate the real boot. Awaiting a green CI run before flipping
+`uml/agentpvm.toml` `use_vhost_blk` to `true`.
+
+### What the "signal: aborted (core dumped)" in test 04 actually was
+
+UML's kernel-panic path calls `os_dump_core()` → `uml_abort()` →
+`kill(getpid(), SIGABRT)` (arch/um/os-Linux/util.c). Go's exec reports that
+as `signal: aborted (core dumped)`. **So SIGABRT from a UML process means
+"guest kernel panicked", not a host-side crash.**
+
+Old `tests/04_test_qcow2_mount.sh` fed the guest a 10MB **empty ext4** image
+(mkfs only, no `/sbin/init`). The kernel booted and then panicked with
+"No working init found" — a content problem, not (necessarily) a vhost
+transport problem. The test still passed because it only asserted that the
+`vhost-blk.sock` *file* existed, and a stale socket file outlives the dead
+qemu-storage-daemon (agentpvm's error path calls `os.Exit(1)`, skipping
+defers, so nothing unlinked it).
 
 ### Fix
 
-1. `scripts/build_kernel.sh`: enable `CONFIG_UML_NET_VECTOR` + `CONFIG_TUN`
-   (the host-side tun module). The `CONFIG_UML_NET` / `CONFIG_UML_NET_TUNTAP`
-   lines an earlier attempt added are no-ops (symbols don't exist in 6.18)
-   and have been removed.
-2. `internal/container/manager.go` `buildTaskArgs` + `buildLegacyArgs`:
-   emit `vec0:transport=tap,ifname=<tap>,depth=128,gro=1` instead of
-   `eth0=tuntap,<tap>`. Parameters per
-   `Documentation/virt/uml/user_mode_linux_howto_v2.rst`.
-3. `scripts/test_pkg_install.sh` init.sh: configure `vec0` inside the guest
-   (not `eth0`); the in-guest interface name matches the kernel parameter.
+`tests/04_test_qcow2_mount.sh` rewritten to validate the full chain:
+alpine rootfs + real init → qcow2 base → per-task CoW overlay →
+qemu-storage-daemon (vhost-user-blk) → UML virtio_uml → virtio_blk (/dev/vda)
+→ ext4 root mount → init → vec0 up → gateway ping. Passes only when
+console.log contains `VHOST_COW_SUCCESS` and no `Kernel panic`; on failure it
+dumps the kernel cmdline, virtio init lines, and panic markers.
 
-The vec tap transport requires the host tap to exist and be UP (the caller
-already does `ip tuntap add` + `ip link set up`) and root or CAP_NET_ADMIN
-(PVM runs the sandbox under sudo, so this is satisfied).
+### Remaining
 
-### Re-validate after the kernel rebuild
-
-- Confirm the guest gets a `vec0` interface and can reach the gateway.
-- Re-check whether the qcow2+vhost path (CoW isolation) also works with vec
-  networking. The earlier "virtio_uml block conflicts with eth0=tuntap"
-  theory was never the bug — it was CONFIG_UML_NET_VECTOR missing — so the
-  vhost+vec combination may now Just Work. If so, flip
-  `uml/agentpvm.toml` `use_vhost_blk` back to `true` for CoW by default.
+- ⬜ Confirm the rewritten test 04 is green in CI (proves vhost+vec end-to-end).
+- ⬜ If green: flip `uml/agentpvm.toml` `use_vhost_blk` to `true` so CoW is
+  the default. Check tests/06 expectations when doing so (the smoke test
+  asserts a specific FSM transition count on launch failure, which may shift
+  when the failure point moves from "kernel exec" to "overlay creation").
+- ⬜ Nice-to-have: `agentpvm run`'s error path uses `os.Exit(1)`, which skips
+  defers and can leave the qemu-storage-daemon socket file behind. Consider
+  unlinking `<statedir>/vhost-blk.sock` on teardown so stale files can't fool
+  anyone again.
 
 ### Reference
 
@@ -66,3 +88,5 @@ already does `ip tuntap add` + `ip link set up`) and root or CAP_NET_ADMIN
 - `Documentation/virt/uml/user_mode_linux_howto_v2.rst` — "tap transport":
   `vecX:transport=tap,ifname=tap0,depth=128,gro=1`, "tap0 must already
   exist and UP".
+- `arch/um/os-Linux/util.c` — `os_dump_core()` / `uml_abort()`: why a guest
+  panic surfaces as SIGABRT on the host.
