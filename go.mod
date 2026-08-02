@@ -5,7 +5,6 @@ go 1.22.0
 require (
 	github.com/cilium/ebpf v0.16.0
 	github.com/google/go-containerregistry v0.19.0
-	github.com/iceber/iouring-go v0.0.0-20230403020409-002cfd2e2a90
 	github.com/labstack/echo/v4 v4.13.1
 	github.com/vishvananda/netlink v1.3.1
 	golang.org/x/sys v0.25.0
@@ -39,5 +38,3 @@ require (
 	golang.org/x/time v0.5.0 // indirect
 	gotest.tools/v3 v3.5.2 // indirect
 )
-
-replace github.com/iceber/iouring-go => ./internal/pkg/iouring-go
