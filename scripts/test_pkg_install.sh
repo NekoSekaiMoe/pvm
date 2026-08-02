@@ -93,22 +93,12 @@ sudo chmod +x mnt_pkg/init.sh
 trap - EXIT
 sudo umount mnt_pkg
 
-# The agent path is qcow2-only: it creates a per-task qcow2 CoW overlay on
-# top of the base and serves it via qemu-storage-daemon (vhost-user-blk). The
-# ubd backend cannot read qcow2, so a raw base would panic the guest with
-# "VFS: Unable to mount root fs". Convert the raw ext4 image to qcow2 once,
-# then hand the .qcow2 to agentpvm with vhost enabled.
-if ! command -v qemu-img >/dev/null 2>&1; then
-    echo "FATAL: qemu-img is required to build the qcow2 base image."
-    exit 1
-fi
-BASE_QCOW2="pkg_rootfs.qcow2"
-rm -f "${BASE_QCOW2}"
-qemu-img convert -p -O qcow2 "${IMG_NAME}" "${BASE_QCOW2}" >/dev/null
-if ! command -v qemu-storage-daemon >/dev/null 2>&1; then
-    echo "FATAL: qemu-storage-daemon is required for vhost-user-blk (qcow2 CoW)."
-    exit 1
-fi
+# Block backend: use the ubd path (raw base mounted directly, no qcow2 CoW).
+# This is the verified-working configuration for networking: eth0=tuntap
+# coexists with ubd0 but NOT with virtio_uml block (see the TODO in
+# internal/container/manager.go buildTaskArgs). The vhost path (qcow2 + CoW)
+# is left for a follow-up that moves networking onto vhost-user-net.
+BASE_IMG="${IMG_NAME}"   # raw ext4 image, mounted directly via ubd0
 
 # Setup Host Networking. Do NOT swallow these errors silently: a missing
 # bridge or a tap that never got mastered leaves the guest with no route,
@@ -153,8 +143,8 @@ sudo rm -f "$CONSOLE_LOG"
 # 容器一打出 PKG_INSTALL_SUCCESS 就立即成功退出；agentpvm 提前崩溃也会被
 # 后台等待器感知；超时则由内层 timeout 兜底。
 sudo ./agentpvm run -name pkg-test \
-    -rootfs ${BASE_QCOW2} -kernel ./bin/linux -init /init.sh \
-    -vhost=true -net-tap tap_pkg
+    -rootfs ${BASE_IMG} -kernel ./bin/linux -init /init.sh \
+    -vhost=false -net-tap tap_pkg
 PVM_PID=$!
 
 cleanup() {
@@ -187,3 +177,20 @@ echo "---- agentpvm output (pkg_agentpvm.log) ----"
 cat pkg_agentpvm.log 2>/dev/null || echo "(no pkg_agentpvm.log)"
 echo "---- Pkg Test Console Output ----"
 sudo cat "$CONSOLE_LOG" 2>/dev/null || echo "(no console.log)"
+
+# ---- Result assertion ----
+# The run succeeds ONLY if the guest printed PKG_INSTALL_SUCCESS. Everything
+# else (guest booted but eth0 missing, apk failed, console.log empty, timeout)
+# is a failure. Earlier versions of this script just `cat`-ed the log and
+# exited 0 unconditionally, so a totally broken run (no networking, no apk)
+# reported SUCCESS and CI stayed green. This block makes the outcome explicit
+# and loud.
+echo "============================================================"
+if sudo grep -q "PKG_INSTALL_SUCCESS" "$CONSOLE_LOG" 2>/dev/null; then
+    echo "✅ pkg-test PASS: PKG_INSTALL_SUCCESS observed in console.log"
+    exit 0
+fi
+echo "❌ pkg-test FAIL: PKG_INSTALL_SUCCESS NOT observed in console.log"
+echo "   Failure detail (last markers seen):"
+sudo grep -E "PING |FAILED|Network unreachable|INIT_DONE|PKG_INSTALL_SUCCESS|No such|not found|panic" "$CONSOLE_LOG" 2>/dev/null | tail -20 || echo "   (no console.log at all — agentpvm likely crashed before boot)"
+exit 1

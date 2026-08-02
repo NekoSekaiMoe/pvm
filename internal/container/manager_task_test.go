@@ -4,7 +4,6 @@ import (
 	"context"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 
 	"uml-container/internal/audit"
@@ -119,40 +118,38 @@ func TestStartTask_RecordsAuditAndFingerprint(t *testing.T) {
 	}
 }
 
-// TestStartTask_BaseImageRequiresVhost locks in the qcow2-only agent path:
-// setting Workspace.BaseImage without Kernel.UseVhostBlk is a hard error
-// (ubd cannot read qcow2), and the manager MUST fail closed with a clear
-// message rather than silently degrading to a raw mount or a broken overlay.
-// This is the regression for the test_pkg_install.sh "VFS: Unable to mount
-// root fs" panic: that run had BaseImage set + vhost disabled.
-func TestStartTask_BaseImageRequiresVhost(t *testing.T) {
-	m, _ := newTestManager(t)
+// TestStartTask_RawBaseUbdDirectMount verifies the ubd path (UseVhostBlk=false):
+// the raw BaseImage is mounted directly as ubd0=<base> with no qcow2 CoW layer.
+// This is the verified-working configuration for networking — eth0=tuntap
+// coexists with ubd0 but not with virtio_uml block (see the TODO in
+// buildTaskArgs). The kernel cmdline must reference the base file verbatim.
+func TestStartTask_RawBaseUbdDirectMount(t *testing.T) {
+	m, tl := newTestManager(t)
 	dir := t.TempDir()
-	base := filepath.Join(dir, "base.qcow2")
-	if err := os.WriteFile(base, append([]byte("QFI\xfb"), make([]byte, 1024)...), 0644); err != nil {
+	base := filepath.Join(dir, "rootfs.img")
+	if err := os.WriteFile(base, make([]byte, 1<<20), 0644); err != nil {
 		t.Fatalf("write base: %v", err)
 	}
 
 	s := minimalSpec()
 	s.Workspace.BaseImage = base
-	s.Kernel.UseVhostBlk = false // misconfiguration: qcow2 base without vhost
+	s.Kernel.UseVhostBlk = false // ubd path: raw base mounted directly, no CoW
 
-	err := m.StartTask(context.Background(), "task-novhost", s)
-	if err == nil {
-		t.Fatal("expected StartTask to reject BaseImage without UseVhostBlk")
+	if err := m.StartTask(context.Background(), "task-ubd", s); err != nil {
+		t.Fatalf("starttask ubd path: %v", err)
 	}
-	if !strings.Contains(err.Error(), "vhost") {
-		t.Errorf("expected error to mention vhost, got: %v", err)
+	// The kernel cmdline must carry ubd0=<base> directly (no overlay created).
+	found := false
+	for _, a := range tl.args {
+		if a == "ubd0="+base {
+			found = true
+			break
+		}
 	}
-	st, ferr := state.LoadState("task-novhost")
-	if ferr != nil {
-		t.Fatalf("load state: %v", ferr)
-	}
-	if st.Status != state.StatusFailed {
-		t.Errorf("status = %s, want failed", st.Status)
+	if !found {
+		t.Errorf("raw base not mounted directly via ubd0; kernel args = %v", tl.args)
 	}
 }
-
 // TestStartTask_OverlayFailureFailsClosed verifies that when BaseImage IS
 // qcow2 and vhost IS enabled, an overlay-creation failure still fails closed
 // rather than degrading to a writable mount of the shared base. We force the

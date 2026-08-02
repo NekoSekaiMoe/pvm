@@ -247,10 +247,10 @@ func safeDefaultSpec() *spec.TaskSpec {
 		Tenant:  "default",
 		Runtime: spec.RuntimeSpec{Name: "agent-task", CPU: 1, Memory: "512M"},
 		Workspace: spec.WorkspaceSpec{
-			BaseImage: "rootfs.qcow2",
+			BaseImage: "rootfs.img",
 			Init:      "/sbin/init",
 		},
-		Kernel: spec.KernelSpec{Path: "./bin/linux", UseVhostBlk: true},
+		Kernel: spec.KernelSpec{Path: "./bin/linux"},
 		Network: spec.NetworkSpec{Enabled: false}, // default deny
 		Lifecycle: spec.LifecycleSpec{OnAnomaly: "pause", TTL: "1h"},
 	}

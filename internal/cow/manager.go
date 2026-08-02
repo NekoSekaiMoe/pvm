@@ -5,15 +5,13 @@
 // overlay backed by that base; all writes diverge into the overlay. The base
 // never changes, so cache/share is safe across tenants.
 //
-// This package is qcow2-ONLY, by deliberate choice:
-//   - The sole block backend on the agent path is qemu-storage-daemon via
-//     vhost-user-blk, which reads qcow2. UML's built-in ubd reads raw bytes
-//     and cannot mount a qcow2 image — so a raw backing image is rejected at
-//     CreateOverlay rather than failing later as an opaque guest
-//     "VFS: Unable to mount root fs" panic. Callers with a raw image must
-//     convert it first (`qemu-img convert -O qcow2 raw.img base.qcow2`).
-//   - qemu-storage-daemon already serves qcow2 via vhost-user-blk, so the
-//     overlay plugs straight into the existing storage path.
+// The OVERLAY is always qcow2. The BACKING image may be either raw or qcow2;
+// CreateOverlay sniffs the magic and passes the right -F flag to qemu-img.
+// This matches the two real callers: the vhost path serves the qcow2 overlay
+// via qemu-storage-daemon over vhost-user-blk, while the ubd path mounts the
+// base directly (no overlay). ubd cannot read qcow2, so a qcow2 base on the
+// ubd path panics with "VFS: Unable to mount root fs" — callers that want
+// ubd must hand CreateOverlay a raw base.
 //
 // The previous host-side overlayfs-on-a-directory approach was broken: UML
 // consumes a block device, so a directory rootfs could never be seen by the
@@ -80,11 +78,12 @@ func CreateOverlay(ctx context.Context, baseImage, overlayFile string) error {
 	if _, err := os.Stat(baseImage); err != nil {
 		return fmt.Errorf("cow: backing image not found: %w", err)
 	}
-	// Enforce qcow2 backing by sniffing the magic, not the extension: qemu-img
-	// would otherwise happily accept a raw file with -F qcow2 and produce an
-	// overlay whose backing probe fails (or worse, a garbage mount).
-	if !isQcow2(baseImage) {
-		return fmt.Errorf("cow: backing image %s is not qcow2; convert it with `qemu-img convert -O qcow2` first (raw backing is not supported)", baseImage)
+	// Detect the backing format by sniffing the magic, not the extension, so a
+	// raw ext4 image and a qcow2 image both produce a correct overlay. qemu-img
+	// needs the explicit -F so it doesn't probe untrusted content.
+	backingFormat := "raw"
+	if isQcow2(baseImage) {
+		backingFormat = "qcow2"
 	}
 	if err := os.MkdirAll(filepath.Dir(overlayFile), 0755); err != nil {
 		return fmt.Errorf("cow: create overlay dir: %w", err)
@@ -100,11 +99,12 @@ func CreateOverlay(ctx context.Context, baseImage, overlayFile string) error {
 	}
 
 	// Fixed argument order and "--" so no filename is ever parsed as an option,
-	// even if validatePath were bypassed. Both base and overlay are qcow2.
+	// even if validatePath were bypassed. The overlay is always qcow2; the
+	// backing format (raw or qcow2) was sniffed above.
 	cmd := exec.CommandContext(ctx, "qemu-img",
 		"create", "-f", "qcow2",
 		"-b", baseImage,
-		"-F", "qcow2",
+		"-F", backingFormat,
 		"--",
 		overlayFile,
 	)

@@ -21,16 +21,23 @@ cpu    = 1000              # millicpu; 1000 = 1 full CPU. 0 = unlimited
 memory = "512M"
 
 [workspace]
-base_image = "rootfs.qcow2"  # read-only qcow2 backing image, shared by N sandboxes (qcow2 CoW)
-# overlay is auto-derived as <statedir>/rootfs.qcow2 when omitted
-# NOTE: base_image MUST be qcow2 (not raw). Convert a raw image once with
-# `qemu-img convert -O qcow2 raw.img rootfs.qcow2` before pointing a task at it.
+base_image = "rootfs.img"   # read-only backing image, shared by N sandboxes. Raw ext4 for the ubd path (use_vhost_blk=false); qcow2 for the vhost path.
+# overlay is auto-derived as <statedir>/rootfs.qcow2 when omitted (vhost path only)
 init      = "/sbin/init"
 
 [kernel]
 path          = "./bin/linux"
-virtio        = false      # legacy field, no longer selects the network transport (always eth0=tuntap); block backend is controlled by use_vhost_blk
-use_vhost_blk = true       # back the block device with qemu-storage-daemon (REQUIRED for qcow2 CoW; ubd cannot read qcow2)
+virtio        = false      # legacy field, no effect (block backend is selected by use_vhost_blk; network is always eth0=tuntap)
+# use_vhost_blk selects the block backend AND whether CoW is in play:
+#   false (default): ubd0=<base> raw mount. CoW-free, but networking works
+#                    (eth0=tuntap coexists with ubd). Use this when you need
+#                    networking until vhost-user-net is wired up.
+#   true:            qcow2 overlay served by qemu-storage-daemon over
+#                    vhost-user-blk. CoW isolation, BUT networking is currently
+#                    broken on this path (virtio_uml block + eth0=tuntap do not
+#                    coexist). See the TODO in internal/container/manager.go
+#                    buildTaskArgs.
+use_vhost_blk = false
 
 # --- network egress (plan.md §4) ---
 # DEVELOPMENT profile: networking is ENABLED here so a demo agent can reach

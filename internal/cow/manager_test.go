@@ -105,22 +105,35 @@ func TestCreateOverlay_IdempotentRecreate(t *testing.T) {
 	}
 }
 
-// TestCreateOverlay_RejectsRawBacking locks in the qcow2-only contract: a raw
-// backing image is rejected with a clear error rather than producing an overlay
-// the guest could never mount via vhost-user-blk's qcow2 driver.
-func TestCreateOverlay_RejectsRawBacking(t *testing.T) {
+// TestCreateOverlay_AcceptsRawBacking verifies the ubd-compatible path: a
+// raw ext4 backing image produces a valid qcow2 overlay (qcow2-over-raw).
+// This is what lets the ubd-path base double as a CoW backing image when the
+// caller later switches to vhost, and it matches qemu-img's native -F raw.
+func TestCreateOverlay_AcceptsRawBacking(t *testing.T) {
+	if _, err := exec.LookPath("qemu-img"); err != nil {
+		t.Skip("qemu-img not installed")
+	}
 	dir := t.TempDir()
 	rawBase := filepath.Join(dir, "base.img")
 	if err := os.WriteFile(rawBase, make([]byte, 1<<20), 0644); err != nil {
 		t.Fatalf("write raw base: %v", err)
 	}
 	overlay := filepath.Join(dir, "ov.qcow2")
-	err := CreateOverlay(context.Background(), rawBase, overlay)
-	if err == nil {
-		t.Fatal("expected error for raw backing image")
+	if err := CreateOverlay(context.Background(), rawBase, overlay); err != nil {
+		t.Fatalf("CreateOverlay with raw backing should succeed: %v", err)
 	}
-	if !strings.Contains(err.Error(), "not qcow2") {
-		t.Errorf("expected a 'not qcow2' error, got: %v", err)
+	// The overlay itself must still be qcow2.
+	hdr := make([]byte, 4)
+	f, err := os.Open(overlay)
+	if err != nil {
+		t.Fatalf("open overlay: %v", err)
+	}
+	defer f.Close()
+	if _, err := f.Read(hdr); err != nil {
+		t.Fatalf("read header: %v", err)
+	}
+	if string(hdr) != qcow2Magic {
+		t.Errorf("overlay is not qcow2 (magic=%q)", string(hdr))
 	}
 }
 

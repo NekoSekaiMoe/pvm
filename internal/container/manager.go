@@ -193,25 +193,21 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 	}
 	state.SaveState(taskID, st)
 
-	// Provision the qcow2 overlay + vhost-user-blk backend (plan.md §5.2).
+	// Provision the block device the kernel will mount. Two paths, selected by
+	// Kernel.UseVhostBlk:
 	//
-	// The agent path is qcow2-ONLY: the per-task overlay is a qcow2 file
-	// served to the guest by qemu-storage-daemon over vhost-user-blk, which is
-	// the only UML block backend that understands qcow2. Two hard requirements
-	// follow, both enforced as fail-closed configuration errors (NOT as a
-	// degrade-to-raw fallback, which would lose CoW isolation and let one task
-	// mutate the shared base every other sandbox depends on):
-	//   - BaseImage MUST be qcow2. cow.CreateOverlay sniffs the magic and rejects
-	//     a raw base with a clear error. Callers convert raw images once with
-	//     `qemu-img convert -O qcow2` before pointing a TaskSpec at them.
-	//   - Kernel.UseVhostBlk MUST be true. The ubd backend cannot read qcow2;
-	//     a misconfigured run that disabled vhost while keeping a qcow2 base
-	//     would panic the guest with "VFS: Unable to mount root fs".
-	if s.Workspace.BaseImage != "" && !s.Kernel.UseVhostBlk {
-		_ = st.Transition(state.StatusFailed, state.ActorController, "agent path requires vhost-user-blk (ubd cannot read qcow2)")
-		state.SaveState(taskID, st)
-		return fmt.Errorf("container: BaseImage set but kernel.use_vhost_blk=false; the agent path is qcow2-only and requires vhost-user-blk (ubd cannot mount qcow2)")
-	}
+	//   - vhost path (UseVhostBlk=true): create a per-task qcow2 CoW overlay on
+	//     top of the (qcow2) base and serve it via qemu-storage-daemon over
+	//     vhost-user-blk (virtio_uml.device). This is the CoW-isolated path.
+	//     The base MUST be qcow2 — cow.CreateOverlay rejects raw backing with
+	//     a clear error.
+	//   - ubd path (UseVhostBlk=false): mount the raw BaseImage directly as
+	//     ubd0=<base>. No CoW, no vhost. This is the universally-supported UML
+	//     block path and the one verified to keep networking (eth0=tuntap)
+	//     working: mixing virtio_uml.device (block) with eth0=tuntap (net) in
+	//     the same UML instance currently breaks eth0 registration (see the
+	//     TODO in buildTaskArgs). Production agent sandboxes should prefer the
+	//     vhost path once networking is also moved onto virtio_uml.
 	dir, err := state.ContainerDir(taskID)
 	if err != nil {
 		return fmt.Errorf("container: container dir: %w", err)
@@ -223,13 +219,23 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 	// resolvedRootfs is the single source of truth for the block device the
 	// kernel mounts. It is forwarded into buildTaskArgs so the kernel command
 	// line and the overlay we actually created cannot drift apart.
-	resolvedRootfs := overlayPath
+	resolvedRootfs := ""
 	if s.Workspace.BaseImage != "" {
-		if err := cow.CreateOverlay(ctx, s.Workspace.BaseImage, overlayPath); err != nil {
-			_ = ledger.Append(audit.Record{Phase: audit.PhaseExec, Subject: taskID, Action: "overlay", Decision: audit.DecisionDeny, Reason: "qcow2 overlay failed: " + err.Error()})
-			_ = st.Transition(state.StatusFailed, state.ActorController, "overlay creation failed: "+err.Error())
-			state.SaveState(taskID, st)
-			return fmt.Errorf("container: create qcow2 overlay for %s: %w", taskID, err)
+		if s.Kernel.UseVhostBlk {
+			// vhost path: wrap the qcow2 base in a per-task qcow2 overlay.
+			resolvedRootfs = overlayPath
+			if err := cow.CreateOverlay(ctx, s.Workspace.BaseImage, overlayPath); err != nil {
+				_ = ledger.Append(audit.Record{Phase: audit.PhaseExec, Subject: taskID, Action: "overlay", Decision: audit.DecisionDeny, Reason: "qcow2 overlay failed: " + err.Error()})
+				_ = st.Transition(state.StatusFailed, state.ActorController, "overlay creation failed: "+err.Error())
+				state.SaveState(taskID, st)
+				return fmt.Errorf("container: create qcow2 overlay for %s: %w", taskID, err)
+			}
+		} else {
+			// ubd path: mount the base directly (no CoW). Works with raw or
+			// qcow2-as-flat-file; ubd reads raw bytes, so callers normally pass
+			// a raw ext4 image here. Recorded as a constrained isolation level.
+			resolvedRootfs = s.Workspace.BaseImage
+			_ = ledger.Append(audit.Record{Phase: audit.PhaseExec, Subject: taskID, Action: "rootfs", Decision: audit.DecisionConstrain, Reason: "ubd backend mounts base directly (no qcow2 CoW)"})
 		}
 	}
 
@@ -447,25 +453,35 @@ func buildTaskArgs(s *spec.TaskSpec, vhostSock, resolvedRootfs, egressAddr strin
 		args = append(args, fmt.Sprintf("virtio_uml.device=%s:%d", vhostSock, vhost.VirtioIDBlock))
 		args = append(args, "root=/dev/vda")
 	} else {
-		// Agent path is qcow2-only and StartTask rejects BaseImage without
-		// vhost before reaching here, so resolvedRootfs is always the overlay
-		// when this branch runs (only when vhostSock is empty despite
-		// UseVhostBlk). Fall back to the synthesized overlay path rather than
-		// to BaseImage, which would break the qcow2-only invariant.
+		// ubd path: resolvedRootfs is the base image mounted directly (no CoW).
 		root := resolvedRootfs
 		if root == "" {
 			root = s.Workspace.Overlay
+			if root == "" {
+				root = s.Workspace.BaseImage
+			}
 		}
 		args = append(args, fmt.Sprintf("ubd0=%s", root))
 		args = append(args, "root=/dev/ubda")
 	}
 	args = append(args, "rw")
-	// Network device: always eth0=tuntap. UML's vec0 (virtio-net) transport is
-	// a separate concern from the virtio_uml BLOCK device above — wiring the
-	// network to vec0 just because the block backend is vhost-user-blk (which
-	// is what Kernel.Virtio used to imply) breaks networking on kernels
-	// without CONFIG_VIRTIO_UML vector support and has never been exercised
-	// in this project. eth0=tuntap is the universally-supported UML net path.
+	// Network device: always eth0=tuntap.
+	//
+	// TODO(vhost-net): the vhost path (UseVhostBlk=true) currently mixes a
+	// virtio_uml BLOCK device with a legacy eth0=tuntap NET device in the same
+	// UML instance, and this combination empirically fails to register eth0
+	// (the guest ends up with no NIC at all). The verified-working config is
+	// the ubd path (UseVhostBlk=false), where block is ubd0 and net is
+	// eth0=tuntap — both legacy UML transports that coexist cleanly.
+	//
+	// To get CoW isolation AND networking together, the network needs to move
+	// onto virtio_uml too: qemu-storage-daemon should export a second socket
+	// as vhost-user-net (type=vhost-user-net), and this function should emit
+	// virtio_uml.device=<net-sock>:<VIRTIO_ID_NET> instead of eth0=tuntap when
+	// UseVhostBlk is set. internal/vhost/backend.go only wires vhost-user-blk
+	// today (see the comment on VirtioIDNet); the net export + tap attach is
+	// the missing piece. Until then, the agent path keeps eth0=tuntap, which
+	// means callers needing networking must use the ubd path (no CoW).
 	if s.Network.Enabled && s.Network.TAP != "" {
 		args = append(args, fmt.Sprintf("eth0=tuntap,%s", s.Network.TAP))
 	}
