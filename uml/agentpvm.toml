@@ -21,7 +21,7 @@ cpu    = 1000              # millicpu; 1000 = 1 full CPU. 0 = unlimited
 memory = "512M"
 
 [workspace]
-base_image = "rootfs.img"   # read-only backing image, shared by N sandboxes. Raw ext4 for the ubd path (use_vhost_blk=false); qcow2 for the vhost path.
+base_image = "rootfs.img"   # read-only backing image, shared by N sandboxes. Raw ext4 for the ubd path (use_vhost_blk=false); qcow2 for the vhost path (default).
 # overlay is auto-derived as <statedir>/rootfs.qcow2 when omitted (vhost path only)
 init      = "/sbin/init"
 
@@ -29,14 +29,16 @@ init      = "/sbin/init"
 path          = "./bin/linux"
 virtio        = false      # legacy field, no effect (block backend is selected by use_vhost_blk; network is always vec0 — the only UML net transport in Linux >= 6.16)
 # use_vhost_blk selects the block backend AND whether CoW is in play:
-#   false (default): ubd0=<base> raw mount. CoW-free.
-#   true:            qcow2 overlay served by qemu-storage-daemon over
-#                    vhost-user-blk. CoW isolation.
+#   false:           ubd0=<base> raw mount. CoW-free.
+#   true (default):  qcow2 overlay served by qemu-storage-daemon over
+#                    vhost-user-blk. CoW isolation. Verified end-to-end in CI
+#                    by tests/04_test_qcow2_mount.sh (guest boots from /dev/vda
+#                    with working vec0 networking).
 # Networking uses the vec0 transport (the only UML net transport in
 # Linux >= 6.16; legacy eth0=tuntap was removed). Requires the kernel to be
 # built with CONFIG_UML_NET_VECTOR (see scripts/build_kernel.sh + todo.md);
 # independent of this switch.
-use_vhost_blk = false
+use_vhost_blk = true
 
 # --- network egress (plan.md §4) ---
 # DEVELOPMENT profile: networking is ENABLED here so a demo agent can reach

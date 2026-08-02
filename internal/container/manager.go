@@ -262,6 +262,10 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 			if vhostProc != nil {
 				vhostProc.Kill()
 			}
+			// Unlink the socket file too: a stale vhost-blk.sock outlives the
+			// daemon and once fooled a test into reporting a successful boot
+			// from file existence alone (see todo.md).
+			_ = os.Remove(sockPath)
 		}()
 	}
 

@@ -39,9 +39,8 @@ check; the ping is kept as informational-only.
 
 ## vhost (qcow2 CoW) path: validate vhost+vec, then flip the default
 
-**Status**: root cause of the CI "SIGABRT" identified; test rewritten to
-validate the real boot. Awaiting a green CI run before flipping
-`uml/agentpvm.toml` `use_vhost_blk` to `true`.
+**Status**: root cause of the CI "SIGABRT" identified; test rewritten and
+green in CI; `use_vhost_blk` flipped to `true`. Section kept as a post-mortem.
 
 ### What the "signal: aborted (core dumped)" in test 04 actually was
 
@@ -69,15 +68,14 @@ dumps the kernel cmdline, virtio init lines, and panic markers.
 
 ### Remaining
 
-- ⬜ Confirm the rewritten test 04 is green in CI (proves vhost+vec end-to-end).
-- ⬜ If green: flip `uml/agentpvm.toml` `use_vhost_blk` to `true` so CoW is
-  the default. Check tests/06 expectations when doing so (the smoke test
-  asserts a specific FSM transition count on launch failure, which may shift
-  when the failure point moves from "kernel exec" to "overlay creation").
-- ⬜ Nice-to-have: `agentpvm run`'s error path uses `os.Exit(1)`, which skips
-  defers and can leave the qemu-storage-daemon socket file behind. Consider
-  unlinking `<statedir>/vhost-blk.sock` on teardown so stale files can't fool
-  anyone again.
+- ✅ Rewritten test 04 green in CI (vhost+vec proven end-to-end).
+- ✅ `uml/agentpvm.toml` `use_vhost_blk` flipped to `true` — CoW is now the
+  default. Checked tests/06 first: its FSM-count assertion uses a spec
+  without `base_image` (vhost branch never entered) and only greps
+  "Loaded TaskSpec" for the default-config path, so the flip is safe there.
+- ✅ Stale socket: `Manager.StartTask`'s vhost defer now unlinks
+  `vhost-blk.sock` after killing qemu-storage-daemon, so a leftover socket
+  file can never masquerade as a live boot again.
 
 ### Reference
 
