@@ -20,7 +20,7 @@ for i in {1..10}; do
     sleep 0.5
 done
 
-echo "Sending execution request to E2B API..."
+echo "Sending execution request to E2B API (no task id -> must be rejected)..."
 HTTP_STATUS=$(curl -s -o resp.json -w "%{http_code}" -X POST http://127.0.0.1:8081/api/exec \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer secret" \
@@ -29,8 +29,11 @@ HTTP_STATUS=$(curl -s -o resp.json -w "%{http_code}" -X POST http://127.0.0.1:80
 echo "API Response:"
 cat resp.json
 
-if [ "$HTTP_STATUS" != "501" ]; then
-    echo "❌ E2B API Test Failed: HTTP status $HTTP_STATUS (expected 501)"
+# /exec is now the Tool/Policy Gateway (plan.md §6). Without a task id it must
+# reject with 400 (not the old 501 mock). 403 is also acceptable if a gateway
+# is registered but denies; both indicate the endpoint is live and gating.
+if [ "$HTTP_STATUS" != "400" ] && [ "$HTTP_STATUS" != "403" ]; then
+    echo "❌ E2B API Test Failed: HTTP status $HTTP_STATUS (expected 400 or 403)"
     exit 1
 fi
 

@@ -6,20 +6,31 @@ go_library(
     importpath = "uml-container/internal/container",
     visibility = ["//:__subpackages__"],
     deps = [
+        "//internal/audit",
         "//internal/cgroup",
         "//internal/config",
+        "//internal/cow",
+        "//internal/identity",
         "//internal/log",
+        "//internal/network/egress",
+        "//internal/spec",
         "//internal/state",
         "//internal/uml",
+        "//internal/vhost",
     ],
 )
 
 go_test(
     name = "container_test",
-    srcs = ["manager_test.go"],
+    srcs = [
+        "manager_test.go",
+        "manager_task_test.go",
+    ],
     embed = [":container"],
     deps = [
+        "//internal/audit",
         "//internal/config",
+        "//internal/spec",
         "//internal/state",
         "//internal/uml",
     ],

@@ -79,6 +79,17 @@ sudo chmod +x mnt/init.sh
 trap - EXIT
 sudo umount mnt
 
+# The agent path is qcow2-only (qemu-storage-daemon serves the overlay via
+# vhost-user-blk; ubd cannot read qcow2). Convert the raw ext4 image to qcow2
+# once and pass the .qcow2 as the base image.
+if ! command -v qemu-img >/dev/null 2>&1; then
+    echo "FATAL: qemu-img is required to build the qcow2 base image."
+    exit 1
+fi
+BASE_QCOW2="perf_rootfs.qcow2"
+rm -f "${BASE_QCOW2}"
+qemu-img convert -p -O qcow2 "${IMG_NAME}" "${BASE_QCOW2}" >/dev/null
+
 # run_one <name> <agentpvm_log> <console_log>
 # Runs one UML guest under the qemu-storage-daemon vhost-user-blk backend,
 # bounded by timeout, and returns 0 only if PERF_TEST_COMPLETED appears in
@@ -95,7 +106,7 @@ run_one() {
     # `timeout` bounds the whole run; agentpvm's own exit (poweroff on success
     # or crash on failure) ends it early. -debug yields the full vhost protocol
     # log to the agentpvm log on failure.
-    sudo timeout 120 ./agentpvm run -name "$name" -rootfs "${IMG_NAME}" \
+    sudo timeout 120 ./agentpvm run -name "$name" -rootfs "${BASE_QCOW2}" \
         -kernel ./bin/linux -init /init.sh -vhost=true -debug \
         > "$ap_log" 2>&1 || true
 

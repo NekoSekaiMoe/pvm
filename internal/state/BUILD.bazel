@@ -9,6 +9,9 @@ go_library(
 
 go_test(
     name = "state_test",
-    srcs = ["manager_test.go"],
+    srcs = [
+        "manager_test.go",
+        "fsm_matrix_test.go",
+    ],
     embed = [":state"],
 )

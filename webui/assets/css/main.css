@@ -157,3 +157,166 @@ input {
   font-family: inherit;
 }
 input:focus { border-color: var(--primary); }
+
+/* ============================================================
+   Extensions for the sandbox control console (plan.md §3-§12)
+   ============================================================ */
+
+/* FSM status badges (plan.md §8) — distinct hue per lifecycle phase */
+.badge.pending      { background: rgba(148, 163, 184, 0.2); color: #94a3b8; }
+.badge.provisioning { background: rgba(59, 130, 246, 0.2);  color: #60a5fa; }
+.badge.ready        { background: rgba(14, 165, 233, 0.2);  color: #38bdf8; }
+.badge.running      { background: rgba(16, 185, 129, 0.2);  color: var(--success); }
+.badge.suspended    { background: rgba(168, 85, 247, 0.2);  color: #c084fc; }
+.badge.resuming     { background: rgba(168, 85, 247, 0.2);  color: #c084fc; }
+.badge.review       { background: rgba(245, 158, 11, 0.2);  color: #fbbf24; }
+.badge.completed    { background: rgba(34, 197, 94, 0.2);   color: #4ade80; }
+.badge.failed       { background: rgba(239, 68, 68, 0.2);   color: var(--danger); }
+.badge.quarantined  { background: rgba(220, 38, 38, 0.3);   color: #fca5a5; }
+.badge.destroy      { background: rgba(100, 116, 139, 0.2); color: #94a3b8; }
+.badge.exited       { background: rgba(239, 68, 68, 0.2);   color: var(--danger); }
+.badge.stopped      { background: rgba(239, 68, 68, 0.2);   color: var(--danger); }
+
+/* Action / decision pills for policy + audit */
+.pill {
+  display: inline-block;
+  padding: 0.15rem 0.6rem;
+  border-radius: 999px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+.pill.allow     { background: rgba(16, 185, 129, 0.2); color: var(--success); }
+.pill.constrain { background: rgba(245, 158, 11, 0.2); color: #fbbf24; }
+.pill.approve   { background: rgba(59, 130, 246, 0.2); color: #60a5fa; }
+.pill.deny      { background: rgba(239, 68, 68, 0.2);  color: var(--danger); }
+.pill.block     { background: rgba(239, 68, 68, 0.2);  color: var(--danger); }
+.pill.revoke    { background: rgba(168, 85, 247, 0.2); color: #c084fc; }
+
+/* Audit timeline (plan.md §14) */
+.timeline {
+  position: relative;
+  padding-left: 1.5rem;
+  margin-top: 1rem;
+}
+.timeline::before {
+  content: '';
+  position: absolute;
+  left: 5px;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: var(--glass-border);
+}
+.timeline-item {
+  position: relative;
+  padding: 0.5rem 0 0.5rem 1rem;
+  font-size: 0.9rem;
+}
+.timeline-item::before {
+  content: '';
+  position: absolute;
+  left: -1.05rem;
+  top: 0.85rem;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--primary);
+  border: 2px solid var(--bg-color);
+}
+.timeline-item.tampered::before { background: var(--danger); }
+.timeline-meta {
+  color: var(--text-muted);
+  font-size: 0.75rem;
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
+}
+.timeline-hash {
+  color: var(--text-muted);
+  font-size: 0.7rem;
+  font-family: ui-monospace, monospace;
+  opacity: 0.7;
+}
+
+/* Stat tiles (pool dashboard) */
+.stat-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 1rem;
+  margin-bottom: 1.5rem;
+}
+.stat-tile {
+  background: rgba(0, 0, 0, 0.2);
+  border: 1px solid var(--glass-border);
+  border-radius: 0.75rem;
+  padding: 1rem;
+  text-align: center;
+}
+.stat-value {
+  font-size: 2rem;
+  font-weight: 700;
+  background: linear-gradient(to right, #3b82f6, #10b981);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+.stat-label {
+  color: var(--text-muted);
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin-top: 0.25rem;
+}
+
+/* Monospace blocks (hashes, params) */
+.mono {
+  font-family: 'JetBrains Mono', ui-monospace, 'Cascadia Code', monospace;
+  font-size: 0.85rem;
+  word-break: break-all;
+}
+
+/* Two-column form rows for TOML editors etc. */
+.form-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1rem;
+  margin-bottom: 1rem;
+}
+.form-row.full { grid-template-columns: 1fr; }
+
+textarea {
+  background: rgba(0, 0, 0, 0.3);
+  border: 1px solid var(--glass-border);
+  color: #e2e8f0;
+  padding: 0.75rem;
+  border-radius: 0.5rem;
+  outline: none;
+  font-family: ui-monospace, monospace;
+  font-size: 0.85rem;
+  width: 100%;
+  min-height: 220px;
+  resize: vertical;
+}
+textarea:focus { border-color: var(--primary); }
+
+/* Subtle section header */
+.section-title {
+  font-size: 0.85rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-muted);
+  margin-bottom: 0.75rem;
+}
+
+/* Success/warn/danger callouts */
+.callout {
+  padding: 0.75rem 1rem;
+  border-radius: 0.5rem;
+  margin-bottom: 1rem;
+  font-size: 0.875rem;
+}
+.callout.ok   { background: rgba(16, 185, 129, 0.12); border: 1px solid rgba(16, 185, 129, 0.3); }
+.callout.warn { background: rgba(245, 158, 11, 0.12); border: 1px solid rgba(245, 158, 11, 0.3); }
+.callout.err  { background: rgba(239, 68, 68, 0.12);  border: 1px solid rgba(239, 68, 68, 0.3); }
+
+/* Pagination/loading hint */
+.muted { color: var(--text-muted); }

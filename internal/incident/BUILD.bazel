@@ -1,0 +1,24 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "incident",
+    srcs = ["controller.go"],
+    importpath = "uml-container/internal/incident",
+    visibility = ["//:__subpackages__"],
+    deps = [
+        "//internal/audit",
+        "//internal/identity",
+        "//internal/state",
+    ],
+)
+
+go_test(
+    name = "incident_test",
+    srcs = ["controller_test.go"],
+    embed = [":incident"],
+    deps = [
+        "//internal/audit",
+        "//internal/identity",
+        "//internal/state",
+    ],
+)

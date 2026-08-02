@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"uml-container/internal/policy"
 	"uml-container/internal/state"
 )
 
@@ -80,9 +81,9 @@ func TestServer_AcceptsBearerSecret(t *testing.T) {
 	}
 }
 
-func TestServer_ExecReturns501(t *testing.T) {
-	// /exec is intentionally a mock for E2B SDK compat. tests/01_test_e2b_api.sh
-	// asserts on this 501 as the contract.
+func TestServer_ExecRequiresTaskID(t *testing.T) {
+	// /exec is now the Tool/Policy Gateway endpoint (plan.md §6). Without a
+	// task id it must reject early (400), rather than silently executing.
 	base := bootServer(t)
 	req, _ := http.NewRequest(http.MethodPost, base+"/api/exec", strings.NewReader(`{"cmd":"ls"}`))
 	req.Header.Set("Authorization", "Bearer secret")
@@ -92,8 +93,53 @@ func TestServer_ExecReturns501(t *testing.T) {
 		t.Fatalf("POST: %v", err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusNotImplemented {
-		t.Errorf("expected 501 for /exec, got %d", resp.StatusCode)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("expected 400 (missing task id), got %d", resp.StatusCode)
+	}
+}
+
+func TestServer_ExecNoGatewayReturns403(t *testing.T) {
+	// A task id is supplied but no policy gateway registered for it: must be
+	// 403 (default-deny), never executed.
+	base := bootServer(t)
+	req, _ := http.NewRequest(http.MethodPost, base+"/api/exec?task=ghost", strings.NewReader(`{"cmd":"ls"}`))
+	req.Header.Set("Authorization", "Bearer secret")
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Errorf("expected 403 (no gateway), got %d", resp.StatusCode)
+	}
+}
+
+// TestServer_ExecHitsRegisteredGateway is the regression test for the split
+// registry bug: before the fix, /api/exec read from a LOCAL registry that was
+// never written to by RegisterPolicyGateway, so /api/exec ALWAYS returned 403
+// even when a gateway was registered. Now both share globalRegistries, so a
+// registered gateway must let /api/exec dispatch and return 200.
+func TestServer_ExecHitsRegisteredGateway(t *testing.T) {
+	base := bootServer(t)
+	// Register a gateway that allows a read-only tool.
+	gw := policy.NewGateway([]policy.Rule{
+		{Name: "read_file", Action: policy.ActionAllow},
+	}, nil)
+	RegisterPolicyGateway("tk-exec", gw)
+	t.Cleanup(func() { UnregisterPolicyGateway("tk-exec") })
+
+	req, _ := http.NewRequest(http.MethodPost, base+"/api/exec?task=tk-exec", strings.NewReader(`{"cmd":"read_file"}`))
+	req.Header.Set("Authorization", "Bearer secret")
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200 with a registered gateway, got %d: %s", resp.StatusCode, body)
 	}
 }
 

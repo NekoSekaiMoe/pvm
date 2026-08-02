@@ -4,13 +4,17 @@ Contributor guide for **PVM** (`uml-container`), a User-Mode Linux (UML) contain
 
 ## Project Structure & Module Organization
 
-- `cmd/` — entry points: `umlctl` (container lifecycle CLI: start/image/logs/ps/network), `agentpvm` (advanced/management: run/api/webui/snapshot/cow/cgroup/network).
-- `internal/` — core Go packages: `api/` (E2B-compatible REST server, Echo), `container/`, `uml/` (kernel launcher), `image/`, `filesystem/` (ext4/overlay), `network/` (bridge/TAP/eBPF), `cgroup/`, `cow/`, `snapshot/`, `vhost/`, `state/`, `config/`, `log/`, `daemon/`.
-- `bpf/` — eBPF C sources (e.g. `egress.c`); compiled into `internal/network/` via `bpf2go`.
+- `cmd/` — entry points: `umlctl` (thin UML container launcher: start/image/logs/ps/network; supports `-config` for launch fields only), `agentpvm` (the real agent sandbox: run/api/webui/snapshot/cow/cgroup/network + new gate/approval/pool subcommands).
+- `internal/` — core Go packages:
+  - **Launch & runtime**: `uml/` (kernel launcher), `container/` (`Start` legacy + `StartTask` TaskSpec-driven), `vhost/`, `image/`, `filesystem/`, `cow/` (qcow2 block-level CoW).
+  - **Control plane (plan.md §3-§11)**: `spec/` (TaskSpec + TOML), `state/` (lifecycle FSM), `audit/` (tamper-evident ledger), `identity/` (Credential Broker), `network/egress/` (L7 proxy) + `network/` (bridge/TAP/eBPF), `policy/` (Tool Gateway), `artifact/` (Artifact Gate), `approval/` (human tickets), `incident/` (Incident Controller), `pool/` (Warm Pool + Quota).
+  - `api/` (E2B-compatible REST server, Echo; `/api/exec` is the Tool Gateway), `config/`, `log/`, `cgroup/`, `snapshot/`, `ebpf/`, `pkg/`.
+- `bpf/` — eBPF C sources (`egress.c`: SSRF IP-floor); compiled into `internal/network/` via `bpf2go`.
+- `uml/agentpvm.toml` — default TaskSpec consumed by `agentpvm run` when no `-config` is given.
 - `webui/` — Nuxt 3 frontend, embedded into the Go binary via `webui/embed.go`.
 - `scripts/` — kernel build and integration/perf test shell scripts.
-- `tests/` — numbered end-to-end shell suites (`01_test_e2b_api.sh`, etc.).
-- `*_test.go` — Go unit tests colocated with their packages (e.g. `internal/cgroup/manager_test.go`).
+- `tests/` — numbered end-to-end shell suites (`01_test_e2b_api.sh` … `06_test_cli_smoke.sh`). Suites `05`/`06` are CI-safe (no UML kernel/root needed); `01`–`04` require a real kernel.
+- `*_test.go` — Go unit tests colocated with their packages.
 
 ## Build, Test, and Development Commands
 
@@ -40,7 +44,7 @@ cd webui && npm run generate                   # static-generate WebUI for embed
 ## Testing Guidelines
 
 - Add a `*_test.go` next to the package under test; aim to cover public functions in `internal/`. Use table-driven tests and `t.Run` subtests.
-- End-to-end checks are shell scripts under `tests/` prefixed with a two-digit order id (`NN_test_*.sh`); each must `exit 1` on failure.
+- Cross-plane and adversarial tests live in dedicated packages: `internal/integrationtest/` (spec→task→audit, incident→revoke, pool→quota, policy→approval, artifact gate) and `internal/securitytest/` (ledger tamper, token forge, SSRF, secret leak, quota bypass). Per-plane deepening tests are `*_matrix_test.go` / `*_edge_test.go`.
 - Run the full CI-equivalent set locally: `go generate ./... && go build ./cmd/umlctl && go test -v ./...`.
 
 ## Commit & Pull Request Guidelines

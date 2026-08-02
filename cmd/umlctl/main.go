@@ -13,9 +13,24 @@ import (
 	"uml-container/internal/container"
 	"uml-container/internal/image"
 	"uml-container/internal/network"
+	"uml-container/internal/spec"
 	"uml-container/internal/state"
 	"uml-container/internal/uml"
 )
+
+// idRegex validates task/container ids: ^[-_A-Za-z0-9]+$. Precompiled once
+// at package load and shared by every subcommand. Same shape as the id
+// validators in internal/{api,state,cgroup,snapshot,container}; each package
+// keeps its own precompiled symbol to avoid an import cycle via a shared helper.
+var idRegex = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
+
+// loadLaunchConfig loads a TaskSpec TOML but returns only the launch-relevant
+// subset. umlctl is a thin UML launcher: it deliberately ignores the control
+// planes (identity/egress/tools/approval/artifacts/lifecycle) which belong to
+// agentpvm. Reading the same TOML format keeps the two binaries interoperable.
+func loadLaunchConfig(path string) (*spec.TaskSpec, error) {
+	return spec.LoadFile(path)
+}
 
 func main() {
 	if len(os.Args) < 2 {
@@ -39,10 +54,50 @@ func main() {
 		rm := startCmd.Bool("rm", false, "Remove container and state after exit")
 		it := startCmd.Bool("it", false, "Interactive mode (direct shell login, bypass logs)")
 		volume := startCmd.String("volume", "", "Host directory to mount via hostfs (e.g. /host:/container)")
+		configPath := startCmd.String("config", "", "Load container settings from TOML (overrides the flags below; default: none)")
 
 		startCmd.Parse(os.Args[2:])
 
-		if !regexp.MustCompile(`^[a-zA-Z0-9_-]+$`).MatchString(*name) {
+		// -config optionally overrides the launch-related flags. umlctl is a
+		// THIN launcher: it only consumes the launch fields (kernel/rootfs/
+		// mem/cpu/init/net), never the full TaskSpec control planes — those
+		// are agentpvm's job.
+		if *configPath != "" {
+			if s, err := loadLaunchConfig(*configPath); err == nil {
+				if *name == "default" && s.Runtime.Name != "" {
+					*name = s.Runtime.Name
+				}
+				if s.Kernel.Path != "" {
+					*kernel = s.Kernel.Path
+				}
+				if s.Workspace.BaseImage != "" {
+					*rootfs = s.Workspace.BaseImage
+				}
+				if s.Workspace.Init != "" {
+					*initCmd = s.Workspace.Init
+				}
+				if s.Runtime.Memory != "" {
+					*mem = s.Runtime.Memory
+				}
+				if s.Runtime.CPU > 0 {
+					*cpu = s.Runtime.CPU
+				}
+				if s.Network.TAP != "" {
+					*netTap = s.Network.TAP
+				}
+				// Only FLIP virtio ON from the spec, never off: a zero-value
+				// s.Kernel.Virtio must not silently disable a -virtio the caller
+				// explicitly passed on the command line (consistent with the
+				// "config augments flags" rule used by every other field above).
+				if s.Kernel.Virtio {
+					*virtio = true
+				}
+			} else {
+				fmt.Printf("Warning: -config %s load failed: %v\n", *configPath, err)
+			}
+		}
+
+		if !idRegex.MatchString(*name) {
 			fmt.Println("Error: Invalid container name format")
 			os.Exit(1)
 		}
@@ -178,7 +233,7 @@ func main() {
 			return
 		}
 		id := os.Args[2]
-		if !regexp.MustCompile(`^[a-zA-Z0-9_-]+$`).MatchString(id) {
+		if !idRegex.MatchString(id) {
 			fmt.Printf("Invalid container ID: %s\n", id)
 			return
 		}

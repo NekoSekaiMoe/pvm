@@ -1,7 +1,7 @@
 #!/bin/bash
 set -ex
 
-KERNEL_VERSION="6.6.9"
+KERNEL_VERSION="6.18.36"
 KERNEL_TAR="linux-${KERNEL_VERSION}.tar.xz"
 KERNEL_URL="https://cdn.kernel.org/pub/linux/kernel/v6.x/${KERNEL_TAR}"
 
@@ -53,6 +53,16 @@ make ARCH=um defconfig
 ./scripts/config --enable CONFIG_VIRTIO_BLK
 ./scripts/config --enable CONFIG_VIRTIO_NET
 ./scripts/config --enable CONFIG_VIRTIO_CONSOLE
+
+# UML networking. Since Linux 6.16 (commit e619e18 "um: Remove legacy network
+# transport infrastructure") the ONLY in-tree UML net transport is the vector
+# driver — CONFIG_UML_NET, CONFIG_UML_NET_TUNTAP and the other legacy
+# symbols no longer exist, so 'eth0=tuntap,<tap>' is reported as an unknown
+# command-line parameter and the guest gets no NIC. Enable the vector driver;
+# PVM emits 'vec0:transport=tap,ifname=<tap>,depth=128,gro=1' for it. The
+# generic TUN module is needed on the host side too.
+./scripts/config --enable CONFIG_UML_NET_VECTOR
+./scripts/config --enable CONFIG_TUN
 
 make ARCH=um olddefconfig
 

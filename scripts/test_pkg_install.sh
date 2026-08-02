@@ -21,16 +21,17 @@ sudo mount -o loop ${IMG_NAME} mnt_pkg
 trap 'sudo umount mnt_pkg 2>/dev/null || true' EXIT
 sudo tar -xzf alpine.tar.gz -C mnt_pkg/
 
-# Set up an init script that configures network via eth0 (NAT) and installs python3
+# Set up an init script that configures network via vec0 (NAT) and installs python3
 cat << 'EOF' | sudo tee mnt_pkg/init.sh
 #!/bin/sh
 mount -t proc proc /proc
 mount -t sysfs sys /sys
 # 以读写重挂载，确保能写 resolv.conf / apk 缓存等。
 mount -o remount,rw / 2>/dev/null || true
-# Assuming eth0 is set up by pvm
-ip link set eth0 up || true
-ip addr add 10.0.0.2/24 dev eth0 || true
+# Assuming vec0 is set up by pvm (UML vector transport; legacy eth0=tuntap
+# was removed in Linux 6.16).
+ip link set vec0 up || true
+ip addr add 10.0.0.2/24 dev vec0 || true
 ip route add default via 10.0.0.1 || true
 echo "nameserver 8.8.8.8" > /etc/resolv.conf
 
@@ -59,15 +60,21 @@ echo "Attempting to install fastfetch..."
 busybox true 2>&1
  echo "BUSYBOX_TRUE rc=$?"
 
-# 3.5) 网络诊断：定位 DNS 失败在哪一层
-echo "--- guest net diag ---"
-ip addr show eth0 2>&1 | grep -E 'inet |state'
+# 3.5) 网络诊断：打印未过滤的接口/路由表，定位 "Network unreachable"
+# 到底是 eth0 根本不存在、还是存在但没拿到 IP/路由。之前的 grep 过滤会
+# 吞掉 "Device not found" 这类错误，让诊断尖细号丢失。
+echo "--- guest net diag (full, unfiltered) ---"
+echo "### ip addr show"
+ip addr show 2>&1
+echo "### ip route show"
 ip route show 2>&1
-echo "ping gateway 10.0.0.1:"
+echo "### ip link show vec0"
+ip link show vec0 2>&1 || echo "(vec0 does not exist in the guest)"
+echo "### ping gateway 10.0.0.1"
 ping -c 2 -W 3 10.0.0.1 2>&1 || echo "ping gw FAILED rc=$?"
-echo "nslookup 8.8.8.8 -> dl-cdn.alpinelinux.org:"
+echo "### nslookup dl-cdn.alpinelinux.org 8.8.8.8"
 nslookup dl-cdn.alpinelinux.org 8.8.8.8 2>&1 || echo "nslookup FAILED rc=$?"
-echo "ping 8.8.8.8 (raw IP, no DNS):"
+echo "### ping 8.8.8.8 (raw IP, no DNS)"
 ping -c 2 -W 3 8.8.8.8 2>&1 || echo "ping 8.8.8.8 FAILED rc=$?"
 echo "--- end guest net diag ---"
 
@@ -87,11 +94,35 @@ sudo chmod +x mnt_pkg/init.sh
 trap - EXIT
 sudo umount mnt_pkg
 
-# Setup Host Networking
-sudo ip tuntap add tap_pkg mode tap || true
-sudo ip link set tap_pkg up || true
-sudo ./bin/umlctl network create pvm_br0 || true
-sudo ip link set tap_pkg master pvm_br0 || true
+# Block backend: use the ubd path (raw base mounted directly, no qcow2 CoW).
+# This is the verified-working configuration for networking: vec0 (the only
+# UML net transport left in Linux >= 6.16) over the ubd block backend.
+# coexists with ubd0 but NOT with virtio_uml block (see the TODO in
+# internal/container/manager.go buildTaskArgs). The vhost path (qcow2 + CoW)
+# is left for a follow-up that moves networking onto vhost-user-net.
+BASE_IMG="${IMG_NAME}"   # raw ext4 image, mounted directly via ubd0
+
+# Setup Host Networking. Do NOT swallow these errors silently: a missing
+# bridge or a tap that never got mastered leaves the guest with no route,
+# which presents as a vague "Network unreachable" deep in apk. Each step logs
+# its outcome so a CI failure points at the broken layer.
+echo "===== HOST NETWORK SETUP ====="
+sudo ip tuntap add tap_pkg mode tap 2>&1 || echo "[net] tap_pkg already exists or failed to add"
+sudo ip link set tap_pkg up 2>&1 || echo "[net] WARN: tap_pkg up failed"
+sudo ./bin/umlctl network create pvm_br0 2>&1 || echo "[net] WARN: pvm_br0 create returned non-zero (may already exist)"
+sudo ip link set tap_pkg master pvm_br0 2>&1 || echo "[net] ERROR: could not master tap_pkg onto pvm_br0 (bridge missing?)"
+
+# Fail fast if the bridge or the tap-mastering actually failed: there is no
+# point booting a guest that cannot reach the gateway. These checks turn the
+# silent ||true failures above into an explicit, diagnosable exit.
+if ! sudo ip link show pvm_br0 >/dev/null 2>&1; then
+    echo "[net] FATAL: pvm_br0 does not exist after setup; aborting before guest boot."
+    exit 1
+fi
+if ! sudo bridge link 2>/dev/null | grep -q tap_pkg; then
+    echo "[net] FATAL: tap_pkg is not attached to pvm_br0; guest would have no L2 path. Aborting."
+    exit 1
+fi
 
 # ---- 诊断：dump host 侧网络状态，定位 DNS 失败是 host 还是 guest 侧问题 ----
 echo "===== HOST NETWORK STATE ====="
@@ -114,7 +145,7 @@ sudo rm -f "$CONSOLE_LOG"
 # 容器一打出 PKG_INSTALL_SUCCESS 就立即成功退出；agentpvm 提前崩溃也会被
 # 后台等待器感知；超时则由内层 timeout 兜底。
 sudo ./agentpvm run -name pkg-test \
-    -rootfs ${IMG_NAME} -kernel ./bin/linux -init /init.sh \
+    -rootfs ${BASE_IMG} -kernel ./bin/linux -init /init.sh \
     -vhost=false -net-tap tap_pkg
 PVM_PID=$!
 
@@ -148,3 +179,27 @@ echo "---- agentpvm output (pkg_agentpvm.log) ----"
 cat pkg_agentpvm.log 2>/dev/null || echo "(no pkg_agentpvm.log)"
 echo "---- Pkg Test Console Output ----"
 sudo cat "$CONSOLE_LOG" 2>/dev/null || echo "(no console.log)"
+
+# ---- Result assertion ----
+# The run succeeds ONLY if the guest printed PKG_INSTALL_SUCCESS. Everything
+# else (guest booted but vec0 missing, apk failed, console.log empty, timeout)
+# is a failure. Earlier versions of this script just `cat`-ed the log and
+# exited 0 unconditionally, so a totally broken run (no networking, no apk)
+# reported SUCCESS and CI stayed green. This block makes the outcome explicit
+# and loud.
+echo "============================================================"
+if sudo grep -q "PKG_INSTALL_SUCCESS" "$CONSOLE_LOG" 2>/dev/null; then
+    echo "✅ pkg-test PASS: PKG_INSTALL_SUCCESS observed in console.log"
+    exit 0
+fi
+echo "❌ pkg-test FAIL: PKG_INSTALL_SUCCESS NOT observed in console.log"
+echo ""
+echo "--- DIAG: UML kernel command line (proves which block/net transports were passed) ---"
+sudo grep -E "Kernel command line:" "$CONSOLE_LOG" 2>/dev/null | tail -1 || echo "   (no 'Kernel command line' line — UML did not finish early boot)"
+echo ""
+echo "--- DIAG: UML network driver init (vec/eth registration, or why it failed) ---"
+sudo grep -Ei "eth0|vec[0-9]|netdevice|tun/tap|tuntap|network device|choosing a random ethernet|uml_net|netfront|virtio.*net" "$CONSOLE_LOG" 2>/dev/null | head -20 || echo "   (no UML net-driver lines — kernel may predate net init, or net transport never parsed)"
+echo ""
+echo "--- DIAG: guest-side failure markers ---"
+sudo grep -E "PING |FAILED|Network unreachable|INIT_DONE|PKG_INSTALL_SUCCESS|No such|not found|panic" "$CONSOLE_LOG" 2>/dev/null | tail -20 || echo "   (no console.log at all — agentpvm likely crashed before boot)"
+exit 1

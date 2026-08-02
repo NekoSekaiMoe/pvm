@@ -1,0 +1,118 @@
+# PVM Agent Sandbox — TaskSpec (plan.md §9 control contract)
+#
+# This is the EXAMPLE config consulted by `agentpvm run` when no -config is
+# given. It demonstrates every control plane. Unlike a hardened production
+# baseline, this file is a DEVELOPMENT/DEMO profile: networking is enabled and
+# a broad package-registry allowlist is configured so an agent can fetch deps.
+# `agentpvm run -name <unique-id>` (or an explicit -config) should be used in
+# multi-tenant or production settings; see plan.md §9 for the safe defaults.
+#
+# umlctl also accepts this file via -config but only consumes the launch fields
+# (runtime/workspace/kernel/network tap) — it ignores the control planes.
+
+version = 1
+caller  = "demo-user"      # WHO authorized this task (required; override per invocation)
+tenant  = "default"        # multi-tenant quota scope (override per invocation)
+
+# --- runtime / sandbox shape ---
+[runtime]
+name   = "agent-task"      # also used as the task id; override with -name per invocation
+cpu    = 1000              # millicpu; 1000 = 1 full CPU. 0 = unlimited
+memory = "512M"
+
+[workspace]
+base_image = "rootfs.img"   # read-only backing image, shared by N sandboxes. Raw ext4 for the ubd path (use_vhost_blk=false); qcow2 for the vhost path.
+# overlay is auto-derived as <statedir>/rootfs.qcow2 when omitted (vhost path only)
+init      = "/sbin/init"
+
+[kernel]
+path          = "./bin/linux"
+virtio        = false      # legacy field, no effect (block backend is selected by use_vhost_blk; network is always eth0=tuntap)
+# use_vhost_blk selects the block backend AND whether CoW is in play:
+#   false (default): ubd0=<base> raw mount. CoW-free.
+#   true:            qcow2 overlay served by qemu-storage-daemon over
+#                    vhost-user-blk. CoW isolation.
+# Networking uses the vec0 transport (the only UML net transport in
+# Linux >= 6.16; legacy eth0=tuntap was removed). Requires the kernel to be
+# built with CONFIG_UML_NET_VECTOR (see scripts/build_kernel.sh + todo.md);
+# independent of this switch.
+use_vhost_blk = false
+
+# --- network egress (plan.md §4) ---
+# DEVELOPMENT profile: networking is ENABLED here so a demo agent can reach
+# package registries. The L7 proxy allowlist + eBPF IP floor below still apply.
+# For a network-isolated task, set `enabled = false` (the safeDefaultSpec path).
+[network]
+enabled       = true      # DEVELOPMENT: NIC created; egress still gated below
+bridge        = "br0"
+gateway_ip    = "10.0.0.1/24"
+tap           = ""        # auto-derived from task name when empty
+max_request_body_bytes = 1048576   # 1 MiB upload cap
+qos_rate      = ""        # e.g. "10mbit"
+
+# Domain allowlist enforced by the L7 CONNECT proxy. HTTPS sees the domain via
+# SNI without TLS MITM. Wildcards supported: "*.github.com".
+egress_allow_domains = [
+    "github.com",
+    "*.githubusercontent.com",
+    "registry.npmjs.org",
+    "pypi.org",
+    "files.pythonhosted.org",
+]
+egress_block_domains = [
+    "169.254.169.254",   # cloud metadata (also blocked by eBPF floor)
+]
+
+# --- tool / policy gateway (plan.md §6) ---
+# First match wins; a default-deny catch-all is auto-appended.
+[[tools]]
+name   = "read_file"
+action = "allow"
+effect = "read"
+
+[[tools]]
+name   = "write_file"
+action = "constrain"
+effect = "write"
+reason = "writes allowed only inside the task workspace branch"
+
+[[tools]]
+name   = "send_email"
+action = "approve"        # pauses for a bound human approval ticket
+effect = "send"
+reason = "external side-effect"
+
+[[tools]]
+name   = "deploy"
+action = "deny"
+effect = "prod"
+reason = "production deploy denied by default"
+
+# --- budget (plan.md §9.2) ---
+[budget]
+max_wall_time  = "15m"    # hard wall-clock cap; on expiry FSM -> Destroy
+max_tokens     = 200000   # LLM token cap; 0 = unlimited
+max_network_mb = 512      # egress byte cap; 0 = unlimited
+max_cost_micro_usd = 0   # spend cap; 0 = unlimited
+
+# --- approval boundary (plan.md §10) ---
+[approval]
+required_for = ["send", "delete", "deploy"]  # which actions pause for a human
+notify       = ""        # reserved: webhook/IM endpoint
+timeout      = "5m"      # auto-deny if no decision within this window
+
+# --- artifacts (plan.md §5.3, §7) ---
+[artifacts]
+declared = [
+    "out/diff.patch",
+    "out/build.log",
+]
+require_tests_passed = true
+block_secrets        = true   # gate fails if a declared artifact diff has a secret
+
+# --- lifecycle (plan.md §8, §11) ---
+[lifecycle]
+paused     = false      # start in Suspended (checkpoint-on-start)
+max_retries = 2         # Failed -> Provisioning attempts
+on_anomaly  = "pause"   # "pause" (default) or "terminate"
+ttl         = "1h"      # overall task lifetime

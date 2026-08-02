@@ -5,10 +5,6 @@
 // socket it serves. A native Go vhost-user server previously lived here but
 // was removed — it never reached a working state, and qemu-storage-daemon is
 // the mature reference implementation.
-//
-// VirtioIDNet is still defined so internal/container/manager.go can keep
-// constructing the virtio_uml net command line for future use, even though no
-// vhost-user-net backend is wired up right now.
 package vhost
 
 import (
@@ -26,7 +22,6 @@ import (
 // Virtio device IDs as defined in the kernel's virtio_ids.h. Used by the UML
 // virtio_uml driver command line: virtio_uml.device=<socket>:<virtio_id>.
 const (
-	VirtioIDNet   = 1
 	VirtioIDBlock = 2
 )
 

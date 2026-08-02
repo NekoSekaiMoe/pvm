@@ -1,0 +1,19 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "policy",
+    srcs = ["gateway.go"],
+    importpath = "uml-container/internal/policy",
+    visibility = ["//:__subpackages__"],
+    deps = ["//internal/audit"],
+)
+
+go_test(
+    name = "policy_test",
+    srcs = [
+        "gateway_test.go",
+        "edge_test.go",
+    ],
+    embed = [":policy"],
+    deps = ["//internal/audit"],
+)

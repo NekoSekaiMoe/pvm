@@ -18,7 +18,6 @@ type ContainerConfig struct {
 	// virtio and network options
 	UseVirtio       bool   `json:"use_virtio"`
 	VhostUserSocket string `json:"vhost_user_socket"`
-	VhostNetSocket  string `json:"vhost_net_socket"`
 	NetworkTap      string `json:"network_tap"`
 }
 

@@ -6,10 +6,16 @@ go_library(
     importpath = "uml-container/internal/api",
     visibility = ["//:__subpackages__"],
     deps = [
+        "//internal/approval",
+        "//internal/artifact",
+        "//internal/audit",
         "//internal/config",
         "//internal/container",
         "//internal/image",
+        "//internal/policy",
+        "//internal/pool",
         "//internal/snapshot",
+        "//internal/spec",
         "//internal/state",
         "//webui",
         "@com_github_labstack_echo_v4//:echo",
@@ -19,7 +25,16 @@ go_library(
 
 go_test(
     name = "api_test",
-    srcs = ["e2b_server_test.go"],
+    srcs = [
+        "e2b_server_test.go",
+        "controlplanes_test.go",
+    ],
     embed = [":api"],
-    deps = ["//internal/state"],
+    deps = [
+        "//internal/approval",
+        "//internal/audit",
+        "//internal/policy",
+        "//internal/pool",
+        "//internal/state",
+    ],
 )
