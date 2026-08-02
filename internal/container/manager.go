@@ -465,23 +465,12 @@ func buildTaskArgs(s *spec.TaskSpec, vhostSock, resolvedRootfs, egressAddr strin
 		args = append(args, "root=/dev/ubda")
 	}
 	args = append(args, "rw")
-	// Network device: always eth0=tuntap.
-	//
-	// TODO(vhost-net): the vhost path (UseVhostBlk=true) currently mixes a
-	// virtio_uml BLOCK device with a legacy eth0=tuntap NET device in the same
-	// UML instance, and this combination empirically fails to register eth0
-	// (the guest ends up with no NIC at all). The verified-working config is
-	// the ubd path (UseVhostBlk=false), where block is ubd0 and net is
-	// eth0=tuntap — both legacy UML transports that coexist cleanly.
-	//
-	// To get CoW isolation AND networking together, the network needs to move
-	// onto virtio_uml too: qemu-storage-daemon should export a second socket
-	// as vhost-user-net (type=vhost-user-net), and this function should emit
-	// virtio_uml.device=<net-sock>:<VIRTIO_ID_NET> instead of eth0=tuntap when
-	// UseVhostBlk is set. internal/vhost/backend.go only wires vhost-user-blk
-	// today (see the comment on VirtioIDNet); the net export + tap attach is
-	// the missing piece. Until then, the agent path keeps eth0=tuntap, which
-	// means callers needing networking must use the ubd path (no CoW).
+	// Network device: always eth0=tuntap. This coexists cleanly with the ubd
+	// block backend (UseVhostBlk=false) but NOT with virtio_uml block
+	// (UseVhostBlk=true) — on the vhost path the guest ends up with no NIC.
+	// Moving networking onto vhost-user-net is tracked in todo.md (item:
+	// "vhost-user-net for the agent path"). Callers that need networking must
+	// use the ubd path until then.
 	if s.Network.Enabled && s.Network.TAP != "" {
 		args = append(args, fmt.Sprintf("eth0=tuntap,%s", s.Network.TAP))
 	}
