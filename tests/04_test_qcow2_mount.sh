@@ -41,7 +41,6 @@ TAP="tap_cow"
 BRIDGE="pvm_br_cow"
 MNT="mnt_cow"
 CONSOLE_LOG=/var/lib/uml-container/containers/$NAME/logs/console.log
-SOCK=/var/lib/uml-container/containers/$NAME/vhost-blk.sock
 
 cleanup() {
     # agentpvm and qemu-storage-daemon both carry "test-cow" in their argv
@@ -132,15 +131,12 @@ timeout 180 sudo ./agentpvm run -name "$NAME" \
     -vhost=true -net-tap "$TAP" || true
 
 # ---- 5) Assertions: boot markers in console.log, not file existence ----
+# NOTE: there is deliberately NO vhost-blk.sock existence check here. The
+# socket file means nothing either way: a stale one outlives a crashed boot
+# (false pass), and StartTask now unlinks it on clean teardown (false fail).
+# The only truthful signal is what the guest printed.
 echo "============================================================"
 PASS=1
-
-if [ -S "$SOCK" ]; then
-    echo "✅ qcow2 vhost-user socket generated."
-else
-    echo "❌ qcow2 vhost-user socket missing ($SOCK)."
-    PASS=0
-fi
 
 if sudo grep -q "VHOST_COW_SUCCESS" "$CONSOLE_LOG" 2>/dev/null; then
     echo "✅ Guest booted from vhost-user-blk qcow2 CoW (root=vda) with working vec0."
