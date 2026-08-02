@@ -29,14 +29,12 @@ init      = "/sbin/init"
 path          = "./bin/linux"
 virtio        = false      # legacy field, no effect (block backend is selected by use_vhost_blk; network is always eth0=tuntap)
 # use_vhost_blk selects the block backend AND whether CoW is in play:
-#   false (default): ubd0=<base> raw mount. CoW-free, but networking works
-#                    (eth0=tuntap coexists with ubd). Use this when you need
-#                    networking until vhost-user-net is wired up.
+#   false (default): ubd0=<base> raw mount. CoW-free.
 #   true:            qcow2 overlay served by qemu-storage-daemon over
-#                    vhost-user-blk. CoW isolation, BUT networking is currently
-#                    broken on this path (virtio_uml block + eth0=tuntap do not
-#                    coexist). See the TODO in internal/container/manager.go
-#                    buildTaskArgs.
+#                    vhost-user-blk. CoW isolation.
+# Networking (eth0=tuntap) requires the UML kernel to be built with
+# CONFIG_UML_NET + CONFIG_UML_NET_TUNTAP (see scripts/build_kernel.sh and
+# todo.md); it is independent of this switch.
 use_vhost_blk = false
 
 # --- network egress (plan.md §4) ---

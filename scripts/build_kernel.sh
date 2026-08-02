@@ -54,6 +54,19 @@ make ARCH=um defconfig
 ./scripts/config --enable CONFIG_VIRTIO_NET
 ./scripts/config --enable CONFIG_VIRTIO_CONSOLE
 
+# UML networking transports. Without CONFIG_UML_NET the kernel has no parser
+# for the 'eth<n>=<transport>,...' command-line syntax, so PVM's
+# 'eth0=tuntap,<tap>' is silently dropped as an unknown parameter and the
+# guest boots with no NIC at all (every connection fails with
+# 'Network unreachable'). defconfig does NOT pull these in, so enable them
+# explicitly. TUNTAP is the legacy transport PVM uses today; VECTOR is the
+# newer/faster one we may switch to later. SLIP/ETHERNG/DAEMON/MCAST are kept
+# off (unused, smaller kernel).
+./scripts/config --enable CONFIG_UML_NET
+./scripts/config --enable CONFIG_UML_NET_TUNTAP
+./scripts/config --enable CONFIG_UML_NET_VECTOR
+./scripts/config --enable CONFIG_TUN
+
 make ARCH=um olddefconfig
 
 echo "Building UML Kernel (this will take a while)..."

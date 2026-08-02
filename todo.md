@@ -1,19 +1,13 @@
 # TODO
 
-## Networking on the vhost (qcow2 CoW) path
+## Networking: kernel defconfig missing CONFIG_UML_NET (root cause found)
 
-**Status**: open. Workaround in place (use the ubd path).
-
-The agent path has two block backends, selected by `Kernel.UseVhostBlk`:
-
-| `use_vhost_blk` | Block device            | CoW isolation | Networking            |
-| --------------- | ----------------------- | ------------- | --------------------- |
-| `false` (default) | `ubd0=<raw base>`       | none          | **works** (eth0=tuntap) |
-| `true`           | `virtio_uml.device` + qcow2 overlay via qemu-storage-daemon | yes           | **broken** (no NIC in guest) |
+**Status**: root cause identified; fix is in `scripts/build_kernel.sh` but
+requires a kernel rebuild to take effect.
 
 ### Symptom
 
-On the vhost path the guest boots, mounts root, but has no `eth0`:
+The guest boots, mounts root, but has no `eth0`:
 
 ```
 ### ip link show eth0
@@ -22,53 +16,57 @@ ip: can't find device 'eth0'
 ping: sendto: Network unreachable
 ```
 
-### Root cause (strong hypothesis, not yet confirmed at the source level)
+### Root cause (CONFIRMED, not a hypothesis)
 
-The UML kernel command line on the vhost path carries both
-`virtio_uml.device=<sock>:2` (block, VIRTIO_ID_BLOCK) **and** `eth0=tuntap,<tap>`
-(net). These two transports do not coexist: the guest ends up with the virtio
-block device but no `eth0`. On the ubd path the command line carries `ubd0=...`
-+ `eth0=tuntap,...` — both legacy UML transports — and networking works.
+The UML kernel build drops `eth0=tuntap,tap_pkg` on the floor:
 
-The command line is the only variable that differs between the two paths
-(the network parameter string is byte-identical: `eth0=tuntap,tap_pkg`), so
-the virtio_uml block device is the prime suspect. Confirming this at the
-source level needs the UML boot log (`Kernel command line:` + the
-`Netdevice 0 ... TUN/TAP backend` / `Choosing a random ethernet address for
-device eth0` dmesg lines, or their absence).
+```
+Kernel command line: init=/init.sh ubd0=pkg_rootfs.img root=/dev/ubda rw eth0=tuntap,tap_pkg ...
+Unknown kernel command line parameters "eth0=tuntap,tap_pkg ...", will be passed to user space.
+```
 
-### Workaround
+`scripts/build_kernel.sh` enabled `CONFIG_VIRTIO_NET` (the generic virtio net
+driver) and `CONFIG_NET_NS`, but never enabled the **UML network transport
+layer**:
 
-Callers that need networking in the guest use the ubd path
-(`use_vhost_blk = false`, raw base image). This is the default in
-`uml/agentpvm.toml` and `safeDefaultSpec`, and what
-`scripts/test_pkg_install.sh` exercises. CoW isolation is lost on this path.
+- `CONFIG_UML_NET` — the framework that parses `eth<n>=<transport>,...`
+- `CONFIG_UML_NET_TUNTAP` — the tuntap transport PVM uses
+- `CONFIG_UML_NET_VECTOR` — the newer/faster vec transport
 
-`scripts/test_io_perf.sh` and `tests/04_test_qcow2_mount.sh` use the vhost
-path but do not need in-guest networking (they only download the alpine
-rootfs on the host), so they are unaffected.
+Without `CONFIG_UML_NET` the kernel has no parser for the `eth<n>=` syntax, so
+the parameter is reported as unknown and discarded, and no NIC is ever created.
+`NET: Registered PF_INET / PF_PACKET` in the boot log is just the generic
+Linux networking stack — it is NOT the UML virtual NIC driver. The dmesg shows
+no `Netdevice 0` / `Choosing a random ethernet address` / `TUN/TAP backend`
+lines precisely because the UML net driver was never compiled in.
 
-### Fix direction
+This is independent of the block backend (ubd vs vhost) and independent of
+the backing image format (raw vs qcow2). Earlier theories about
+`virtio_uml.device` conflicting with `eth0=tuntap` were wrong.
 
-Move networking onto `virtio_uml` as well, so block and net share the same
-transport family. Concretely:
+### Fix
 
-1. `internal/vhost/backend.go` currently exports only `vhost-user-blk`. Add a
-   second `--export type=vhost-user-net,...` with its own UNIX socket, and
-   attach the host TAP to it (the daemon has a `--export` for net that takes
-   a tap fd via SCM_RIGHTS). `VirtioIDNet` (= 1) is already defined for this
-   purpose and is currently unused (see its comment).
-2. `internal/container/manager.go buildTaskArgs`: when `UseVhostBlk` is set,
-   emit `virtio_uml.device=<net-sock>:<VIRTIO_ID_NET>` instead of
-   `eth0=tuntap,<tap>`. The net socket path is published by the daemon just
-   like the block socket.
-3. Decide the lifecycle: one net export per task (per-task listener style,
-   mirroring the block export) vs. a shared net export keyed by the X-Task-Id
-   the guest would send. Per-task is the safer attribution model and matches
-   the block path.
-4. Update `uml/agentpvm.toml` default to `use_vhost_blk = true` once the
-   vhost path has working networking, so CoW isolation becomes the default.
+`scripts/build_kernel.sh` now enables:
 
-Reference: UML HowTo — `virtio_uml.device=<socket>:<virtio_id>` syntax, where
-`virtio_id` for net is `1` (`VIRTIO_ID_NET`) and for block is `2`
-(`VIRTIO_ID_BLOCK`); see `arch/um/drivers/virtio_uml.c`.
+```
+CONFIG_UML_NET
+CONFIG_UML_NET_TUNTAP
+CONFIG_UML_NET_VECTOR
+CONFIG_TUN
+```
+
+**Requires rebuilding the kernel** (`scripts/build_kernel.sh`) before the guest
+gets a NIC. No PVM code change needed — `eth0=tuntap,<tap>` is the correct
+parameter syntax and the code already emits it.
+
+### Follow-ups (after the kernel rebuild confirms networking works)
+
+- Revisit whether to switch networking to the vec transport for performance
+  (UML docs say vec with tap does > 8 Gbit/s vs tuntap's much lower ceiling).
+  That would change `buildTaskArgs` to emit `vec0:transport=tap,ifname=...`
+  with the correct parameters (depth=128,gro=1; the old `vnet=1` was wrong).
+- Once networking works on the ubd path, re-evaluate whether the qcow2+vhost
+  path (CoW isolation) also works with networking, or still needs the network
+  moved onto virtio_uml (vhost-user-net export from qemu-storage-daemon).
+  The previous "virtio_uml block conflicts with eth0=tuntap" theory needs
+  re-validation now that we know the kernel was missing UML_NET entirely.

@@ -199,15 +199,12 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 	//   - vhost path (UseVhostBlk=true): create a per-task qcow2 CoW overlay on
 	//     top of the (qcow2) base and serve it via qemu-storage-daemon over
 	//     vhost-user-blk (virtio_uml.device). This is the CoW-isolated path.
-	//     The base MUST be qcow2 — cow.CreateOverlay rejects raw backing with
-	//     a clear error.
-	//   - ubd path (UseVhostBlk=false): mount the raw BaseImage directly as
+	//     The base backing may be raw or qcow2 (sniffed by cow.CreateOverlay).
+	//   - ubd path (UseVhostBlk=false): mount the BaseImage directly as
 	//     ubd0=<base>. No CoW, no vhost. This is the universally-supported UML
-	//     block path and the one verified to keep networking (eth0=tuntap)
-	//     working: mixing virtio_uml.device (block) with eth0=tuntap (net) in
-	//     the same UML instance currently breaks eth0 registration (see the
-	//     TODO in buildTaskArgs). Production agent sandboxes should prefer the
-	//     vhost path once networking is also moved onto virtio_uml.
+	//     block path and the only one that works when the guest's networking
+	//     needs eth0=tuntap, until the kernel is rebuilt with CONFIG_UML_NET
+	//     (see todo.md) and the vhost path's networking is re-verified.
 	dir, err := state.ContainerDir(taskID)
 	if err != nil {
 		return fmt.Errorf("container: container dir: %w", err)
@@ -465,12 +462,12 @@ func buildTaskArgs(s *spec.TaskSpec, vhostSock, resolvedRootfs, egressAddr strin
 		args = append(args, "root=/dev/ubda")
 	}
 	args = append(args, "rw")
-	// Network device: always eth0=tuntap. This coexists cleanly with the ubd
-	// block backend (UseVhostBlk=false) but NOT with virtio_uml block
-	// (UseVhostBlk=true) — on the vhost path the guest ends up with no NIC.
-	// Moving networking onto vhost-user-net is tracked in todo.md (item:
-	// "vhost-user-net for the agent path"). Callers that need networking must
-	// use the ubd path until then.
+	// Network device: eth0=tuntap. NOTE: this only produces a NIC if the UML
+	// kernel was built with CONFIG_UML_NET + CONFIG_UML_NET_TUNTAP (see
+	// scripts/build_kernel.sh and todo.md). Without those, UML reports
+	// 'eth0=tuntap,...' as an unknown command-line parameter and the guest
+	// gets no NIC. The parameter syntax here is correct; the kernel build is
+	// the other half.
 	if s.Network.Enabled && s.Network.TAP != "" {
 		args = append(args, fmt.Sprintf("eth0=tuntap,%s", s.Network.TAP))
 	}
