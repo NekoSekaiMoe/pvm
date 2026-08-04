@@ -14,6 +14,13 @@ var (
 	ipForwardMu       sync.Mutex
 )
 
+// execRun runs an external command. It is a package-level variable so tests
+// can substitute a recording stub and assert on the exact teardown commands
+// DeleteBridge issues (no root/iproute2 required).
+var execRun = func(name string, args ...string) error {
+	return exec.Command(name, args...).Run()
+}
+
 // SetupBridge creates a NAT bridge.
 // 只有在函数返回错误时才回滚已创建的资源；成功路径必须保留 bridge 与
 // ip_forward 状态。早期的 defer 无条件执行 DeleteBridge，会导致成功创建后
@@ -133,17 +140,17 @@ func DeleteBridge(bridgeName string, gatewayIP string) error {
 			subnetCIDR := ipnet.String()
 			// 与 SetupBridge 对称删除：MASQUERADE + FORWARD 入/出规则。
 			// 删除失败不阻断清理（规则可能本来就没加上），使用 -D 静默。
-			exec.Command("iptables", "-t", "nat", "-D", "POSTROUTING", "-s", subnetCIDR, "!", "-o", bridgeName, "-j", "MASQUERADE").Run()
-			exec.Command("iptables", "-D", "FORWARD", "-s", subnetCIDR, "-j", "ACCEPT").Run()
-			exec.Command("iptables", "-D", "FORWARD", "-d", subnetCIDR, "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-j", "ACCEPT").Run()
+			execRun("iptables", "-t", "nat", "-D", "POSTROUTING", "-s", subnetCIDR, "!", "-o", bridgeName, "-j", "MASQUERADE")
+			execRun("iptables", "-D", "FORWARD", "-s", subnetCIDR, "-j", "ACCEPT")
+			execRun("iptables", "-D", "FORWARD", "-d", subnetCIDR, "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-j", "ACCEPT")
 		}
 	}
 
-	exec.Command("ip", "link", "set", bridgeName, "down").Run()
+	execRun("ip", "link", "set", bridgeName, "down")
 	// 仅在网桥确实不存在时忽略错误；权限不足、设备忙、名称错误等其他
 	// 错误必须返回给调用方，否则引用计数和 ip_forward 恢复逻辑会基于
 	// “已删除”的假象继续执行。
-	if err := exec.Command("ip", "link", "delete", bridgeName, "type", "bridge").Run(); err != nil {
+	if err := execRun("ip", "link", "delete", bridgeName, "type", "bridge"); err != nil {
 		if !isDeviceNotExist(err) {
 			return fmt.Errorf("failed to delete bridge %s: %v", bridgeName, err)
 		}
