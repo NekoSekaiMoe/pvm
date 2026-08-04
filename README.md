@@ -12,7 +12,7 @@ PVM is a lightweight, User-Mode Linux (UML)-based container management system. I
 
 ## Dependency
 - x86/x64 device(no limits, arm64 uml is porting)
-- qemu-storage-daemon(for virtio blk)
+- qemu-storage-daemon(for virtio blk) and qemu-img(for qcow2 disk management)
 
 ## Quick Start
 
