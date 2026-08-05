@@ -1,0 +1,27 @@
+name: opencode
+
+on:
+  issue_comment:
+  pull_request_review_comment:
+
+jobs:
+  opencode:
+    if: |
+      contains(github.event.comment.body, '/oc') ||
+      contains(github.event.comment.body, '/opencode')
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+    steps:
+       - name: Checkout repository
+         uses: actions/checkout@v6
+         with:
+           fetch-depth: 1
+           persist-credentials: false
+
+       - name: Run OpenCode
+         uses: anomalyco/opencode/github@latest
+         with:
+           model: opencode-zen/deepseek-v4-flash-free
+          # share: true
+          # github_token: xxxx
