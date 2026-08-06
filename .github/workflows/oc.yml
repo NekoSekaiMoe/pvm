@@ -13,10 +13,11 @@ jobs:
       startsWith(github.event.comment.body, '/opencode')
     runs-on: ubuntu-latest
     permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+      actions: read
       id-token: write
-      contents: read
-      pull-requests: read
-      issues: read
     steps:
        - name: Checkout repository
          uses: actions/checkout@v7
@@ -25,8 +26,10 @@ jobs:
            persist-credentials: false
 
        - name: Run OpenCode
+         env:
+           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
          uses: anomalyco/opencode/github@latest
          with:
            model: opencode-zen/deepseek-v4-flash-free
           # share: true
-          # github_token: xxxx
+           github_token: ${{ secrets.GITHUB_TOKEN }}
