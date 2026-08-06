@@ -33,4 +33,4 @@ jobs:
         with:
           # model: zhipuai-coding-plan/glm-4.7
           # model: minimax-cn/MiniMax-M2.7
-          model: opencode-zen/deepseek-v4-flash-free
+          model: opencode/deepseek-v4-flash-free
