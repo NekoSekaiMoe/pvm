@@ -34,3 +34,4 @@ jobs:
           # model: zhipuai-coding-plan/glm-4.7
           # model: minimax-cn/MiniMax-M2.7
           model: opencode/deepseek-v4-flash-free
+          use-github-token: true
