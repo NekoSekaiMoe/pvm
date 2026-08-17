@@ -125,9 +125,11 @@ type KernelSpec struct {
 	// eth0=tuntap was removed upstream). New code should use UseVhostBlk
 	// directly; this field has no effect on networking.
 	Virtio bool `toml:"virtio"`
-	// UseVhostBlk requires qemu-storage-daemon for the block backend (qcow2
-	// overlay served over vhost-user-blk). The agent path is qcow2-only, so
-	// this MUST be true for `agentpvm run`.
+	// UseVhostBlk serves the block device over vhost-user-blk (qcow2 CoW
+	// overlay). The default backend is the pure-Go server
+	// (internal/vhost/vu); PVM_VHOST_BACKEND=qemu falls back to
+	// qemu-storage-daemon. The agent path is qcow2-only, so this MUST be
+	// true for `agentpvm run`.
 	UseVhostBlk bool `toml:"use_vhost_blk"`
 }
 

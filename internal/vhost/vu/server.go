@@ -232,7 +232,7 @@ func (s *session) handle(m *msg) (bool, error) {
 		}
 		s.vq.enabled = num != 0
 		if s.vq.enabled {
-			s.startPump()
+			s.maybeStartPump()
 		}
 		return false, nil
 
@@ -297,11 +297,19 @@ func (s *session) setVringFile(m *msg, dst **eventfd) error {
 		(*dst).close()
 	}
 	*dst = &eventfd{f: f}
+	if dst == &s.vq.kick {
+		s.maybeStartPump()
+	}
 	return nil
 }
 
-// startPump launches the queue-processing goroutine once kick+call exist.
-func (s *session) startPump() {
+// maybeStartPump launches the queue-processing goroutine once the queue is
+// enabled AND the kick fd exists. Called from both SET_VRING_ENABLE and
+// SET_VRING_KICK so either message order works; pumpOnce dedupes.
+func (s *session) maybeStartPump() {
+	if !s.vq.enabled || s.vq.kick == nil {
+		return
+	}
 	s.pumpOnce.Do(func() {
 		go s.pump()
 	})

@@ -4,9 +4,10 @@ set -eo pipefail
 echo "========== Test 04: qcow2 CoW + vhost-user-blk boot (vec0 networking) =========="
 
 # This test proves the FULL vhost path end-to-end:
-#   qemu-img CoW overlay on a qcow2 base -> qemu-storage-daemon (vhost-user-blk)
-#   -> UML virtio_uml -> virtio_blk (/dev/vda) -> ext4 root mount -> init runs
-#   -> vec0 network up -> gateway reachable.
+#   pure-Go CoW overlay (internal/cow) -> pure-Go vhost-user-blk server
+#   (internal/vhost/vu) -> UML virtio_uml -> virtio_blk (/dev/vda)
+#   -> ext4 root mount -> init runs -> vec0 network up -> gateway reachable.
+# Set PVM_VHOST_BACKEND=qemu to A/B against qemu-storage-daemon.
 #
 # History: the previous version created a 10MB empty ext4 (no /sbin/init) and
 # only asserted that the vhost-blk.sock file existed. The guest kernel actually
@@ -19,15 +20,15 @@ echo "========== Test 04: qcow2 CoW + vhost-user-blk boot (vec0 networking) ====
 go build -o agentpvm cmd/agentpvm/main.go
 go build -o bin/umlctl ./cmd/umlctl
 
-# qemu-img/qemu-storage-daemon are the sole vhost backend; skip gracefully on
-# hosts without them (this suite is CI-gated on ubuntu-latest which has both).
-if ! command -v qemu-img &> /dev/null; then
-    echo "qemu-img not found, skipping qcow2 base creation step."
-    exit 0
-fi
-if ! command -v qemu-storage-daemon &> /dev/null; then
-    echo "qemu-storage-daemon not found, skipping (required for qcow2 vhost)."
-    exit 0
+# The vhost backend is pure Go by default (internal/vhost/vu + internal/cow).
+# qemu-img is only used to build a qcow2 LAYERED base (qcow2-over-qcow2
+# coverage); without it we boot the raw ext4 base directly, which still
+# exercises the full qcow2 overlay + vhost-user path.
+if command -v qemu-img &> /dev/null; then
+    HAVE_QEMU_IMG=1
+else
+    echo "qemu-img not found; will boot the RAW base (qcow2 overlay on raw)."
+    HAVE_QEMU_IMG=0
 fi
 if [ ! -x ./bin/linux ]; then
     echo "./bin/linux (UML kernel) not found, skipping boot test."
@@ -101,9 +102,15 @@ EOF
 sudo chmod +x "$MNT"/init.sh
 sudo umount "$MNT"
 
-# ---- 2) Convert to qcow2; agentpvm builds the per-task CoW overlay on top ----
-echo "Converting raw ext4 base to qcow2..."
-qemu-img convert -p -O qcow2 "$IMG_NAME" "$QCOW_NAME" > /dev/null
+# ---- 2) Base image: qcow2 (layered) when qemu-img is around, raw otherwise.
+# ----    Either way agentpvm builds a per-task pure-Go qcow2 CoW overlay. ----
+if [ "$HAVE_QEMU_IMG" = "1" ]; then
+    echo "Converting raw ext4 base to qcow2..."
+    qemu-img convert -p -O qcow2 "$IMG_NAME" "$QCOW_NAME" > /dev/null
+    BASE="$QCOW_NAME"
+else
+    BASE="$IMG_NAME"
+fi
 
 # ---- 3) Host networking (same proven pattern as scripts/test_pkg_install.sh,
 # ----    distinct names so the two suites never collide) ----
@@ -125,9 +132,9 @@ fi
 # ---- 4) Launch on the vhost path. The guest powers itself off after init;
 # ----    timeout is only a hang guard, the real gate is the console marker. ----
 sudo rm -f "$CONSOLE_LOG"
-echo "Launching agentpvm (qcow2 base -> per-task CoW overlay via qemu-storage-daemon, vec0 net)..."
+echo "Launching agentpvm (base -> per-task pure-Go CoW overlay via internal/vhost/vu, vec0 net)..."
 timeout 180 sudo ./agentpvm run -name "$NAME" \
-    -rootfs "$QCOW_NAME" -kernel ./bin/linux -init /init.sh \
+    -rootfs "$BASE" -kernel ./bin/linux -init /init.sh \
     -vhost=true -net-tap "$TAP" || true
 
 # ---- 5) Assertions: boot markers in console.log, not file existence ----

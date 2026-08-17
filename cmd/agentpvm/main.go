@@ -525,7 +525,7 @@ var (
 	_ = config.ParseMemory
 	_ = strings.TrimSpace
 	_ = exec.Command
-	_ = vhost.StartStorageDaemon
+	_ = vhost.StartBlk
 	_ = policy.NewGateway
 	_ = spec.SpecVersion
 )
