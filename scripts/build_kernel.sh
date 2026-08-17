@@ -42,6 +42,11 @@ make ARCH=um defconfig
 ./scripts/config --enable CONFIG_CGROUPS
 ./scripts/config --enable CONFIG_CGROUP_FREEZER
 ./scripts/config --enable CONFIG_CGROUP_SCHED
+# Memory controller (cgroup v2 memory.max / OOM enforcement in guest) and
+# PIDs controller (pids.max fork-bomb protection). Both default n; enable so
+# TaskSpec resource limits are really enforced inside the UML guest.
+./scripts/config --enable CONFIG_MEMCG
+./scripts/config --enable CONFIG_CGROUP_PIDS
 ./scripts/config --enable CONFIG_DEVTMPFS
 ./scripts/config --enable CONFIG_DEVTMPFS_MOUNT
 ./scripts/config --enable CONFIG_UNIX
