@@ -16,6 +16,7 @@ While unit tests in Go are typically placed alongside the code they test (e.g., 
 | `06_test_cli_smoke.sh` | **no** | CLI wiring: `agentpvm run -config`, default config path, FSM recording on launch failure, audit spec evidence, cow path-injection guard, pool subcommands, `umlctl -config` |
 | `07_test_gate_snapshot_cli.sh` | **no** | `agentpvm gate`: PASS/FAIL verdicts + exit codes, secret scan in diff and in declared files, missing/malformed bundle, audit allow/deny rows; `agentpvm snapshot`: export/import round trip, invalid-id and existing-id rejection |
 | `08_test_approval_pool_cli.sh` | **no** | `agentpvm approval`/`pool` subcommands against a live API: mandatory `API_SECRET`, empty/pending/decided ticket listing, pool stats reflecting REST-driven warm, documented `pool warm` CLI gap |
+| `09_test_cgroup_limits.sh` | **yes** (+ root) | Guest-side cgroup v2 limits inside a real UML boot: `memory`/`pids` controllers present in `/proc/cgroups` (proves `CONFIG_MEMCG`/`CONFIG_CGROUP_PIDS`), `pids.max=8` caps a 32-fork burst at `pids.current<=8`, `memory.max=32M` OOM-kills a 256M tmpfs writer (exit 137) |
 
 Suites `05`–`08` are **CI-safe** (no kernel, no root needed beyond `go build`). They require `curl`, `jq` and a POSIX `base64` on `PATH` (all preinstalled on GitHub `ubuntu-latest` runners; on macOS install jq via `brew install jq`). Run all of them serially:
 
