@@ -3,6 +3,7 @@ package container
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"regexp"
 	"time"
@@ -247,23 +248,23 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 
 	// vhost-user-blk backend over the overlay.
 	var sockPath string
-	var vhostProc *os.Process
+	var vhostBackend io.Closer
 	var egressAddr string // host:port of this task's dedicated egress listener
 	if s.Kernel.UseVhostBlk && s.Workspace.BaseImage != "" {
-		sock, daemonCmd, err := vhost.StartStorageDaemon(taskID, resolvedRootfs)
+		sock, backend, err := vhost.StartBlk(taskID, resolvedRootfs)
 		if err != nil {
 			_ = st.Transition(state.StatusFailed, state.ActorController, "vhost daemon failed: "+err.Error())
 			state.SaveState(taskID, st)
 			return fmt.Errorf("container: vhost: %w", err)
 		}
 		sockPath = sock
-		vhostProc = daemonCmd.Process
+		vhostBackend = backend
 		defer func() {
-			if vhostProc != nil {
-				vhostProc.Kill()
+			if vhostBackend != nil {
+				vhostBackend.Close()
 			}
 			// Unlink the socket file too: a stale vhost-blk.sock outlives the
-			// daemon and once fooled a test into reporting a successful boot
+			// backend and once fooled a test into reporting a successful boot
 			// from file existence alone (see todo.md).
 			_ = os.Remove(sockPath)
 		}()
