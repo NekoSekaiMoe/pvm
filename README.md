@@ -12,7 +12,7 @@ PVM is a lightweight, User-Mode Linux (UML)-based container management system. I
 
 ## Dependency
 - x86/x64 device(no limits, arm64 uml is porting)
-- qemu-storage-daemon(for virtio blk) and qemu-img(for qcow2 disk management)
+- qemu-storage-daemon (for virtio blk); qcow2 overlay create/convert is pure Go (`internal/cow`), no qemu-img needed at runtime
 
 ## Quick Start
 
@@ -115,7 +115,7 @@ layer.
 | **Cheap cold start** | An overlay is created in milliseconds and starts ~96 KB; no full-base copy. |
 | **Shared host cache** | N sandboxes share one base.qcow2, so the host page cache holds it once. |
 | **Guest is unmodified** | qcow2 parsing lives in the host daemon; the guest mounts a normal block device with any filesystem. |
-| **Auditable teardown** | Deleting the overlay returns a known-good empty state; `agentpvm cow` / `qemu-img convert` can merge an overlay into a standalone artifact. |
+| **Auditable teardown** | Deleting the overlay returns a known-good empty state; `agentpvm cow` merges an overlay into a standalone artifact (pure-Go qcow2 convert). |
 
 ### Two launch paths
 

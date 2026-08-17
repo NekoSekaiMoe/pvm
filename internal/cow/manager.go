@@ -6,12 +6,15 @@
 // never changes, so cache/share is safe across tenants.
 //
 // The OVERLAY is always qcow2. The BACKING image may be either raw or qcow2;
-// CreateOverlay sniffs the magic and passes the right -F flag to qemu-img.
+// CreateOverlay sniffs the magic and records the right backing format.
 // This matches the two real callers: the vhost path serves the qcow2 overlay
 // via qemu-storage-daemon over vhost-user-blk, while the ubd path mounts the
 // base directly (no overlay). ubd cannot read qcow2, so a qcow2 base on the
 // ubd path panics with "VFS: Unable to mount root fs" — callers that want
 // ubd must hand CreateOverlay a raw base.
+//
+// qcow2 create/convert are implemented in pure Go (qcow2.go); no qemu-img
+// binary is required at runtime.
 //
 // The previous host-side overlayfs-on-a-directory approach was broken: UML
 // consumes a block device, so a directory rootfs could never be seen by the
@@ -23,49 +26,46 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
-	"time"
 )
 
 // qcow2Magic is the first 4 bytes of every qcow2 image ("QFI\xfb").
 const qcow2Magic = "QFI\xfb"
 
 // CreateOverlay creates a qcow2 overlay backed by baseImage. The base is
-// treated as read-only by qemu; only overlayFile receives writes.
+// treated as read-only; only overlayFile receives writes.
 //
-// The backing image MUST itself be qcow2 (see the package doc for why raw is
-// not supported). CreateOverlay sniffs the backing magic and rejects a
-// non-qcow2 base with a clear error.
+// The backing image may be raw or qcow2; CreateOverlay sniffs the backing
+// magic (not the extension) and records the format in the overlay header, so
+// consumers never probe untrusted backing content.
 //
-// The ctx bounds how long the synchronous qemu-img invocation may run; a
-// hung backing store cannot block the caller indefinitely. A nil ctx is
-// treated as context.Background().
+// The ctx bounds the (fast, metadata-only) creation; a nil ctx is treated as
+// context.Background().
 func CreateOverlay(ctx context.Context, baseImage, overlayFile string) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	ctx, cancel := context.WithTimeout(ctx, qemuTimeout)
-	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if baseImage == "" || overlayFile == "" {
 		return errors.New("cow: base and overlay paths required")
 	}
 	// Validate BOTH paths before touching the filesystem. validatePath is the
-	// only guard against qemu-img option/protocol injection (commas, leading
-	// '-', and remote-image specifiers like json:/nbd://), so it must run on
-	// baseImage and overlayFile before os.Stat / os.MkdirAll / qemu-img.
+	// guard against option/protocol injection patterns (commas, leading '-',
+	// remote-image specifiers like json:/nbd://) that qcow2-capable consumers
+	// might otherwise interpret.
 	if err := validatePath(baseImage); err != nil {
 		return err
 	}
 	if err := validatePath(overlayFile); err != nil {
 		return err
 	}
-	// Resolve both paths to ABSOLUTE before handing them to qemu-img. qemu-img
-	// resolves a relative backing file (-b) against the OVERLAY's directory,
-	// not the caller's CWD — so a relative base that os.Stat happily finds in
-	// the agentpvm CWD would make qemu-img look for <statedir>/<task>/<base>
-	// and fail. Absolutizing here makes the backing path unambiguous.
+	// Resolve both paths to ABSOLUTE before recording the backing reference.
+	// qcow2 consumers resolve a relative backing name against the OVERLAY's
+	// directory, not the caller's CWD — storing an absolute path makes the
+	// reference unambiguous regardless of who opens the overlay from where.
 	absBase, err := filepath.Abs(baseImage)
 	if err != nil {
 		return fmt.Errorf("cow: resolve backing path: %w", err)
@@ -77,13 +77,6 @@ func CreateOverlay(ctx context.Context, baseImage, overlayFile string) error {
 	baseImage, overlayFile = absBase, absOverlay
 	if _, err := os.Stat(baseImage); err != nil {
 		return fmt.Errorf("cow: backing image not found: %w", err)
-	}
-	// Detect the backing format by sniffing the magic, not the extension, so a
-	// raw ext4 image and a qcow2 image both produce a correct overlay. qemu-img
-	// needs the explicit -F so it doesn't probe untrusted content.
-	backingFormat := "raw"
-	if isQcow2(baseImage) {
-		backingFormat = "qcow2"
 	}
 	if err := os.MkdirAll(filepath.Dir(overlayFile), 0755); err != nil {
 		return fmt.Errorf("cow: create overlay dir: %w", err)
@@ -98,20 +91,19 @@ func CreateOverlay(ctx context.Context, baseImage, overlayFile string) error {
 		}
 	}
 
-	// Fixed argument order and "--" so no filename is ever parsed as an option,
-	// even if validatePath were bypassed. The overlay is always qcow2; the
-	// backing format (raw or qcow2) was sniffed above.
-	cmd := exec.CommandContext(ctx, "qemu-img",
-		"create", "-f", "qcow2",
-		"-b", baseImage,
-		"-F", backingFormat,
-		"--",
-		overlayFile,
-	)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("cow: qemu-img create failed: %w: %s", err, string(out))
+	// Sniff the backing format by magic and derive the virtual size from the
+	// base: header field for qcow2, file size for raw.
+	backing, err := openGuestImage(baseImage)
+	if err != nil {
+		return fmt.Errorf("cow: open backing image: %w", err)
 	}
-	return nil
+	virtualSize := backing.Size()
+	backing.Close()
+	backingFormat := "raw"
+	if isQcow2(baseImage) {
+		backingFormat = "qcow2"
+	}
+	return createQcow2(overlayFile, virtualSize, baseImage, backingFormat)
 }
 
 // isQcow2 reports whether path begins with the qcow2 magic ("QFI\xfb"). A
@@ -130,25 +122,21 @@ func isQcow2(path string) bool {
 	return string(hdr[:]) == qcow2Magic
 }
 
-// CommitOverlay merges an overlay back into a new full image (leaving the
-// original base untouched). Used when a task's output should be captured as a
-// standalone artifact (plan.md §5.3 Artifact = declared output only).
+// CommitOverlay merges an overlay back into a new full raw image (leaving
+// the original base untouched). Used when a task's output should be captured
+// as a standalone artifact (plan.md §5.3 Artifact = declared output only).
 func CommitOverlay(ctx context.Context, overlayFile, destImage string) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	ctx, cancel := context.WithTimeout(ctx, qemuTimeout)
-	defer cancel()
 	if err := validatePath(overlayFile); err != nil {
 		return err
 	}
 	if err := validatePath(destImage); err != nil {
 		return err
 	}
-	// Absolutize for consistency with CreateOverlay: qemu-img resolves paths
-	// relative to its own CWD, and a relative destImage passed to MkdirAll
-	// would create dirs under the caller CWD rather than where the caller
-	// intended when CWD changed between validation and exec.
+	// Absolutize for consistency with CreateOverlay: relative paths would
+	// resolve against the (possibly changed) caller CWD at MkdirAll time.
 	if abs, err := filepath.Abs(overlayFile); err == nil {
 		overlayFile = abs
 	}
@@ -158,23 +146,15 @@ func CommitOverlay(ctx context.Context, overlayFile, destImage string) error {
 	if err := os.MkdirAll(filepath.Dir(destImage), 0755); err != nil {
 		return err
 	}
-	cmd := exec.CommandContext(ctx, "qemu-img", "convert", "-O", "raw", "--", overlayFile, destImage)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("cow: convert failed: %w: %s", err, string(out))
-	}
-	return nil
+	return convertToRaw(ctx, overlayFile, destImage)
 }
 
-// qemuTimeout bounds every qemu-img invocation so a hung backing store can't
-// block the task startup path indefinitely.
-var qemuTimeout = 2 * time.Minute
-
 // validatePath rejects empty, comma-bearing, NUL-bearing and option/protocol
-// injection patterns. Commas delimit qemu-img options; a leading '-' would let
-// a filename pose as a flag; and qemu-img interprets several prefixes (json:,
-// nbd://, http://, ...) as remote/spec image sources rather than local files —
-// we refuse any of those so an untrusted path can never be parsed as a remote
-// backing image.
+// injection patterns. Commas delimit image-option syntax for qcow2-aware
+// consumers; a leading '-' would let a filename pose as a flag; and remote
+// prefixes (json:, nbd://, ...) name remote/synthetic image sources rather
+// than local files — we refuse any of those so an untrusted path can never
+// be parsed as a remote backing image.
 func validatePath(p string) error {
 	if p == "" {
 		return errors.New("cow: empty path")
