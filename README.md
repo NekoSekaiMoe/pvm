@@ -28,7 +28,7 @@ go build ./cmd/umlctl
 
 # Start an agent sandbox (agentpvm: qcow2 base + per-task CoW overlay + vhost)
 qemu-img convert -O qcow2 alpine.img alpine.qcow2
-./agentpvm run -name my-agent -rootfs alpine.qcow2 -vhost=true
+./agentpvm run -name my-agent -rootfs alpine.qcow2
 ```
 
 ## Storage & Overlay Architecture
@@ -82,10 +82,11 @@ layer.
      --export   type=vhost-user-blk,...,addr.path=vhost-blk.sock,writable=on
    ```
 
-   This is why `agentpvm run` requires `-vhost=true` (and qemu-storage-daemon
-   installed): UML's built-in `ubd0=` backend reads raw bytes and cannot parse
-   qcow2, so feeding it a qcow2 file would panic the guest with
-   `VFS: Unable to mount root fs`.
+   This is why `agentpvm run` always uses the vhost-user-blk path with a
+   per-task qcow2 CoW overlay (no flag to turn it off): UML's built-in
+   `ubd0=` backend reads raw bytes and cannot parse qcow2, so feeding it a
+   qcow2 file would panic the guest with `VFS: Unable to mount root fs`.
+   For raw images without CoW needs, use the `umlctl` thin launcher.
 
 3. **Guest — virtio_uml mounts the block device** (`internal/container`)
 
