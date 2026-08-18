@@ -139,6 +139,18 @@ func runCmd(args []string) {
 	}
 
 	// Apply CLI launch overrides (flag > config > default).
+	// Boolean flags need explicit-set detection: -vhost=false must be able
+	// to turn OFF a config-provided use_vhost_blk=true, so only apply the
+	// override when the flag was actually given on the command line.
+	vhostGiven, netGiven := false, false
+	fs.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "vhost":
+			vhostGiven = true
+		case "net":
+			netGiven = true
+		}
+	})
 	if *rootfs != "" {
 		s.Workspace.BaseImage = *rootfs
 	}
@@ -148,8 +160,9 @@ func runCmd(args []string) {
 	if *initCmd != "" {
 		s.Workspace.Init = *initCmd
 	}
-	if *vhost {
-		s.Kernel.UseVhostBlk = true
+	if vhostGiven {
+		// Explicit -vhost=true/false beats the config file.
+		s.Kernel.UseVhostBlk = *vhost
 		// NOTE: do NOT set s.Kernel.Virtio here. Virtio used to be a single
 		// switch that wired BOTH the block device (virtio_uml/vhost-user-blk)
 		// AND the network device. The two are independent: buildTaskArgs now
@@ -159,8 +172,8 @@ func runCmd(args []string) {
 		// backend). Setting Virtio=true here would be a no-op now, but we
 		// leave the field alone to avoid muddying the spec semantics.
 	}
-	if *netEnabled {
-		s.Network.Enabled = true
+	if netGiven {
+		s.Network.Enabled = *netEnabled
 	}
 	if *netTap != "" {
 		s.Network.Enabled = true // a TAP name implies the caller wants networking
