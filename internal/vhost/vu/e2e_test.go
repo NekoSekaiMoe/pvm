@@ -83,6 +83,25 @@ func (f *e2eFrontend) sendMsg(req uint32, payload []byte, fds ...int) {
 	}
 }
 
+// sendMsgAck mimics the kernel's vhost_user_send once REPLY_ACK is
+// negotiated: NEED_REPLY is set and a u64 status reply is read back. The
+// reply flags must be exactly REPLY|VERSION — virtio_uml's
+// vhost_user_recv_resp rejects anything else with -EPROTO (this is what
+// used to fail the real kernel's device probe with error -71).
+func (f *e2eFrontend) sendMsgAck(req uint32, payload []byte, fds ...int) {
+	f.t.Helper()
+	if err := f.cc.send(req, 1|flagNeedReply, payload, fds...); err != nil {
+		f.t.Fatalf("send req %d: %v", req, err)
+	}
+	m := f.recvMsg()
+	if m.flags != 1|flagReply {
+		f.t.Fatalf("req %d ack flags = %#x, want REPLY|VERSION", req, m.flags)
+	}
+	if v := m.u64(); v != 0 {
+		f.t.Fatalf("req %d ack status = %d, want 0", req, v)
+	}
+}
+
 func (f *e2eFrontend) recvMsg() *msg {
 	f.t.Helper()
 	m, err := f.cc.recv()
@@ -108,13 +127,15 @@ func (f *e2eFrontend) handshake() uint64 {
 	if proto&(1<<protoFConfig) == 0 {
 		f.t.Fatalf("backend does not offer PROTOCOL_F_CONFIG (virtio_uml needs GET_CONFIG)")
 	}
-	// Negotiate the intersection, like the kernel does.
+	// Negotiate the intersection, like the kernel does. REPLY_ACK is part
+	// of it, so from here on every fire-and-forget message carries
+	// NEED_REPLY and waits for an ACK — exactly like the real kernel.
 	var p [8]byte
 	binary.LittleEndian.PutUint64(p[:], proto)
-	f.sendMsg(reqSetProtocolFeatures, p[:])
+	f.sendMsgAck(reqSetProtocolFeatures, p[:])
 	// Device features: accept all offered.
 	binary.LittleEndian.PutUint64(p[:], features)
-	f.sendMsg(reqSetFeatures, p[:])
+	f.sendMsgAck(reqSetFeatures, p[:])
 	return features
 }
 
@@ -142,24 +163,24 @@ func (f *e2eFrontend) setupVring() {
 	binary.Write(&p, binary.LittleEndian, uint64(e2eMemSize))
 	binary.Write(&p, binary.LittleEndian, uint64(0x1000)) // user_addr
 	binary.Write(&p, binary.LittleEndian, uint64(0))      // mmap_offset
-	f.sendMsg(reqSetMemTable, p.Bytes(), f.mfd)
+	f.sendMsgAck(reqSetMemTable, p.Bytes(), f.mfd)
 
 	// gpa base for vring addrs
 	base := uint64(0x1000)
 	var s [8]byte
 	binary.LittleEndian.PutUint32(s[0:], 0)     // index
 	binary.LittleEndian.PutUint32(s[4:], f.num) // num
-	f.sendMsg(reqSetVringNum, s[:])
+	f.sendMsgAck(reqSetVringNum, s[:])
 
 	a := make([]byte, 40)
 	binary.LittleEndian.PutUint32(a[0:], 0)
 	binary.LittleEndian.PutUint64(a[8:], base+f.descAddr)
 	binary.LittleEndian.PutUint64(a[16:], base+f.usedAddr)
 	binary.LittleEndian.PutUint64(a[24:], base+f.availAddr)
-	f.sendMsg(reqSetVringAddr, a)
+	f.sendMsgAck(reqSetVringAddr, a)
 
 	binary.LittleEndian.PutUint32(s[4:], 0) // base
-	f.sendMsg(reqSetVringBase, s[:])
+	f.sendMsgAck(reqSetVringBase, s[:])
 
 	kickFd, err := unix.Eventfd(0, 0)
 	if err != nil {
@@ -173,11 +194,11 @@ func (f *e2eFrontend) setupVring() {
 	f.kickFd, f.callFd = kickFd, callFd
 	var i [8]byte
 	binary.LittleEndian.PutUint64(i[:], 0) // index 0, fd follows
-	f.sendMsg(reqSetVringCall, i[:], f.callFd)
-	f.sendMsg(reqSetVringKick, i[:], f.kickFd)
+	f.sendMsgAck(reqSetVringCall, i[:], f.callFd)
+	f.sendMsgAck(reqSetVringKick, i[:], f.kickFd)
 
 	binary.LittleEndian.PutUint32(s[4:], 1) // enable
-	f.sendMsg(reqSetVringEnable, s[:])
+	f.sendMsgAck(reqSetVringEnable, s[:])
 }
 
 // submit queues one descriptor chain (head = desc 0) as round `round`

@@ -145,6 +145,49 @@ func TestVringPopIndirect(t *testing.T) {
 }
 
 // TestVringPushNotify: used ring update + interrupt unless masked.
+// TestReplyClearsNeedReply is a regression test for the virtio_uml probe
+// failure (error -71): once REPLY_ACK is negotiated the kernel sends every
+// fire-and-forget message with NEED_REPLY and rejects any reply whose flags
+// are not exactly REPLY|VERSION. Echoing NEED_REPLY back breaks the probe.
+func TestReplyClearsNeedReply(t *testing.T) {
+	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
+	if err != nil {
+		t.Fatalf("socketpair: %v", err)
+	}
+	defer unix.Close(fds[0])
+	defer unix.Close(fds[1])
+	toConn := func(fd int) *conn {
+		f := os.NewFile(uintptr(fd), "sock")
+		defer f.Close()
+		uc, err := net.FileConn(f)
+		if err != nil {
+			t.Fatalf("FileConn: %v", err)
+		}
+		return newConn(uc.(*net.UnixConn))
+	}
+	server, client := toConn(fds[0]), toConn(fds[1])
+
+	// Frontend sends a NEED_REPLY request, backend ACKs it.
+	if err := client.send(reqSetVringEnable, 1|flagNeedReply, make([]byte, 8)); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	m, err := server.recv()
+	if err != nil {
+		t.Fatalf("recv: %v", err)
+	}
+	if err := server.ack(m); err != nil {
+		t.Fatalf("ack: %v", err)
+	}
+	resp, err := client.recv()
+	if err != nil {
+		t.Fatalf("recv resp: %v", err)
+	}
+	const want = 1 | flagReply // REPLY|VERSION, NEED_REPLY cleared
+	if resp.flags != want {
+		t.Fatalf("reply flags = %#x, want %#x", resp.flags, want)
+	}
+}
+
 func TestVringPushNotify(t *testing.T) {
 	g := newFakeGuest(1<<20, 8)
 	callFd, err := unix.Eventfd(0, unix.EFD_NONBLOCK)

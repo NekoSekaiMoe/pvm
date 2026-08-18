@@ -219,8 +219,11 @@ func (c *conn) recv() (m *msg, err error) {
 }
 
 // reply sends a response to m with the given payload and optional fds.
+// NEED_REPLY must be cleared: the UML kernel's vhost_user_recv_resp rejects
+// any reply whose flags aren't exactly REPLY|VERSION with -EPROTO, which
+// fails virtio_uml device probe (error -71). qemu does the same clearing.
 func (c *conn) reply(m *msg, payload []byte, fds ...int) error {
-	return c.send(m.request, m.flags|flagReply, payload, fds...)
+	return c.send(m.request, (m.flags|flagReply)&^flagNeedReply, payload, fds...)
 }
 
 // ack replies to a NEED_REPLY message with a u64 zero ("success").
