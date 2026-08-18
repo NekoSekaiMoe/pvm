@@ -12,8 +12,9 @@ if [ ! -f "bin/linux" ]; then
     exit 1
 fi
 
-# Block backend: qemu-storage-daemon is the sole vhost-user-blk backend
-# (the experimental native Go backend was removed). The daemon is required.
+# Block backend under test: qemu-storage-daemon (the optional fallback
+# selected by PVM_VHOST_BACKEND=qemu; the default backend is the pure-Go
+# server in internal/vhost/vu, covered by tests/04). The daemon is required.
 
 if qemu-img --help | grep -q "io_uring"; then
     echo "AIO Backend: io_uring supported and will be used by qemu-storage-daemon where applicable."
@@ -105,9 +106,10 @@ run_one() {
 
     # `timeout` bounds the whole run; agentpvm's own exit (poweroff on success
     # or crash on failure) ends it early. -debug yields the full vhost protocol
-    # log to the agentpvm log on failure.
-    sudo timeout 120 ./agentpvm run -name "$name" -rootfs "${BASE_QCOW2}" \
-        -kernel ./bin/linux -init /init.sh -vhost=true -debug \
+    # log to the agentpvm log on failure. PVM_VHOST_BACKEND=qemu selects the
+    # qemu-storage-daemon backend explicitly (the default is the Go server).
+    sudo PVM_VHOST_BACKEND=qemu timeout 120 ./agentpvm run -name "$name" -rootfs "${BASE_QCOW2}" \
+        -kernel ./bin/linux -init /init.sh -debug \
         > "$ap_log" 2>&1 || true
 
     # Ensure no lingering UML process keeps the socket/logs open for the next run.
@@ -125,8 +127,9 @@ run_one() {
     return 1
 }
 
-# qemu-storage-daemon is the sole vhost-user-blk backend (the experimental
-# native Go backend was removed). Skip cleanly if the daemon is not installed.
+# This suite targets the qemu-storage-daemon backend (the optional fallback;
+# the default pure-Go backend is covered by tests/04). Skip cleanly if the
+# daemon is not installed.
 if ! command -v qemu-storage-daemon &> /dev/null; then
     echo "Skipping I/O performance test: qemu-storage-daemon is not installed."
     exit 0

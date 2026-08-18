@@ -135,3 +135,32 @@ jobs:
         done
         echo "===== systemd-cgls top ====="
         systemd-cgls --no-pager 2>/dev/null | head -40 || true
+
+  bazel:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        persist-credentials: false
+
+    - name: Set up Node.js
+      uses: actions/setup-node@v7
+      with:
+        node-version: '24'
+
+    # webui's go_library embeds .output/public (gitignored), so the static
+    # assets must be generated before Bazel analysis, same as the Go job.
+    - name: Build WebUI (Nuxt)
+      working-directory: ./webui
+      run: |
+        npm install
+        npm run generate
+
+    # bazelisk is preinstalled on the runner and honors .bazelversion (7.5.0).
+    - name: Bazel build
+      run: bazelisk build //...
+
+    - name: Bazel test
+      run: bazelisk test //... --test_output=errors

@@ -1,0 +1,28 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "vu",
+    srcs = [
+        "blk.go",
+        "mem.go",
+        "proto.go",
+        "server.go",
+        "vring.go",
+    ],
+    importpath = "uml-container/internal/vhost/vu",
+    visibility = ["//:__subpackages__"],
+    deps = ["@org_golang_x_sys//unix:go_default_library"],
+)
+
+go_test(
+    name = "vu_test",
+    srcs = [
+        "e2e_test.go",
+        "vu_test.go",
+    ],
+    embed = [":vu"],
+    deps = [
+        "//internal/cow",
+        "@org_golang_x_sys//unix:go_default_library",
+    ],
+)

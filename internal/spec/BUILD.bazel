@@ -5,14 +5,14 @@ go_library(
     srcs = ["spec.go"],
     importpath = "uml-container/internal/spec",
     visibility = ["//:__subpackages__"],
-    deps = ["@com_github_burntsushi_toml//"],
+    deps = ["@com_github_burntsushi_toml//:go_default_library"],
 )
 
 go_test(
     name = "spec_test",
     srcs = [
-        "spec_test.go",
         "spec_matrix_test.go",
+        "spec_test.go",
     ],
     embed = [":spec"],
 )

@@ -23,8 +23,8 @@ go_library(
 go_test(
     name = "container_test",
     srcs = [
-        "manager_test.go",
         "manager_task_test.go",
+        "manager_test.go",
     ],
     embed = [":container"],
     deps = [

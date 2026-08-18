@@ -13,7 +13,7 @@ Contributor guide for **PVM** (`uml-container`), a User-Mode Linux (UML) contain
 - `uml/agentpvm.toml` — default TaskSpec consumed by `agentpvm run` when no `-config` is given.
 - `webui/` — Nuxt 3 frontend, embedded into the Go binary via `webui/embed.go`.
 - `scripts/` — kernel build and integration/perf test shell scripts.
-- `tests/` — numbered end-to-end shell suites (`01_test_e2b_api.sh` … `06_test_cli_smoke.sh`). Suites `05`/`06` are CI-safe (no UML kernel/root needed); `01`–`04` require a real kernel.
+- `tests/` — numbered end-to-end shell suites (`01_test_e2b_api.sh` … `09_test_cgroup_limits.sh`). Suites `05`–`08` are CI-safe (no UML kernel/root needed); `09` additionally requires root + a kernel rebuilt with `CONFIG_MEMCG`/`CONFIG_CGROUP_PIDS` (guest-side limit enforcement); `01`–`04` exercise kernel-adjacent paths.
 - `*_test.go` — Go unit tests colocated with their packages.
 
 ## Build, Test, and Development Commands
@@ -26,7 +26,7 @@ go generate ./...                     # regenerate eBPF bytecode (requires clang
 go test -v ./...                      # run all Go unit tests (CI default)
 go vet ./...                          # static checks before pushing
 
-./scripts/build_kernel.sh             # download + compile UML kernel (Linux 6.6.9) to bin/linux
+./scripts/build_kernel.sh             # download + compile UML kernel (Linux 6.18.x) to bin/linux
 ./scripts/test_integration.sh         # boot a real UML container and assert init output
 for s in tests/*.sh; do ./"$s"; done  # run the numbered integration suites serially
 

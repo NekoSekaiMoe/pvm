@@ -102,8 +102,13 @@ func resolveConfigPath(explicit string) (string, bool) {
 //
 // In addition to -config (the full TaskSpec TOML), the launch-relevant
 // fields can be overridden on the command line. These mirror umlctl's thin
-// launcher flags so the same kernel/rootfs/init/vhost knobs work on both
+// launcher flags so the same kernel/rootfs/init/net knobs work on both
 // binaries; CLI flags take precedence over the config file.
+//
+// There is deliberately no -vhost flag: the agent path MUST use the
+// vhost-user-blk backend with a per-task qcow2 CoW overlay (spec contract),
+// so UseVhostBlk comes from the config file only. For the raw ubd direct
+// mount, use the umlctl thin launcher instead.
 func runCmd(args []string) {
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
 	configPath := fs.String("config", "", "Path to TaskSpec TOML (default: ./uml/agentpvm.toml)")
@@ -114,7 +119,6 @@ func runCmd(args []string) {
 	rootfs := fs.String("rootfs", "", "Override workspace.base_image (rootfs / backing image path)")
 	kernel := fs.String("kernel", "", "Override kernel.path (UML kernel binary)")
 	initCmd := fs.String("init", "", "Override workspace.init (in-guest init command)")
-	vhost := fs.Bool("vhost", false, "Use qemu-storage-daemon vhost-user-blk backend (implies virtio)")
 	netEnabled := fs.Bool("net", false, "Enable guest networking (overrides network.enabled)")
 	netTap := fs.String("net-tap", "", "Host TAP device name (overrides network.tap)")
 	fs.Parse(args)
@@ -139,6 +143,15 @@ func runCmd(args []string) {
 	}
 
 	// Apply CLI launch overrides (flag > config > default).
+	// Boolean flags need explicit-set detection (e.g. -net=false must be
+	// able to turn OFF a config-provided network.enabled=true), so only
+	// apply the override when the flag was actually given on the command line.
+	netGiven := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "net" {
+			netGiven = true
+		}
+	})
 	if *rootfs != "" {
 		s.Workspace.BaseImage = *rootfs
 	}
@@ -148,19 +161,8 @@ func runCmd(args []string) {
 	if *initCmd != "" {
 		s.Workspace.Init = *initCmd
 	}
-	if *vhost {
-		s.Kernel.UseVhostBlk = true
-		// NOTE: do NOT set s.Kernel.Virtio here. Virtio used to be a single
-		// switch that wired BOTH the block device (virtio_uml/vhost-user-blk)
-		// AND the network device. The two are independent: buildTaskArgs now
-		// keys the block backend off UseVhostBlk alone and always uses the
-		// vec0 vector transport for networking (the only UML net transport
-		// left in Linux >= 6.16; verified working in CI on the ubd block
-		// backend). Setting Virtio=true here would be a no-op now, but we
-		// leave the field alone to avoid muddying the spec semantics.
-	}
-	if *netEnabled {
-		s.Network.Enabled = true
+	if netGiven {
+		s.Network.Enabled = *netEnabled
 	}
 	if *netTap != "" {
 		s.Network.Enabled = true // a TAP name implies the caller wants networking
@@ -251,8 +253,11 @@ func safeDefaultSpec() *spec.TaskSpec {
 			BaseImage: "rootfs.img",
 			Init:      "/sbin/init",
 		},
-		Kernel: spec.KernelSpec{Path: "./bin/linux"},
-		Network: spec.NetworkSpec{Enabled: false}, // default deny
+		// UseVhostBlk=true: the agent path contract — per-task qcow2 CoW
+		// overlay served over vhost-user-blk (raw bases work too; the overlay
+		// is always qcow2). The ubd direct-mount path is umlctl's job.
+		Kernel:    spec.KernelSpec{Path: "./bin/linux", UseVhostBlk: true},
+		Network:   spec.NetworkSpec{Enabled: false}, // default deny
 		Lifecycle: spec.LifecycleSpec{OnAnomaly: "pause", TTL: "1h"},
 	}
 	_ = s.Validate()
@@ -525,7 +530,7 @@ var (
 	_ = config.ParseMemory
 	_ = strings.TrimSpace
 	_ = exec.Command
-	_ = vhost.StartStorageDaemon
+	_ = vhost.StartBlk
 	_ = policy.NewGateway
 	_ = spec.SpecVersion
 )

@@ -4,8 +4,8 @@ go_library(
     name = "webui",
     srcs = ["embed.go"],
     # 不再枚举带 hash 的 Nuxt 产物：改用 glob，使重新生成 WebUI 后无需手工同步本文件，
-    # 避免出现 "嵌入旧产物 / Bazel 分析失败"。
-    embedsrcs = glob([".output/public/**/*"]),
+    # 避免出现 "嵌入旧产物 / Bazel 分析失败"。# keep：gazelle 无法 merge glob，保持手写。
+    embedsrcs = glob([".output/public/**/*"]),  # keep
     importpath = "uml-container/webui",
     visibility = ["//visibility:public"],
 )

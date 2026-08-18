@@ -16,9 +16,5 @@ go_test(
     name = "incident_test",
     srcs = ["controller_test.go"],
     embed = [":incident"],
-    deps = [
-        "//internal/audit",
-        "//internal/identity",
-        "//internal/state",
-    ],
+    deps = ["//internal/audit"],
 )

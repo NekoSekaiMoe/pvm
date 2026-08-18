@@ -2,8 +2,9 @@
 set -ex
 echo "Testing Package Installation inside Sandbox..."
 
-# Make sure agentpvm and umlctl are built
-go build -o agentpvm ./cmd/agentpvm
+# Make sure umlctl is built (umlctl is the thin UML launcher used here: this
+# smoke test needs no agent control planes, and agentpvm's vhost flag is
+# gone — the agent path always uses the CoW/vhost backend).
 go build -o bin/umlctl ./cmd/umlctl
 
 IMG_NAME="pkg_rootfs.img"
@@ -144,20 +145,20 @@ CONSOLE_LOG=/var/lib/uml-container/containers/pkg-test/logs/console.log
 sudo rm -f "$CONSOLE_LOG"
 
 # Using tap=tap_pkg for network
-# 后台运行 agentpvm，同时轮询成功标记；不再先同步等待再轮询。
-# 容器一打出 PKG_INSTALL_SUCCESS 就立即成功退出；agentpvm 提前崩溃也会被
-# 后台等待器感知；超时则由内层 timeout 兜底。
-sudo ./agentpvm run -name pkg-test \
-    -rootfs ${BASE_IMG} -kernel ./bin/linux -init /init.sh \
-    -vhost=false -net-tap tap_pkg
+# 后台启动并把输出写进 pkg_umlctl.log；此处 $! 是本 shell 的直接子进程
+# （sudo），所以 PVM_PID 真实有效。timeout 是挂死兜底；成功标记出现后
+# guest 随即 poweroff，umlctl 会自行退出。
+sudo timeout 180 ./bin/umlctl start --name pkg-test \
+    --rootfs ${BASE_IMG} --kernel ./bin/linux --init /init.sh \
+    --tap tap_pkg > pkg_umlctl.log 2>&1 &
 PVM_PID=$!
 
 cleanup() {
-    # agentpvm 仍在运行则终止它（其子进程 UML 会被一并回收）。
+    # umlctl 仍在运行则终止它（其子进程 UML 会被一并回收）。
     kill "$PVM_PID" 2>/dev/null || true
     wait "$PVM_PID" 2>/dev/null || true
     # 兜底：杀掉残留的、以本容器名为参数的 UML 内核进程。
-    sudo pkill -f "agentpvm run -name pkg-test" 2>/dev/null || true
+    sudo pkill -f "umlctl start --name pkg-test" 2>/dev/null || true
     sudo ./bin/umlctl network rm pvm_br0 || true
     sudo ip link delete tap_pkg || true
 }
@@ -165,21 +166,20 @@ trap cleanup EXIT
 
 STATUS_FILE=pkg_exit_status
 rm -f "$STATUS_FILE"
-# 后台等待器：agentpvm 退出后把状态落到文件，供主轮询循环感知。
-# 不用 wait $PVM_PID，因为 sudo/timeout 链可能让 $PVM_PID 不再是本 shell 的
-# 直接子进程（上一轮 CI 日志报 “pid is not a child of this shell”）。
-# 改用 pgrep -f 按命令行匹配存活状态，与 pid 亲缘关系无关，也不会被 sudo
-# 提前返回误导。
-(
-    while pgrep -f "agentpvm run -name pkg-test" >/dev/null 2>&1; do
-        sleep 1
-    done
-    wait "$PVM_PID" 2>/dev/null
-    echo $? > "$STATUS_FILE"
-) &
+# 监控在主（父）shell 内执行：进程退出或成功标记出现即结束轮询，然后由
+# 父 shell 亲自 wait —— STATUS_FILE 记录的是真实退出状态，而不是后台
+# 子 shell 里被吞掉的 wait 失败码。
+while kill -0 "$PVM_PID" 2>/dev/null; do
+    if sudo grep -q "PKG_INSTALL_SUCCESS" "$CONSOLE_LOG" 2>/dev/null; then
+        break
+    fi
+    sleep 2
+done
+wait "$PVM_PID" 2>/dev/null
+echo $? > "$STATUS_FILE"
 
-echo "---- agentpvm output (pkg_agentpvm.log) ----"
-cat pkg_agentpvm.log 2>/dev/null || echo "(no pkg_agentpvm.log)"
+echo "---- umlctl output (pkg_umlctl.log) ----"
+cat pkg_umlctl.log 2>/dev/null || echo "(no pkg_umlctl.log)"
 echo "---- Pkg Test Console Output ----"
 sudo cat "$CONSOLE_LOG" 2>/dev/null || echo "(no console.log)"
 
@@ -204,5 +204,5 @@ echo "--- DIAG: UML network driver init (vec/eth registration, or why it failed)
 sudo grep -Ei "eth0|vec[0-9]|netdevice|tun/tap|tuntap|network device|choosing a random ethernet|uml_net|netfront|virtio.*net" "$CONSOLE_LOG" 2>/dev/null | head -20 || echo "   (no UML net-driver lines — kernel may predate net init, or net transport never parsed)"
 echo ""
 echo "--- DIAG: guest-side failure markers ---"
-sudo grep -E "PING |FAILED|Network unreachable|INIT_DONE|PKG_INSTALL_SUCCESS|No such|not found|panic" "$CONSOLE_LOG" 2>/dev/null | tail -20 || echo "   (no console.log at all — agentpvm likely crashed before boot)"
+sudo grep -E "PING |FAILED|Network unreachable|INIT_DONE|PKG_INSTALL_SUCCESS|No such|not found|panic" "$CONSOLE_LOG" 2>/dev/null | tail -20 || echo "   (no console.log at all — umlctl likely crashed before boot)"
 exit 1

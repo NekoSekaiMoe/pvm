@@ -5,7 +5,11 @@ go_library(
     srcs = ["backend.go"],
     importpath = "uml-container/internal/vhost",
     visibility = ["//:__subpackages__"],
-    deps = ["//internal/state"],
+    deps = [
+        "//internal/cow",
+        "//internal/state",
+        "//internal/vhost/vu",
+    ],
 )
 
 go_test(

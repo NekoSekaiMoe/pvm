@@ -3,7 +3,7 @@ bin/
 *.log
 rootfs.img
 *.tar.gz
-umlctl
+/umlctl
 *.img
 webui/node-modules/
 webui/.nuxt/

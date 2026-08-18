@@ -55,14 +55,17 @@ go_library(
     importpath = "uml-container/internal/network",
     visibility = ["//:__subpackages__"],
     deps = [
-        "@com_github_cilium_ebpf//:ebpf",
-        "@com_github_vishvananda_netlink//:netlink",
-        "@org_golang_x_sys//unix",
+        "@com_github_cilium_ebpf//:go_default_library",
+        "@com_github_vishvananda_netlink//:go_default_library",
+        "@org_golang_x_sys//unix:go_default_library",
     ],
 )
 
 go_test(
     name = "network_test",
-    srcs = ["network_test.go"],
+    srcs = [
+        "bridge_internal_test.go",
+        "network_test.go",
+    ],
     embed = [":network"],
 )

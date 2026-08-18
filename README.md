@@ -8,11 +8,11 @@ PVM is a lightweight, User-Mode Linux (UML)-based container management system. I
 - **REST API**: Built-in HTTP server (`internal/api`) for remote orchestration, compatible with E2B SDK patterns.
 - **Modern WebUI**: An embedded, glassmorphism-designed WebUI (built with Nuxt 3) for visually managing containers, images, and logs.
 - **Networking**: Bridge and TAP interface management for UML networking.
-- **Image Management**: Seamless pulling of Docker base images to be used as container rootfs via qcow2 CoW overlays served by qemu-storage-daemon over vhost-user-blk.
+- **Image Management**: Seamless pulling of Docker base images to be used as container rootfs via qcow2 CoW overlays served over vhost-user-blk (pure-Go backend by default; qemu-storage-daemon optional).
 
 ## Dependency
 - x86/x64 device(no limits, arm64 uml is porting)
-- qemu-storage-daemon(for virtio blk) and qemu-img(for qcow2 disk management)
+- qemu-storage-daemon (optional fallback, only needed with `PVM_VHOST_BACKEND=qemu`); the default vhost-user-blk backend is pure Go (`internal/vhost/vu`), and qcow2 overlay create/convert is pure Go (`internal/cow`), no qemu-img needed at runtime
 
 ## Quick Start
 
@@ -26,9 +26,10 @@ go build ./cmd/umlctl
 # Start a container via CLI (umlctl legacy path: raw rootfs + ubd)
 ./umlctl start -name my-container -rootfs alpine.img
 
-# Start an agent sandbox (agentpvm: qcow2 base + per-task CoW overlay + vhost)
-qemu-img convert -O qcow2 alpine.img alpine.qcow2
-./agentpvm run -name my-agent -rootfs alpine.qcow2 -vhost=true
+# Start an agent sandbox (agentpvm: raw or qcow2 base + per-task CoW overlay
+# + vhost-user-blk). No qemu-img convert needed — overlay creation and the
+# vhost backend are pure Go; the base is sniffed (raw or qcow2 both work).
+./agentpvm run -name my-agent -rootfs alpine.qcow2
 ```
 
 ## Storage & Overlay Architecture
@@ -43,37 +44,45 @@ layer.
 ```text
                        host                                      guest
 +----------------------------------------+   +------------------------+
-|  base.qcow2  (shared, read-only)       |   |                        |
-|     ^                                  |   |  /dev/vda (virtio-blk) |
-|     | qcow2 backing reference          |   |     ^                  |
+|  base image (shared, read-only;        |   |                        |
+|    raw or qcow2)                       |   |  /dev/vda (virtio-blk) |
+|     ^                                  |   |     ^                  |
+|     | qcow2 backing reference          |   |     |                  |
 |  overlay.qcow2 (per-task, writable)    |<===+-----+  vhost-user-blk |
 |     ^                                  |   |       over UNIX socket |
-|     | --export vhost-user-blk          |   |                        |
-|  qemu-storage-daemon                   |   |  ext4 root filesystem   |
+|     | serves                           |   |                        |
+|  pure-Go vhost-user-blk server         |   |  ext4 root filesystem   |
+|  (internal/vhost/vu; qemu-storage-     |   |                        |
+|   daemon is an optional fallback)      |   |                        |
 +----------------------------------------+   +------------------------+
 ```
 
 1. **Storage — qcow2 block-level CoW** (`internal/cow`)
 
-   `agentpvm run` creates a per-task overlay on top of the shared base:
+   `agentpvm run` creates a per-task overlay on top of the shared base — in
+   pure Go (`cow.CreateOverlay`), no `qemu-img` at runtime:
 
    ```bash
-   qemu-img create -f qcow2 -b base.qcow2 -F qcow2 overlay.qcow2
+   # the pure-Go equivalent of:
+   qemu-img create -f qcow2 -b base.img -F qcow2 overlay.qcow2
    ```
 
-   - **base.qcow2** is the immutable toolchain + repo snapshot, shared by N
-     sandboxes. It is never written to.
+   - **base image** is the immutable toolchain + repo snapshot, shared by N
+     sandboxes. It is never written to, and may be **raw or qcow2** —
+     `cow.CreateOverlay` sniffs the format; the overlay itself is always
+     qcow2.
    - **overlay.qcow2** is per-task and starts nearly empty (just qcow2
      metadata). All guest writes diverge into this file; unmodified blocks
      are satisfied by recursing into the backing base.
-   - The base MUST be qcow2 — a raw backing image is rejected because the
-     block backend only knows how to read qcow2.
 
-2. **Device — qemu-storage-daemon → vhost-user-blk** (`internal/vhost`)
+2. **Device — pure-Go vhost-user-blk server** (`internal/vhost/vu`)
 
-   `qemu-storage-daemon` opens the overlay and exports it as a vhost-user-blk
-   device over a UNIX socket. **This is the only layer that understands qcow2** —
-   it performs the backing recursion so the guest never has to:
+   The in-process Go server opens the overlay (via `internal/cow`, the layer
+   that understands qcow2 and performs the backing recursion) and serves it
+   as a vhost-user-blk device over a UNIX socket — no external daemon needed.
+   Setting `PVM_VHOST_BACKEND=qemu` swaps in the reference
+   `qemu-storage-daemon` subprocess instead (used for A/B debugging and by
+   `scripts/test_io_perf.sh`):
 
    ```bash
    qemu-storage-daemon \
@@ -82,14 +91,15 @@ layer.
      --export   type=vhost-user-blk,...,addr.path=vhost-blk.sock,writable=on
    ```
 
-   This is why `agentpvm run` requires `-vhost=true` (and qemu-storage-daemon
-   installed): UML's built-in `ubd0=` backend reads raw bytes and cannot parse
-   qcow2, so feeding it a qcow2 file would panic the guest with
-   `VFS: Unable to mount root fs`.
+   This is why `agentpvm run` always uses the vhost-user-blk path with a
+   per-task qcow2 CoW overlay (no flag to turn it off): UML's built-in
+   `ubd0=` backend reads raw bytes and cannot parse qcow2, so feeding it a
+   qcow2 file would panic the guest with `VFS: Unable to mount root fs`.
+   For raw images without CoW needs, use the `umlctl` thin launcher.
 
 3. **Guest — virtio_uml mounts the block device** (`internal/container`)
 
-   The UML kernel command line points virtio_uml at the daemon's socket:
+   The UML kernel command line points virtio_uml at the backend's socket:
 
    ```
    virtio_uml.device=<socket>:<id>  root=/dev/vda  rw
@@ -115,7 +125,7 @@ layer.
 | **Cheap cold start** | An overlay is created in milliseconds and starts ~96 KB; no full-base copy. |
 | **Shared host cache** | N sandboxes share one base.qcow2, so the host page cache holds it once. |
 | **Guest is unmodified** | qcow2 parsing lives in the host daemon; the guest mounts a normal block device with any filesystem. |
-| **Auditable teardown** | Deleting the overlay returns a known-good empty state; `agentpvm cow` / `qemu-img convert` can merge an overlay into a standalone artifact. |
+| **Auditable teardown** | Deleting the overlay returns a known-good empty state; `agentpvm cow` merges an overlay into a standalone artifact (pure-Go qcow2 convert). |
 
 ### Two launch paths
 
