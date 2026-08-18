@@ -145,10 +145,12 @@ CONSOLE_LOG=/var/lib/uml-container/containers/pkg-test/logs/console.log
 sudo rm -f "$CONSOLE_LOG"
 
 # Using tap=tap_pkg for network
-# umlctl start 前台运行，guest poweroff 后返回；成功标记由 console.log 判定。
-sudo ./bin/umlctl start --name pkg-test \
+# 后台启动并把输出写进 pkg_umlctl.log；此处 $! 是本 shell 的直接子进程
+# （sudo），所以 PVM_PID 真实有效。timeout 是挂死兜底；成功标记出现后
+# guest 随即 poweroff，umlctl 会自行退出。
+sudo timeout 180 ./bin/umlctl start --name pkg-test \
     --rootfs ${BASE_IMG} --kernel ./bin/linux --init /init.sh \
-    --tap tap_pkg
+    --tap tap_pkg > pkg_umlctl.log 2>&1 &
 PVM_PID=$!
 
 cleanup() {
@@ -164,18 +166,17 @@ trap cleanup EXIT
 
 STATUS_FILE=pkg_exit_status
 rm -f "$STATUS_FILE"
-# 后台等待器：umlctl 退出后把状态落到文件，供主轮询循环感知。
-# 不用 wait $PVM_PID，因为 sudo/timeout 链可能让 $PVM_PID 不再是本 shell 的
-# 直接子进程（上一轮 CI 日志报 “pid is not a child of this shell”）。
-# 改用 pgrep -f 按命令行匹配存活状态，与 pid 亲缘关系无关，也不会被 sudo
-# 提前返回误导。
-(
-    while pgrep -f "umlctl start --name pkg-test" >/dev/null 2>&1; do
-        sleep 1
-    done
-    wait "$PVM_PID" 2>/dev/null
-    echo $? > "$STATUS_FILE"
-) &
+# 监控在主（父）shell 内执行：进程退出或成功标记出现即结束轮询，然后由
+# 父 shell 亲自 wait —— STATUS_FILE 记录的是真实退出状态，而不是后台
+# 子 shell 里被吞掉的 wait 失败码。
+while kill -0 "$PVM_PID" 2>/dev/null; do
+    if sudo grep -q "PKG_INSTALL_SUCCESS" "$CONSOLE_LOG" 2>/dev/null; then
+        break
+    fi
+    sleep 2
+done
+wait "$PVM_PID" 2>/dev/null
+echo $? > "$STATUS_FILE"
 
 echo "---- umlctl output (pkg_umlctl.log) ----"
 cat pkg_umlctl.log 2>/dev/null || echo "(no pkg_umlctl.log)"
