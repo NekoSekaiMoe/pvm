@@ -151,7 +151,8 @@ func TestVringPushNotify(t *testing.T) {
 	if err != nil {
 		t.Fatalf("eventfd: %v", err)
 	}
-	defer unix.Close(callFd)
+	// os.NewFile takes ownership of the fd; closing is left to the
+	// resulting *os.File (a separate unix.Close would double-close).
 	v := g.vring(t)
 	v.call = &eventfd{f: os.NewFile(uintptr(callFd), "call")}
 

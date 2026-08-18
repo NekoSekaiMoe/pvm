@@ -24,8 +24,15 @@ CONSOLE_LOG=/var/lib/uml-container/containers/$NAME/logs/console.log
 UMLCTL_LOG=uml-cgroup-test.log
 
 cleanup() {
-    sudo umount mnt 2>/dev/null || true
-    rm -rf mnt "$ROOTFS" alpine-cgroup-test.tar.gz
+    # Only remove mnt when it is not (or no longer) mounted: rm -rf on a
+    # live mountpoint would delete files inside the mounted filesystem.
+    if mountpoint -q mnt 2>/dev/null; then
+        sudo umount mnt && rm -rf mnt || echo "warn: umount mnt failed; leaving it mounted"
+    else
+        rm -rf mnt
+    fi
+    rm -f "$ROOTFS" alpine-cgroup-test.tar.gz
+    sudo rm -rf "/var/lib/uml-container/containers/$NAME"
 }
 trap cleanup EXIT
 
@@ -94,6 +101,9 @@ sudo chmod +x mnt/init.sh
 sudo umount mnt
 
 echo "Booting UML with the cgroup-limit test init..."
+# Isolate this run from stale logs of a previous same-named container.
+rm -f "$UMLCTL_LOG"
+sudo rm -f "$CONSOLE_LOG"
 sudo ./bin/umlctl start --name "$NAME" --kernel ./bin/linux --rootfs "$ROOTFS" --init /init.sh > "$UMLCTL_LOG" 2>&1 || true
 
 echo "---- guest console ($CONSOLE_LOG) ----"

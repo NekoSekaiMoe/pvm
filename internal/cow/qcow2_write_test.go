@@ -16,6 +16,9 @@ func openWritable(t *testing.T, path string) WritableBackend {
 	if err != nil {
 		t.Fatalf("OpenWritable(%s): %v", path, err)
 	}
+	// Close even if a later t.Fatalf exits the test early; explicit Close
+	// calls in tests simply make the cleanup a no-op-ish second close.
+	t.Cleanup(func() { be.Close() })
 	return be
 }
 
@@ -47,6 +50,9 @@ func TestQcow2Write_FullClusterShadows(t *testing.T) {
 	got, err := os.ReadFile(dest)
 	if err != nil {
 		t.Fatalf("read dest: %v", err)
+	}
+	if len(got) < 4*clusterSize {
+		t.Fatalf("converted output too small: %d bytes, want >= %d", len(got), 4*clusterSize)
 	}
 	if !bytes.Equal(got[3*clusterSize:4*clusterSize], guest) {
 		t.Error("cluster 3 should be guest data")
@@ -195,8 +201,14 @@ func TestQcow2Write_DifferentialCheck(t *testing.T) {
 	if out, err := exec.Command(qemuImg, "convert", "-O", "raw", overlay, qemuOut).CombinedOutput(); err != nil {
 		t.Fatalf("qemu convert: %v: %s", err, out)
 	}
-	g, _ := os.ReadFile(goOut)
-	q, _ := os.ReadFile(qemuOut)
+	g, err := os.ReadFile(goOut)
+	if err != nil {
+		t.Fatalf("read go convert output: %v", err)
+	}
+	q, err := os.ReadFile(qemuOut)
+	if err != nil {
+		t.Fatalf("read qemu convert output: %v", err)
+	}
 	if !bytes.Equal(g, q) {
 		t.Errorf("convert mismatch after writes: go=%d qemu=%d bytes", len(g), len(q))
 	}

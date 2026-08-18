@@ -13,6 +13,7 @@ package vu
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -92,6 +93,24 @@ type msg struct {
 	fds     []int
 }
 
+// takeFds hands ownership of the received fds to the caller, which must
+// either store them long-term or close them.
+func (m *msg) takeFds() []int {
+	f := m.fds
+	m.fds = nil
+	return f
+}
+
+// closeFds releases any fds still attached to the message. Each received fd
+// is a fresh descriptor owned by this process; handlers that did not take
+// them over would otherwise leak one per message.
+func (m *msg) closeFds() {
+	for _, fd := range m.fds {
+		unix.Close(fd)
+	}
+	m.fds = nil
+}
+
 func (m *msg) u64() uint64 {
 	if len(m.payload) < 8 {
 		return 0
@@ -144,13 +163,22 @@ func newConn(c *net.UnixConn) *conn { return &conn{c: c} }
 // recv reads one message. Payload is capped defensively: the largest
 // legitimate payload is the memory table (nregions*32 + 8 with the baseline
 // 8 regions == 264) or a config read (4096+12).
-func (c *conn) recv() (*msg, error) {
+func (c *conn) recv() (m *msg, err error) {
 	// The socket is SOCK_STREAM, so one read may coalesce multiple messages:
 	// read exactly the 12-byte header first (fds arrive attached to the first
 	// bytes of a sendmsg batch), then exactly `size` payload bytes.
 	hdr := make([]byte, 0, 12)
 	oob := make([]byte, unix.CmsgSpace(4*8)) // up to 8 fds
 	var fds []int
+	// Collected fds are owned by the returned message; on error they have no
+	// owner and must be closed here.
+	defer func() {
+		if err != nil {
+			for _, fd := range fds {
+				unix.Close(fd)
+			}
+		}
+	}()
 	for len(hdr) < 12 {
 		chunk := make([]byte, 12-len(hdr))
 		n, oobn, _, _, err := c.c.ReadMsgUnix(chunk, oob)
@@ -172,7 +200,7 @@ func (c *conn) recv() (*msg, error) {
 			}
 		}
 	}
-	m := &msg{
+	m = &msg{
 		request: binary.LittleEndian.Uint32(hdr[0:]),
 		flags:   binary.LittleEndian.Uint32(hdr[4:]),
 		fds:     fds,
@@ -229,7 +257,9 @@ func (e *eventfd) wait() error {
 	var b [8]byte
 	for {
 		_, err := e.f.Read(b[:])
-		if err == unix.EINTR {
+		// os.File.Read wraps the errno in *os.PathError: use errors.Is or
+		// the EINTR retry never fires.
+		if errors.Is(err, unix.EINTR) {
 			continue
 		}
 		return err

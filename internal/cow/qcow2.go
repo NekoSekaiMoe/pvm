@@ -397,8 +397,14 @@ func convertToRaw(ctx context.Context, srcPath, destPath string) error {
 			n = rem
 		}
 		chunk := buf[:n]
-		if _, err := img.ReadAt(chunk, int64(off)); err != nil && err != io.EOF {
+		m, err := img.ReadAt(chunk, int64(off))
+		if err != nil && err != io.EOF {
 			return fmt.Errorf("cow: read guest at %#x: %w", off, err)
+		}
+		// Tolerated short read (io.EOF): zero the unread tail so stale bytes
+		// from the previous iteration are never mistaken for guest data.
+		if m < len(chunk) {
+			clear(chunk[m:])
 		}
 		if allZero(chunk) {
 			continue // seek past: keeps the raw output sparse

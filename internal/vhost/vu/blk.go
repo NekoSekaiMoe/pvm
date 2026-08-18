@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 )
 
 // virtio-blk request types / status codes / config (linux/virtio_blk.h).
@@ -74,7 +75,9 @@ func (d *BlkDev) features() uint64 {
 
 // config returns the device config bytes at [offset, offset+size).
 func (d *BlkDev) config(offset, size uint32) ([]byte, error) {
-	if offset+size > blkConfigSize {
+	// 64-bit arithmetic: offset and size are peer-controlled and offset+size
+	// must not wrap around uint32.
+	if uint64(offset)+uint64(size) > blkConfigSize {
 		return nil, fmt.Errorf("vu: config read out of range (off %d size %d)", offset, size)
 	}
 	out := make([]byte, size)
@@ -87,6 +90,20 @@ type outhdr struct {
 	typ    uint32
 	ioprio uint32
 	sector uint64
+}
+
+// inRange validates a guest-controlled sector request against the backend
+// size with overflow-safe arithmetic: sector*512 must not wrap int64/uint64
+// and sector*512+length must stay within the declared virtual size.
+func (d *BlkDev) inRange(sector uint64, length int) bool {
+	if sector > math.MaxUint64/512 || length < 0 {
+		return false
+	}
+	off := sector * 512
+	if uint64(length) > math.MaxUint64-off {
+		return false
+	}
+	return off+uint64(length) <= uint64(d.be.Size())
 }
 
 // process executes one request element against the backend.
@@ -116,16 +133,24 @@ func (d *BlkDev) process(e *elem) (usedLen uint32, err error) {
 	switch h.typ &^ blkTBarrier {
 	case blkTIn:
 		n := sgLen(dataIn)
+		if !d.inRange(h.sector, n) {
+			status = blkSIOErr
+			usedLen = 1
+			break
+		}
 		buf := make([]byte, n)
-		if _, err := d.be.ReadAt(buf, int64(h.sector)*512); err != nil && n > 0 {
+		m, rerr := d.be.ReadAt(buf, int64(h.sector)*512)
+		if rerr != nil && rerr != io.EOF {
 			status = blkSIOErr
 		} else {
-			sgCopy(dataIn, buf)
+			// io.EOF is a partial success: deliver the bytes actually read.
+			sgCopy(dataIn, buf[:m])
 		}
-		usedLen = uint32(n) + 1
+		usedLen = uint32(m) + 1
 	case blkTOut:
-		if d.ro {
+		if d.ro || !d.inRange(h.sector, sgLen(dataOut)) {
 			status = blkSIOErr
+			usedLen = 1
 			break
 		}
 		buf := sgGather(dataOut)

@@ -43,7 +43,8 @@ func TestStartBlk_GoBackend(t *testing.T) {
 func TestStartBlk_GoBackendBadImage(t *testing.T) {
 	useTempState(t)
 	t.Setenv("PVM_VHOST_BACKEND", "")
-	_, _, err := StartBlk("c-go-bad", "/tmp/nope.img")
+	// Guaranteed-nonexistent image path under the test's temp dir.
+	_, _, err := StartBlk("c-go-bad", filepath.Join(t.TempDir(), "missing.img"))
 	if err == nil {
 		t.Fatal("expected error for missing image")
 	}

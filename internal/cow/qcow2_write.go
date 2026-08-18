@@ -12,11 +12,13 @@ package cow
 import (
 	"encoding/binary"
 	"fmt"
+	"io"
 	"os"
 	"sync"
 )
 
 // WritableBackend is the storage interface the vhost-user-blk device needs.
+// Implementations are safe for concurrent use.
 type WritableBackend interface {
 	ReadAt(p []byte, off int64) (int, error)
 	WriteAt(p []byte, off int64) (int, error)
@@ -83,6 +85,14 @@ type qcow2Writable struct {
 func (w *qcow2Writable) Size() int64 { return int64(w.hdr.size) }
 func (w *qcow2Writable) Sync() error { return w.f.Sync() }
 
+// ReadAt serializes with WriteAt under w.mu so a concurrent reader never
+// observes half-updated L1/L2 or refcount metadata.
+func (w *qcow2Writable) ReadAt(p []byte, off int64) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.qcow2Image.ReadAt(p, off)
+}
+
 // WriteAt writes at a guest offset, allocating clusters on first write and
 // copying backing content for partial-cluster writes (qcow2 CoW).
 func (w *qcow2Writable) WriteAt(p []byte, off int64) (int, error) {
@@ -145,6 +155,16 @@ func (w *qcow2Writable) hostOffset(clusterIdx uint64) (uint64, error) {
 	if l2e&oflagCompressed != 0 {
 		return 0, fmt.Errorf("cow: compressed clusters unsupported")
 	}
+	// Only clusters we fully own (COPIED set, ZERO clear) may be written in
+	// place. A ZERO-flagged entry reads as all zeros even when it carries a
+	// host offset (preallocation), so an in-place write would be invisible
+	// to resolve(); a non-COPIED entry may share its cluster (refcount > 1),
+	// so an in-place write would corrupt the shared data. Treat both as
+	// unallocated: WriteAt allocates a fresh cluster and linkL2 installs a
+	// new COPIED entry, clearing ZERO.
+	if l2e&(oflagCopied|oflagZero) != oflagCopied {
+		return 0, nil
+	}
 	return l2e & l2eOffsetMask, nil
 }
 
@@ -162,11 +182,19 @@ func (w *qcow2Writable) allocDataCluster(clusterIdx uint64, data []byte, guest u
 		}
 	} else {
 		// CoW: materialize the backing view of this cluster, then overlay
-		// the partial write.
+		// the partial write. The final cluster may extend past the virtual
+		// size: read only what exists (a short read at EOF leaves the rest
+		// of buf zeroed).
 		buf := make([]byte, clusterSize)
 		clusterStart := int64(clusterIdx << clusterBits)
-		if _, err := w.qcow2Image.ReadAt(buf, clusterStart); err != nil {
-			return 0, fmt.Errorf("cow: read backing for CoW at %#x: %w", clusterStart, err)
+		readLen := int64(clusterSize)
+		if rem := int64(w.hdr.size) - clusterStart; rem < readLen {
+			readLen = rem
+		}
+		if readLen > 0 {
+			if _, err := w.qcow2Image.ReadAt(buf[:readLen], clusterStart); err != nil && err != io.EOF {
+				return 0, fmt.Errorf("cow: read backing for CoW at %#x: %w", clusterStart, err)
+			}
 		}
 		inCluster := guest & w.clusterMask
 		copy(buf[inCluster:], data)

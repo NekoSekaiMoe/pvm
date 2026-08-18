@@ -56,6 +56,15 @@ func (v *vring) setup(mt *memTable, a vringAddr) error {
 	if v.used, err = mt.translate(a.used, 4+uint64(v.num)*8); err != nil {
 		return fmt.Errorf("vu: used ring: %w", err)
 	}
+	// availIdx and push perform 32-bit atomics on &avail[0] and &used[0];
+	// both addresses are frontend-supplied and must be 4-byte aligned, or
+	// the atomic ops fault (SIGBUS on arm64).
+	if uintptr(unsafe.Pointer(&v.avail[0]))%4 != 0 {
+		return fmt.Errorf("vu: avail ring address %#x is not 4-byte aligned", a.avail)
+	}
+	if uintptr(unsafe.Pointer(&v.used[0]))%4 != 0 {
+		return fmt.Errorf("vu: used ring address %#x is not 4-byte aligned", a.used)
+	}
 	return nil
 }
 
@@ -68,16 +77,19 @@ func (v *vring) availIdx() uint16 {
 }
 
 // pop returns the next request element or nil when the queue is empty.
+// virtio avail.idx is 16-bit and wraps at 65536; lastAvail is tracked with
+// the same 16-bit wraparound semantics so empty-queue detection survives
+// beyond 65536 requests.
 func (v *vring) pop(mt *memTable) (*elem, error) {
 	if v.desc == nil {
 		return nil, fmt.Errorf("vu: pop on unconfigured vring")
 	}
 	avail := v.availIdx()
-	if uint32(avail) == v.lastAvail {
+	if avail == uint16(v.lastAvail) {
 		return nil, nil
 	}
-	head := binary.LittleEndian.Uint16(v.avail[4+uint64(v.lastAvail%v.num)*2:])
-	v.lastAvail++
+	head := binary.LittleEndian.Uint16(v.avail[4+uint64(uint32(uint16(v.lastAvail))%v.num)*2:])
+	v.lastAvail = (v.lastAvail + 1) & 0xffff
 	return v.walkChain(mt, uint32(head))
 }
 

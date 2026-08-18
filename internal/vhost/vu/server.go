@@ -73,6 +73,12 @@ func (s *Server) acceptLoop() {
 			c.Close()
 			return
 		}
+		if s.sess != nil {
+			// One frontend at a time: release the previous session's
+			// mappings, fds and pump before the new one starts, or two
+			// pumps would write the same Backend concurrently.
+			s.sess.close()
+		}
 		s.sess = newSession(s.dev, newConn(c))
 		sess := s.sess
 		s.mu.Unlock()
@@ -96,17 +102,39 @@ type session struct {
 	status   uint64
 	closed   bool
 	pumpOnce sync.Once
+	pumpWg   sync.WaitGroup // tracks the pump goroutine
 }
 
 func newSession(dev *BlkDev, c *conn) *session {
 	return &session{dev: dev, c: c}
 }
 
+// close tears the session down exactly once: it stops the control channel,
+// wakes and waits for the pump goroutine, and only then unmaps guest memory
+// and closes the eventfds — munmap while the pump still touches v.desc,
+// v.avail, v.used or SG slices would be a use-after-munmap (SIGSEGV, not
+// recoverable).
 func (s *session) close() {
 	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		s.pumpWg.Wait() // a concurrent first close is still tearing down
+		return
+	}
 	s.closed = true
+	kick := s.vq.kick
 	s.mu.Unlock()
-	s.c.c.Close()
+
+	s.c.c.Close() // unblock the control-channel recv
+	if kick != nil {
+		// Wake the pump so it observes closed and exits. (Closing the fd
+		// would NOT interrupt a blocked read(2) on Linux.)
+		kick.signal()
+	}
+	s.pumpWg.Wait()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.mem.close()
 	if s.vq.kick != nil {
 		s.vq.kick.close()
@@ -131,6 +159,7 @@ func (s *session) run() {
 			return
 		}
 		replied, err := s.handle(m)
+		m.closeFds() // release fds no handler took over
 		if err != nil {
 			log.Printf("vu: request %d: %v", m.request, err)
 		}
@@ -184,12 +213,17 @@ func (s *session) handle(m *msg) (bool, error) {
 		return true, s.c.reply(m, p[:])
 
 	case reqSetMemTable:
-		return false, s.mem.setMemTable(m.payload, m.fds)
+		return false, s.mem.setMemTable(m.payload, m.takeFds())
 
 	case reqSetVringNum:
 		idx, num := m.vringState()
 		if idx != 0 {
 			return false, fmt.Errorf("only queue 0 supported (got %d)", idx)
+		}
+		// virtio requires a power-of-two queue size and pop/push index with
+		// % num; reject zero, non-power-of-two and oversized values.
+		if num == 0 || num > 32768 || num&(num-1) != 0 {
+			return false, fmt.Errorf("vu: invalid vring num %d (want a power of two <= 32768)", num)
 		}
 		s.vq.num = num
 		return false, nil
@@ -206,14 +240,14 @@ func (s *session) handle(m *msg) (bool, error) {
 		if idx != 0 {
 			return false, fmt.Errorf("only queue 0 supported")
 		}
-		s.vq.lastAvail = base
+		s.vq.lastAvail = base & 0xffff // avail idx is 16-bit virtio state
 		return false, nil
 
 	case reqGetVringBase:
 		// Queue reset: frontend asks for last_avail_idx and stops the queue.
 		var p [8]byte
 		binary.LittleEndian.PutUint32(p[0:], 0)
-		binary.LittleEndian.PutUint32(p[4:], uint32(s.vq.lastAvail))
+		binary.LittleEndian.PutUint32(p[4:], s.vq.lastAvail&0xffff)
 		return true, s.c.reply(m, p[:])
 
 	case reqSetVringKick:
@@ -240,6 +274,11 @@ func (s *session) handle(m *msg) (bool, error) {
 		return false, nil // we only do little-endian; legacy flag, ignore
 
 	case reqGetConfig:
+		// The payload length is peer-controlled; short messages would panic
+		// the session goroutine on the Uint32 / [:12] accesses below.
+		if len(m.payload) < 12 {
+			return false, fmt.Errorf("vu: short GET_CONFIG payload (%d bytes)", len(m.payload))
+		}
 		off := binary.LittleEndian.Uint32(m.payload[0:])
 		sz := binary.LittleEndian.Uint32(m.payload[4:])
 		data, err := s.dev.config(off, sz)
@@ -273,8 +312,13 @@ func (s *session) handle(m *msg) (bool, error) {
 }
 
 // setVringFile handles KICK/CALL/ERR: payload u64 (index | NOFD), optional fd.
+// Takes ownership of the message's fds: the one we adopt is dup'ed, and all
+// message fds (including the dup source and any surplus) are closed here so
+// reconnects don't leak descriptors.
 func (s *session) setVringFile(m *msg, dst **eventfd) error {
 	u := m.u64()
+	fds := m.takeFds()
+	defer closeFds(fds)
 	if u&vringNoFD != 0 {
 		if *dst != nil {
 			(*dst).close()
@@ -282,12 +326,11 @@ func (s *session) setVringFile(m *msg, dst **eventfd) error {
 		}
 		return nil
 	}
-	if len(m.fds) < 1 {
+	if len(fds) < 1 {
 		return errors.New("vu: vring file message without fd")
 	}
-	fd := m.fds[0]
-	// Take ownership: dup so later cleanup paths don't double-close fds
-	// still referenced by the message.
+	fd := fds[0]
+	// Dup so our eventfd outlives the message-scoped fd cleanup above.
 	nfd, err := unix.Dup(fd)
 	if err != nil {
 		return err
@@ -305,13 +348,19 @@ func (s *session) setVringFile(m *msg, dst **eventfd) error {
 
 // maybeStartPump launches the queue-processing goroutine once the queue is
 // enabled AND the kick fd exists. Called from both SET_VRING_ENABLE and
-// SET_VRING_KICK so either message order works; pumpOnce dedupes.
+// SET_VRING_KICK so either message order works; pumpOnce dedupes. Callers
+// hold s.mu, which also serializes against close(): the closed check keeps
+// pumpWg.Add from racing a pumpWg.Wait already in progress.
 func (s *session) maybeStartPump() {
-	if !s.vq.enabled || s.vq.kick == nil {
+	if s.closed || !s.vq.enabled || s.vq.kick == nil {
 		return
 	}
 	s.pumpOnce.Do(func() {
-		go s.pump()
+		s.pumpWg.Add(1)
+		go func() {
+			defer s.pumpWg.Done()
+			s.pump()
+		}()
 	})
 }
 

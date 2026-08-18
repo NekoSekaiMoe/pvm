@@ -161,8 +161,16 @@ func (f *e2eFrontend) setupVring() {
 	binary.LittleEndian.PutUint32(s[4:], 0) // base
 	f.sendMsg(reqSetVringBase, s[:])
 
-	f.kickFd, _ = unix.Eventfd(0, 0)
-	f.callFd, _ = unix.Eventfd(0, unix.EFD_NONBLOCK)
+	kickFd, err := unix.Eventfd(0, 0)
+	if err != nil {
+		f.t.Fatalf("kick eventfd: %v", err)
+	}
+	callFd, err := unix.Eventfd(0, unix.EFD_NONBLOCK)
+	if err != nil {
+		unix.Close(kickFd)
+		f.t.Fatalf("call eventfd: %v", err)
+	}
+	f.kickFd, f.callFd = kickFd, callFd
 	var i [8]byte
 	binary.LittleEndian.PutUint64(i[:], 0) // index 0, fd follows
 	f.sendMsg(reqSetVringCall, i[:], f.callFd)
