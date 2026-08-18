@@ -26,7 +26,7 @@ go generate ./...                     # regenerate eBPF bytecode (requires clang
 go test -v ./...                      # run all Go unit tests (CI default)
 go vet ./...                          # static checks before pushing
 
-./scripts/build_kernel.sh             # download + compile UML kernel (Linux 6.6.9) to bin/linux
+./scripts/build_kernel.sh             # download + compile UML kernel (Linux 6.18.x) to bin/linux
 ./scripts/test_integration.sh         # boot a real UML container and assert init output
 for s in tests/*.sh; do ./"$s"; done  # run the numbered integration suites serially
 
