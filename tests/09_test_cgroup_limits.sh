@@ -106,8 +106,19 @@ sleep 1
 CUR=$(cat $CG/pidstest/pids.current)
 kill $BOMB 2>/dev/null
 wait $BOMB 2>/dev/null
-echo "pids.current=$CUR (pids.max=8)"
-[ "$CUR" -le 8 ] && echo "PIDS_LIMIT_ENFORCED" || echo "PIDS_LIMIT_NOT_ENFORCED"
+# pids.events' "max" counter records how many times the limit was hit — a
+# deterministic enforcement signal, unlike the timing-based pids.current
+# sample above. Both must hold.
+MAX_EVENTS=0
+if [ -f $CG/pidstest/pids.events ]; then
+    MAX_EVENTS=$(awk '/^max / {print $2}' $CG/pidstest/pids.events)
+fi
+echo "pids.current=$CUR (pids.max=8) pids.events.max=$MAX_EVENTS"
+if [ "$CUR" -le 8 ] && [ "${MAX_EVENTS:-0}" -gt 0 ]; then
+    echo "PIDS_LIMIT_ENFORCED"
+else
+    echo "PIDS_LIMIT_NOT_ENFORCED"
+fi
 
 # 3. memory.max enforcement: 32M cap, then write 256M into tmpfs.
 #    tmpfs pages are charged to the writer's memcg, so the dd must be
