@@ -1,6 +1,6 @@
 # PVM
 
-PVM is a lightweight, User-Mode Linux (UML)-based container management system. It provides strong isolation for processes by leveraging virtualized Linux kernels while maintaining a container-like CLI and experience.
+PVM(Pico VM for legacy x86_64 device) is a lightweight, User-Mode Linux (UML)-based container management system. It provides strong isolation for processes by leveraging virtualized Linux kernels while maintaining a container-like CLI and experience.
 
 ## Features
 
