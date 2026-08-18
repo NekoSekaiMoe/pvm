@@ -23,8 +23,6 @@ jobs:
       working-directory: ./webui
       run: |
         npm install
-        npx nuxi typecheck || true
-        npm run generate
 
     - name: Set up Go
       uses: actions/setup-go@v7
@@ -156,7 +154,6 @@ jobs:
       working-directory: ./webui
       run: |
         npm install
-        npm run generate
 
     # bazelisk is preinstalled on the runner and honors .bazelversion (7.5.0).
     - name: Bazel build
