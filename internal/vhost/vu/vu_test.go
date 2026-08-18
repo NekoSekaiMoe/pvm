@@ -150,41 +150,55 @@ func TestVringPopIndirect(t *testing.T) {
 // fire-and-forget message with NEED_REPLY and rejects any reply whose flags
 // are not exactly REPLY|VERSION. Echoing NEED_REPLY back breaks the probe.
 func TestReplyClearsNeedReply(t *testing.T) {
-	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
-	if err != nil {
-		t.Fatalf("socketpair: %v", err)
+	cases := []struct {
+		name  string
+		flags uint32 // request flags the frontend sends
+	}{
+		{"request with NEED_REPLY (post REPLY_ACK negotiation)", 1 | flagNeedReply},
+		{"plain request", 1},
 	}
-	defer unix.Close(fds[0])
-	defer unix.Close(fds[1])
-	toConn := func(fd int) *conn {
-		f := os.NewFile(uintptr(fd), "sock")
-		defer f.Close()
-		uc, err := net.FileConn(f)
-		if err != nil {
-			t.Fatalf("FileConn: %v", err)
-		}
-		return newConn(uc.(*net.UnixConn))
-	}
-	server, client := toConn(fds[0]), toConn(fds[1])
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
+			if err != nil {
+				t.Fatalf("socketpair: %v", err)
+			}
+			toConn := func(fd int) *conn {
+				f := os.NewFile(uintptr(fd), "sock")
+				defer f.Close() // FileConn dup'ed the fd; the original is done
+				uc, err := net.FileConn(f)
+				if err != nil {
+					t.Fatalf("FileConn: %v", err)
+				}
+				return newConn(uc.(*net.UnixConn))
+			}
+			server, client := toConn(fds[0]), toConn(fds[1])
+			// The conns own the (dup'ed) descriptors; closing them releases
+			// everything. Do NOT unix.Close the socketpair fds — they were
+			// already closed inside toConn and the numbers may be reused.
+			defer server.c.Close()
+			defer client.c.Close()
 
-	// Frontend sends a NEED_REPLY request, backend ACKs it.
-	if err := client.send(reqSetVringEnable, 1|flagNeedReply, make([]byte, 8)); err != nil {
-		t.Fatalf("send: %v", err)
-	}
-	m, err := server.recv()
-	if err != nil {
-		t.Fatalf("recv: %v", err)
-	}
-	if err := server.ack(m); err != nil {
-		t.Fatalf("ack: %v", err)
-	}
-	resp, err := client.recv()
-	if err != nil {
-		t.Fatalf("recv resp: %v", err)
-	}
-	const want = 1 | flagReply // REPLY|VERSION, NEED_REPLY cleared
-	if resp.flags != want {
-		t.Fatalf("reply flags = %#x, want %#x", resp.flags, want)
+			// Frontend sends a request, backend ACKs it.
+			if err := client.send(reqSetVringEnable, tc.flags, make([]byte, 8)); err != nil {
+				t.Fatalf("send: %v", err)
+			}
+			m, err := server.recv()
+			if err != nil {
+				t.Fatalf("recv: %v", err)
+			}
+			if err := server.ack(m); err != nil {
+				t.Fatalf("ack: %v", err)
+			}
+			resp, err := client.recv()
+			if err != nil {
+				t.Fatalf("recv resp: %v", err)
+			}
+			const want = 1 | flagReply // REPLY|VERSION, NEED_REPLY cleared
+			if resp.flags != want {
+				t.Fatalf("reply flags = %#x, want %#x", resp.flags, want)
+			}
+		})
 	}
 }
 

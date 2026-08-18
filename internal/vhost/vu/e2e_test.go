@@ -97,6 +97,9 @@ func (f *e2eFrontend) sendMsgAck(req uint32, payload []byte, fds ...int) {
 	if m.flags != 1|flagReply {
 		f.t.Fatalf("req %d ack flags = %#x, want REPLY|VERSION", req, m.flags)
 	}
+	if len(m.payload) != 8 {
+		f.t.Fatalf("req %d ack payload = %d bytes, want 8", req, len(m.payload))
+	}
 	if v := m.u64(); v != 0 {
 		f.t.Fatalf("req %d ack status = %d, want 0", req, v)
 	}
