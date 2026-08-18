@@ -71,6 +71,28 @@ make ARCH=um defconfig
 
 make ARCH=um olddefconfig
 
+# olddefconfig silently DROPS symbols it doesn't know (e.g. renamed options:
+# CONFIG_MEMCG's v1 listing moved behind CONFIG_MEMCG_V1, off by default,
+# since 6.12) or whose dependencies are unmet. Fail loudly instead of
+# discovering a missing controller from a guest panic in CI.
+echo "Verifying required symbols survived olddefconfig..."
+missing=0
+for sym in CONFIG_NAMESPACES CONFIG_PID_NS CONFIG_NET_NS \
+           CONFIG_CGROUPS CONFIG_CGROUP_FREEZER CONFIG_CGROUP_SCHED \
+           CONFIG_MEMCG CONFIG_CGROUP_PIDS \
+           CONFIG_DEVTMPFS CONFIG_DEVTMPFS_MOUNT CONFIG_UNIX \
+           CONFIG_EXT4_FS CONFIG_OVERLAY_FS \
+           CONFIG_VIRTIO_UML CONFIG_VIRTIO_BLK CONFIG_VIRTIO_NET CONFIG_VIRTIO_CONSOLE \
+           CONFIG_UML_NET_VECTOR CONFIG_TUN; do
+    if ! grep -q "^${sym}=y" .config; then
+        echo "FATAL: ${sym} missing from .config (renamed symbol or unmet dependency)"
+        missing=1
+    fi
+done
+# CONFIG_MEMCG_V1 intentionally left off: tests use v2-native detection
+# (cgroup.controllers), and 6.18 defaults it to n.
+[ "$missing" -eq 0 ] || exit 1
+
 echo "Building UML Kernel (this will take a while)..."
 make ARCH=um -j$(nproc)
 
