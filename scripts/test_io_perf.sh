@@ -109,7 +109,7 @@ run_one() {
     # log to the agentpvm log on failure. PVM_VHOST_BACKEND=qemu selects the
     # qemu-storage-daemon backend explicitly (the default is the Go server).
     sudo PVM_VHOST_BACKEND=qemu timeout 120 ./agentpvm run -name "$name" -rootfs "${BASE_QCOW2}" \
-        -kernel ./bin/linux -init /init.sh -vhost=true -debug \
+        -kernel ./bin/linux -init /init.sh -debug \
         > "$ap_log" 2>&1 || true
 
     # Ensure no lingering UML process keeps the socket/logs open for the next run.

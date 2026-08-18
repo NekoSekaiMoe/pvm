@@ -135,7 +135,7 @@ sudo rm -f "$CONSOLE_LOG"
 echo "Launching agentpvm (base -> per-task pure-Go CoW overlay via internal/vhost/vu, vec0 net)..."
 timeout 180 sudo ./agentpvm run -name "$NAME" \
     -rootfs "$BASE" -kernel ./bin/linux -init /init.sh \
-    -vhost=true -net-tap "$TAP" || true
+    -net-tap "$TAP" || true
 
 # ---- 5) Assertions: boot markers in console.log, not file existence ----
 # NOTE: there is deliberately NO vhost-blk.sock existence check here. The
