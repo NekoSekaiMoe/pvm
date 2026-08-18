@@ -9,6 +9,9 @@ go_library(
 
 go_test(
     name = "cgroup_test",
-    srcs = ["manager_test.go"],
+    srcs = [
+        "manager_edge_test.go",
+        "manager_test.go",
+    ],
     embed = [":cgroup"],
 )

@@ -1,0 +1,42 @@
+load("@rules_go//go:def.bzl", "go_binary", "go_library", "go_test")
+
+go_library(
+    name = "agentpvm_lib",
+    srcs = ["main.go"],
+    importpath = "uml-container/cmd/agentpvm",
+    visibility = ["//visibility:private"],
+    deps = [
+        "//internal/api",
+        "//internal/approval",
+        "//internal/artifact",
+        "//internal/audit",
+        "//internal/cgroup",
+        "//internal/config",
+        "//internal/container",
+        "//internal/cow",
+        "//internal/ebpf",
+        "//internal/identity",
+        "//internal/incident",
+        "//internal/log",
+        "//internal/network",
+        "//internal/network/egress",
+        "//internal/policy",
+        "//internal/snapshot",
+        "//internal/spec",
+        "//internal/state",
+        "//internal/vhost",
+    ],
+)
+
+go_binary(
+    name = "agentpvm",
+    embed = [":agentpvm_lib"],
+    visibility = ["//visibility:public"],
+)
+
+go_test(
+    name = "agentpvm_test",
+    srcs = ["main_test.go"],
+    embed = [":agentpvm_lib"],
+    deps = ["//internal/spec"],
+)

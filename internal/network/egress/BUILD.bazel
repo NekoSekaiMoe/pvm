@@ -11,8 +11,8 @@ go_library(
 go_test(
     name = "egress_test",
     srcs = [
-        "gateway_test.go",
         "edge_test.go",
+        "gateway_test.go",
     ],
     embed = [":egress"],
     deps = ["//internal/audit"],

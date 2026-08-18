@@ -9,6 +9,9 @@ go_library(
 
 go_test(
     name = "config_test",
-    srcs = ["config_test.go"],
+    srcs = [
+        "config_test.go",
+        "parse_memory_test.go",
+    ],
     embed = [":config"],
 )

@@ -10,8 +10,8 @@ go_library(
 go_test(
     name = "audit_test",
     srcs = [
-        "ledger_test.go",
         "edge_test.go",
+        "ledger_test.go",
     ],
     embed = [":audit"],
 )
