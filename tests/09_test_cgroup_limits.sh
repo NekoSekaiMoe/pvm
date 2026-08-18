@@ -26,12 +26,22 @@ UMLCTL_LOG=uml-cgroup-test.log
 cleanup() {
     # Only remove mnt when it is not (or no longer) mounted: rm -rf on a
     # live mountpoint would delete files inside the mounted filesystem.
+    local mounted=0
     if mountpoint -q mnt 2>/dev/null; then
-        sudo umount mnt && rm -rf mnt || echo "warn: umount mnt failed; leaving it mounted"
+        if sudo umount mnt; then
+            rm -rf mnt
+        else
+            mounted=1
+            echo "warn: umount mnt failed; leaving it mounted"
+        fi
     else
         rm -rf mnt
     fi
-    rm -f "$ROOTFS" alpine-cgroup-test.tar.gz
+    # Keep the rootfs image when its loop mount is still alive.
+    if [ "$mounted" -eq 0 ]; then
+        rm -f "$ROOTFS"
+    fi
+    rm -f alpine-cgroup-test.tar.gz
     sudo rm -rf "/var/lib/uml-container/containers/$NAME"
 }
 trap cleanup EXIT
@@ -62,27 +72,37 @@ mount -t tmpfs none /dev/shm
 CG=/sys/fs/cgroup
 
 # 1. Controllers compiled in (proves CONFIG_MEMCG / CONFIG_CGROUP_PIDS).
-grep -q '^memory' /proc/cgroups && echo "MEMCG_PRESENT" || echo "MEMCG_MISSING"
-grep -q '^pids'   /proc/cgroups && echo "PIDS_PRESENT"  || echo "PIDS_MISSING"
+#    Check the cgroup v2 way: /proc/cgroups only lists controllers with
+#    v1 support (6.18 cgroup-v1.c: cgroup1_subsys_absent), and the v1
+#    memory controller (CONFIG_MEMCG_V1) defaults to n, so 'memory'
+#    legitimately never appears there even when CONFIG_MEMCG=y.
+grep -qw memory $CG/cgroup.controllers && echo "MEMCG_PRESENT" || echo "MEMCG_MISSING"
+grep -qw pids   $CG/cgroup.controllers && echo "PIDS_PRESENT"  || echo "PIDS_MISSING"
 
-echo "+memory +pids" > $CG/cgroup.subtree_control
+# Enable controllers independently: a missing one must not block the other.
+echo +memory > $CG/cgroup.subtree_control 2>/dev/null || true
+echo +pids   > $CG/cgroup.subtree_control 2>/dev/null || true
 
 # 2. pids.max enforcement: cap at 8 tasks, try to spawn 32 sleeps.
-#    With enforcement pids.current never exceeds 8 (forks fail with EAGAIN).
+#    Run the whole test in a CHILD shell: PID 1 must never enter the capped
+#    cgroup — with forks rejected, init cannot even spawn builtins' helpers
+#    and its exit panics the kernel. Inside the child, only shell builtins
+#    (read/echo/wait) are used after the fork bomb, since external commands
+#    need fork.
 mkdir $CG/pidstest
 echo 8 > $CG/pidstest/pids.max
-echo $$ > $CG/pidstest/cgroup.procs
-i=0
-while [ $i -lt 32 ]; do
-    ( sleep 2 ) &
-    i=$((i+1))
-done
-sleep 1
-CUR=$(cat $CG/pidstest/pids.current)
-echo "pids.current=$CUR (pids.max=8)"
-[ "$CUR" -le 8 ] && echo "PIDS_LIMIT_ENFORCED" || echo "PIDS_LIMIT_NOT_ENFORCED"
-wait
-echo $$ > $CG/cgroup.procs
+sh -c '
+    echo $$ > /sys/fs/cgroup/pidstest/cgroup.procs
+    i=0
+    while [ $i -lt 32 ]; do
+        ( sleep 2 ) &
+        i=$((i+1))
+    done
+    read CUR < /sys/fs/cgroup/pidstest/pids.current
+    echo "pids.current=$CUR (pids.max=8)"
+    [ "$CUR" -le 8 ] && echo "PIDS_LIMIT_ENFORCED" || echo "PIDS_LIMIT_NOT_ENFORCED"
+    wait
+'
 
 # 3. memory.max enforcement: 32M cap, then write 256M into tmpfs.
 #    tmpfs pages are charged to the writer's memcg, so the dd must be
