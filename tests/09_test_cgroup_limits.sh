@@ -84,11 +84,12 @@ echo +memory > $CG/cgroup.subtree_control 2>/dev/null || true
 echo +pids   > $CG/cgroup.subtree_control 2>/dev/null || true
 
 # 2. pids.max enforcement: cap at 8 tasks, try to spawn 32 sleeps.
-#    Run the whole test in a CHILD shell: PID 1 must never enter the capped
-#    cgroup — with forks rejected, init cannot even spawn builtins' helpers
-#    and its exit panics the kernel. Inside the child, only shell builtins
-#    (read/echo/wait) are used after the fork bomb, since external commands
-#    need fork.
+#    A shell that hits the pids cap DIES on its next fork failure (busybox
+#    ash treats a failed fork as fatal — see the earlier 'Attempted to kill
+#    init' panic), so the fork bomb runs in a sacrificial child INSIDE the
+#    cgroup while PID 1 — never in the capped cgroup, so its own forks
+#    (sleep/cat below) always work — samples pids.current from outside.
+#    The bomb dying of "can't fork" is the expected, enforcing outcome.
 mkdir $CG/pidstest
 echo 8 > $CG/pidstest/pids.max
 sh -c '
@@ -98,11 +99,15 @@ sh -c '
         ( sleep 2 ) &
         i=$((i+1))
     done
-    read CUR < /sys/fs/cgroup/pidstest/pids.current
-    echo "pids.current=$CUR (pids.max=8)"
-    [ "$CUR" -le 8 ] && echo "PIDS_LIMIT_ENFORCED" || echo "PIDS_LIMIT_NOT_ENFORCED"
     wait
-'
+' &
+BOMB=$!
+sleep 1
+CUR=$(cat $CG/pidstest/pids.current)
+kill $BOMB 2>/dev/null
+wait $BOMB 2>/dev/null
+echo "pids.current=$CUR (pids.max=8)"
+[ "$CUR" -le 8 ] && echo "PIDS_LIMIT_ENFORCED" || echo "PIDS_LIMIT_NOT_ENFORCED"
 
 # 3. memory.max enforcement: 32M cap, then write 256M into tmpfs.
 #    tmpfs pages are charged to the writer's memcg, so the dd must be
