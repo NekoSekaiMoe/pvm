@@ -7,6 +7,10 @@ import (
 )
 
 //go:generate npm run generate
+// The embedded path depends on how the package is built:
+//   - go build (local):        nuxt writes .output/public in webui/ (gitignored)
+//   - bazel (//webui:webui):  the nuxt_generate tree artifact is mapped to
+//     .output/public relative to the package root (embedsrcs remap)
 //go:embed all:.output/public
 var embedFS embed.FS
 

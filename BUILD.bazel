@@ -2,6 +2,11 @@ load("@gazelle//:def.bzl", "gazelle")
 
 # gazelle:prefix uml-container
 # gazelle:exclude webui/node_modules
+# gazelle:exclude webui/.aspect_rules_js
+# gazelle:exclude webui/node_modules/.aspect_rules_js
+# gazelle:exclude webui/.output
+# gazelle:exclude webui/dist
+# gazelle:exclude webui/.nuxt
 # gazelle:exclude mnt_pkg
 # gazelle:exclude ref
 gazelle(name = "gazelle")

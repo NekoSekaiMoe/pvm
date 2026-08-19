@@ -1,11 +1,49 @@
+load("@npm//:defs.bzl", "npm_link_all_packages")
+load("@npm//webui:nuxt/package_json.bzl", nuxt_bin = "bin")
 load("@rules_go//go:def.bzl", "go_library")
+
+# Generates the package store targets (.aspect_rules_js/node_modules/...)
+# that the nuxt bin macros above reference. Must be called in the root
+# package of the pnpm lockfile importer (webui).
+npm_link_all_packages(name = "node_modules")
+
+# Nuxt CLI target generated from the nuxt package's bin entry point.
+# This is an executable js_run_binary (tool = nuxt's js_binary).
+nuxt_bin.nuxt(
+    name = "nuxt_generate",
+    srcs = [
+        "app.vue",
+        "nuxt.config.ts",
+        "package.json",
+        "pnpm-lock.yaml",
+    ] + glob(
+        [
+            "pages/**",
+            "composables/**",
+            "assets/**",
+        ],
+    ),
+    args = ["generate"],
+    # js_run_binary's launcher first cd's to $(BINDIR) (root of output tree);
+    # chdir is then resolved relative to that, so only the package-relative
+    # part is needed. Sources are copied to bin via copy_srcs_to_bin (default)
+    # and node_modules/ is linked there by npm_link_all_packages.
+    chdir = "webui",
+    data = ["//webui:node_modules"],
+    env = {
+        "NUXT_TELEMETRY_DISABLED": "1",
+    },
+    # nuxt generate writes to .output/public by default (outDir is fixed to
+    # .output; buildDir dist). Collect it as a tree artifact.
+    out_dirs = [".output/public"],
+)
 
 go_library(
     name = "webui",
     srcs = ["embed.go"],
-    # 不再枚举带 hash 的 Nuxt 产物：改用 glob，使重新生成 WebUI 后无需手工同步本文件，
-    # 避免出现 "嵌入旧产物 / Bazel 分析失败"。# keep：gazelle 无法 merge glob，保持手写。
-    embedsrcs = glob([".output/public/**/*"]),  # keep
+    # Embed the Bazel-generated Nuxt static assets (tree artifact).
+    # keep：gazelle 不认识生成目标的 embedsrcs，会删除该行，勿跑 gazelle 后丢失。
+    embedsrcs = [":nuxt_generate"],  # keep
     importpath = "uml-container/webui",
     visibility = ["//visibility:public"],
 )

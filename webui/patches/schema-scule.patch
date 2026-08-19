@@ -1,0 +1,12 @@
+fix: drop bare `import 'scule'` that isn't a declared dependency
+
+dist/index.mjs has a side-effect import of 'scule' which is only a
+devDependency of @nuxt/schema, so strict module layouts (pnpm / Bazel
+rules_js) fail to resolve it at runtime.
+--- a/dist/index.mjs
++++ b/dist/index.mjs
+@@ -1,4 +1,3 @@
+-import 'scule';
+ import process from 'node:process';
+ import { defu } from 'defu';
+ import { resolve, join, relative, basename } from 'pathe';

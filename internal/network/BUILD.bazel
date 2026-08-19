@@ -1,63 +1,106 @@
 load("@rules_go//go:def.bzl", "go_library", "go_test")
+load("@bazel_lib//lib:run_binary.bzl", "run_binary")
+
+# Multiarch include dir (asm/types.h etc.) for the host that runs clang.
+# Resolved for the *execution* platform, not the target platform, because
+# clang reads host headers while generating eBPF bytecode.
+# Branches are lists so the select concatenates into the args list.
+ARCH_INCLUDE_FLAGS = select({
+    "@platforms//cpu:arm64": ["-I/usr/include/aarch64-linux-gnu"],
+    "@platforms//cpu:x86_64": ["-I/usr/include/x86_64-linux-gnu"],
+    "//conditions:default": [],
+})
+
+# Generate the bpf2go Go bindings + stripped eBPF object files from bpf/egress.c.
+#
+# bpf2go invokes clang with -target bpfel/bpfeb; each endianness run emits
+#   <prefix>_<target>.go  (generated Go bindings, //go:build tagged)
+#   <prefix>_<target>.o   (stripped eBPF ELF, embedded via //go:embed)
+#
+# This replaces the manual `go generate ./...` step for Bazel builds: the
+# C source -> bytecode -> Go embedding chain is now fully in the action graph.
+
+[
+    run_binary(
+        name = "bpf2go_" + target,
+        tool = "@com_github_cilium_ebpf//cmd/bpf2go",
+        srcs = [
+            "//bpf:egress.c",
+            "bpf.go",  # materializes internal/network/ in the sandbox so chdir works
+        ],
+        outs = [
+            "bpf_" + target + ".go",
+            "bpf_" + target + ".o",
+        ],
+        args = [
+            "-go-package",
+            "network",  # Go package name (not importpath); must be a valid identifier
+            "-target",
+            target,
+            "bpf",
+            "../../../../../bpf/egress.c",  # execroot-relative source (5 up from bin/internal/network)
+            "--",
+            "-I/usr/include",
+        ] + ARCH_INCLUDE_FLAGS + [
+            "-O2",
+        ],
+        # bpf2go writes <stem>_<target>.{go,o} into its working directory.
+        # chdir to the package's bin dir so outputs land exactly on the
+        # declared bazel-out paths ($(BINDIR) = root of the output tree).
+        chdir = "$(BINDIR)/internal/network",
+    )
+    for target in [
+        "bpfel",
+        "bpfeb",
+    ]
+]
 
 go_library(
     name = "network",
     srcs = [
         "bpf.go",
-        "bpf_bpfeb.go",
-        "bpf_bpfel.go",
         "bridge.go",
         "filter.go",
         "tap.go",
-    ],
+    ] + select({
+        # generated bindings carry their own //go:build constraints; each
+        # endianness file only compiles on matching platforms.
+        "@rules_go//go/platform:386": [":bpf_bpfel.go"],
+        "@rules_go//go/platform:amd64": [":bpf_bpfel.go"],
+        "@rules_go//go/platform:arm": [":bpf_bpfel.go"],
+        "@rules_go//go/platform:arm64": [":bpf_bpfel.go"],
+        "@rules_go//go/platform:mips64le": [":bpf_bpfel.go"],
+        "@rules_go//go/platform:mipsle": [":bpf_bpfel.go"],
+        "@rules_go//go/platform:ppc64le": [":bpf_bpfel.go"],
+        "@rules_go//go/platform:riscv64": [":bpf_bpfel.go"],
+        "@rules_go//go/platform:mips": [":bpf_bpfeb.go"],
+        "@rules_go//go/platform:mips64": [":bpf_bpfeb.go"],
+        "@rules_go//go/platform:ppc64": [":bpf_bpfeb.go"],
+        "@rules_go//go/platform:s390x": [":bpf_bpfeb.go"],
+        "//conditions:default": [],
+    }),
+    # keep：gazelle 会用本地 go generate 产物重写 srcs/embedsrcs；本文件手写。
     embedsrcs = select({
-        "@rules_go//go/platform:386": [
-            "bpf_bpfel.o",
-        ],
-        "@rules_go//go/platform:amd64": [
-            "bpf_bpfel.o",
-        ],
-        "@rules_go//go/platform:arm": [
-            "bpf_bpfel.o",
-        ],
-        "@rules_go//go/platform:arm64": [
-            "bpf_bpfel.o",
-        ],
-        "@rules_go//go/platform:mips": [
-            "bpf_bpfeb.o",
-        ],
-        "@rules_go//go/platform:mips64": [
-            "bpf_bpfeb.o",
-        ],
-        "@rules_go//go/platform:mips64le": [
-            "bpf_bpfel.o",
-        ],
-        "@rules_go//go/platform:mipsle": [
-            "bpf_bpfel.o",
-        ],
-        "@rules_go//go/platform:ppc64": [
-            "bpf_bpfeb.o",
-        ],
-        "@rules_go//go/platform:ppc64le": [
-            "bpf_bpfel.o",
-        ],
-        "@rules_go//go/platform:riscv64": [
-            "bpf_bpfel.o",
-        ],
-        "@rules_go//go/platform:s390x": [
-            "bpf_bpfeb.o",
-        ],
-        "@rules_go//go/platform:wasm": [
-            "bpf_bpfel.o",
-        ],
+        "@rules_go//go/platform:386": [":bpf_bpfel.o"],
+        "@rules_go//go/platform:amd64": [":bpf_bpfel.o"],
+        "@rules_go//go/platform:arm": [":bpf_bpfel.o"],
+        "@rules_go//go/platform:arm64": [":bpf_bpfel.o"],
+        "@rules_go//go/platform:mips64le": [":bpf_bpfel.o"],
+        "@rules_go//go/platform:mipsle": [":bpf_bpfel.o"],
+        "@rules_go//go/platform:ppc64le": [":bpf_bpfel.o"],
+        "@rules_go//go/platform:riscv64": [":bpf_bpfel.o"],
+        "@rules_go//go/platform:mips": [":bpf_bpfeb.o"],
+        "@rules_go//go/platform:mips64": [":bpf_bpfeb.o"],
+        "@rules_go//go/platform:ppc64": [":bpf_bpfeb.o"],
+        "@rules_go//go/platform:s390x": [":bpf_bpfeb.o"],
         "//conditions:default": [],
     }),
     importpath = "uml-container/internal/network",
     visibility = ["//:__subpackages__"],
     deps = [
-        "@com_github_cilium_ebpf//:go_default_library",
-        "@com_github_vishvananda_netlink//:go_default_library",
-        "@org_golang_x_sys//unix:go_default_library",
+        "@com_github_cilium_ebpf//:ebpf",
+        "@com_github_vishvananda_netlink//:netlink",
+        "@org_golang_x_sys//unix",
     ],
 )
 

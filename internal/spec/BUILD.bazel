@@ -5,7 +5,7 @@ go_library(
     srcs = ["spec.go"],
     importpath = "uml-container/internal/spec",
     visibility = ["//:__subpackages__"],
-    deps = ["@com_github_burntsushi_toml//:go_default_library"],
+    deps = ["@com_github_burntsushi_toml//:toml"],
 )
 
 go_test(

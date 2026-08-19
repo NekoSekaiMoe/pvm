@@ -11,3 +11,8 @@ webui/.output/
 linux-*.tar.xz
 linux-*/
 pkg_rootfs.img
+
+# Bazel
+bazel-*
+MODULE.bazel.lock
+internal/network/bpf_bpf*

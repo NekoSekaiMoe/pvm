@@ -5,6 +5,7 @@ module(
 
 bazel_dep(name = "rules_go", version = "0.59.0")
 bazel_dep(name = "gazelle", version = "0.47.0")
+bazel_dep(name = "platforms", version = "1.0.0")
 
 go_sdk = use_extension("@rules_go//go:extensions.bzl", "go_sdk")
 go_sdk.download(version = "1.22.0")
@@ -12,3 +13,34 @@ go_sdk.download(version = "1.22.0")
 go_deps = use_extension("@gazelle//:extensions.bzl", "go_deps")
 go_deps.from_file(go_mod = "//:go.mod")
 use_repo(go_deps, "com_github_burntsushi_toml", "com_github_cilium_ebpf", "com_github_google_go_containerregistry", "com_github_labstack_echo_v4", "com_github_vishvananda_netlink", "org_golang_x_sys")
+
+# --- WebUI (Nuxt 3) via rules_js -------------------------------------------
+# npm deps are fetched & linked hermetically from webui/pnpm-lock.yaml.
+# Node toolchain is downloaded (no host node needed).
+bazel_dep(name = "aspect_rules_js", version = "3.4.0")
+bazel_dep(name = "bazel_lib", version = "3.7.0")
+bazel_dep(name = "rules_nodejs", version = "6.7.3")
+
+node = use_extension("@rules_nodejs//nodejs:extensions.bzl", "node")
+node.toolchain(
+    name = "nodejs",
+    # keep in sync with webui's local dev toolchain (node 24.x)
+    node_version = "24.8.0",
+)
+use_repo(node, "nodejs")
+
+pnpm = use_extension("@aspect_rules_js//npm:extensions.bzl", "pnpm")
+pnpm.pnpm(name = "pnpm")
+use_repo(pnpm, "pnpm")
+
+npm = use_extension("@aspect_rules_js//npm:extensions.bzl", "npm")
+npm.npm_translate_lock(
+    name = "npm",
+    pnpm_lock = "//webui:pnpm-lock.yaml",
+    data = ["//webui:pnpm-workspace.yaml"],
+    bins = {
+        # expose the nuxt CLI (nuxt generate / dev) as @npm//nuxt
+        "nuxt": ["nuxt=./nuxt/bin/nuxt.mjs"],
+    },
+)
+use_repo(npm, "npm")

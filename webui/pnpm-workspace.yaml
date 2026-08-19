@@ -1,0 +1,13 @@
+# pnpm workspace/build settings consumed by rules_js npm_translate_lock.
+# rules_js 3.x requires explicitly declaring packages allowed to run
+# install scripts (pnpm >= 10.26 'allowBuilds'; older: onlyBuiltDependencies).
+# Only esbuild in this tree has a postinstall (binary download); its
+# platform binaries ship as optionalDependencies and install as-is.
+allowBuilds:
+  esbuild: true
+
+# @nuxt/schema 3.21.x dist has a bare `import 'scule'` while scule is only a
+# devDependency; npm gets away with it via hoisting, pnpm/rules_js don't.
+# Patch it out until upstream ships the fix.
+patchedDependencies:
+  '@nuxt/schema@3.21.10': patches/schema-scule.patch
