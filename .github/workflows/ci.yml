@@ -44,7 +44,7 @@ jobs:
     - name: Install eBPF (C) Dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y clang llvm libbpf-dev linux-libc-dev clang-tidy
+        sudo apt-get install -y clang lld llvm libbpf-dev linux-libc-dev clang-tidy
         # aarch64: the UML arm64 port builds with LLVM=1 (clang maps
         # SUBARCH=arm64); gcc-multilib/qemu-system-x86 are x86-only extras.
         if [ "$(uname -m)" = "x86_64" ]; then
