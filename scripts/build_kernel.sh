@@ -1,39 +1,74 @@
 #!/bin/bash
 set -ex
 
+# Architecture-adaptive UML kernel build. Intended to run in CI — building a
+# kernel on a laptop is painfully slow, do not run locally unless you must.
+#
+#   x86_64 : mainline Linux ${KERNEL_VERSION} + xstate workaround (AMX hosts)
+#   aarch64: zalexdev/linux-um-arm64 @ ${ZALEXDEV_REV} (ARCH=um SUBARCH=arm64;
+#            not yet mainline — see docs; revision is PINNED, a drifted remote
+#            fails the build instead of silently changing the kernel)
+ARCH=$(uname -m)
 KERNEL_VERSION="6.18.36"
 KERNEL_TAR="linux-${KERNEL_VERSION}.tar.xz"
 KERNEL_URL="https://cdn.kernel.org/pub/linux/kernel/v6.x/${KERNEL_TAR}"
+ZALEXDEV_REPO="https://github.com/zalexdev/linux-um-arm64"
+ZALEXDEV_REV="8897487c52233cd00cf2850008ca068892f1ae91"
 
-echo "Downloading Linux kernel ${KERNEL_VERSION}..."
-wget -q "${KERNEL_URL}"
-tar -xf "${KERNEL_TAR}"
-cd "linux-${KERNEL_VERSION}"
+case "$ARCH" in
+  x86_64)
+    echo "Downloading Linux kernel ${KERNEL_VERSION}..."
+    wget -q "${KERNEL_URL}"
+    tar -xf "${KERNEL_TAR}"
+    cd "linux-${KERNEL_VERSION}"
 
-# UML 6.6.9 在支持大 XSAVE 扩展（AMX/AVX-512）的 host（如 GitHub Actions 的
-# Xeon runner）上，init 启动后立即 SIGSEGV:
-#   userspace - ptrace set fp regs failed, errno = 14
-#   Kernel panic - not syncing: Attempted to kill init! exitcode=0x0000000b
-#
-# 根因：arch/x86/um/os-Linux/registers.c 的 have_xstate_support 路径用编译时
-# 固定大小的 FP_SIZE buffer 走 PTRACE_SETREGSET(NT_X86_XSTATE)。当 host 内核
-# 要求的 xstate size > FP_SIZE（AMX 就是这种情况），内核返回 EFAULT。上游修复
-# （2024-10 [PATCH v5] um: switch to regset API and depend on XSTATE）让 UML
-# 运行时发现 host xstate size，但未进 6.6.9。
-#
-# 规避：强制 have_xstate_support=0，让 UML 回退到 PTRACE_GETFPREGS/SETFPREGS
-# （老 fxsave，512 字节固定，所有 x86_64 host 都支持）。代价：guest 内不暴露
-# AVX/AMX 等扩展；alpine busybox/dd 等常规负载用不到，不影响正确性。
-echo "Patching arch/x86/um/os-Linux/registers.c to disable xstate path (AMX/AVX EFAULT workaround)..."
-if grep -q 'have_xstate_support = 1' arch/x86/um/os-Linux/registers.c; then
-    sed -i 's/\(.*have_xstate_support = 1.*\)/\/* AMX xstate EFAULT workaround: force fxsave path *\/ \/*\1*\//' arch/x86/um/os-Linux/registers.c
-    grep -n 'AMM xstate EFAULT workaround\|have_xstate_support' arch/x86/um/os-Linux/registers.c || true
-else
-    echo "Warning: have_xstate_support assignment not found; patch skipped (kernel source layout changed?)."
-fi
+    # UML 6.6.9 在支持大 XSAVE 扩展（AMX/AVX-512）的 host（如 GitHub Actions 的
+    # Xeon runner）上，init 启动后立即 SIGSEGV:
+    #   userspace - ptrace set fp regs failed, errno = 14
+    #   Kernel panic - not syncing: Attempted to kill init! exitcode=0x0000000b
+    #
+    # 根因：arch/x86/um/os-Linux/registers.c 的 have_xstate_support 路径用编译时
+    # 固定大小的 FP_SIZE buffer 走 PTRACE_SETREGSET(NT_X86_XSTATE)。当 host 内核
+    # 要求的 xstate size > FP_SIZE（AMX 就是这种情况），内核返回 EFAULT。上游修复
+    # （2024-10 [PATCH v5] um: switch to regset API and depend on XSTATE）让 UML
+    # 运行时发现 host xstate size，但未进 6.6.9。
+    #
+    # 规避：强制 have_xstate_support=0，让 UML 回退到 PTRACE_GETFPREGS/SETFPREGS
+    # （老 fxsave，512 字节固定，所有 x86_64 host 都支持）。代价：guest 内不暴露
+    # AVX/AMX 等扩展；alpine busybox/dd 等常规负载用不到，不影响正确性。
+    echo "Patching arch/x86/um/os-Linux/registers.c to disable xstate path (AMX/AVX EFAULT workaround)..."
+    if grep -q 'have_xstate_support = 1' arch/x86/um/os-Linux/registers.c; then
+        sed -i 's/\(.*have_xstate_support = 1.*\)/\/* AMX xstate EFAULT workaround: force fxsave path *\/ \/*\1*\//' arch/x86/um/os-Linux/registers.c
+        grep -n 'AMM xstate EFAULT workaround\|have_xstate_support' arch/x86/um/os-Linux/registers.c || true
+    else
+        echo "Warning: have_xstate_support assignment not found; patch skipped (kernel source layout changed?)."
+    fi
+    MAKE_ARGS=(ARCH=um)
+    ;;
+  aarch64)
+    echo "Cloning zalexdev/linux-um-arm64 @ ${ZALEXDEV_REV}..."
+    command -v git >/dev/null || { echo "FATAL: git required for aarch64 kernel source"; exit 1; }
+    git clone --depth 1 --single-branch --branch um-arm64 "${ZALEXDEV_REPO}" linux-um-arm64
+    cd linux-um-arm64
+    ACTUAL_REV=$(git rev-parse HEAD)
+    if [ "$ACTUAL_REV" != "${ZALEXDEV_REV}" ]; then
+        echo "FATAL: upstream um-arm64 HEAD drifted: got ${ACTUAL_REV}, pinned ${ZALEXDEV_REV}"
+        echo "       (re-pin after reviewing the new commits, then update bin/linux in CI caches)"
+        exit 1
+    fi
+    # The port needs clang (LLVM=1 maps SUBARCH=arm64 to a aarch64 target);
+    # upstream defconfig for SUBARCH=arm64 enables SECCOMP userspace mode.
+    command -v clang >/dev/null || { echo "FATAL: clang required for aarch64 UML build (LLVM=1)"; exit 1; }
+    MAKE_ARGS=(ARCH=um SUBARCH=arm64 LLVM=1)
+    ;;
+  *)
+    echo "FATAL: unsupported host architecture '${ARCH}' (supported: x86_64, aarch64)"
+    exit 1
+    ;;
+esac
 
 echo "Configuring UML Kernel..."
-make ARCH=um defconfig
+make "${MAKE_ARGS[@]}" defconfig
 
 # Enable required features according to plan.md
 ./scripts/config --enable CONFIG_NAMESPACES
@@ -69,7 +104,7 @@ make ARCH=um defconfig
 ./scripts/config --enable CONFIG_UML_NET_VECTOR
 ./scripts/config --enable CONFIG_TUN
 
-make ARCH=um olddefconfig
+make "${MAKE_ARGS[@]}" olddefconfig
 
 # olddefconfig silently DROPS symbols it doesn't know (e.g. renamed options:
 # CONFIG_MEMCG's v1 listing moved behind CONFIG_MEMCG_V1, off by default,
@@ -80,8 +115,8 @@ missing=0
 for sym in CONFIG_NAMESPACES CONFIG_PID_NS CONFIG_NET_NS \
            CONFIG_CGROUPS CONFIG_CGROUP_FREEZER CONFIG_CGROUP_SCHED \
            CONFIG_MEMCG CONFIG_CGROUP_PIDS \
-           CONFIG_DEVTMPFS CONFIG_DEVTMPFS_MOUNT CONFIG_UNIX \
-           CONFIG_EXT4_FS CONFIG_OVERLAY_FS \
+           CONFIG_DEVTMPFS CONFIG_DEVTMPFS_MOUNT \
+           CONFIG_UNIX CONFIG_EXT4_FS CONFIG_OVERLAY_FS \
            CONFIG_VIRTIO_UML CONFIG_VIRTIO_BLK CONFIG_VIRTIO_NET CONFIG_VIRTIO_CONSOLE \
            CONFIG_UML_NET_VECTOR CONFIG_TUN; do
     if ! grep -q "^${sym}=y" .config; then
@@ -91,10 +126,20 @@ for sym in CONFIG_NAMESPACES CONFIG_PID_NS CONFIG_NET_NS \
 done
 # CONFIG_MEMCG_V1 intentionally left off: tests use v2-native detection
 # (cgroup.controllers), and 6.18 defaults it to n.
+# aarch64 extra: the port supports the SECCOMP userspace mode (mainline since
+# 6.16 as CONFIG_UML_SECCOMP); its defconfig already enables it — verify, and
+# note it in the build log for visibility.
+if [ "$ARCH" = "aarch64" ]; then
+    if ! grep -q "^CONFIG_UML_SECCOMP=y" .config; then
+        echo "NOTE: CONFIG_UML_SECCOMP not set on aarch64 (defconfig change?); ptrace userspace mode will be used"
+    else
+        echo "aarch64: CONFIG_UML_SECCOMP=y (fast userspace mode available via seccomp=on)"
+    fi
+fi
 [ "$missing" -eq 0 ] || exit 1
 
 echo "Building UML Kernel (this will take a while)..."
-make ARCH=um -j$(nproc)
+make "${MAKE_ARGS[@]}" -j$(nproc)
 
 echo "Copying kernel binary to bin/..."
 mkdir -p ../bin

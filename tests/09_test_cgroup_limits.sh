@@ -8,6 +8,8 @@
 #
 # Requires: root (loop mount), ./bin/linux rebuilt with the new config.
 set -eo pipefail
+# Alpine 架构名与 uname -m 一致（x86_64/aarch64），riscv64 等未来再议
+ALPINE_ARCH=$(uname -m)
 
 echo "========== Test 09: Guest Cgroup Limits (memory.max / pids.max) =========="
 
@@ -51,8 +53,8 @@ dd if=/dev/zero of="$ROOTFS" bs=1M count=100 status=none
 mkfs.ext4 -q "$ROOTFS"
 
 echo "Downloading Alpine minirootfs..."
-EDGE_TAR=$(curl -s https://dl-cdn.alpinelinux.org/alpine/edge/releases/x86_64/latest-releases.yaml | grep "file: alpine-minirootfs" | head -n 1 | awk '{print $2}')
-wget -q "https://dl-cdn.alpinelinux.org/alpine/edge/releases/x86_64/${EDGE_TAR}" -O alpine-cgroup-test.tar.gz
+EDGE_TAR=$(curl -s https://dl-cdn.alpinelinux.org/alpine/edge/releases/$ALPINE_ARCH/latest-releases.yaml | grep "file: alpine-minirootfs" | head -n 1 | awk '{print $2}')
+wget -q "https://dl-cdn.alpinelinux.org/alpine/edge/releases/$ALPINE_ARCH/${EDGE_TAR}" -O alpine-cgroup-test.tar.gz
 
 mkdir -p mnt
 sudo mount -o loop "$ROOTFS" mnt

@@ -6,7 +6,19 @@ on:
 
 jobs:
   build-and-test:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: amd64
+            runner: ubuntu-latest
+          - name: arm64
+            # Public ARM runners (2025-01): ubuntu-24.04-arm / ubuntu-22.04-arm.
+            # The aarch64 leg builds the zalexdev UML arm64 kernel (pinned rev)
+            # and runs the whole suite against it.
+            runner: ubuntu-24.04-arm
+    name: build-and-test (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
     steps:
@@ -32,7 +44,12 @@ jobs:
     - name: Install eBPF (C) Dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y clang llvm libbpf-dev linux-libc-dev gcc-multilib qemu-system-x86 clang-tidy
+        sudo apt-get install -y clang llvm libbpf-dev linux-libc-dev clang-tidy
+        # aarch64: the UML arm64 port builds with LLVM=1 (clang maps
+        # SUBARCH=arm64); gcc-multilib/qemu-system-x86 are x86-only extras.
+        if [ "$(uname -m)" = "x86_64" ]; then
+          sudo apt-get install -y gcc-multilib qemu-system-x86
+        fi
 
     - name: Run clang-tidy
       run: clang-tidy bpf/egress.c -- -I/usr/include -I/usr/include/bpf || true
@@ -51,7 +68,7 @@ jobs:
     - name: Build UML Kernel
       run: |
         chmod +x scripts/build_kernel.sh
-        sudo apt-get install -y build-essential libelf-dev pkg-config bc
+        sudo apt-get install -y build-essential libelf-dev pkg-config bc git
         ./scripts/build_kernel.sh
         
     - name: Run Integration Scripts

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -307,5 +308,215 @@ func TestQcow2_DifferentialQemuImg(t *testing.T) {
 	qemuBytes, _ := os.ReadFile(qemuOut)
 	if !bytes.Equal(goBytes, qemuBytes) {
 		t.Errorf("convert mismatch: go=%d bytes qemu=%d bytes", len(goBytes), len(qemuBytes))
+	}
+}
+
+// TestCreateOverlay_DefaultGeometry: the default overlay must be 4 KiB
+// clusters with metadata preallocated — 4 KiB matches the ext4 block / guest
+// page size so aligned writes cost exactly one data cluster (no 60 KiB
+// read-modify-write tail), and preallocated L2 tables remove the first-write
+// metadata allocation storms.
+func TestCreateOverlay_DefaultGeometry(t *testing.T) {
+	dir := t.TempDir()
+	base := filepath.Join(dir, "base.img")
+	// Sparse 64 MiB base.
+	bf, err := os.OpenFile(base, os.O_WRONLY|os.O_CREATE, 0644)
+	if err != nil {
+		t.Fatalf("create base: %v", err)
+	}
+	if err := bf.Truncate(64 << 20); err != nil {
+		t.Fatalf("truncate: %v", err)
+	}
+	bf.Close()
+
+	overlay := filepath.Join(dir, "ov.qcow2")
+	if err := CreateOverlay(context.Background(), base, overlay); err != nil {
+		t.Fatalf("create overlay: %v", err)
+	}
+	f, err := os.Open(overlay)
+	if err != nil {
+		t.Fatalf("open overlay: %v", err)
+	}
+	defer f.Close()
+	var hdr [qcow2HeaderLen]byte
+	if _, err := f.ReadAt(hdr[:], 0); err != nil {
+		t.Fatalf("read header: %v", err)
+	}
+	if cb := binary.BigEndian.Uint32(hdr[0x14:]); cb != 12 {
+		t.Errorf("default cluster_bits = %d, want 12 (4 KiB)", cb)
+	}
+	l1Size := binary.BigEndian.Uint32(hdr[0x24:])
+	l1Off := binary.BigEndian.Uint64(hdr[0x28:])
+
+	// Metadata preallocation: every L1 entry must point at a linked L2 table.
+	// 64 MiB / (512 entries * 4 KiB) = 32 L2 tables.
+	if l1Size != 32 {
+		t.Errorf("l1_size = %d, want 32 (64 MiB at 4 KiB clusters)", l1Size)
+	}
+	buf := make([]byte, l1Size*8)
+	if _, err := f.ReadAt(buf, int64(l1Off)); err != nil {
+		t.Fatalf("read L1: %v", err)
+	}
+	for i := uint32(0); i < l1Size; i++ {
+		e := binary.BigEndian.Uint64(buf[i*8:])
+		if e&l1eOffsetMask == 0 {
+			t.Fatalf("L1[%d] not preallocated (entry %#x)", i, e)
+		}
+		if e&oflagCopied == 0 {
+			t.Errorf("L1[%d] missing COPIED flag (qemu-img check would fail)", i)
+		}
+	}
+	// 32 L2 tables at 4 KiB = 128 KiB of preallocated metadata beyond the
+	// fixed header/reftable/refblock/L1 clusters.
+	st, _ := f.Stat()
+	wantMin := int64(l1Off) + int64(l1Size*8) + int64(l1Size)*4096
+	if st.Size() < wantMin {
+		t.Errorf("overlay size %d < preallocated size %d (L2 tables missing?)", st.Size(), wantMin)
+	}
+}
+
+// TestQcow2Write_AlignedWriteAmplification: a guest-4K-aligned 4K write on a
+// default (4 KiB cluster) overlay must grow the host file by exactly one
+// cluster — pure data append, no CoW read, no L2/refcount-block allocation
+// (those are preallocated). This is the regression test for the 64 KiB
+// cluster write amplification (4K write => 60K backing read + 64K alloc).
+func TestQcow2Write_AlignedWriteAmplification(t *testing.T) {
+	dir := t.TempDir()
+	base := filepath.Join(dir, "base.img")
+	bf, err := os.OpenFile(base, os.O_WRONLY|os.O_CREATE, 0644)
+	if err != nil {
+		t.Fatalf("create base: %v", err)
+	}
+	if err := bf.Truncate(16 << 20); err != nil {
+		t.Fatalf("truncate: %v", err)
+	}
+	bf.Close()
+
+	overlay := filepath.Join(dir, "ov.qcow2")
+	if err := CreateOverlay(context.Background(), base, overlay); err != nil {
+		t.Fatalf("create overlay: %v", err)
+	}
+	be := openWritable(t, overlay)
+
+	// 4 KiB write at a 4 KiB-aligned guest offset.
+	data := patterned(0xAB, 4096)
+	if _, err := be.WriteAt(data, 8192); err != nil {
+		t.Fatalf("aligned write: %v", err)
+	}
+	if err := be.Sync(); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	st, err := os.Stat(overlay)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	// virtual size is untouched; HOST file must grow by exactly one cluster.
+	grew := st.Size() - preallocSize(t, overlay)
+	if grew != 4096 {
+		t.Errorf("host file grew by %d bytes for one 4 KiB aligned write, want 4096 (pure data append)", grew)
+	}
+
+	// Read back through the chain: the written data plus untouched base.
+	got := make([]byte, 4096)
+	if _, err := be.ReadAt(got, 8192); err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Error("aligned write readback mismatch")
+	}
+	be.Close()
+}
+
+// preallocSize reads the overlay header and returns the byte offset just past
+// the preallocated L2 tables (= the file size right after create).
+func preallocSize(t *testing.T, path string) int64 {
+	t.Helper()
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatalf("open %s: %v", path, err)
+	}
+	defer f.Close()
+	var hdr [qcow2HeaderLen]byte
+	if _, err := f.ReadAt(hdr[:], 0); err != nil {
+		t.Fatalf("read header: %v", err)
+	}
+	l1Size := binary.BigEndian.Uint32(hdr[0x24:])
+	l1Off := binary.BigEndian.Uint64(hdr[0x28:])
+	cb := binary.BigEndian.Uint32(hdr[0x14:])
+	cs := int64(1) << cb
+	l1Clusters := (int64(l1Size)*8 + cs - 1) / cs
+	return int64(l1Off) + l1Clusters*cs + int64(l1Size)*cs
+}
+
+// TestQcow2_ForeignClusterGeometry: images created with non-default cluster
+// sizes (e.g. by qemu-img or older PVM versions) must still read and write
+// correctly — geometry comes from the header, not the package constant.
+func TestQcow2_ForeignClusterGeometry(t *testing.T) {
+	for _, bits := range []uint32{9, 13, 16, 20} {
+		t.Run(fmt.Sprint(bits), func(t *testing.T) {
+			dir := t.TempDir()
+			base := filepath.Join(dir, "base.img")
+			bf, err := os.OpenFile(base, os.O_WRONLY|os.O_CREATE, 0644)
+			if err != nil {
+				t.Fatalf("create base: %v", err)
+			}
+			if err := bf.Truncate(8 << 20); err != nil {
+				t.Fatalf("truncate: %v", err)
+			}
+			bf.Close()
+
+			overlay := filepath.Join(dir, "ov.qcow2")
+			opt := OverlayOpt{ClusterBits: bits, PreallocMetadata: bits > 9}
+			if err := CreateOverlayWithOptions(context.Background(), base, overlay, opt); err != nil {
+				t.Fatalf("create overlay (bits=%d): %v", bits, err)
+			}
+
+			be := openWritable(t, overlay)
+			cs := int64(1) << bits
+			// Partial write (forces CoW of the backing view), full write,
+			// and an unaligned span crossing a cluster boundary.
+			if _, err := be.WriteAt(patterned(0x31, 100), cs+7); err != nil {
+				t.Fatalf("partial write: %v", err)
+			}
+			if _, err := be.WriteAt(patterned(0x32, int(cs)), 3*cs); err != nil {
+				t.Fatalf("full write: %v", err)
+			}
+			if _, err := be.WriteAt(patterned(0x33, int(cs)+50), 5*cs-25); err != nil {
+				t.Fatalf("crossing write: %v", err)
+			}
+			// Commit and verify via the chain reader.
+			if err := be.Sync(); err != nil {
+				t.Fatalf("sync: %v", err)
+			}
+			be.Close()
+
+			img, err := openGuestImage(overlay)
+			if err != nil {
+				t.Fatalf("reopen: %v", err)
+			}
+			defer img.Close()
+			got := make([]byte, int(cs)+50)
+			if _, err := img.ReadAt(got, 5*cs-25); err != nil {
+				t.Fatalf("read crossing region: %v", err)
+			}
+			if !bytes.Equal(got, patterned(0x33, int(cs)+50)) {
+				t.Error("crossing write readback mismatch")
+			}
+		})
+	}
+}
+
+// TestQcow2_ClusterBitsRange: cluster_bits outside the qcow2 spec range
+// (9..21) must be rejected at create time, not produce a corrupt image.
+func TestQcow2_ClusterBitsRange(t *testing.T) {
+	dir := t.TempDir()
+	base := filepath.Join(dir, "base.img")
+	mustWriteRaw(t, base, 0, patterned(0x01, 8192))
+	for _, bits := range []uint32{8, 22, 32} {
+		err := CreateOverlayWithOptions(context.Background(), base, filepath.Join(dir, "ov.qcow2"),
+			OverlayOpt{ClusterBits: bits})
+		if err == nil {
+			t.Errorf("cluster_bits %d accepted, want rejection", bits)
+		}
 	}
 }

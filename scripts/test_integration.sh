@@ -1,5 +1,7 @@
 #!/bin/bash
 set -ex
+# Alpine 架构名与 uname -m 一致（x86_64/aarch64），riscv64 等未来再议
+ALPINE_ARCH=$(uname -m)
 
 echo "Building binary..."
 go build -o bin/umlctl ./cmd/umlctl
@@ -9,8 +11,8 @@ dd if=/dev/zero of=rootfs.img bs=1M count=100
 mkfs.ext4 rootfs.img
 
 echo "Downloading Alpine Edge minirootfs..."
-EDGE_TAR=$(curl -s https://dl-cdn.alpinelinux.org/alpine/edge/releases/x86_64/latest-releases.yaml | grep "file: alpine-minirootfs" | head -n 1 | awk '{print $2}')
-wget -q "https://dl-cdn.alpinelinux.org/alpine/edge/releases/x86_64/${EDGE_TAR}" -O alpine.tar.gz
+EDGE_TAR=$(curl -s https://dl-cdn.alpinelinux.org/alpine/edge/releases/$ALPINE_ARCH/latest-releases.yaml | grep "file: alpine-minirootfs" | head -n 1 | awk '{print $2}')
+wget -q "https://dl-cdn.alpinelinux.org/alpine/edge/releases/$ALPINE_ARCH/${EDGE_TAR}" -O alpine.tar.gz
 
 echo "Mounting and extracting..."
 mkdir -p mnt

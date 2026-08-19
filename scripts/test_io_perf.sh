@@ -1,5 +1,7 @@
 #!/bin/bash
 set -eo pipefail
+# Alpine 架构名与 uname -m 一致（x86_64/aarch64），riscv64 等未来再议
+ALPINE_ARCH=$(uname -m)
 
 echo "========== I/O Performance Test (virtio-blk via qemu-storage-daemon) =========="
 
@@ -30,8 +32,8 @@ mkfs.ext4 -q -F ${IMG_NAME}
 # Check if alpine minirootfs exists, otherwise download
 if [ ! -f "alpine.tar.gz" ]; then
     echo "Downloading Alpine Edge minirootfs..."
-    EDGE_TAR=$(curl -s https://dl-cdn.alpinelinux.org/alpine/edge/releases/x86_64/latest-releases.yaml | grep "file: alpine-minirootfs" | head -n 1 | awk '{print $2}')
-    wget -q "https://dl-cdn.alpinelinux.org/alpine/edge/releases/x86_64/${EDGE_TAR}" -O alpine.tar.gz
+    EDGE_TAR=$(curl -s https://dl-cdn.alpinelinux.org/alpine/edge/releases/$ALPINE_ARCH/latest-releases.yaml | grep "file: alpine-minirootfs" | head -n 1 | awk '{print $2}')
+    wget -q "https://dl-cdn.alpinelinux.org/alpine/edge/releases/$ALPINE_ARCH/${EDGE_TAR}" -O alpine.tar.gz
 fi
 
 echo "Mounting and extracting..."

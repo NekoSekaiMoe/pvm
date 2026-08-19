@@ -98,15 +98,16 @@ func (w *qcow2Writable) ReadAt(p []byte, off int64) (int, error) {
 func (w *qcow2Writable) WriteAt(p []byte, off int64) (int, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	cs := w.clusterSize
 	total := 0
 	for total < len(p) {
 		guest := uint64(off) + uint64(total)
 		if guest >= w.hdr.size {
 			return total, fmt.Errorf("cow: write beyond virtual size (%#x >= %#x)", guest, w.hdr.size)
 		}
-		clusterIdx := guest >> clusterBits
+		clusterIdx := guest >> w.clusterBits
 		inCluster := guest & w.clusterMask
-		n := uint64(clusterSize) - inCluster
+		n := cs - inCluster
 		if rem := uint64(len(p)) - uint64(total); rem < n {
 			n = rem
 		}
@@ -116,7 +117,7 @@ func (w *qcow2Writable) WriteAt(p []byte, off int64) (int, error) {
 		}
 		if host == 0 {
 			// Unallocated (or zero) cluster: allocate + COW.
-			fullCluster := inCluster == 0 && n == clusterSize
+			fullCluster := inCluster == 0 && n == cs
 			host, err = w.allocDataCluster(clusterIdx, p[total:total+int(n)], guest, fullCluster)
 			if err != nil {
 				return total, err
@@ -135,8 +136,9 @@ func (w *qcow2Writable) WriteAt(p []byte, off int64) (int, error) {
 // hostOffset returns the host file offset of a guest cluster's start, or 0
 // when the cluster is unallocated/zero (reads fall through to backing).
 func (w *qcow2Writable) hostOffset(clusterIdx uint64) (uint64, error) {
-	l1Idx := clusterIdx / (clusterSize / 8)
-	l2Idx := clusterIdx % (clusterSize / 8)
+	l2Entries := w.clusterSize / 8
+	l1Idx := clusterIdx / l2Entries
+	l2Idx := clusterIdx % l2Entries
 	if l1Idx >= uint64(w.hdr.l1Size) {
 		return 0, fmt.Errorf("cow: guest cluster %d beyond L1", clusterIdx)
 	}
@@ -185,9 +187,10 @@ func (w *qcow2Writable) allocDataCluster(clusterIdx uint64, data []byte, guest u
 		// the partial write. The final cluster may extend past the virtual
 		// size: read only what exists (a short read at EOF leaves the rest
 		// of buf zeroed).
-		buf := make([]byte, clusterSize)
-		clusterStart := int64(clusterIdx << clusterBits)
-		readLen := int64(clusterSize)
+		cs := w.clusterSize
+		buf := make([]byte, cs)
+		clusterStart := int64(clusterIdx << w.clusterBits)
+		readLen := int64(cs)
 		if rem := int64(w.hdr.size) - clusterStart; rem < readLen {
 			readLen = rem
 		}
@@ -211,8 +214,9 @@ func (w *qcow2Writable) allocDataCluster(clusterIdx uint64, data []byte, guest u
 // linkL2 points the L2 entry for clusterIdx at hostOff, allocating the L2
 // table first if needed.
 func (w *qcow2Writable) linkL2(clusterIdx, hostOff uint64) error {
-	l1Idx := clusterIdx / (clusterSize / 8)
-	l2Idx := clusterIdx % (clusterSize / 8)
+	l2Entries := w.clusterSize / 8
+	l1Idx := clusterIdx / l2Entries
+	l2Idx := clusterIdx % l2Entries
 	var l1e uint64
 	if err := w.readUint64At(&l1e, w.hdr.l1Offset+l1Idx*8); err != nil {
 		return err
@@ -225,7 +229,7 @@ func (w *qcow2Writable) linkL2(clusterIdx, hostOff uint64) error {
 			return err
 		}
 		// Fresh L2 table: zero it, refcount 1, link L1.
-		if _, err := w.f.WriteAt(make([]byte, clusterSize), int64(l2Off)); err != nil {
+		if _, err := w.f.WriteAt(make([]byte, w.clusterSize), int64(l2Off)); err != nil {
 			return err
 		}
 		var b [8]byte
@@ -245,15 +249,16 @@ func (w *qcow2Writable) linkL2(clusterIdx, hostOff uint64) error {
 // allocCluster appends a zeroed cluster at EOF and sets its refcount to 1.
 // Returns the host offset.
 func (w *qcow2Writable) allocCluster() (uint64, error) {
+	cs := w.clusterSize
 	off := w.fileSize
-	if off%clusterSize != 0 {
+	if off%cs != 0 {
 		return 0, fmt.Errorf("cow: host file size %#x not cluster-aligned", off)
 	}
-	if _, err := w.f.WriteAt(make([]byte, clusterSize), int64(off)); err != nil {
+	if _, err := w.f.WriteAt(make([]byte, cs), int64(off)); err != nil {
 		return 0, err
 	}
-	w.fileSize += clusterSize
-	if err := w.bumpRefcount(off >> clusterBits); err != nil {
+	w.fileSize += cs
+	if err := w.bumpRefcount(off >> w.clusterBits); err != nil {
 		return 0, err
 	}
 	return off, nil
@@ -264,10 +269,10 @@ func (w *qcow2Writable) allocCluster() (uint64, error) {
 // the existing blocks cover. The refcount table itself is fixed at one
 // cluster (8192 entries → covers 16 TiB of host file), sized at create time.
 func (w *qcow2Writable) bumpRefcount(clusterIdx uint64) error {
-	const entriesPerBlock = clusterSize / 2 // 32768 u16 entries
+	entriesPerBlock := w.clusterSize / 2 // u16 entries per refcount block
 	blockIdx := clusterIdx / entriesPerBlock
 	inBlock := clusterIdx % entriesPerBlock
-	maxBlocks := uint64(w.hdr.refcountClusters) * (clusterSize / 8)
+	maxBlocks := uint64(w.hdr.refcountClusters) * (w.clusterSize / 8)
 	if blockIdx >= maxBlocks {
 		return fmt.Errorf("cow: refcount table full at cluster %d", clusterIdx)
 	}
@@ -275,14 +280,14 @@ func (w *qcow2Writable) bumpRefcount(clusterIdx uint64) error {
 	if err := w.readUint64At(&tableEntry, w.hdr.refcountOffset+blockIdx*8); err != nil {
 		return err
 	}
-	blockOff := tableEntry & 0xfffffffffffffe00 // REFT_OFFSET_MASK
+	blockOff := tableEntry & reftOffsetMask // REFT_OFFSET_MASK
 	if blockOff == 0 {
 		// Allocate a new refcount block at EOF and register it in the table.
 		blockOff = w.fileSize
-		if _, err := w.f.WriteAt(make([]byte, clusterSize), int64(blockOff)); err != nil {
+		if _, err := w.f.WriteAt(make([]byte, w.clusterSize), int64(blockOff)); err != nil {
 			return err
 		}
-		w.fileSize += clusterSize
+		w.fileSize += w.clusterSize
 		var b [8]byte
 		binary.BigEndian.PutUint64(b[:], blockOff)
 		if _, err := w.f.WriteAt(b[:], int64(w.hdr.refcountOffset+blockIdx*8)); err != nil {
@@ -291,7 +296,7 @@ func (w *qcow2Writable) bumpRefcount(clusterIdx uint64) error {
 		// The new block's own cluster also needs refcount 1; now that the
 		// table entry is registered, recursion lands in the right block
 		// (its own if covered, an earlier one otherwise).
-		selfCluster := blockOff >> clusterBits
+		selfCluster := blockOff >> w.clusterBits
 		if selfCluster != clusterIdx {
 			if err := w.bumpRefcount(selfCluster); err != nil {
 				return err

@@ -43,6 +43,21 @@ const qcow2Magic = "QFI\xfb"
 // The ctx bounds the (fast, metadata-only) creation; a nil ctx is treated as
 // context.Background().
 func CreateOverlay(ctx context.Context, baseImage, overlayFile string) error {
+	return createOverlayValidated(ctx, baseImage, overlayFile, defaultOverlayOpt)
+}
+
+// CreateOverlayWithOptions is CreateOverlay with explicit qcow2 tuning
+// (cluster size, metadata preallocation). See OverlayOpt.
+func CreateOverlayWithOptions(ctx context.Context, baseImage, overlayFile string, opt OverlayOpt) error {
+	if opt.ClusterBits == 0 {
+		opt.ClusterBits = clusterBits
+	}
+	return createOverlayValidated(ctx, baseImage, overlayFile, opt)
+}
+
+// createOverlayValidated validates paths, removes stale overlays, sniffs the
+// backing format and writes the overlay with opt.
+func createOverlayValidated(ctx context.Context, baseImage, overlayFile string, opt OverlayOpt) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -103,7 +118,7 @@ func CreateOverlay(ctx context.Context, baseImage, overlayFile string) error {
 	if isQcow2(baseImage) {
 		backingFormat = "qcow2"
 	}
-	return createQcow2(overlayFile, virtualSize, baseImage, backingFormat)
+	return createQcow2(overlayFile, virtualSize, baseImage, backingFormat, opt)
 }
 
 // isQcow2 reports whether path begins with the qcow2 magic ("QFI\xfb"). A

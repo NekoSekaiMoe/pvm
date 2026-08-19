@@ -1,5 +1,7 @@
 #!/bin/bash
 set -ex
+# Alpine 架构名与 uname -m 一致（x86_64/aarch64），riscv64 等未来再议
+ALPINE_ARCH=$(uname -m)
 echo "Testing Package Installation inside Sandbox..."
 
 # Make sure umlctl is built (umlctl is the thin UML launcher used here: this
@@ -13,8 +15,8 @@ dd if=/dev/zero of=${IMG_NAME} bs=1M count=200 >/dev/null 2>&1
 mkfs.ext4 -q ${IMG_NAME}
 
 if [ ! -f "alpine.tar.gz" ]; then
-    EDGE_TAR=$(curl -s https://dl-cdn.alpinelinux.org/alpine/edge/releases/x86_64/latest-releases.yaml | grep "file: alpine-minirootfs" | head -n 1 | awk '{print $2}')
-    wget -q "https://dl-cdn.alpinelinux.org/alpine/edge/releases/x86_64/${EDGE_TAR}" -O alpine.tar.gz
+    EDGE_TAR=$(curl -s https://dl-cdn.alpinelinux.org/alpine/edge/releases/$ALPINE_ARCH/latest-releases.yaml | grep "file: alpine-minirootfs" | head -n 1 | awk '{print $2}')
+    wget -q "https://dl-cdn.alpinelinux.org/alpine/edge/releases/$ALPINE_ARCH/${EDGE_TAR}" -O alpine.tar.gz
 fi
 
 mkdir -p mnt_pkg
@@ -40,7 +42,7 @@ echo "nameserver 8.8.8.8" > /etc/resolv.conf
 echo "PATH=$PATH"
 command -v apk || echo "command -v apk: NOT FOUND in PATH"
 ls -la /sbin/apk 2>/dev/null || echo "/sbin/apk: missing"
-ls -la /lib/ld-musl-x86_64.so.1 2>/dev/null || echo "/lib/ld-musl-x86_64.so.1: missing"
+ls -la /lib/ld-musl-$(uname -m).so.1 2>/dev/null || echo "/lib/ld-musl-$(uname -m).so.1: missing"
 mount | grep ' / ' || true
 # ----------------------------------------------------------------
 
@@ -54,7 +56,7 @@ echo "Attempting to install fastfetch..."
  echo "APK_VERSION rc=$?"
 
 # 2) 绕过内核 PT_INTERP，显式用 musl ldso 启动 apk
-/lib/ld-musl-x86_64.so.1 /sbin/apk --version 2>&1
+/lib/ld-musl-$(uname -m).so.1 /sbin/apk --version 2>&1
  echo "LDSO_APK rc=$?"
 
 # 3) busybox 子命令——确认是否所有动态 ELF 都同样失败

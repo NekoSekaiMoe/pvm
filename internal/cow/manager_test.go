@@ -12,7 +12,7 @@ import (
 // the pure-Go writer — no qemu-img binary required.
 func makeQcow2Base(t *testing.T, path string) {
 	t.Helper()
-	if err := createQcow2(path, 1<<20, "", ""); err != nil {
+	if err := createQcow2(path, 1<<20, "", "", OverlayOpt{ClusterBits: 16}); err != nil {
 		t.Fatalf("create qcow2 base %s: %v", path, err)
 	}
 }

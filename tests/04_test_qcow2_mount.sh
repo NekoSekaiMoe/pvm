@@ -1,5 +1,7 @@
 #!/bin/bash
 set -eo pipefail
+# Alpine 架构名与 uname -m 一致（x86_64/aarch64），riscv64 等未来再议
+ALPINE_ARCH=$(uname -m)
 
 echo "========== Test 04: qcow2 CoW + vhost-user-blk boot (vec0 networking) =========="
 
@@ -61,8 +63,8 @@ dd if=/dev/zero of="$IMG_NAME" bs=1M count=200 > /dev/null 2>&1
 mkfs.ext4 -q -F "$IMG_NAME"
 
 if [ ! -f "alpine.tar.gz" ]; then
-    EDGE_TAR=$(curl -s https://dl-cdn.alpinelinux.org/alpine/edge/releases/x86_64/latest-releases.yaml | grep "file: alpine-minirootfs" | head -n 1 | awk '{print $2}')
-    wget -q "https://dl-cdn.alpinelinux.org/alpine/edge/releases/x86_64/${EDGE_TAR}" -O alpine.tar.gz
+    EDGE_TAR=$(curl -s https://dl-cdn.alpinelinux.org/alpine/edge/releases/$ALPINE_ARCH/latest-releases.yaml | grep "file: alpine-minirootfs" | head -n 1 | awk '{print $2}')
+    wget -q "https://dl-cdn.alpinelinux.org/alpine/edge/releases/$ALPINE_ARCH/${EDGE_TAR}" -O alpine.tar.gz
 fi
 
 mkdir -p "$MNT"

@@ -16,3 +16,7 @@ pkg_rootfs.img
 bazel-*
 MODULE.bazel.lock
 internal/network/bpf_bpf*
+node_modules/
+package.json
+package-lock.json
+webui/package-lock.json

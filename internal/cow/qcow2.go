@@ -29,7 +29,7 @@ import (
 const (
 	qcow2Version3    = 3
 	qcow2HeaderLen   = 112 // v3 fixed header (104) + end-of-extensions area
-	clusterBits      = 16  // 64 KiB clusters, same as qemu-img default
+	clusterBits      = 12  // 4 KiB clusters (default): matches ext4 block size
 	clusterSize      = 1 << clusterBits
 	refcountOrder    = 4 // 2^4 = 16-bit refcount entries (qemu-img default)
 	extBackingFormat = 0xE2792ACA
@@ -41,6 +41,10 @@ const (
 	// Standard-cluster offset masks (block/qcow2.h L1E/L2E_OFFSET_MASK).
 	l1eOffsetMask = 0x00fffffffffffe00
 	l2eOffsetMask = 0x00fffffffffffe00
+
+	// Refcount table entry mask (qcow2 REFT_OFFSET_MASK): offsets are
+	// cluster-aligned so this holds for any cluster size >= 512.
+	reftOffsetMask = 0xfffffffffffffe00
 )
 
 // qcow2Header mirrors the on-disk v3 header layout.
@@ -53,49 +57,134 @@ type qcow2Header struct {
 	refcountClusters uint32
 }
 
+// OverlayOpt configures qcow2 overlay creation.
+type OverlayOpt struct {
+	// ClusterBits sets the qcow2 cluster size to 2^bits bytes (512 B .. 2 MiB,
+	// the qcow2-spec range). 0 means the package default (4 KiB).
+	//
+	// 4 KiB matches the ext4 block size and the 4 KiB guest page size, so a
+	// guest page-aligned write covers exactly one cluster: the write path
+	// stores pure data with no read-modify-write of the tail. With the old
+	// 64 KiB default every 4 KiB random write forced a 60 KiB backing read
+	// plus a 64 KiB allocation (15x write amplification).
+	ClusterBits uint32
+	// PreallocMetadata allocates and links every L2 table (and the refcount
+	// blocks covering them) at create time, like `qemu-img create
+	// preallocation=metadata`. First writes then cost one data-cluster
+	// allocation and nothing else — no L2 allocation, no refcount-block
+	// allocation, no distributed metadata lock-and-flush. Cost: virtualSize /
+	// (clusterSize/8 * clusterSize) bytes of L2 tables upfront (4 KiB
+	// clusters: 2 MiB of guest coverage per 4 KiB L2 table = 0.2% of the
+	// virtual size).
+	PreallocMetadata bool
+}
+
+// defaultOverlayOpt is what CreateOverlay (the no-options entry point) uses.
+var defaultOverlayOpt = OverlayOpt{ClusterBits: clusterBits, PreallocMetadata: true}
+
+// qcow2Layout is the create-time physical metadata plan for an image.
+type qcow2Layout struct {
+	clusterBits uint32
+	clusterSize uint64
+	l1Size      uint64 // L1 entries (one per L2 table)
+	l1Clusters  uint64
+	l2Count     uint64 // L2 tables written at create (0 unless prealloc)
+	reftableCls uint64 // refcount table clusters
+	refblockCnt uint64 // refcount blocks written at create
+	physMeta    uint64 // total physical metadata clusters at create
+	reftableOff uint64
+	refblockOff uint64
+	l1Off       uint64
+	l2Off       uint64 // first L2 table (== end of metadata when !prealloc)
+}
+
+// computeQcow2Layout sizes the metadata for virtualSize.
+//
+// The refcount TABLE is sized for the worst case (every data cluster
+// allocated) because the write path cannot grow it: bumpRefcount allocates
+// refcount BLOCKS lazily, but the table itself is fixed at create. The block
+// count written at create only covers the create-time metadata; blocks for
+// data clusters appear lazily via bumpRefcount, exactly like before.
+func computeQcow2Layout(virtualSize uint64, bits uint32, prealloc bool) (*qcow2Layout, error) {
+	if bits == 0 {
+		bits = clusterBits
+	}
+	if bits < 9 || bits > 21 {
+		return nil, fmt.Errorf("cow: cluster_bits %d out of qcow2 range 9..21", bits)
+	}
+	cs := uint64(1) << bits
+	l2Entries := cs / 8
+	l1Size := (virtualSize + l2Entries*cs - 1) / (l2Entries * cs)
+	if l1Size > 0xFFFFFFFF {
+		return nil, fmt.Errorf("cow: L1 table too large for virtual size %d", virtualSize)
+	}
+	l1Clusters := (l1Size*8 + cs - 1) / cs
+	var l2Count uint64
+	if prealloc {
+		l2Count = l1Size
+	}
+	dataClusters := (virtualSize + cs - 1) / cs
+
+	// Refblocks are preallocated for the WORST CASE (every data cluster
+	// allocated): 0.05% of the virtual size at 4 KiB clusters. Without this,
+	// the first write into each 8 MiB of new data lazily allocates a refcount
+	// block — a distributed metadata update exactly like the L2 allocation
+	// this preallocation exists to remove. The fixed point converges because
+	// physMeta (hence nbW) grows far slower than refblockCnt each round.
+	refblockCnt, reftableCls := uint64(1), uint64(1)
+	for i := 0; i < 32; i++ {
+		physMeta := 1 + reftableCls + refblockCnt + l1Clusters + l2Count
+		worst := physMeta + dataClusters
+		nbW := (worst + cs/2 - 1) / (cs / 2) // blocks covering worst case
+		nt := (nbW + cs/8 - 1) / (cs / 8)    // table clusters covering worst case
+		if nbW == refblockCnt && nt == reftableCls {
+			l := &qcow2Layout{
+				clusterBits: bits, clusterSize: cs,
+				l1Size: l1Size, l1Clusters: l1Clusters, l2Count: l2Count,
+				reftableCls: reftableCls, refblockCnt: refblockCnt,
+				physMeta: physMeta,
+			}
+			l.reftableOff = cs
+			l.refblockOff = (1 + reftableCls) * cs
+			l.l1Off = l.refblockOff + refblockCnt*cs
+			l.l2Off = l.l1Off + l1Clusters*cs
+			return l, nil
+		}
+		refblockCnt, reftableCls = nbW, nt
+	}
+	return nil, fmt.Errorf("cow: metadata layout did not converge for virtual size %d", virtualSize)
+}
+
 // createQcow2 writes an empty qcow2 v3 image at path with the given virtual
 // size. If backingPath is non-empty the image is an overlay: every cluster
 // reads through to backingPath (format backingFormat: "raw" or "qcow2")
 // until written. backingPath is stored as given (callers pass an absolute
 // path so the reference is unambiguous).
-func createQcow2(path string, virtualSize uint64, backingPath, backingFormat string) error {
+func createQcow2(path string, virtualSize uint64, backingPath, backingFormat string, opt OverlayOpt) error {
 	if virtualSize == 0 {
 		return errors.New("cow: qcow2 virtual size must be > 0")
 	}
-	// L1 coverage: one L2 table holds clusterSize/8 = 8192 entries, each
-	// covering one 64 KiB cluster => 512 MiB of guest data per L1 entry.
-	l2Entries := uint64(clusterSize / 8)
-	l1Size := (virtualSize + l2Entries*clusterSize - 1) / (l2Entries * clusterSize)
-	l1Clusters := (l1Size*8 + clusterSize - 1) / clusterSize
-
-	// Fixed metadata layout, one cluster each unless L1 needs more:
-	//   cluster 0: header (+ extensions + backing file name)
-	//   cluster 1: refcount table (8192 u64 entries)
-	//   cluster 2: refcount block 0 (32768 u16 entries => covers 32K clusters)
-	//   cluster 3..: L1 table
-	refTableOff := uint64(clusterSize)
-	refBlockOff := uint64(2 * clusterSize)
-	l1Off := uint64(3 * clusterSize)
-	nMeta := 3 + l1Clusters
-	// A single refcount block covers 32768 clusters; L1 would need to describe
-	// a > 16 TiB image before metadata outgrows it. Guard anyway.
-	if nMeta > 32768 {
-		return fmt.Errorf("cow: image too large for single refcount block (%d meta clusters)", nMeta)
+	lay, err := computeQcow2Layout(virtualSize, opt.ClusterBits, opt.PreallocMetadata)
+	if err != nil {
+		return err
 	}
+	cs := lay.clusterSize
 
-	buf := make([]byte, nMeta*clusterSize)
+	// Everything before the (optional) preallocated L2 tables is built in
+	// one buffer: header cluster, refcount table, refcount blocks, L1.
+	buf := make([]byte, lay.l2Off)
 
 	// --- header (cluster 0) ---
 	hdr := buf[:qcow2HeaderLen]
 	copy(hdr[0:4], qcow2Magic)
 	binary.BigEndian.PutUint32(hdr[4:], qcow2Version3)
-	binary.BigEndian.PutUint32(hdr[0x14:], clusterBits)
+	binary.BigEndian.PutUint32(hdr[0x14:], lay.clusterBits)
 	binary.BigEndian.PutUint64(hdr[0x18:], virtualSize)
 	// crypt_method (0x20) stays 0 (no encryption)
-	binary.BigEndian.PutUint32(hdr[0x24:], uint32(l1Size))
-	binary.BigEndian.PutUint64(hdr[0x28:], l1Off)
-	binary.BigEndian.PutUint64(hdr[0x30:], refTableOff)
-	binary.BigEndian.PutUint32(hdr[0x38:], 1) // refcount_table_clusters
+	binary.BigEndian.PutUint32(hdr[0x24:], uint32(lay.l1Size))
+	binary.BigEndian.PutUint64(hdr[0x28:], lay.l1Off)
+	binary.BigEndian.PutUint64(hdr[0x30:], lay.reftableOff)
+	binary.BigEndian.PutUint32(hdr[0x38:], uint32(lay.reftableCls))
 	// nb_snapshots / snapshots_offset stay 0
 	// incompatible/compatible/autoclear features stay 0
 	binary.BigEndian.PutUint32(hdr[0x60:], refcountOrder)
@@ -115,7 +204,7 @@ func createQcow2(path string, virtualSize uint64, backingPath, backingFormat str
 	// end-of-extensions marker: magic 0, length 0 (already zeroed)
 	off += 8
 	if backingPath != "" {
-		if len(backingPath) > 4096 || off+uint64(len(backingPath)) > clusterSize {
+		if len(backingPath) > 4096 || off+uint64(len(backingPath)) > cs {
 			return fmt.Errorf("cow: backing path too long for qcow2 header cluster")
 		}
 		binary.BigEndian.PutUint64(buf[0x08:], off)
@@ -123,15 +212,24 @@ func createQcow2(path string, virtualSize uint64, backingPath, backingFormat str
 		copy(buf[off:], backingPath)
 	}
 
-	// --- refcount table (cluster 1): entry 0 -> refcount block 0 ---
-	binary.BigEndian.PutUint64(buf[refTableOff:], refBlockOff)
-
-	// --- refcount block 0 (cluster 2): metadata clusters have refcount 1 ---
-	for i := uint64(0); i < nMeta; i++ {
-		binary.BigEndian.PutUint16(buf[refBlockOff+2*i:], 1)
+	// --- refcount table: entry b -> refcount block b ---
+	for b := uint64(0); b < lay.refblockCnt; b++ {
+		binary.BigEndian.PutUint64(buf[lay.reftableOff+b*8:], lay.refblockOff+b*cs)
 	}
 
-	// --- L1 table (cluster 3..): all zero = every cluster reads from backing ---
+	// --- refcount blocks: every create-time metadata cluster has count 1.
+	// Blocks are contiguous, so a flat fill works: entry i lands in block
+	// i/(cs/2) at byte refblockOff + i*2 regardless of block boundaries. ---
+	for i := uint64(0); i < lay.physMeta; i++ {
+		binary.BigEndian.PutUint16(buf[lay.refblockOff+2*i:], 1)
+	}
+
+	// --- L1 table: preallocated L2 tables are linked up front (COPIED set,
+	// refcount 1 — qemu-img check requires the flag on refcount-1 entries);
+	// otherwise all zero = every cluster reads from backing. ---
+	for k := uint64(0); k < lay.l2Count; k++ {
+		binary.BigEndian.PutUint64(buf[lay.l1Off+k*8:], lay.l2Off+k*cs|oflagCopied)
+	}
 
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
 	if err != nil {
@@ -140,6 +238,24 @@ func createQcow2(path string, virtualSize uint64, backingPath, backingFormat str
 	defer f.Close()
 	if _, err := f.Write(buf); err != nil {
 		return fmt.Errorf("cow: write qcow2 metadata: %w", err)
+	}
+	// Preallocated L2 tables are all zeros; stream them (a 1 TiB image at
+	// 4 KiB clusters has 512K L2 tables = 2 GiB — never buffer that).
+	if lay.l2Count > 0 {
+		zero := make([]byte, 1<<20)
+		if cs < uint64(len(zero)) {
+			zero = zero[:cs]
+		}
+		for rem := lay.l2Count * cs; rem > 0; {
+			n := uint64(len(zero))
+			if rem < n {
+				n = rem
+			}
+			if _, err := f.Write(zero[:n]); err != nil {
+				return fmt.Errorf("cow: write preallocated L2 tables: %w", err)
+			}
+			rem -= n
+		}
 	}
 	return nil
 }
@@ -168,10 +284,15 @@ func (r *rawImage) Size() uint64                            { return r.size }
 func (r *rawImage) Close() error                            { return r.f.Close() }
 
 type qcow2Image struct {
-	f           *os.File
-	hdr         qcow2Header
-	backing     guestImage // nil for standalone images
+	f   *os.File
+	hdr qcow2Header
+	// Cluster geometry is per-image (cluster_bits lives in the header at
+	// 0x14); images we created with other cluster sizes — or foreign images —
+	// must read with THEIR geometry, not the package default.
+	clusterBits uint32
+	clusterSize uint64
 	clusterMask uint64
+	backing     guestImage // nil for standalone images
 }
 
 func (q *qcow2Image) Size() uint64 { return q.hdr.size }
@@ -236,14 +357,15 @@ const hostZero = ^uint64(0) // sentinel: cluster reads as zero
 // come from the backing chain. n is the number of bytes resolvable within
 // the current cluster.
 func (q *qcow2Image) resolve(guest, want uint64) (host uint64, fromBacking bool, n uint64, err error) {
-	clusterIdx := guest >> clusterBits
+	clusterIdx := guest >> q.clusterBits
 	inCluster := guest & q.clusterMask
-	n = clusterSize - inCluster
+	n = q.clusterSize - inCluster
 	if want < n {
 		n = want
 	}
-	l1Idx := clusterIdx / (clusterSize / 8)
-	l2Idx := clusterIdx % (clusterSize / 8)
+	l2Entries := q.clusterSize / 8
+	l1Idx := clusterIdx / l2Entries
+	l2Idx := clusterIdx % l2Entries
 	if l1Idx >= uint64(q.hdr.l1Size) {
 		return 0, false, 0, fmt.Errorf("cow: guest offset %#x beyond L1 table", guest)
 	}
@@ -324,9 +446,9 @@ func openGuestImage(path string) (guestImage, error) {
 		f.Close()
 		return nil, fmt.Errorf("cow: unsupported qcow2 version %d in %s (want 3)", v, path)
 	}
-	if cb := binary.BigEndian.Uint32(hdrBuf[0x14:]); cb != clusterBits {
+	if cb := binary.BigEndian.Uint32(hdrBuf[0x14:]); cb < 9 || cb > 21 {
 		f.Close()
-		return nil, fmt.Errorf("cow: unsupported cluster_bits %d in %s (want %d)", cb, path, clusterBits)
+		return nil, fmt.Errorf("cow: invalid cluster_bits %d in %s (qcow2 range 9..21)", cb, path)
 	}
 	if cm := binary.BigEndian.Uint32(hdrBuf[0x20:]); cm != 0 {
 		f.Close()
@@ -336,7 +458,13 @@ func openGuestImage(path string) (guestImage, error) {
 		f.Close()
 		return nil, fmt.Errorf("cow: qcow2 incompatible features %#x in %s unsupported", inc, path)
 	}
-	q := &qcow2Image{f: f, clusterMask: clusterSize - 1}
+	cb := binary.BigEndian.Uint32(hdrBuf[0x14:])
+	q := &qcow2Image{
+		f:           f,
+		clusterBits: cb,
+		clusterSize: uint64(1) << cb,
+		clusterMask: (uint64(1) << cb) - 1,
+	}
 	q.hdr = qcow2Header{
 		size:             binary.BigEndian.Uint64(hdrBuf[0x18:]),
 		l1Size:           binary.BigEndian.Uint32(hdrBuf[0x24:]),
@@ -386,13 +514,19 @@ func convertToRaw(ctx context.Context, srcPath, destPath string) error {
 	}
 	defer out.Close()
 
+	// Convert in chunks of the source's own cluster geometry (or 1 MiB for
+	// raw sources, which have no clusters).
+	chunk := uint64(1) << 20
+	if q, ok := img.(*qcow2Image); ok {
+		chunk = q.clusterSize
+	}
 	size := img.Size()
-	buf := make([]byte, clusterSize)
-	for off := uint64(0); off < size; off += clusterSize {
+	buf := make([]byte, chunk)
+	for off := uint64(0); off < size; off += chunk {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		n := uint64(clusterSize)
+		n := uint64(len(buf))
 		if rem := size - off; rem < n {
 			n = rem
 		}
