@@ -61,6 +61,7 @@ go_library(
         "bpf.go",
         "bridge.go",
         "filter.go",
+        "policy.go",
         "tap.go",
     ] + select({
         # generated bindings carry their own //go:build constraints; each

@@ -4,6 +4,7 @@ go_library(
     name = "cow",
     srcs = [
         "convert.go",
+        "engine.go",
         "manager.go",
         "qcow2.go",
         "qcow2_compact.go",

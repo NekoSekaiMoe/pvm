@@ -1,0 +1,20 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "volume",
+    srcs = [
+        "binary.go",
+        "builtin.go",
+        "manager.go",
+        "plugin.go",
+        "store.go",
+    ],
+    importpath = "uml-container/internal/volume",
+    visibility = ["//:__subpackages__"],
+)
+
+go_test(
+    name = "volume_test",
+    srcs = ["volume_test.go"],
+    embed = [":volume"],
+)

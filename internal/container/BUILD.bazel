@@ -11,12 +11,14 @@ go_library(
         "//internal/config",
         "//internal/cow",
         "//internal/identity",
+        "//internal/lifecycle",
         "//internal/log",
         "//internal/network/egress",
         "//internal/spec",
         "//internal/state",
         "//internal/uml",
         "//internal/vhost",
+        "//internal/volume",
     ],
 )
 
