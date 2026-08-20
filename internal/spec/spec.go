@@ -71,6 +71,9 @@ type TaskSpec struct {
 	Approval  ApprovalSpec  `toml:"approval"`
 	Artifacts ArtifactsSpec `toml:"artifacts"`
 	Lifecycle LifecycleSpec `toml:"lifecycle"`
+
+	// --- volumes (Cube parity: per-sandbox persistent mounts) ---
+	Volumes []VolumeMount `toml:"volumes"`
 }
 
 // Identity describes the short-lived credential scope granted to the sandbox
@@ -165,6 +168,29 @@ type NetworkSpec struct {
 	MaxRequestBodyBytes int64 `toml:"max_request_body_bytes"`
 	// QoSRate is a tc tbf rate, e.g. "10mbit". Empty = no shaping.
 	QoSRate string `toml:"qos_rate"`
+	// EgressRules is the extended L7 rule set (Cube parity: docs/guide/security-proxy.md).
+	// When non-empty, it takes precedence over the flat allow/block domain lists.
+	EgressRules []EgressRule `toml:"egress_rules"`
+}
+
+// EgressRule is one L7 egress rule, mirroring CubeSandbox's Rule/Match/Action.
+type EgressRule struct {
+	Name   string            `toml:"name" json:"name"`
+	Host   string            `toml:"host" json:"host"`     // exact or "*.suffix"
+	SNI    string            `toml:"sni" json:"sni"`       // TLS SNI, same wildcard as Host
+	Method []string          `toml:"method" json:"method"` // OR within list
+	Path   string            `toml:"path" json:"path"`     // exact or "/prefix/*"
+	Scheme string            `toml:"scheme" json:"scheme"` // "http" | "https"
+	Port   int               `toml:"port" json:"port"`     // 1..65535, 0 = default 80/443
+	Allow  *bool             `toml:"allow" json:"allow"`   // nil = allow=true
+	Inject *EgressInject     `toml:"inject" json:"inject"`
+}
+
+// EgressInject mirrors Cube's Inject{header, format, secret} for credential injection.
+type EgressInject struct {
+	Header string `toml:"header" json:"header"`
+	Format string `toml:"format" json:"format"` // e.g. "Bearer ${SECRET}", default "${SECRET}"
+	Secret string `toml:"secret" json:"secret"`
 }
 
 // ToolRule is one row of the tool gateway decision matrix (plan.md §6.2).
@@ -218,6 +244,20 @@ type ArtifactsSpec struct {
 	BlockSecrets bool `toml:"block_secrets"`
 }
 
+// VolumeMount declares one persistent volume attachment. Mirrors
+// sdk/go:VolumeMount{Name, Path, ReadOnly} and the TOML form:
+//   [[volumes]]
+//   name = "my-data"
+//   path = "/workspace"
+//   driver = "hostdir"   # optional, defaults to first registered plugin
+//   read_only = true
+type VolumeMount struct {
+	Name     string `toml:"name" json:"name"`
+	Path     string `toml:"path" json:"path"`
+	Driver   string `toml:"driver" json:"driver"`
+	ReadOnly bool   `toml:"read_only" json:"read_only"`
+}
+
 // LifecycleSpec is the task lifecycle policy (plan.md §8, §11).
 type LifecycleSpec struct {
 	// Paused starts the task in Suspended state (checkpoint-on-start).
@@ -228,6 +268,13 @@ type LifecycleSpec struct {
 	OnAnomaly string `toml:"on_anomaly"`
 	// TTL is the task's overall lifetime; on expiry the task is Destroyed.
 	TTL string `toml:"ttl"`
+	// IdleTimeout triggers AutoPause: after this much idle time the task is
+	// frozen (cgroup freeze) and moved to Suspended. Empty = disabled.
+	// Mirrors CubeSandbox docs/guide/lifecycle.md: timeout + on_timeout=pause.
+	IdleTimeout string `toml:"idle_timeout"`
+	// AutoResume re-arms a Suspended task on the next API activity (any
+	// /exec, /tasks/:id/*). Mirrors Cube's auto_resume.
+	AutoResume bool `toml:"auto_resume"`
 }
 
 // --- loading & validation ---
@@ -347,6 +394,21 @@ func (s *TaskSpec) Validate() error {
 	// declared outputs; warn (not fail) so an empty declared list is allowed.
 	if s.Artifacts.BlockSecrets && len(s.Artifacts.Declared) == 0 {
 		// not fatal — a task may declare no outputs.
+	}
+	for i, vm := range s.Volumes {
+		if vm.Name == "" {
+			errs = append(errs, fmt.Errorf("spec: volumes[%d].name is required", i))
+		}
+		if vm.Path == "" {
+			errs = append(errs, fmt.Errorf("spec: volumes[%d].path is required", i))
+		} else if vm.Path[0] != '/' {
+			errs = append(errs, fmt.Errorf("spec: volumes[%d].path %q must be absolute", i, vm.Path))
+		}
+	}
+	if s.Lifecycle.IdleTimeout != "" {
+		if _, err := time.ParseDuration(s.Lifecycle.IdleTimeout); err != nil {
+			errs = append(errs, fmt.Errorf("spec: lifecycle.idle_timeout: %w", err))
+		}
 	}
 	return errors.Join(errs...)
 }
