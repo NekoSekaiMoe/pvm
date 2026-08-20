@@ -249,6 +249,21 @@ func ConvertToQcow2(ctx context.Context, srcPath, destPath string, opt OverlayOp
 		cleanupTmp()
 		return fmt.Errorf("cow: convert: close dest: %w", err)
 	}
+	// Align the temp file's mode with the source before renaming: os.CreateTemp
+	// creates it 0600 (umask cannot widen that), and createQcow2's O_CREATE
+	// open of the already-existing temp file does not change the mode, so
+	// without an explicit chmod the renamed result would keep 0600 no matter
+	// what the source allowed. Mirror the source's permission bits instead
+	// of a fixed constant — a source under a private (0600) task dir must
+	// stay 0600 — exactly the policy Compact already applies. A chmod
+	// failure is fatal: do NOT rename a file with the wrong mode and pretend
+	// success.
+	if st, serr := os.Stat(absSrc); serr == nil {
+		if err := os.Chmod(tmp, st.Mode().Perm()); err != nil {
+			cleanupTmp()
+			return fmt.Errorf("cow: convert: align dest mode: %w", err)
+		}
+	}
 	if err := os.Rename(tmp, absDst); err != nil {
 		cleanupTmp()
 		return fmt.Errorf("cow: convert: rename into place: %w", err)

@@ -558,18 +558,21 @@ func openGuestImage(path string) (guestImage, error) {
 	bfOff := binary.BigEndian.Uint64(hdrBuf[0x08:])
 	bfSize := binary.BigEndian.Uint32(hdrBuf[0x10:])
 	// Header extensions live between the fixed header and the backing-file
-	// name (bfOff). Parse them to recover the stored backing format
-	// (extBackingFormat) instead of re-probing later — a probe can race or
-	// disagree with what qemu-img wrote, and Compact must rebuild with the
-	// SAME format the source declared.
+	// name (bfOff), and always terminate with an explicit 0-magic marker.
+	// Parse them to recover the stored backing format (extBackingFormat)
+	// instead of re-probing later — a probe can race or disagree with what
+	// qemu-img wrote, and Compact must rebuild with the SAME format the
+	// source declared.
+	//
+	// Scan bound: the backing-file offset when a name is present; otherwise
+	// (bfOff == 0, standalone image) the rest of cluster 0, where the spec
+	// confines header extensions. Capping a standalone image at
+	// header_length instead would silently SKIP every extension a foreign
+	// writer placed after a short (104-byte) header — qemu-img emits
+	// header_length=104 — or reject one as overflowing.
 	extEnd := bfOff
 	if extEnd == 0 {
-		// No backing name: extensions still end with the 0-marker. Bound
-		// the parse at the fixed header length, or header_length if larger.
-		extEnd = uint64(qcow2HeaderLen)
-		if hdrLen > extEnd {
-			extEnd = hdrLen
-		}
+		extEnd = q.clusterSize
 	}
 	// Extensions live in cluster 0 AFTER the fixed header, so hdrBuf
 	// (only qcow2HeaderLen bytes) does not cover them. Read the whole
@@ -592,6 +595,7 @@ func openGuestImage(path string) (guestImage, error) {
 		return nil, fmt.Errorf("cow: invalid header extension region in %s (end=%#x before header_length=%#x)", path, extEnd, hdrLen)
 	}
 	e := hdrLen
+	marker := false
 	for e+8 <= extEnd {
 		var magic, elen uint32
 		if e+8 <= uint64(len(hdrBuf)) {
@@ -602,6 +606,7 @@ func openGuestImage(path string) (guestImage, error) {
 			elen = binary.BigEndian.Uint32(extBuf[e+4:])
 		}
 		if magic == 0 { // end-of-extensions marker
+			marker = true
 			break
 		}
 		dataOff := e + 8
@@ -623,12 +628,29 @@ func openGuestImage(path string) (guestImage, error) {
 		}
 		e = dataOff + roundUp8(uint64(elen))
 	}
+	// The spec mandates the 0-magic end-of-extensions marker directly after
+	// the last extension. A scan that ran to the bound without finding one
+	// means the image is malformed (or its bound fields lie) — refuse it
+	// instead of guessing where the extensions end.
+	if !marker {
+		f.Close()
+		return nil, fmt.Errorf("cow: missing end-of-extensions marker in %s (scanned %#x..%#x)", path, hdrLen, extEnd)
+	}
 	if bfSize > 0 {
 		// The qcow2 spec caps the backing name at 1023 bytes (it must fit
 		// in cluster 0 after the header); qemu-img enforces the same bound.
 		if bfSize > maxBackingNameLen {
 			f.Close()
 			return nil, fmt.Errorf("cow: implausible backing name length %d in %s (max %d)", bfSize, path, maxBackingNameLen)
+		}
+		// The name must also live entirely inside cluster 0, after the fixed
+		// header and its extensions. Without a bound on bfOff/bfSize the read
+		// below happily pulls in whatever follows cluster 0 — L1/refcount
+		// metadata, or attacker-chosen data clusters — and parses it as a
+		// backing path.
+		if bfOff < hdrLen || bfOff > q.clusterSize || uint64(bfSize) > q.clusterSize-bfOff {
+			f.Close()
+			return nil, fmt.Errorf("cow: invalid backing name region in %s (offset=%#x size=%d, cluster=%d, header_length=%d)", path, bfOff, bfSize, q.clusterSize, hdrLen)
 		}
 		name := make([]byte, bfSize)
 		if _, err := f.ReadAt(name, int64(bfOff)); err != nil {

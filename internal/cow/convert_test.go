@@ -266,7 +266,7 @@ func TestSniffFormat(t *testing.T) {
 // file must be rejected before any filesystem mutation — the O_TRUNC
 // (ConvertToRaw) or final rename (ConvertToQcow2) would replace a file the
 // source chain still reads through. The backing must survive byte-for-byte.
-func TestConvert_DestIsBackingFile(t *testing.T) {
+func TestConvertDestIsBackingFile(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		run  func(t *testing.T, overlay, base string, baseContent []byte)
