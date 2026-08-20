@@ -7,7 +7,7 @@ require (
 	github.com/google/go-containerregistry v0.19.0
 	github.com/labstack/echo/v4 v4.13.1
 	github.com/vishvananda/netlink v1.3.1
-	golang.org/x/sys v0.25.0
+	golang.org/x/sys v0.30.0
 )
 
 require (
