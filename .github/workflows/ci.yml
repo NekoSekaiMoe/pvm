@@ -26,15 +26,23 @@ jobs:
       with:
         persist-credentials: false
 
+    - name: Setup pnpm
+      uses: pnpm/action-setup@v4
+      with:
+        version: 10
+
     - name: Setup Node.js
       uses: actions/setup-node@v7
       with:
         node-version: '24'
+        cache: 'pnpm'
+        cache-dependency-path: webui/pnpm-lock.yaml
 
     - name: Build WebUI (Nuxt)
       working-directory: ./webui
       run: |
-        npm install
+        pnpm install --frozen-lockfile
+        pnpm exec nuxt generate
 
     - name: Set up Go
       uses: actions/setup-go@v7
@@ -69,6 +77,11 @@ jobs:
       run: |
         chmod +x scripts/build_kernel.sh
         sudo apt-get install -y build-essential libelf-dev pkg-config bc git
+        # LLVM=1 builds need ld.lld on PATH; the bare 'lld' package installs
+        # it as /usr/lib/llvm-<n>/bin/ld.lld on some distro layouts. Export a
+        # guaranteed-PATH location so kbuild's 'LD=ld.lld' resolves.
+        LLD_DIR=$(dirname "$(find /usr/lib/llvm-*/bin /usr/bin -maxdepth 1 -name ld.lld 2>/dev/null | head -1)")
+        echo "${LLD_DIR}" >> "$GITHUB_PATH"
         ./scripts/build_kernel.sh
         
     - name: Run Integration Scripts

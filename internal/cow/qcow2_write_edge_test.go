@@ -1,9 +1,11 @@
 package cow
 
 import (
+	"bytes"
 	"encoding/binary"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -18,8 +20,9 @@ func forgeForeignOverlay(t *testing.T, path string, virtualSize uint64) {
 	l2Entries := cs / 8
 	l1Size := (virtualSize + l2Entries*cs - 1) / (l2Entries * cs)
 	l1Clusters := (l1Size*8 + cs - 1) / cs
-	// Layout: header | reftable (1) | L1. No refblocks; reftableCls 8
-	// leaves room for lazy registration.
+	// Layout: header | reftable (1) | L1. No refblocks; a single reftable
+	// cluster covers cs/8 refblocks = cs²/16 cluster indexes — far beyond
+	// this test's file size — so lazy registration has room.
 	l1Off := 2 * cs
 	buf := make([]byte, l1Off+l1Clusters*cs)
 	copy(buf[0:4], qcow2Magic)
@@ -29,7 +32,7 @@ func forgeForeignOverlay(t *testing.T, path string, virtualSize uint64) {
 	binary.BigEndian.PutUint32(buf[0x24:], uint32(l1Size))
 	binary.BigEndian.PutUint64(buf[0x28:], l1Off)
 	binary.BigEndian.PutUint64(buf[0x30:], cs) // reftable at cluster 1
-	binary.BigEndian.PutUint32(buf[0x38:], 8)  // 8 reftable clusters
+	binary.BigEndian.PutUint32(buf[0x38:], 1)  // 1 reftable cluster, matching the layout above
 	binary.BigEndian.PutUint32(buf[0x60:], refcountOrder)
 	binary.BigEndian.PutUint32(buf[0x64:], qcow2HeaderLen)
 	if err := os.WriteFile(path, buf, 0644); err != nil {
@@ -129,21 +132,9 @@ func TestQcow2Write_ForeignLazyRefblocks(t *testing.T) {
 	if _, err := img.ReadAt(got, int64(off)); err != nil {
 		t.Fatalf("read back: %v", err)
 	}
-	if !equalBytes(got, patterned(0x43, clusterSize)) {
+	if !bytes.Equal(got, patterned(0x43, clusterSize)) {
 		t.Error("written data readback mismatch")
 	}
-}
-
-func equalBytes(a, b []byte) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
 }
 
 // TestQcow2Write_RefcountTableFullGuard: an allocation beyond the reftable's
@@ -173,20 +164,7 @@ func TestQcow2Write_RefcountTableFullGuard(t *testing.T) {
 	defer be.Close()
 	if _, err := be.WriteAt(patterned(0x66, 512), 0); err == nil {
 		t.Fatal("expected refcount-table-full error, got success")
-	} else if got := err.Error(); !contains(got, "refcount table full") {
+	} else if got := err.Error(); !strings.Contains(got, "refcount table full") {
 		t.Fatalf("error = %q, want refcount table full", got)
 	}
-}
-
-func contains(s, sub string) bool {
-	return len(s) >= len(sub) && (s == sub || indexOf(s, sub) >= 0)
-}
-
-func indexOf(s, sub string) int {
-	for i := 0; i+len(sub) <= len(s); i++ {
-		if s[i:i+len(sub)] == sub {
-			return i
-		}
-	}
-	return -1
 }

@@ -261,7 +261,8 @@ func createQcow2(path string, virtualSize uint64, backingPath, backingFormat str
 		l1 := make([]byte, cs)
 		for j := uint64(0); j < entriesPerCluster; j++ {
 			if e := k*entriesPerCluster + j; e < lay.l2Count {
-				binary.BigEndian.PutUint64(l1[j*8:], lay.l2Off+e*cs|oflagCopied)
+				host := lay.l2Off + e*cs
+				binary.BigEndian.PutUint64(l1[j*8:], host|oflagCopied)
 			}
 		}
 		if _, err := f.Write(l1); err != nil {
@@ -476,7 +477,8 @@ func openGuestImage(path string) (guestImage, error) {
 		f.Close()
 		return nil, fmt.Errorf("cow: unsupported qcow2 version %d in %s (want 3)", v, path)
 	}
-	if cb := binary.BigEndian.Uint32(hdrBuf[0x14:]); cb < 9 || cb > 21 {
+	cb := binary.BigEndian.Uint32(hdrBuf[0x14:])
+	if cb < 9 || cb > 21 {
 		f.Close()
 		return nil, fmt.Errorf("cow: invalid cluster_bits %d in %s (qcow2 range 9..21)", cb, path)
 	}
@@ -488,7 +490,6 @@ func openGuestImage(path string) (guestImage, error) {
 		f.Close()
 		return nil, fmt.Errorf("cow: qcow2 incompatible features %#x in %s unsupported", inc, path)
 	}
-	cb := binary.BigEndian.Uint32(hdrBuf[0x14:])
 	q := &qcow2Image{
 		f:           f,
 		clusterBits: cb,

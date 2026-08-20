@@ -270,8 +270,14 @@ func (w *qcow2Writable) allocCluster() (uint64, error) {
 // time (its size covers the image's worst case).
 func (w *qcow2Writable) bumpRefcount(clusterIdx uint64) error {
 	entriesPerBlock := w.clusterSize / 2 // u16 entries per refcount block
+	// Overflow-safe bounds check: blockIdx must stay below the number of
+	// entries the reftable can hold. Computing maxBlocks*entriesPerBlock as
+	// a ceiling can wrap for large refcountClusters/clusterSize combinations
+	// (both attacker-controlled in foreign images), so divide instead:
+	// maxBlocks = refcountClusters * cs/8 may itself overflow only past 2^64,
+	// and the per-iteration check below re-validates with the same value.
 	maxBlocks := uint64(w.hdr.refcountClusters) * (w.clusterSize / 8)
-	if clusterIdx >= maxBlocks*entriesPerBlock {
+	if maxBlocks != 0 && clusterIdx/entriesPerBlock >= maxBlocks {
 		return fmt.Errorf("cow: refcount table full at cluster %d", clusterIdx)
 	}
 	// Register refcount blocks iteratively instead of recursively: a freshly

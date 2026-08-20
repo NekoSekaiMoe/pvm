@@ -60,6 +60,23 @@ case "$ARCH" in
     # upstream defconfig for SUBARCH=arm64 enables SECCOMP userspace mode.
     command -v clang >/dev/null || { echo "FATAL: clang required for aarch64 UML build (LLVM=1)"; exit 1; }
     MAKE_ARGS=(ARCH=um SUBARCH=arm64 LLVM=1 CC=clang LD=ld.lld)
+    # The port's stub_exe link rule (arch/um/kernel/skas/Makefile) drives the
+    # linker through $(CC) and only carries --target from CLANG_FLAGS, so
+    # LD=ld.lld never applies there. clang then falls back to its default
+    # GNU cross linker (aarch64-linux-gnu-ld; binutils 2.42 on
+    # ubuntu-24.04-arm), which rejects the lld-only --no-rosegment flag:
+    #   STUB_EXE arch/um/kernel/skas/stub_exe.dbg
+    #   aarch64-linux-gnu-ld: unrecognized option '--no-rosegment'
+    # Force lld for that link (mirrors what kbuild itself does for host tools
+    # under LLVM=1: Makefile adds -fuse-ld=lld to KBUILD_HOSTLDFLAGS). Upstream
+    # mainline does not pass --no-rosegment at all, so guard the patch: apply
+    # only while the flag is present and lld is not already forced.
+    STUB_MK=arch/um/kernel/skas/Makefile
+    if grep -q '^STUB_EXE_LDFLAGS = .*--no-rosegment' "${STUB_MK}" && \
+       ! grep -q '^STUB_EXE_LDFLAGS = .*fuse-ld=lld' "${STUB_MK}"; then
+        sed -i 's/^STUB_EXE_LDFLAGS = /STUB_EXE_LDFLAGS = -fuse-ld=lld /' "${STUB_MK}"
+        echo "Patched ${STUB_MK}: stub_exe link now forces ld.lld (--no-rosegment is lld-only)."
+    fi
     ;;
   *)
     echo "FATAL: unsupported host architecture '${ARCH}' (supported: x86_64, aarch64)"
