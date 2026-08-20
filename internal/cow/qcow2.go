@@ -90,7 +90,8 @@ type qcow2Layout struct {
 	l1Clusters  uint64
 	l2Count     uint64 // L2 tables written at create (0 unless prealloc)
 	reftableCls uint64 // refcount table clusters
-	refblockCnt uint64 // refcount blocks written at create
+	refblockCnt uint64 // refcount blocks sized into the region (worst case)
+	refUsedCls  uint64 // refcount-block clusters carrying nonzero entries
 	physMeta    uint64 // total physical metadata clusters at create
 	reftableOff uint64
 	refblockOff uint64
@@ -144,6 +145,10 @@ func computeQcow2Layout(virtualSize uint64, bits uint32, prealloc bool) (*qcow2L
 				reftableCls: reftableCls, refblockCnt: refblockCnt,
 				physMeta: physMeta,
 			}
+			// Only the first 2*physMeta bytes of the refblock region are
+			// nonzero (one u16 per create-time metadata cluster); the rest is
+			// streamed zeros at write time.
+			l.refUsedCls = (2*physMeta + cs - 1) / cs
 			l.reftableOff = cs
 			l.refblockOff = (1 + reftableCls) * cs
 			l.l1Off = l.refblockOff + refblockCnt*cs
@@ -170,9 +175,14 @@ func createQcow2(path string, virtualSize uint64, backingPath, backingFormat str
 	}
 	cs := lay.clusterSize
 
-	// Everything before the (optional) preallocated L2 tables is built in
-	// one buffer: header cluster, refcount table, refcount blocks, L1.
-	buf := make([]byte, lay.l2Off)
+	// Only the USED prefix of the refcount-block region carries data (one
+	// u16 set to 1 per create-time metadata cluster); everything through
+	// that prefix — header cluster, refcount table, refcount blocks — is
+	// built in one buffer. The unused refblock remainder and the
+	// (optional) preallocated L2 tables are all zeros and are streamed
+	// instead: a 1 TiB image at 4 KiB clusters has 128K refblocks = 512 MiB
+	// (and 2 GiB of L2) that must never sit in memory.
+	buf := make([]byte, lay.refblockOff+lay.refUsedCls*cs)
 
 	// --- header (cluster 0) ---
 	hdr := buf[:qcow2HeaderLen]
@@ -205,7 +215,7 @@ func createQcow2(path string, virtualSize uint64, backingPath, backingFormat str
 	off += 8
 	if backingPath != "" {
 		if len(backingPath) > 4096 || off+uint64(len(backingPath)) > cs {
-			return fmt.Errorf("cow: backing path too long for qcow2 header cluster")
+			return fmt.Errorf("cow: backing path too long for qcow2 header cluster: path length %d, header extensions end at %d, cluster size %d", len(backingPath), off, cs)
 		}
 		binary.BigEndian.PutUint64(buf[0x08:], off)
 		binary.BigEndian.PutUint32(buf[0x10:], uint32(len(backingPath)))
@@ -226,36 +236,56 @@ func createQcow2(path string, virtualSize uint64, backingPath, backingFormat str
 
 	// --- L1 table: preallocated L2 tables are linked up front (COPIED set,
 	// refcount 1 — qemu-img check requires the flag on refcount-1 entries);
-	// otherwise all zero = every cluster reads from backing. ---
-	for k := uint64(0); k < lay.l2Count; k++ {
-		binary.BigEndian.PutUint64(buf[lay.l1Off+k*8:], lay.l2Off+k*cs|oflagCopied)
-	}
+	// otherwise all zero = every cluster reads from backing. Written after
+	// the zero-streamed refblock remainder, one cluster at a time. ---
 
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
 	if err != nil {
 		return fmt.Errorf("cow: create %s: %w", path, err)
 	}
 	defer f.Close()
+	// All writes are sequential: the buffer (header..used refblocks), zeros
+	// up to l1Off, the L1 table, then the preallocated L2 tables.
 	if _, err := f.Write(buf); err != nil {
 		return fmt.Errorf("cow: write qcow2 metadata: %w", err)
 	}
+	zero := make([]byte, 1<<20)
+	if cs < uint64(len(zero)) {
+		zero = zero[:cs]
+	}
+	if err := streamZeros(f, zero, lay.l1Off-uint64(len(buf)), "zero-fill refcount blocks"); err != nil {
+		return err
+	}
+	entriesPerCluster := cs / 8
+	for k := uint64(0); k < lay.l1Clusters; k++ {
+		l1 := make([]byte, cs)
+		for j := uint64(0); j < entriesPerCluster; j++ {
+			if e := k*entriesPerCluster + j; e < lay.l2Count {
+				binary.BigEndian.PutUint64(l1[j*8:], lay.l2Off+e*cs|oflagCopied)
+			}
+		}
+		if _, err := f.Write(l1); err != nil {
+			return fmt.Errorf("cow: write L1 table: %w", err)
+		}
+	}
 	// Preallocated L2 tables are all zeros; stream them (a 1 TiB image at
 	// 4 KiB clusters has 512K L2 tables = 2 GiB — never buffer that).
-	if lay.l2Count > 0 {
-		zero := make([]byte, 1<<20)
-		if cs < uint64(len(zero)) {
-			zero = zero[:cs]
+	return streamZeros(f, zero, lay.l2Count*cs, "preallocated L2 tables")
+}
+
+// streamZeros writes rem zero bytes sequentially to f in chunks of buf,
+// so only the 1 MiB chunk buffer (never the full hundreds-of-MiB region)
+// sits in memory.
+func streamZeros(f *os.File, buf []byte, rem uint64, what string) error {
+	for rem > 0 {
+		n := uint64(len(buf))
+		if rem < n {
+			n = rem
 		}
-		for rem := lay.l2Count * cs; rem > 0; {
-			n := uint64(len(zero))
-			if rem < n {
-				n = rem
-			}
-			if _, err := f.Write(zero[:n]); err != nil {
-				return fmt.Errorf("cow: write preallocated L2 tables: %w", err)
-			}
-			rem -= n
+		if _, err := f.Write(buf[:n]); err != nil {
+			return fmt.Errorf("cow: write %s: %w", what, err)
 		}
+		rem -= n
 	}
 	return nil
 }
@@ -514,11 +544,16 @@ func convertToRaw(ctx context.Context, srcPath, destPath string) error {
 	}
 	defer out.Close()
 
-	// Convert in chunks of the source's own cluster geometry (or 1 MiB for
-	// raw sources, which have no clusters).
+	// Convert in ~1 MiB chunks. Raw sources have no cluster geometry, so
+	// they convert at exactly 1 MiB; qcow2 sources round the baseline UP to
+	// a whole multiple of the source's cluster size — one ReadAt then
+	// resolves whole clusters in bulk (4 KiB clusters: 256 per call instead
+	// of 1) without paying a per-cluster syscall per MiB.
 	chunk := uint64(1) << 20
 	if q, ok := img.(*qcow2Image); ok {
-		chunk = q.clusterSize
+		if r := chunk % q.clusterSize; r != 0 {
+			chunk += q.clusterSize - r
+		}
 	}
 	size := img.Size()
 	buf := make([]byte, chunk)

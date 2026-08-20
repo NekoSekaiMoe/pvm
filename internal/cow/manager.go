@@ -48,6 +48,13 @@ func CreateOverlay(ctx context.Context, baseImage, overlayFile string) error {
 
 // CreateOverlayWithOptions is CreateOverlay with explicit qcow2 tuning
 // (cluster size, metadata preallocation). See OverlayOpt.
+//
+// NOTE: unlike CreateOverlay (which applies defaultOverlayOpt — including
+// PreallocMetadata: true), opt is used as given: fields left at their zero
+// value are NOT defaulted. In particular OverlayOpt{} (or any opt without
+// PreallocMetadata: true) creates an overlay with NO preallocated L2 tables
+// or refcount blocks — first writes then pay the lazy metadata allocations
+// that preallocation exists to avoid.
 func CreateOverlayWithOptions(ctx context.Context, baseImage, overlayFile string, opt OverlayOpt) error {
 	if opt.ClusterBits == 0 {
 		opt.ClusterBits = clusterBits

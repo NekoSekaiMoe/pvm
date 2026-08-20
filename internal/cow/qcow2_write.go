@@ -266,47 +266,62 @@ func (w *qcow2Writable) allocCluster() (uint64, error) {
 
 // bumpRefcount sets refcount(clusterIdx) = 1, allocating additional refcount
 // blocks (registered in the refcount table) when the image grows past what
-// the existing blocks cover. The refcount table itself is fixed at one
-// cluster (8192 entries → covers 16 TiB of host file), sized at create time.
+// the existing blocks cover. The refcount table itself is fixed at create
+// time (its size covers the image's worst case).
 func (w *qcow2Writable) bumpRefcount(clusterIdx uint64) error {
 	entriesPerBlock := w.clusterSize / 2 // u16 entries per refcount block
-	blockIdx := clusterIdx / entriesPerBlock
-	inBlock := clusterIdx % entriesPerBlock
 	maxBlocks := uint64(w.hdr.refcountClusters) * (w.clusterSize / 8)
-	if blockIdx >= maxBlocks {
+	if clusterIdx >= maxBlocks*entriesPerBlock {
 		return fmt.Errorf("cow: refcount table full at cluster %d", clusterIdx)
 	}
-	var tableEntry uint64
-	if err := w.readUint64At(&tableEntry, w.hdr.refcountOffset+blockIdx*8); err != nil {
-		return err
-	}
-	blockOff := tableEntry & reftOffsetMask // REFT_OFFSET_MASK
-	if blockOff == 0 {
-		// Allocate a new refcount block at EOF and register it in the table.
-		blockOff = w.fileSize
-		if _, err := w.f.WriteAt(make([]byte, w.clusterSize), int64(blockOff)); err != nil {
+	// Register refcount blocks iteratively instead of recursively: a freshly
+	// registered block's own cluster needs a refcount too, which may fall in
+	// a block that doesn't exist yet. deferred mirrors the call stack the
+	// recursion would build: each pending cluster's entry is written after
+	// the blocks it depends on are registered (its own blockOff, re-read on
+	// the way back, is non-zero by then). Termination: a new block is
+	// appended at EOF, so its self-cluster index is strictly larger than
+	// any cluster seen so far, bounded by the per-iteration table check.
+	var deferred []uint64
+	idx := clusterIdx
+	for {
+		blockIdx := idx / entriesPerBlock
+		if blockIdx >= maxBlocks {
+			return fmt.Errorf("cow: refcount table full at cluster %d", idx)
+		}
+		var tableEntry uint64
+		if err := w.readUint64At(&tableEntry, w.hdr.refcountOffset+blockIdx*8); err != nil {
 			return err
 		}
-		w.fileSize += w.clusterSize
-		var b [8]byte
-		binary.BigEndian.PutUint64(b[:], blockOff)
-		if _, err := w.f.WriteAt(b[:], int64(w.hdr.refcountOffset+blockIdx*8)); err != nil {
-			return err
-		}
-		// The new block's own cluster also needs refcount 1; now that the
-		// table entry is registered, recursion lands in the right block
-		// (its own if covered, an earlier one otherwise).
-		selfCluster := blockOff >> w.clusterBits
-		if selfCluster != clusterIdx {
-			if err := w.bumpRefcount(selfCluster); err != nil {
+		blockOff := tableEntry & reftOffsetMask // REFT_OFFSET_MASK
+		if blockOff == 0 {
+			// Allocate a new refcount block at EOF and register it in the table.
+			blockOff = w.fileSize
+			if _, err := w.f.WriteAt(make([]byte, w.clusterSize), int64(blockOff)); err != nil {
 				return err
 			}
+			w.fileSize += w.clusterSize
+			var b [8]byte
+			binary.BigEndian.PutUint64(b[:], blockOff)
+			if _, err := w.f.WriteAt(b[:], int64(w.hdr.refcountOffset+blockIdx*8)); err != nil {
+				return err
+			}
+			// The new block's own cluster also needs refcount 1; it is larger
+			// than idx, so register its block first and come back for idx.
+			if selfCluster := blockOff >> w.clusterBits; selfCluster != idx {
+				deferred = append(deferred, idx)
+				idx = selfCluster
+				continue
+			}
 		}
+		var c [2]byte
+		binary.BigEndian.PutUint16(c[:], 1)
+		if _, err := w.f.WriteAt(c[:], int64(blockOff+(idx%entriesPerBlock)*2)); err != nil {
+			return err
+		}
+		if len(deferred) == 0 {
+			return nil
+		}
+		idx, deferred = deferred[len(deferred)-1], deferred[:len(deferred)-1]
 	}
-	var c [2]byte
-	binary.BigEndian.PutUint16(c[:], 1)
-	if _, err := w.f.WriteAt(c[:], int64(blockOff+inBlock*2)); err != nil {
-		return err
-	}
-	return nil
 }

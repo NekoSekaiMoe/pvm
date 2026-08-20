@@ -366,12 +366,15 @@ func TestCreateOverlay_DefaultGeometry(t *testing.T) {
 			t.Errorf("L1[%d] missing COPIED flag (qemu-img check would fail)", i)
 		}
 	}
-	// 32 L2 tables at 4 KiB = 128 KiB of preallocated metadata beyond the
-	// fixed header/reftable/refblock/L1 clusters.
-	st, _ := f.Stat()
-	wantMin := int64(l1Off) + int64(l1Size*8) + int64(l1Size)*4096
-	if st.Size() < wantMin {
-		t.Errorf("overlay size %d < preallocated size %d (L2 tables missing?)", st.Size(), wantMin)
+	// Create-time size must equal exactly the header-derived preallocated
+	// size (reftable + refblocks + L1 + every L2 table); preallocSize
+	// centralizes that layout math.
+	st, err := f.Stat()
+	if err != nil {
+		t.Fatalf("stat overlay: %v", err)
+	}
+	if want := preallocSize(t, overlay); st.Size() != want {
+		t.Errorf("overlay size %d != preallocated size %d (L2 tables missing?)", st.Size(), want)
 	}
 }
 
@@ -506,17 +509,35 @@ func TestQcow2_ForeignClusterGeometry(t *testing.T) {
 	}
 }
 
-// TestQcow2_ClusterBitsRange: cluster_bits outside the qcow2 spec range
-// (9..21) must be rejected at create time, not produce a corrupt image.
+// TestQcow2_ClusterBitsRange: cluster_bits is validated against the qcow2
+// spec range [9, 21]; values outside must be rejected at create time (not
+// produce a corrupt image) and the boundary values themselves must be
+// accepted.
 func TestQcow2_ClusterBitsRange(t *testing.T) {
 	dir := t.TempDir()
 	base := filepath.Join(dir, "base.img")
 	mustWriteRaw(t, base, 0, patterned(0x01, 8192))
-	for _, bits := range []uint32{8, 22, 32} {
-		err := CreateOverlayWithOptions(context.Background(), base, filepath.Join(dir, "ov.qcow2"),
-			OverlayOpt{ClusterBits: bits})
-		if err == nil {
-			t.Errorf("cluster_bits %d accepted, want rejection", bits)
-		}
+	cases := []struct {
+		bits   uint32
+		accept bool
+	}{
+		{8, false},  // below spec minimum (512 B clusters)
+		{9, true},   // spec minimum
+		{21, true},  // spec maximum (2 MiB clusters)
+		{22, false}, // above spec maximum
+		{32, false}, // far out of range
+	}
+	for _, tc := range cases {
+		t.Run(fmt.Sprintf("bits_%d", tc.bits), func(t *testing.T) {
+			opt := OverlayOpt{ClusterBits: tc.bits}
+			err := CreateOverlayWithOptions(context.Background(), base,
+				filepath.Join(dir, fmt.Sprintf("ov_%d.qcow2", tc.bits)), opt)
+			if tc.accept && err != nil {
+				t.Fatalf("cluster_bits %d rejected, want acceptance: %v", tc.bits, err)
+			}
+			if !tc.accept && err == nil {
+				t.Fatalf("cluster_bits %d accepted, want rejection", tc.bits)
+			}
+		})
 	}
 }

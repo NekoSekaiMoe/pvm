@@ -59,7 +59,7 @@ case "$ARCH" in
     # The port needs clang (LLVM=1 maps SUBARCH=arm64 to a aarch64 target);
     # upstream defconfig for SUBARCH=arm64 enables SECCOMP userspace mode.
     command -v clang >/dev/null || { echo "FATAL: clang required for aarch64 UML build (LLVM=1)"; exit 1; }
-    MAKE_ARGS=(ARCH=um SUBARCH=arm64 LLVM=1)
+    MAKE_ARGS=(ARCH=um SUBARCH=arm64 LLVM=1 CC=clang LD=ld.lld)
     ;;
   *)
     echo "FATAL: unsupported host architecture '${ARCH}' (supported: x86_64, aarch64)"
