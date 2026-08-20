@@ -227,6 +227,7 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 	// kernel mounts. It is forwarded into buildTaskArgs so the kernel command
 	// line and the overlay we actually created cannot drift apart.
 	resolvedRootfs := ""
+	overlayCreated := false // true only when we created a qcow2 overlay (the compact path)
 	if s.Workspace.BaseImage != "" {
 		if s.Kernel.UseVhostBlk {
 			// vhost path: wrap the qcow2 base in a per-task qcow2 overlay.
@@ -237,6 +238,7 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 				state.SaveState(taskID, st)
 				return fmt.Errorf("container: create qcow2 overlay for %s: %w", taskID, err)
 			}
+			overlayCreated = true
 		} else {
 			// ubd path: mount the base directly (no CoW). Works with raw or
 			// qcow2-as-flat-file; ubd reads raw bytes, so callers normally pass
@@ -281,7 +283,7 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 		pol := &egress.Policy{
 			AllowDomains:   s.Network.EgressAllowDomains,
 			BlockDomains:   s.Network.EgressBlockDomains,
-			MaxRequestBody:  s.Network.MaxRequestBodyBytes,
+			MaxRequestBody: s.Network.MaxRequestBodyBytes,
 		}
 		m.Egress.SetPolicy(taskID, pol)
 		if lp, err := m.Egress.ListenForTask(ctx, taskID); err == nil {
@@ -394,6 +396,30 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 		_ = st.Transition(state.StatusReview, state.ActorAgent, "exited cleanly, awaiting review")
 	}
 	state.SaveState(taskID, st)
+
+	// Post-stop overlay compaction. Only the vhost path creates an overlay, so
+	// overlayCreated gates the whole thing (the ubd path mounts the base
+	// directly and has nothing to compact). The guest has exited (Wait
+	// returned) and no more I/O is in flight; close the vhost backend
+	// explicitly so it is not holding the overlay file open while we rename
+	// a rebuilt file over it. The deferred close becomes a no-op once we nil
+	// vhostBackend here. A compact failure must NOT flip a clean task to
+	// Failed — the task already exited — so it is logged + audited only.
+	if s.Workspace.CompactOnExit && overlayCreated {
+		if vhostBackend != nil {
+			vhostBackend.Close()
+			vhostBackend = nil
+		}
+		stats, cerr := cow.Compact(context.Background(), overlayPath)
+		if cerr != nil {
+			fmt.Printf("Warning: compact overlay for %s failed: %v\n", taskID, cerr)
+			_ = ledger.Append(audit.Record{Phase: audit.PhaseExec, Subject: taskID, Action: "overlay_compact", Decision: audit.DecisionConstrain, Reason: "compact failed: " + cerr.Error()})
+		} else {
+			fmt.Printf("Overlay compacted for %s: %d -> %d bytes (%d clusters copied, %d zeroed, %d dropped)\n",
+				taskID, stats.BeforeBytes, stats.AfterBytes, stats.ClustersCopied, stats.ClustersZeroed, stats.ClustersDropped)
+			_ = ledger.Append(audit.Record{Phase: audit.PhaseExec, Subject: taskID, Action: "overlay_compact", Decision: audit.DecisionAllow, Reason: fmt.Sprintf("overlay compacted: %d -> %d bytes", stats.BeforeBytes, stats.AfterBytes)})
+		}
+	}
 	return waitErr
 }
 

@@ -24,6 +24,12 @@ memory = "512M"
 base_image = "rootfs.img"   # read-only backing image, shared by N sandboxes. Raw ext4 for the ubd path (use_vhost_blk=false); qcow2 for the vhost path (default).
 # overlay is auto-derived as <statedir>/rootfs.qcow2 when omitted (vhost path only)
 init      = "/sbin/init"
+# Rebuild the per-task qcow2 overlay in place right after the sandbox exits:
+# only allocated clusters are rewritten, zero clusters become ZERO-flag
+# entries, and unused preallocated metadata is dropped. Pure-Go equivalent of
+# `qemu-img convert -O qcow2` (no qemu binaries needed). Keeps snapshot
+# exports / state dirs small. vhost path only; non-fatal on failure.
+compact_on_exit = true
 
 [kernel]
 path          = "./bin/linux"

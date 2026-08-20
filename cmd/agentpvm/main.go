@@ -312,9 +312,49 @@ func cowCmd(args []string) {
 	fs := flag.NewFlagSet("cow", flag.ExitOnError)
 	backing := fs.String("backing", "", "Backing (base) qcow2 image path")
 	overlay := fs.String("overlay", "", "Output qcow2 overlay path")
+	compact := fs.String("compact", "", "Compact an existing qcow2 overlay in place (rebuild, drop zero clusters, no qemu-img)")
+	toRaw := fs.String("to-raw", "", "Convert any image (raw/qcow2, +backing chain) to a standalone raw image: -to-raw <src> [-overlay <dst>]")
+	toQcow2 := fs.String("to-qcow2", "", "Convert any image to a standalone qcow2: -to-qcow2 <src> [-overlay <dst>]")
 	fs.Parse(args)
+	if *compact != "" {
+		stats, err := cow.Compact(context.Background(), *compact)
+		if err != nil {
+			fmt.Printf("Compact failed: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("Compacted %s: %d -> %d bytes (%d clusters copied, %d zeroed, %d dropped)\n",
+			*compact, stats.BeforeBytes, stats.AfterBytes, stats.ClustersCopied, stats.ClustersZeroed, stats.ClustersDropped)
+		return
+	}
+	if *toRaw != "" {
+		dst := *overlay
+		if dst == "" {
+			dst = trimExt(*toRaw) + ".img"
+		}
+		if err := cow.ConvertToRaw(context.Background(), *toRaw, dst); err != nil {
+			fmt.Printf("Convert to raw failed: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("Converted %s (%s) -> %s (raw)\n", *toRaw, cow.SniffFormat(*toRaw), dst)
+		return
+	}
+	if *toQcow2 != "" {
+		dst := *overlay
+		if dst == "" {
+			dst = trimExt(*toQcow2) + ".qcow2"
+		}
+		if err := cow.ConvertToQcow2(context.Background(), *toQcow2, dst, cow.ConvertDefaultOpt); err != nil {
+			fmt.Printf("Convert to qcow2 failed: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("Converted %s (%s) -> %s (qcow2)\n", *toQcow2, cow.SniffFormat(*toQcow2), dst)
+		return
+	}
 	if *backing == "" || *overlay == "" {
 		fmt.Println("Usage: agentpvm cow -backing <base.qcow2> -overlay <overlay.qcow2>")
+		fmt.Println("       agentpvm cow -compact <overlay.qcow2>")
+		fmt.Println("       agentpvm cow -to-raw <src> [-overlay <dst.img>]")
+		fmt.Println("       agentpvm cow -to-qcow2 <src> [-overlay <dst.qcow2>]")
 		os.Exit(1)
 	}
 	if err := cow.CreateOverlay(context.Background(), *backing, *overlay); err != nil {
@@ -322,6 +362,22 @@ func cowCmd(args []string) {
 		os.Exit(1)
 	}
 	fmt.Printf("CoW overlay created: %s -> %s\n", *backing, *overlay)
+}
+
+// trimExt strips the final path extension (used to derive a default dest name
+// for convert operations).
+func trimExt(p string) string {
+	d := p
+	for i := len(p) - 1; i >= 0; i-- {
+		if p[i] == '.' {
+			d = p[:i]
+			break
+		}
+		if p[i] == '/' {
+			break
+		}
+	}
+	return d
 }
 
 func snapshotCmd(args []string) {

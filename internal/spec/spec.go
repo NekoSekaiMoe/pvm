@@ -60,9 +60,9 @@ type TaskSpec struct {
 	Identity Identity `toml:"identity"`
 
 	// --- runtime / sandbox shape ---
-	Runtime  RuntimeSpec  `toml:"runtime"`
+	Runtime   RuntimeSpec   `toml:"runtime"`
 	Workspace WorkspaceSpec `toml:"workspace"`
-	Kernel   KernelSpec   `toml:"kernel"`
+	Kernel    KernelSpec    `toml:"kernel"`
 
 	// --- control planes ---
 	Network   NetworkSpec   `toml:"network"`
@@ -110,6 +110,16 @@ type WorkspaceSpec struct {
 	// ExtraEnv is injected into the guest via the init contract. Values here
 	// are NOT secrets — secrets come from the Credential Broker at runtime.
 	ExtraEnv map[string]string `toml:"extra_env"`
+
+	// CompactOnExit rebuilds the per-task qcow2 overlay in place right after
+	// the sandbox exits: only allocated clusters are rewritten, zero clusters
+	// become ZERO-flag entries, and unused preallocated metadata is dropped.
+	// This is the pure-Go equivalent of `qemu-img convert -O qcow2` (no
+	// qemu binaries) and keeps snapshot exports / state dirs small. Only
+	// meaningful on the vhost path (use_vhost_blk=true); the ubd path mounts
+	// the base directly and has no overlay to compact. Non-fatal: a compact
+	// failure is logged + audited but does not flip a clean task to Failed.
+	CompactOnExit bool `toml:"compact_on_exit"`
 }
 
 // KernelSpec selects the UML kernel binary and its launch mode.

@@ -211,9 +211,12 @@ func (w *qcow2Writable) allocDataCluster(clusterIdx uint64, data []byte, guest u
 	return hostOff, nil
 }
 
-// linkL2 points the L2 entry for clusterIdx at hostOff, allocating the L2
-// table first if needed.
-func (w *qcow2Writable) linkL2(clusterIdx, hostOff uint64) error {
+// setL2Entry points the L2 entry for clusterIdx at the raw l2e value,
+// allocating the L2 table first if needed. host clusters referenced by
+// l2e must already be refcounted by the caller; a bare oflagZero entry
+// ("cluster reads as zero, no host offset") references nothing and needs no
+// refcount — that is the compact path's zero-cluster representation.
+func (w *qcow2Writable) setL2Entry(clusterIdx, l2e uint64) error {
 	l2Entries := w.clusterSize / 8
 	l1Idx := clusterIdx / l2Entries
 	l2Idx := clusterIdx % l2Entries
@@ -239,11 +242,18 @@ func (w *qcow2Writable) linkL2(clusterIdx, hostOff uint64) error {
 		}
 	}
 	var b [8]byte
-	binary.BigEndian.PutUint64(b[:], hostOff|oflagCopied)
+	binary.BigEndian.PutUint64(b[:], l2e)
 	if _, err := w.f.WriteAt(b[:], int64(l2Off+l2Idx*8)); err != nil {
 		return err
 	}
 	return nil
+}
+
+// linkL2 points the L2 entry for clusterIdx at hostOff (a freshly allocated,
+// refcount-1 data cluster) with the COPIED flag set. It is the normal
+// allocate-on-write path; setL2Entry is the general form used by compact.
+func (w *qcow2Writable) linkL2(clusterIdx, hostOff uint64) error {
+	return w.setL2Entry(clusterIdx, hostOff|oflagCopied)
 }
 
 // allocCluster appends a zeroed cluster at EOF and sets its refcount to 1.

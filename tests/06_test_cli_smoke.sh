@@ -72,6 +72,40 @@ HTTP=$("$TMP/agentpvm" cow -backing "/tmp/a.img" -overlay "/tmp/evil,opt=x.qcow2
 echo "$HTTP" | grep -qi "forbidden\|comma\|failed" || { echo "❌ comma path not rejected: $HTTP"; exit 1; }
 echo "   comma rejected ✓"
 
+# --- 5b. cow -compact rebuilds a qcow2 overlay in place (pure-Go, no qemu-img) ---
+echo "--- cow -compact CLI"
+# Build a tiny base + overlay, write nothing, compact: must succeed and the
+# overlay must still be a valid qcow2 (magic intact).
+BASE2="$TMP/c_base.img"
+head -c $((4 * 1024 * 1024)) /dev/zero > "$BASE2"
+mkfs.ext4 -q -F "$BASE2" >/dev/null 2>&1 || true
+OV2="$TMP/c_overlay.qcow2"
+"$TMP/agentpvm" cow -backing "$BASE2" -overlay "$OV2" >/dev/null 2>&1 || { echo "❌ cow create failed"; exit 1; }
+OUT=$("$TMP/agentpvm" cow -compact "$OV2" 2>&1) || { echo "❌ cow -compact failed: $OUT"; exit 1; }
+echo "$OUT" | grep -q "Compacted" || { echo "❌ compact output missing: $OUT"; exit 1; }
+# magic still qcow2?
+head -c 4 "$OV2" | grep -q $'QFI\xfb' || { echo "❌ compacted file lost qcow2 magic"; exit 1; }
+echo "   cow -compact ✓"
+
+# --- 5c. cow -to-qcow2 / -to-raw convert (pure-Go, no qemu-img) ---
+echo "--- cow convert (raw<->qcow2)"
+# raw -> qcow2 -> raw round trip; content must be byte-identical.
+RAW_IN="$TMP/conv_in.img"
+head -c $((4 * 1024 * 1024)) /dev/zero > "$RAW_IN"
+# scatter some nonzero bytes so the qcow2 has real data clusters
+printf 'X1Y2Z3' | dd of="$RAW_IN" bs=1 seek=4096 conv=notrunc 2>/dev/null
+QC="$("$TMP/agentpvm" cow -to-qcow2 "$RAW_IN" -overlay "$TMP/conv.qcow2" 2>&1)" \
+    || { echo "❌ cow -to-qcow2 failed: $QC"; exit 1; }
+echo "$QC" | grep -q "Converted" || { echo "❌ to-qcow2 output: $QC"; exit 1; }
+head -c 4 "$TMP/conv.qcow2" | grep -q $'QFI\xfb' || { echo "❌ converted file not qcow2"; exit 1; }
+RAW_OUT="$("$TMP/agentpvm" cow -to-raw "$TMP/conv.qcow2" -overlay "$TMP/conv_out.img" 2>&1)" \
+    || { echo "❌ cow -to-raw failed: $RAW_OUT"; exit 1; }
+# round-trip content check on the nonzero region
+if ! cmp -s <(dd if="$RAW_IN" bs=1 skip=4096 count=6 2>/dev/null) <(dd if="$TMP/conv_out.img" bs=1 skip=4096 count=6 2>/dev/null); then
+    echo "❌ convert round-trip content mismatch"; exit 1
+fi
+echo "   cow convert ✓"
+
 # --- 6. pool stats subcommand ---
 # pool stats talks to a running controller over HTTP. Start a stub server that
 # serves /api/pool/stats and requires the same bearer secret the CLI sends, so

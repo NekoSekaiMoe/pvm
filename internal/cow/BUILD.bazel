@@ -3,8 +3,10 @@ load("@rules_go//go:def.bzl", "go_library", "go_test")
 go_library(
     name = "cow",
     srcs = [
+        "convert.go",
         "manager.go",
         "qcow2.go",
+        "qcow2_compact.go",
         "qcow2_write.go",
     ],
     importpath = "uml-container/internal/cow",
@@ -14,7 +16,10 @@ go_library(
 go_test(
     name = "cow_test",
     srcs = [
+        "compact_helpers_test.go",
+        "convert_test.go",
         "manager_test.go",
+        "qcow2_compact_test.go",
         "qcow2_test.go",
         "qcow2_write_test.go",
     ],

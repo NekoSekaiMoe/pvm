@@ -3,7 +3,7 @@ set -eo pipefail
 # Alpine 架构名与 uname -m 一致（x86_64/aarch64），riscv64 等未来再议
 ALPINE_ARCH=$(uname -m)
 
-echo "========== I/O Performance Test (virtio-blk via qemu-storage-daemon) =========="
+echo "========== I/O Performance Test (vhost-user-blk: Go + qemu backends) =========="
 
 # Build the agentpvm and umlctl
 go build -o agentpvm cmd/agentpvm/main.go
@@ -14,14 +14,20 @@ if [ ! -f "bin/linux" ]; then
     exit 1
 fi
 
-# Block backend under test: qemu-storage-daemon (the optional fallback
-# selected by PVM_VHOST_BACKEND=qemu; the default backend is the pure-Go
-# server in internal/vhost/vu, covered by tests/04). The daemon is required.
+# Block backends under test:
+#   1. the pure-Go vhost-user-blk server (internal/vhost/vu + internal/cow) —
+#      the DEFAULT, no qemu binaries needed (production path for the agent
+#      sandbox, exercised here in addition to tests/04).
+#   2. the qemu-storage-daemon backend (PVM_VHOST_BACKEND=qemu) — the optional
+#      fallback, skipped cleanly if the daemon is not installed.
+#
+# The raw ext4 image is converted to qcow2 ONCE via the pure-Go converter
+# (agentpvm cow -to-qcow2) so NO qemu-img binary is required to build the base.
 
-if qemu-img --help | grep -q "io_uring"; then
+if qemu-img --help >/dev/null 2>&1 && qemu-img --help | grep -q "io_uring"; then
     echo "AIO Backend: io_uring supported and will be used by qemu-storage-daemon where applicable."
 else
-    echo "AIO Backend: io_uring not supported, qemu-storage-daemon will fallback to threads."
+    echo "AIO Backend: io_uring not supported (or qemu-img missing); qemu-storage-daemon will fallback to threads."
 fi
 
 IMG_NAME="perf_rootfs.img"
@@ -82,35 +88,47 @@ sudo chmod +x mnt/init.sh
 trap - EXIT
 sudo umount mnt
 
-# The agent path is qcow2-only (qemu-storage-daemon serves the overlay via
+# The agent path is qcow2-only (the vhost backends serve the overlay via
 # vhost-user-blk; ubd cannot read qcow2). Convert the raw ext4 image to qcow2
-# once and pass the .qcow2 as the base image.
-if ! command -v qemu-img >/dev/null 2>&1; then
-    echo "FATAL: qemu-img is required to build the qcow2 base image."
-    exit 1
-fi
+# ONCE using the pure-Go converter (no qemu-img dependency). Falls back to
+# qemu-img if the agentpvm binary somehow lacks the converter.
 BASE_QCOW2="perf_rootfs.qcow2"
 rm -f "${BASE_QCOW2}"
-qemu-img convert -p -O qcow2 "${IMG_NAME}" "${BASE_QCOW2}" >/dev/null
+if ./agentpvm cow -to-qcow2 "${IMG_NAME}" -overlay "${BASE_QCOW2}" 2>/dev/null; then
+    echo "Built qcow2 base via pure-Go converter."
+elif command -v qemu-img >/dev/null 2>&1; then
+    echo "Pure-Go converter unavailable; falling back to qemu-img convert."
+    qemu-img convert -p -O qcow2 "${IMG_NAME}" "${BASE_QCOW2}" >/dev/null
+else
+    echo "FATAL: cannot build qcow2 base (no pure-Go converter and no qemu-img)."
+    exit 1
+fi
 
-# run_one <name> <agentpvm_log> <console_log>
-# Runs one UML guest under the qemu-storage-daemon vhost-user-blk backend,
-# bounded by timeout, and returns 0 only if PERF_TEST_COMPLETED appears in
-# the console log. It never exits the script itself; the caller decides the
-# overall result.
+# run_one <name> <backend_label> <env...> <agentpvm_log> <console_log>
+# Runs one UML guest under a vhost-user-blk backend, bounded by timeout, and
+# returns 0 only if PERF_TEST_COMPLETED appears in the console log. It never
+# exits the script itself; the caller decides the overall result.
+#
+# The default backend is the pure-Go vhost-user-blk server (internal/vhost/vu
+# + internal/cow) — NO qemu binaries needed. Setting PVM_VHOST_BACKEND=qemu in
+# the environment selects the qemu-storage-daemon subprocess backend instead
+# (the optional fallback, useful for A/B testing against the reference).
 run_one() {
     local name="$1"
-    local ap_log="$2"
-    local console_log="$3"
+    local label="$2"
+    local ap_log="$3"
+    local console_log="$4"
+    shift 4
+    local env=("$@")
 
-    echo "---- running qemu-storage-daemon backend: $name ----"
+    echo "---- running ${label} backend: $name ----"
     sudo rm -f "/var/lib/uml-container/containers/${name}/vhost-blk.sock" "$console_log" "$ap_log"
 
     # `timeout` bounds the whole run; agentpvm's own exit (poweroff on success
     # or crash on failure) ends it early. -debug yields the full vhost protocol
-    # log to the agentpvm log on failure. PVM_VHOST_BACKEND=qemu selects the
-    # qemu-storage-daemon backend explicitly (the default is the Go server).
-    sudo PVM_VHOST_BACKEND=qemu timeout 120 ./agentpvm run -name "$name" -rootfs "${BASE_QCOW2}" \
+    # log to the agentpvm log on failure. PVM_VHOST_BACKEND in env selects the
+    # backend (default Go server; =qemu selects qemu-storage-daemon).
+    sudo env "${env[@]}" timeout 120 ./agentpvm run -name "$name" -rootfs "${BASE_QCOW2}" \
         -kernel ./bin/linux -init /init.sh -debug \
         > "$ap_log" 2>&1 || true
 
@@ -118,10 +136,10 @@ run_one() {
     sudo pkill -f "agentpvm run -name $name" 2>/dev/null || true
 
     if sudo grep -q "PERF_TEST_COMPLETED" "$console_log" 2>/dev/null; then
-        echo "✅ $name: I/O perf completed."
+        echo "✅ $name ($label): I/O perf completed."
         return 0
     fi
-    echo "❌ $name: I/O perf failed (no PERF_TEST_COMPLETED)."
+    echo "❌ $name ($label): I/O perf failed (no PERF_TEST_COMPLETED)."
     echo "----- $name console.log -----"
     sudo cat "$console_log" 2>/dev/null || echo "(no console.log)"
     echo "----- $name $ap_log -----"
@@ -129,19 +147,38 @@ run_one() {
     return 1
 }
 
-# This suite targets the qemu-storage-daemon backend (the optional fallback;
-# the default pure-Go backend is covered by tests/04). Skip cleanly if the
-# daemon is not installed.
-if ! command -v qemu-storage-daemon &> /dev/null; then
-    echo "Skipping I/O performance test: qemu-storage-daemon is not installed."
-    exit 0
+# This suite runs BOTH vhost-user-blk backends:
+#   1. the pure-Go server (internal/vhost/vu + internal/cow) — the DEFAULT,
+#      no qemu binaries needed. This is the path used in production by the
+#      agent sandbox, so it must be exercised here, not only in tests/04.
+#   2. the qemu-storage-daemon backend (PVM_VHOST_BACKEND=qemu) — the optional
+#      fallback, skipped cleanly if the daemon is not installed.
+# A failure of EITHER backend fails the suite.
+
+HAVE_QSD=0
+if command -v qemu-storage-daemon &> /dev/null; then
+    HAVE_QSD=1
 fi
 
-AP_LOG=agentpvm.log
-CONSOLE_LOG=/var/lib/uml-container/containers/perf-test/logs/console.log
-if run_one "perf-test" "$AP_LOG" "$CONSOLE_LOG"; then
-    echo "✅ I/O Performance Test completed successfully!"
+RC=0
+
+# --- 1. pure-Go vhost-user-blk backend (default) ---
+AP_LOG_GO=agentpvm.go.log
+CONSOLE_LOG_GO=/var/lib/uml-container/containers/perf-test-go/logs/console.log
+run_one "perf-test-go" "go-vhost-blk" "$AP_LOG_GO" "$CONSOLE_LOG_GO" || RC=1
+
+# --- 2. qemu-storage-daemon backend (fallback) ---
+if [ "$HAVE_QSD" -eq 1 ]; then
+    AP_LOG_QEMU=agentpvm.qemu.log
+    CONSOLE_LOG_QEMU=/var/lib/uml-container/containers/perf-test-qemu/logs/console.log
+    run_one "perf-test-qemu" "qemu-storage-daemon" "$AP_LOG_QEMU" "$CONSOLE_LOG_QEMU" PVM_VHOST_BACKEND=qemu || RC=1
+else
+    echo "Skipping qemu-storage-daemon backend: qemu-storage-daemon is not installed."
+fi
+
+if [ $RC -eq 0 ]; then
+    echo "✅ I/O Performance Test completed successfully (all backends)!"
     exit 0
 fi
-echo "❌ I/O Performance Test failed."
+echo "❌ I/O Performance Test failed (one or more backends)."
 exit 1

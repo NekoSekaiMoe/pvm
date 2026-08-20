@@ -55,6 +55,11 @@ type qcow2Header struct {
 	l1Size           uint32
 	refcountOffset   uint64
 	refcountClusters uint32
+	// snapshots/snapshotsOffset are parsed for a guard: Compact refuses
+	// images with internal snapshots (the L1 active-table walk would skip
+	// snapshot-only clusters, silently dropping them).
+	snapshots       uint32
+	snapshotsOffset uint64
 }
 
 // OverlayOpt configures qcow2 overlay creation.
@@ -245,16 +250,21 @@ func createQcow2(path string, virtualSize uint64, backingPath, backingFormat str
 	}
 	defer f.Close()
 	// All writes are sequential: the buffer (header..used refblocks), zeros
-	// up to l1Off, the L1 table, then the preallocated L2 tables.
+	// up to l1Off, the L1 table, then the preallocated L2 tables. The zero
+	// regions (unused refcount-block remainder and preallocated L2 tables)
+	// are extended SPARSELY via Truncate rather than written: a 1 TiB image
+	// at 4 KiB clusters has 512K L2 tables = 2 GiB that must read as zeros
+	// but should never consume disk (qemu-img create produces sparse images
+	// too). Truncate extends the file with a sparse hole, so st_blocks stays
+	// tiny while reads return zeros.
 	if _, err := f.Write(buf); err != nil {
 		return fmt.Errorf("cow: write qcow2 metadata: %w", err)
 	}
-	zero := make([]byte, 1<<20)
-	if cs < uint64(len(zero)) {
-		zero = zero[:cs]
+	if err := f.Truncate(int64(lay.l1Off)); err != nil {
+		return fmt.Errorf("cow: zero-fill refcount blocks: %w", err)
 	}
-	if err := streamZeros(f, zero, lay.l1Off-uint64(len(buf)), "zero-fill refcount blocks"); err != nil {
-		return err
+	if _, err := f.Seek(int64(lay.l1Off), io.SeekStart); err != nil {
+		return fmt.Errorf("cow: seek to L1: %w", err)
 	}
 	entriesPerCluster := cs / 8
 	for k := uint64(0); k < lay.l1Clusters; k++ {
@@ -269,24 +279,12 @@ func createQcow2(path string, virtualSize uint64, backingPath, backingFormat str
 			return fmt.Errorf("cow: write L1 table: %w", err)
 		}
 	}
-	// Preallocated L2 tables are all zeros; stream them (a 1 TiB image at
-	// 4 KiB clusters has 512K L2 tables = 2 GiB — never buffer that).
-	return streamZeros(f, zero, lay.l2Count*cs, "preallocated L2 tables")
-}
-
-// streamZeros writes rem zero bytes sequentially to f in chunks of buf,
-// so only the 1 MiB chunk buffer (never the full hundreds-of-MiB region)
-// sits in memory.
-func streamZeros(f *os.File, buf []byte, rem uint64, what string) error {
-	for rem > 0 {
-		n := uint64(len(buf))
-		if rem < n {
-			n = rem
+	// Preallocated L2 tables are all zeros; extend the file sparsely over
+	// them rather than streaming zeros (see the Truncate note above).
+	if lay.l2Count > 0 {
+		if err := f.Truncate(int64(lay.l2Off + lay.l2Count*cs)); err != nil {
+			return fmt.Errorf("cow: extend preallocated L2 tables: %w", err)
 		}
-		if _, err := f.Write(buf[:n]); err != nil {
-			return fmt.Errorf("cow: write %s: %w", what, err)
-		}
-		rem -= n
 	}
 	return nil
 }
@@ -324,6 +322,11 @@ type qcow2Image struct {
 	clusterSize uint64
 	clusterMask uint64
 	backing     guestImage // nil for standalone images
+	// backingAbs is the backing file path resolved to ABSOLUTE at open time
+	// (qcow2 resolves a relative backing name against the image's own
+	// directory). Empty when the image is standalone. Compact uses it to
+	// rebuild an overlay that references the same backing.
+	backingAbs string
 }
 
 func (q *qcow2Image) Size() uint64 { return q.hdr.size }
@@ -502,6 +505,8 @@ func openGuestImage(path string) (guestImage, error) {
 		l1Offset:         binary.BigEndian.Uint64(hdrBuf[0x28:]),
 		refcountOffset:   binary.BigEndian.Uint64(hdrBuf[0x30:]),
 		refcountClusters: binary.BigEndian.Uint32(hdrBuf[0x38:]),
+		snapshots:        binary.BigEndian.Uint32(hdrBuf[0x3C:]),
+		snapshotsOffset:  binary.BigEndian.Uint64(hdrBuf[0x40:]),
 	}
 	bfOff := binary.BigEndian.Uint64(hdrBuf[0x08:])
 	bfSize := binary.BigEndian.Uint32(hdrBuf[0x10:])
@@ -525,6 +530,7 @@ func openGuestImage(path string) (guestImage, error) {
 			return nil, fmt.Errorf("cow: open backing of %s: %w", path, err)
 		}
 		q.backing = backing
+		q.backingAbs = backingPath
 	}
 	return q, nil
 }
