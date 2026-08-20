@@ -105,11 +105,11 @@ func TestCompact_PreservesContent(t *testing.T) {
 	zeroCluster := make([]byte, clusterSize) // explicit zeros
 	totalClusters := compactVirtual / clusterSize
 	for _, tc := range []struct {
-		name         string
-		ops          []writeOp
-		wantCopied   int64
-		wantZeroed   int64
-		wantDropped  int64 // totalClusters - clusters touched by ops
+		name        string
+		ops         []writeOp
+		wantCopied  int64
+		wantZeroed  int64
+		wantDropped int64 // totalClusters - clusters touched by ops
 	}{
 		{
 			"mixed_first_and_second_l2",
@@ -335,8 +335,8 @@ func TestCompact_RejectsInternalSnapshots(t *testing.T) {
 	// nb_snapshots at 0x3C (u32), snapshots_offset at 0x40 (u64). Set both to
 	// nonzero to trip the guard without pointing at real snapshot data.
 	var hdr [12]byte
-	binary.BigEndian.PutUint32(hdr[0:], 1)          // nb_snapshots = 1
-	binary.BigEndian.PutUint64(hdr[4:], 0x10000)    // snapshots_offset (nonzero)
+	binary.BigEndian.PutUint32(hdr[0:], 1)       // nb_snapshots = 1
+	binary.BigEndian.PutUint64(hdr[4:], 0x10000) // snapshots_offset (nonzero)
 	if _, err := qw.f.WriteAt(hdr[:], 0x3C); err != nil {
 		w.Close()
 		t.Fatalf("poke header: %v", err)
@@ -472,4 +472,294 @@ func TestQcow2_HeaderLengthInvalid(t *testing.T) {
 	if !strings.Contains(err.Error(), "header_length") {
 		t.Errorf("error should mention header_length, got: %v", err)
 	}
+}
+
+// TestCompact_TruncatedDataCluster: truncating the overlay's host file so an
+// ALLOCATED data cluster's bytes are cut off must abort Compact with an
+// error mentioning the cluster — never silently zero-fill the unread tail
+// and rename the truncated rebuild over the original.
+func TestCompact_TruncatedDataCluster(t *testing.T) {
+	dir := t.TempDir()
+	overlay, _ := buildOverlayWithWrites(t, dir, []writeOp{
+		{0, patterned(0x61, clusterSize)}, // first allocated cluster
+	})
+
+	// Shrink the host file to cut into the FIRST allocated data cluster
+	// (layout: cluster 0 header, then refcount/L1 metadata, then data).
+	// Keep the header + tables intact: locate the data start via the
+	// writable's own file size minus a cut in the middle of the last cluster.
+	st, err := os.Stat(overlay)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	before := st.Size()
+	// Cut 1000 bytes off the tail: the final cluster's read comes up short.
+	cut := before - 1000
+	if err := os.Truncate(overlay, cut); err != nil {
+		t.Fatalf("truncate: %v", err)
+	}
+
+	_, err = Compact(context.Background(), overlay)
+	if err == nil {
+		t.Fatal("Compact on truncated image: expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "read source cluster") {
+		t.Errorf("error should come from the source-cluster read, got: %v", err)
+	}
+	// The original (truncated) file must survive untouched — no rename of
+	// a zero-filled rebuild over it.
+	st2, err := os.Stat(overlay)
+	if err != nil {
+		t.Fatalf("stat after: %v", err)
+	}
+	if st2.Size() != cut {
+		t.Errorf("overlay size after failed compact = %d, want %d (original must survive)", st2.Size(), cut)
+	}
+}
+
+// TestQcow2_HeaderLengthUnaligned: header_length must be 8-byte aligned per
+// the qcow2 spec (qemu-img rejects unaligned values); our parser must too.
+func TestQcow2_HeaderLengthUnaligned(t *testing.T) {
+	dir := t.TempDir()
+	overlay, _ := buildOverlayWithWrites(t, dir, []writeOp{
+		{1, patterned(0x42, clusterSize)},
+	})
+	f, err := os.OpenFile(overlay, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatalf("open overlay: %v", err)
+	}
+	var b [4]byte
+	binary.BigEndian.PutUint32(b[:], 106) // >=104 but not 8-aligned
+	if _, err := f.WriteAt(b[:], 0x64); err != nil {
+		t.Fatalf("forge header_length: %v", err)
+	}
+	f.Close()
+
+	_, err = Compact(context.Background(), overlay)
+	if err == nil {
+		t.Fatal("Compact on header_length=106 image: expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "header_length") {
+		t.Errorf("error should mention header_length, got: %v", err)
+	}
+}
+
+// TestQcow2_BackingNameTooLong: a backing_file_size beyond the spec cap of
+// 1023 must be rejected at open time (previously the bound was a lax 4096).
+func TestQcow2_BackingNameTooLong(t *testing.T) {
+	dir := t.TempDir()
+	base := filepath.Join(dir, "base.img")
+	mustWriteRaw(t, base, 0, patterned(0x10, 2*clusterSize))
+	overlay := filepath.Join(dir, "overlay.qcow2")
+	if err := CreateOverlay(context.Background(), base, overlay); err != nil {
+		t.Fatalf("CreateOverlay: %v", err)
+	}
+	for _, size := range []uint32{1024, 2000} {
+		f, err := os.OpenFile(overlay, os.O_RDWR, 0)
+		if err != nil {
+			t.Fatalf("open overlay: %v", err)
+		}
+		var b [4]byte
+		binary.BigEndian.PutUint32(b[:], size)
+		if _, err := f.WriteAt(b[:], 0x10); err != nil {
+			t.Fatalf("forge backing_file_size: %v", err)
+		}
+		f.Close()
+
+		_, err = Compact(context.Background(), overlay)
+		if err == nil {
+			t.Fatalf("Compact with backing_file_size=%d: expected error, got nil", size)
+		}
+		if !strings.Contains(err.Error(), "backing name length") {
+			t.Errorf("backing_file_size=%d error should mention backing name length, got: %v", size, err)
+		}
+	}
+}
+
+// TestQcow2_UnsupportedDeclaredBackingFormat: a backing-format extension
+// declaring anything but raw/qcow2 must be rejected at open, not probed and
+// not silently preserved for rebuilds.
+func TestQcow2_UnsupportedDeclaredBackingFormat(t *testing.T) {
+	dir := t.TempDir()
+	base := filepath.Join(dir, "base.img")
+	mustWriteRaw(t, base, 0, patterned(0x10, 2*clusterSize))
+	overlay := filepath.Join(dir, "overlay.qcow2")
+	if err := CreateOverlay(context.Background(), base, overlay); err != nil {
+		t.Fatalf("CreateOverlay: %v", err)
+	}
+	// Our createQcow2 writes "raw\0" (len 3, padded to 8). Overwrite the 3
+	// name bytes with "vmdk" and the length field with 4 — the padded slot
+	// fits both (roundUp8(4) == roundUp8(3) == 8), so no shift is needed.
+	f, err := os.OpenFile(overlay, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatalf("open overlay: %v", err)
+	}
+	cluster0 := make([]byte, clusterSize)
+	if _, err := f.ReadAt(cluster0, 0); err != nil {
+		t.Fatalf("read cluster 0: %v", err)
+	}
+	if m := binary.BigEndian.Uint32(cluster0[qcow2HeaderLen:]); m != extBackingFormat {
+		t.Fatalf("no backing-format extension at %d (magic %#x)", qcow2HeaderLen, m)
+	}
+	binary.BigEndian.PutUint32(cluster0[qcow2HeaderLen+4:], 4)
+	copy(cluster0[qcow2HeaderLen+8:], "vmdk")
+	if _, err := f.WriteAt(cluster0, 0); err != nil {
+		t.Fatalf("rewrite cluster 0: %v", err)
+	}
+	f.Close()
+
+	_, err = Compact(context.Background(), overlay)
+	if err == nil {
+		t.Fatal("Compact with declared backing format \"vmdk\": expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "unsupported backing format") {
+		t.Errorf("error should mention unsupported backing format, got: %v", err)
+	}
+}
+
+// TestQcow2_DeclaredBackingFormatMismatch: when the header DECLARES a
+// backing format, the opened backing must actually be that format. Here the
+// declaration says "raw" but the backing file is qcow2.
+func TestQcow2_DeclaredBackingFormatMismatch(t *testing.T) {
+	dir := t.TempDir()
+	// qcow2 backing (not raw).
+	base := filepath.Join(dir, "base.qcow2")
+	if err := createQcow2(base, 2*clusterSize, "", "", defaultOverlayOpt); err != nil {
+		t.Fatalf("createQcow2 base: %v", err)
+	}
+	overlay := filepath.Join(dir, "overlay.qcow2")
+	if err := CreateOverlay(context.Background(), base, overlay); err != nil {
+		t.Fatalf("CreateOverlay: %v", err)
+	}
+	// The declaration legitimately says "qcow2"; forge it to "raw" (same
+	// length, in-place overwrite).
+	f, err := os.OpenFile(overlay, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatalf("open overlay: %v", err)
+	}
+	cluster0 := make([]byte, clusterSize)
+	if _, err := f.ReadAt(cluster0, 0); err != nil {
+		t.Fatalf("read cluster 0: %v", err)
+	}
+	if string(cluster0[qcow2HeaderLen+8:qcow2HeaderLen+13]) != "qcow2" {
+		t.Fatalf("expected declared format qcow2 at %#x, got %q",
+			qcow2HeaderLen+8, cluster0[qcow2HeaderLen+8:qcow2HeaderLen+12])
+	}
+	binary.BigEndian.PutUint32(cluster0[qcow2HeaderLen+4:], 3)
+	copy(cluster0[qcow2HeaderLen+8:], "raw\x00")
+	if _, err := f.WriteAt(cluster0, 0); err != nil {
+		t.Fatalf("rewrite cluster 0: %v", err)
+	}
+	f.Close()
+
+	_, err = Compact(context.Background(), overlay)
+	if err == nil {
+		t.Fatal("Compact with declared raw over qcow2 backing: expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "backing format mismatch") {
+		t.Errorf("error should mention backing format mismatch, got: %v", err)
+	}
+}
+
+// TestCompact_PreservesRelativeBackingName: an overlay whose header stores a
+// RELATIVE backing name (written by a foreign tool like qemu-img) must keep
+// that relative name after Compact, so the overlay+backing pair stays
+// relocatable. Previously Compact re-emitted the resolved ABSOLUTE path.
+func TestCompact_PreservesRelativeBackingName(t *testing.T) {
+	dir := t.TempDir()
+	// Backing + overlay live in the same directory; the overlay header will
+	// reference the backing by its bare name.
+	relBase := "base.img"
+	base := filepath.Join(dir, relBase)
+	view := make([]byte, compactVirtual)
+	for i := range view {
+		view[i] = byte(0x20 + i%211)
+	}
+	mustWriteRaw(t, base, 0, view)
+
+	// Create with the absolute path first (CreateOverlay requires abs-ish
+	// inputs), then rewrite the stored backing name to the bare relative one.
+	overlay := filepath.Join(dir, "overlay.qcow2")
+	if err := CreateOverlay(context.Background(), base, overlay); err != nil {
+		t.Fatalf("CreateOverlay: %v", err)
+	}
+	f, err := os.OpenFile(overlay, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatalf("open overlay: %v", err)
+	}
+	cluster0 := make([]byte, clusterSize)
+	if _, err := f.ReadAt(cluster0, 0); err != nil {
+		t.Fatalf("read cluster 0: %v", err)
+	}
+	bfOff := int(binary.BigEndian.Uint64(cluster0[0x08:]))
+	bfSize := int(binary.BigEndian.Uint32(cluster0[0x10:]))
+	stored := string(cluster0[bfOff : bfOff+bfSize])
+	if stored != base {
+		t.Fatalf("stored backing name = %q, want %q", stored, base)
+	}
+	// Shrink the name in place: copy the tail of cluster 0 over the old
+	// name, write the short one, update bfSize (bfOff can stay — the gap
+	// is ignored), zero the remainder.
+	copy(cluster0[bfOff:], cluster0[bfOff+bfSize:])
+	binary.BigEndian.PutUint32(cluster0[0x10:], uint32(len(relBase)))
+	copy(cluster0[bfOff:], relBase)
+	clear(cluster0[bfOff+len(relBase):])
+	if _, err := f.WriteAt(cluster0, 0); err != nil {
+		t.Fatalf("rewrite cluster 0: %v", err)
+	}
+	f.Close()
+
+	// Write one data cluster through the writable path so Compact has
+	// something to rebuild (opens fine: relative name resolves against the
+	// overlay's own directory).
+	w := openWritable(t, overlay)
+	data := patterned(0x51, clusterSize)
+	if _, err := w.WriteAt(data, 5*clusterSize); err != nil {
+		t.Fatalf("WriteAt: %v", err)
+	}
+	copy(view[5*clusterSize:], data)
+	if err := w.Sync(); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	w.Close()
+
+	if _, err := Compact(context.Background(), overlay); err != nil {
+		t.Fatalf("Compact: %v", err)
+	}
+	assertView(t, overlay, view)
+
+	// The rebuilt header must still carry the RELATIVE name.
+	rf, err := os.Open(overlay)
+	if err != nil {
+		t.Fatalf("open rebuilt overlay: %v", err)
+	}
+	defer rf.Close()
+	hdr := make([]byte, clusterSize)
+	if _, err := rf.ReadAt(hdr, 0); err != nil {
+		t.Fatalf("read rebuilt header: %v", err)
+	}
+	gotSize := int(binary.BigEndian.Uint32(hdr[0x10:]))
+	gotOff := int(binary.BigEndian.Uint64(hdr[0x08:]))
+	if gotSize != len(relBase) {
+		t.Fatalf("rebuilt backing name length = %d, want %d (relative name not preserved)", gotSize, len(relBase))
+	}
+	if got := string(hdr[gotOff : gotOff+gotSize]); got != relBase {
+		t.Fatalf("rebuilt backing name = %q, want %q", got, relBase)
+	}
+
+	// Relocatability: move BOTH files to a new directory and confirm the
+	// overlay still resolves its backing (reads the same view).
+	newDir := filepath.Join(dir, "moved")
+	if err := os.MkdirAll(newDir, 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	movedOverlay := filepath.Join(newDir, "overlay.qcow2")
+	movedBase := filepath.Join(newDir, relBase)
+	if err := os.Rename(overlay, movedOverlay); err != nil {
+		t.Fatalf("rename overlay: %v", err)
+	}
+	if err := os.Rename(base, movedBase); err != nil {
+		t.Fatalf("rename base: %v", err)
+	}
+	assertView(t, movedOverlay, view)
 }

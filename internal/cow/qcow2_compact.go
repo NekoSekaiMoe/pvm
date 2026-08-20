@@ -56,8 +56,10 @@ type CompactStats struct {
 // Compact rebuilds the qcow2 image at overlayFile in place: it rewrites only
 // the allocated clusters into a fresh, minimal qcow2, dropping zero clusters
 // to ZERO-flag entries and leaving unallocated clusters to fall through to
-// the backing chain. The backing reference (path + format) and virtual size
-// are preserved.
+// the backing chain. The backing reference is preserved VERBATIM — the
+// original name (relative names stay relative, so the overlay+backing pair
+// remains relocatable) and the declared format. The virtual size is
+// preserved too.
 //
 // Compact is the pure-Go analogue of `qemu-img convert -O qcow2` over an
 // overlay that keeps its backing file. It requires no qemu binaries.
@@ -107,6 +109,16 @@ func Compact(ctx context.Context, overlayFile string) (CompactStats, error) {
 	virtualSize := q.hdr.size
 	bits := q.clusterBits
 	backingAbs := q.backingAbs
+	// Re-emit the ORIGINAL backing name (relative stays relative, so the
+	// overlay+backing pair remains relocatable); backingAbs — resolved at
+	// open time — is only used to decide WHETHER there is a backing. The
+	// temp file is a sibling of the original, so a relative name written
+	// into the temp resolves to the same directory as before, and the final
+	// rename keeps the pair together.
+	backingName := q.backingName
+	if backingName == "" {
+		backingName = backingAbs
+	}
 	// Prefer the backing format DECLARED in the source's header extension —
 	// it is what qemu-img (or our createQcow2) wrote and must be preserved.
 	// Fall back to probing with isQcow2 only when the header omitted it; never
@@ -136,7 +148,7 @@ func Compact(ctx context.Context, overlayFile string) (CompactStats, error) {
 	// tables — we only want to materialize L2 slots we actually fill.
 	opt := OverlayOpt{ClusterBits: bits, PreallocMetadata: false}
 	if backingAbs != "" {
-		if err := createQcow2(tmp, virtualSize, backingAbs, backingFormat, opt); err != nil {
+		if err := createQcow2(tmp, virtualSize, backingName, backingFormat, opt); err != nil {
 			src.Close()
 			return stats, fmt.Errorf("cow: compact: create overlay: %w", err)
 		}
@@ -268,7 +280,8 @@ func compactWalk(ctx context.Context, src *qcow2Image, dst *qcow2Writable, stats
 			// UNKNOWN state, not zeros: treating it as unallocated would
 			// silently drop still-live clusters from the rebuilt image.
 			// Fail BEFORE any tmp-file replacement so the original survives.
-			return fmt.Errorf("read L2 table at %#x: got %d of %d bytes: %w", l2Off, n, len(l2Table), io.ErrUnexpectedEOF)
+			return fmt.Errorf("read L2 table at %#x: got %d of %d bytes: %w",
+				l2Off, n, len(l2Table), io.ErrUnexpectedEOF)
 		}
 		for j := uint64(0); j < l2Entries; j++ {
 			// Inner-loop cancellation: with 4 KiB clusters an L2 table holds
@@ -319,16 +332,20 @@ func compactWalk(ctx context.Context, src *qcow2Image, dst *qcow2Writable, stats
 			if rem := src.hdr.size - guestOff; rem < n {
 				n = rem
 			}
-			// ReadAt fills buf[:n] from the merged chain; zero the tail so a
-			// short read (shouldn't happen within size, but be safe) can't
-			// fool the allZero check with stale bytes.
-			clear(buf[n:])
+			// ReadAt fills buf[:n] from the merged chain. n is already clamped
+			// to the virtual size and the chain internally zero-pads short
+			// BACKING reads (a legal overlay-over-shorter-backing layout), so
+			// a short read or error here means the overlay's own host file is
+			// truncated/corrupt: zero-filling would silently convert live data
+			// into ZERO flags in the rebuilt image. Fail instead, BEFORE any
+			// tmp-file replacement, so the original survives.
 			m, err := src.ReadAt(buf[:n], int64(guestOff))
-			if err != nil && err != io.EOF {
+			if err != nil {
 				return fmt.Errorf("read source cluster %d: %w", clusterIdx, err)
 			}
 			if m < int(n) {
-				clear(buf[m:n])
+				return fmt.Errorf("read source cluster %d: got %d of %d bytes: %w",
+					clusterIdx, m, n, io.ErrUnexpectedEOF)
 			}
 			if allZero(buf[:n]) {
 				if err := dst.setL2Entry(clusterIdx, oflagZero); err != nil {

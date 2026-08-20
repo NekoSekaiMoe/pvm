@@ -417,9 +417,16 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 		if vhostBackend != nil {
 			if cerr := vhostBackend.Close(); cerr != nil {
 				fmt.Printf("Warning: vhost backend close for %s failed: %v (skipping overlay compaction)\n", taskID, cerr)
-				if aerr := ledger.Append(audit.Record{Phase: audit.PhaseExec, Subject: taskID, Action: "overlay_compact", Decision: audit.DecisionConstrain, Reason: "vhost backend close failed, compact skipped: " + cerr.Error()}); aerr != nil {
+				rec := audit.Record{
+					Phase:    audit.PhaseExec,
+					Subject:  taskID,
+					Action:   "overlay_compact",
+					Decision: audit.DecisionConstrain,
+					Reason:   "vhost backend close failed, compact skipped: " + cerr.Error(),
+				}
+				if aerr := ledger.Append(rec); aerr != nil {
 					// Non-fatal (the task already exited), but never silent: the
-				// audit trail must record that a record COULD NOT be appended.
+					// audit trail must record that a record COULD NOT be appended.
 					fmt.Printf("Warning: audit append overlay_compact(close-failed) for %s: %v\n", taskID, aerr)
 				}
 			} else {
@@ -430,13 +437,28 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 			stats, cerr := cow.Compact(context.Background(), overlayPath)
 			if cerr != nil {
 				fmt.Printf("Warning: compact overlay for %s failed: %v\n", taskID, cerr)
-				if aerr := ledger.Append(audit.Record{Phase: audit.PhaseExec, Subject: taskID, Action: "overlay_compact", Decision: audit.DecisionConstrain, Reason: "compact failed: " + cerr.Error()}); aerr != nil {
+				rec := audit.Record{
+					Phase:    audit.PhaseExec,
+					Subject:  taskID,
+					Action:   "overlay_compact",
+					Decision: audit.DecisionConstrain,
+					Reason:   "compact failed: " + cerr.Error(),
+				}
+				if aerr := ledger.Append(rec); aerr != nil {
 					fmt.Printf("Warning: audit append overlay_compact(failed) for %s: %v\n", taskID, aerr)
 				}
 			} else {
 				fmt.Printf("Overlay compacted for %s: %d -> %d bytes (%d clusters copied, %d zeroed, %d dropped)\n",
 					taskID, stats.BeforeBytes, stats.AfterBytes, stats.ClustersCopied, stats.ClustersZeroed, stats.ClustersDropped)
-				if aerr := ledger.Append(audit.Record{Phase: audit.PhaseExec, Subject: taskID, Action: "overlay_compact", Decision: audit.DecisionAllow, Reason: fmt.Sprintf("overlay compacted: %d -> %d bytes", stats.BeforeBytes, stats.AfterBytes)}); aerr != nil {
+				rec := audit.Record{
+					Phase:    audit.PhaseExec,
+					Subject:  taskID,
+					Action:   "overlay_compact",
+					Decision: audit.DecisionAllow,
+					Reason: fmt.Sprintf("overlay compacted: %d -> %d bytes",
+						stats.BeforeBytes, stats.AfterBytes),
+				}
+				if aerr := ledger.Append(rec); aerr != nil {
 					fmt.Printf("Warning: audit append overlay_compact(ok) for %s: %v\n", taskID, aerr)
 				}
 			}

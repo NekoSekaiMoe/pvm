@@ -35,6 +35,10 @@ const (
 	refcountOrder    = 4 // 2^4 = 16-bit refcount entries (qemu-img default)
 	extBackingFormat = 0xE2792ACA
 
+	// maxBackingNameLen is the qcow2 spec cap on the backing file name
+	// (1023 bytes; qemu-img enforces the same bound on create and open).
+	maxBackingNameLen = 1023
+
 	oflagCopied     = 1 << 63
 	oflagCompressed = 1 << 62
 	oflagZero       = 1 << 0
@@ -51,7 +55,6 @@ const (
 // qcow2Header mirrors the on-disk v3 header layout.
 type qcow2Header struct {
 	size             uint64 // virtual disk size
-	backingFile      string // original backing name as stored in the header (pre-Abs)
 	l1Offset         uint64
 	l1Size           uint32
 	refcountOffset   uint64
@@ -220,7 +223,7 @@ func createQcow2(path string, virtualSize uint64, backingPath, backingFormat str
 	// end-of-extensions marker: magic 0, length 0 (already zeroed)
 	off += 8
 	if backingPath != "" {
-		if len(backingPath) > 4096 || off+uint64(len(backingPath)) > cs {
+		if len(backingPath) > maxBackingNameLen || off+uint64(len(backingPath)) > cs {
 			return fmt.Errorf("cow: backing path too long for qcow2 header cluster: path length %d, header extensions end at %d, cluster size %d", len(backingPath), off, cs)
 		}
 		binary.BigEndian.PutUint64(buf[0x08:], off)
@@ -301,6 +304,11 @@ func roundUp8(v uint64) uint64 { return (v + 7) &^ 7 }
 type guestImage interface {
 	io.ReaderAt // ReadAt reads at a GUEST offset; short reads at EOF return io.EOF
 	Size() uint64
+	// Format reports the on-disk format the image was opened as: "qcow2"
+	// or "raw". It is the ground truth openGuestImage probed from the
+	// magic, used to cross-check a header-DECLARED backing format against
+	// what the backing file actually is.
+	Format() string
 	Close() error
 }
 
@@ -311,6 +319,7 @@ type rawImage struct {
 
 func (r *rawImage) ReadAt(p []byte, off int64) (int, error) { return r.f.ReadAt(p, off) }
 func (r *rawImage) Size() uint64                            { return r.size }
+func (r *rawImage) Format() string                          { return "raw" }
 func (r *rawImage) Close() error                            { return r.f.Close() }
 
 type qcow2Image struct {
@@ -328,6 +337,12 @@ type qcow2Image struct {
 	// directory). Empty when the image is standalone. Compact uses it to
 	// rebuild an overlay that references the same backing.
 	backingAbs string
+	// backingName is the backing file name EXACTLY as stored in the header
+	// (qcow2 resolves it relative to the image's own directory when not
+	// absolute). Compact re-emits it verbatim into the rebuilt overlay so a
+	// relocated overlay+backing pair keeps resolving; backingAbs above is
+	// the resolved absolute copy used for actually opening the file.
+	backingName string
 	// backingFormat is the backing format parsed from the qcow2 header
 	// extension (extBackingFormat), if present. "" means the header did not
 	// carry one, so callers must probe (isQcow2) themselves. Compact passes
@@ -349,6 +364,8 @@ func (q *qcow2Image) Close() error {
 
 // ReadAt reads guest data at off, resolving L1/L2 mappings and falling
 // through to the backing chain for unallocated clusters.
+func (q *qcow2Image) Format() string { return "qcow2" }
+
 func (q *qcow2Image) ReadAt(p []byte, off int64) (int, error) {
 	total := 0
 	for total < len(p) {
@@ -531,6 +548,13 @@ func openGuestImage(path string) (guestImage, error) {
 		f.Close()
 		return nil, fmt.Errorf("cow: invalid header_length %d in %s (exceeds cluster size %d)", hdrLen, path, q.clusterSize)
 	}
+	// The spec requires header_length to be a multiple of 8 (like every
+	// extension-boundary offset); qemu-img rejects unaligned values because
+	// extension walking would go off-grid.
+	if hdrLen%8 != 0 {
+		f.Close()
+		return nil, fmt.Errorf("cow: invalid header_length %d in %s (not 8-byte aligned)", hdrLen, path)
+	}
 	bfOff := binary.BigEndian.Uint64(hdrBuf[0x08:])
 	bfSize := binary.BigEndian.Uint32(hdrBuf[0x10:])
 	// Header extensions live between the fixed header and the backing-file
@@ -586,14 +610,25 @@ func openGuestImage(path string) (guestImage, error) {
 			return nil, fmt.Errorf("cow: header extension %#x overflows header in %s", magic, path)
 		}
 		if magic == extBackingFormat && elen > 0 {
-			q.backingFormat = string(extBuf[dataOff : dataOff+uint64(elen)])
+			name := string(extBuf[dataOff : dataOff+uint64(elen)])
+			// Only the two formats this package can actually open are
+			// acceptable. Anything else (vmdk, vpc, ...) would be unopenable
+			// later and would be re-emitted verbatim by Compact into rebuilt
+			// headers — reject at parse time with the offending value.
+			if name != "raw" && name != "qcow2" {
+				f.Close()
+				return nil, fmt.Errorf("cow: unsupported backing format %q declared in %s (want raw or qcow2)", name, path)
+			}
+			q.backingFormat = name
 		}
 		e = dataOff + roundUp8(uint64(elen))
 	}
 	if bfSize > 0 {
-		if bfSize > 4096 {
+		// The qcow2 spec caps the backing name at 1023 bytes (it must fit
+		// in cluster 0 after the header); qemu-img enforces the same bound.
+		if bfSize > maxBackingNameLen {
 			f.Close()
-			return nil, fmt.Errorf("cow: implausible backing name length %d in %s", bfSize, path)
+			return nil, fmt.Errorf("cow: implausible backing name length %d in %s (max %d)", bfSize, path, maxBackingNameLen)
 		}
 		name := make([]byte, bfSize)
 		if _, err := f.ReadAt(name, int64(bfOff)); err != nil {
@@ -601,10 +636,11 @@ func openGuestImage(path string) (guestImage, error) {
 			return nil, fmt.Errorf("cow: read backing name in %s: %w", path, err)
 		}
 		backingPath := string(name)
-		// Preserve the original backing name in the header (pre-Abs) so a
-		// rebuild can re-emit it verbatim; resolve a separate absolute copy
-		// for actually opening the file and for Compact's rebuild target.
-		q.hdr.backingFile = backingPath
+		// Preserve the original name (pre-Abs) for Compact to re-emit
+		// verbatim in rebuilt overlays — a relative name stays relative, so
+		// the overlay+backing pair stays relocatable. A separate absolute
+		// copy drives the actual open below.
+		q.backingName = backingPath
 		absBacking, err := filepath.Abs(filepath.Join(filepath.Dir(path), backingPath))
 		if err != nil {
 			f.Close()
@@ -617,6 +653,17 @@ func openGuestImage(path string) (guestImage, error) {
 		if err != nil {
 			f.Close()
 			return nil, fmt.Errorf("cow: open backing of %s: %w", path, err)
+		}
+		// If the header DECLARED a backing format, the opened file must
+		// actually be that format. A mismatch (e.g. "raw" declared over a
+		// qcow2 file) means the header lies; trusting it would poison every
+		// rebuilt descendant that re-emits the declaration. Only probe
+		// (no declaration) keeps the auto-detect behavior.
+		if q.backingFormat != "" && backing.Format() != q.backingFormat {
+			backing.Close()
+			f.Close()
+			return nil, fmt.Errorf("cow: backing format mismatch in %s: header declares %q but %s is %q",
+				path, q.backingFormat, backingPath, backing.Format())
 		}
 		q.backing = backing
 		q.backingAbs = backingPath // absolute; see filepath.Abs above
@@ -633,6 +680,11 @@ func convertToRaw(ctx context.Context, srcPath, destPath string) error {
 		return err
 	}
 	defer img.Close()
+	// Dest must not be the source itself nor any member of its backing
+	// chain: O_TRUNC below would destroy that data mid-read.
+	if err := checkNotInChain(img, srcPath, destPath); err != nil {
+		return err
+	}
 
 	out, err := os.OpenFile(destPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
 	if err != nil {

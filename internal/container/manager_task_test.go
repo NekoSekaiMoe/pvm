@@ -37,10 +37,10 @@ func newTestManager(t *testing.T) (*Manager, *trackingLauncher) {
 
 func minimalSpec() *spec.TaskSpec {
 	return &spec.TaskSpec{
-		Version: 1,
-		Caller:  "alice",
-		Tenant:  "eng",
-		Runtime: spec.RuntimeSpec{Name: "task-x", CPU: 1, Memory: "256M"},
+		Version:   1,
+		Caller:    "alice",
+		Tenant:    "eng",
+		Runtime:   spec.RuntimeSpec{Name: "task-x", CPU: 1, Memory: "256M"},
 		Workspace: spec.WorkspaceSpec{BaseImage: "", Init: "/sbin/init"}, // no base => skip overlay
 		Kernel:    spec.KernelSpec{Path: "/usr/lib/uml/linux"},
 		Network:   spec.NetworkSpec{Enabled: false},
@@ -150,6 +150,7 @@ func TestStartTask_RawBaseUbdDirectMount(t *testing.T) {
 		t.Errorf("raw base not mounted directly via ubd0; kernel args = %v", tl.args)
 	}
 }
+
 // TestStartTask_OverlayFailureFailsClosed verifies that when BaseImage IS
 // qcow2 and vhost IS enabled, an overlay-creation failure still fails closed
 // rather than degrading to a writable mount of the shared base. We force the

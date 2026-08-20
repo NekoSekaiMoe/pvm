@@ -28,6 +28,43 @@ func ConvertToRaw(ctx context.Context, srcPath, destPath string) error {
 	return convertToRaw(ctx, srcPath, destPath)
 }
 
+// checkNotInChain rejects destPath when it is the same inode as srcPath or
+// any member of img's backing chain. Creating the destination (O_TRUNC or a
+// rename over it) would destroy the source's own backing data mid-read or
+// leave a live overlay pointing at replaced content, so both convert paths
+// must refuse BEFORE touching the filesystem.
+func checkNotInChain(img guestImage, srcPath, destPath string) error {
+	df, err := os.Stat(destPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil // nothing to clobber
+		}
+		return fmt.Errorf("cow: convert: stat dest: %w", err)
+	}
+	if sf, err := os.Stat(srcPath); err == nil && os.SameFile(sf, df) {
+		return fmt.Errorf("cow: convert: source and destination are the same file: %s", destPath)
+	}
+	// Walk the opened chain: every live backing is a file the destination
+	// must not replace. Compare inodes (os.SameFile), not strings — the
+	// header may store relative or differently-spelled names.
+	cur := img
+	for cur != nil {
+		q, ok := cur.(*qcow2Image)
+		if !ok {
+			break // raw images never have a backing
+		}
+		if q.backingAbs == "" {
+			break
+		}
+		bf, err := os.Stat(q.backingAbs)
+		if err == nil && os.SameFile(bf, df) {
+			return fmt.Errorf("cow: convert: destination %s is a backing file of source %s (replacing it would corrupt the chain)", destPath, srcPath)
+		}
+		cur = q.backing
+	}
+	return nil
+}
+
 // ConvertToQcow2 builds a STANDALONE qcow2 image at destPath (no backing file)
 // from any source image (raw or qcow2, possibly with its own backing chain).
 // Only clusters that read as non-zero are written; fully-zero clusters are
@@ -85,6 +122,14 @@ func ConvertToQcow2(ctx context.Context, srcPath, destPath string, opt OverlayOp
 		return fmt.Errorf("cow: convert: open src: %w", err)
 	}
 	defer src.Close()
+	// Now that the chain is OPEN (and its backing inodes known), re-check
+	// the destination against every member: converting onto the overlay's
+	// own backing would let the final rename replace a file a live overlay
+	// still references. The direct src/dst SameFile check above stays as a
+	// fast path that fires before any directory is created.
+	if err := checkNotInChain(src, absSrc, absDst); err != nil {
+		return err
+	}
 	virtualSize := src.Size()
 	if virtualSize == 0 {
 		return fmt.Errorf("cow: convert: source %s has zero size", absSrc)

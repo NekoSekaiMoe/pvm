@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -256,6 +257,77 @@ func TestSniffFormat(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := SniffFormat(tc.path); got != tc.want {
 				t.Errorf("SniffFormat(%s) = %q, want %q", tc.name, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestConvert_DestIsBackingFile: converting an overlay onto its OWN backing
+// file must be rejected before any filesystem mutation — the O_TRUNC
+// (ConvertToRaw) or final rename (ConvertToQcow2) would replace a file the
+// source chain still reads through. The backing must survive byte-for-byte.
+func TestConvert_DestIsBackingFile(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		run  func(t *testing.T, overlay, base string, baseContent []byte)
+	}{
+		{"to_qcow2", func(t *testing.T, overlay, base string, baseContent []byte) {
+			err := ConvertToQcow2(context.Background(), overlay, base, ConvertDefaultOpt)
+			if err == nil {
+				t.Fatal("ConvertToQcow2 onto own backing: expected error, got nil")
+			}
+			if !strings.Contains(err.Error(), "backing file of source") {
+				t.Errorf("error should identify dest as a backing of the source, got: %v", err)
+			}
+		}},
+		{"to_raw", func(t *testing.T, overlay, base string, baseContent []byte) {
+			err := ConvertToRaw(context.Background(), overlay, base)
+			if err == nil {
+				t.Fatal("ConvertToRaw onto own backing: expected error, got nil")
+			}
+			if !strings.Contains(err.Error(), "backing file of source") {
+				t.Errorf("error should identify dest as a backing of the source, got: %v", err)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			base := filepath.Join(dir, "base.img")
+			baseContent := patterned(0x30, 4*clusterSize)
+			mustWriteRaw(t, base, 0, baseContent)
+
+			overlay := filepath.Join(dir, "overlay.qcow2")
+			if err := CreateOverlay(context.Background(), base, overlay); err != nil {
+				t.Fatalf("CreateOverlay: %v", err)
+			}
+			w := openWritable(t, overlay)
+			if _, err := w.WriteAt(patterned(0x70, clusterSize), 0); err != nil {
+				t.Fatalf("WriteAt: %v", err)
+			}
+			if err := w.Sync(); err != nil {
+				t.Fatalf("Sync: %v", err)
+			}
+			w.Close()
+
+			tc.run(t, overlay, base, baseContent)
+
+			// The backing must be untouched: same bytes, same size.
+			got, err := os.ReadFile(base)
+			if err != nil {
+				t.Fatalf("read base after: %v", err)
+			}
+			if !bytes.Equal(got, baseContent) {
+				t.Fatalf("backing file was modified by the rejected conversion (%d bytes, want %d)", len(got), len(baseContent))
+			}
+			// And the overlay still opens and reads through the chain.
+			img := openGuestImageFile(t, overlay)
+			defer img.Close()
+			buf := make([]byte, clusterSize)
+			if _, err := img.ReadAt(buf, clusterSize); err != nil {
+				t.Fatalf("overlay read through chain: %v", err)
+			}
+			if !bytes.Equal(buf, baseContent[clusterSize:2*clusterSize]) {
+				t.Fatal("overlay no longer reads its backing after rejected conversion")
 			}
 		})
 	}
