@@ -29,6 +29,7 @@ import (
 const (
 	qcow2Version3    = 3
 	qcow2HeaderLen   = 112 // v3 fixed header (104) + end-of-extensions area
+	qcow2V3HeaderLen = 104 // minimum v3 header_length per the qcow2 spec
 	clusterBits      = 12  // 4 KiB clusters (default): matches ext4 block size
 	clusterSize      = 1 << clusterBits
 	refcountOrder    = 4 // 2^4 = 16-bit refcount entries (qemu-img default)
@@ -514,23 +515,44 @@ func openGuestImage(path string) (guestImage, error) {
 		snapshots:        binary.BigEndian.Uint32(hdrBuf[0x3C:]),
 		snapshotsOffset:  binary.BigEndian.Uint64(hdrBuf[0x40:]),
 	}
+	// v3 header_length (offset 0x64) is where header extensions START —
+	// not necessarily our own qcow2HeaderLen. The spec minimum is 104 (the
+	// bare fixed v3 header); foreign writers (qemu-img included) may emit
+	// 104, so a fixed 112 start would skip the first 8 bytes of an extension
+	// and misparse its tail as a new extension header. Reject impossible
+	// values: below the fixed header, or beyond cluster 0 where extensions
+	// must live.
+	hdrLen := uint64(binary.BigEndian.Uint32(hdrBuf[0x64:]))
+	if hdrLen < qcow2V3HeaderLen {
+		f.Close()
+		return nil, fmt.Errorf("cow: invalid header_length %d in %s (minimum %d)", hdrLen, path, qcow2V3HeaderLen)
+	}
+	if hdrLen > q.clusterSize {
+		f.Close()
+		return nil, fmt.Errorf("cow: invalid header_length %d in %s (exceeds cluster size %d)", hdrLen, path, q.clusterSize)
+	}
 	bfOff := binary.BigEndian.Uint64(hdrBuf[0x08:])
 	bfSize := binary.BigEndian.Uint32(hdrBuf[0x10:])
-	// Header extensions live between the fixed header (qcow2HeaderLen) and
-	// the backing-file name (bfOff). Parse them to recover the stored
-	// backing format (extBackingFormat) instead of re-probing later — a
-	// probe can race or disagree with what qemu-img wrote, and Compact
-	// must rebuild with the SAME format the source declared.
+	// Header extensions live between the fixed header and the backing-file
+	// name (bfOff). Parse them to recover the stored backing format
+	// (extBackingFormat) instead of re-probing later — a probe can race or
+	// disagree with what qemu-img wrote, and Compact must rebuild with the
+	// SAME format the source declared.
 	extEnd := bfOff
 	if extEnd == 0 {
-		extEnd = uint64(qcow2HeaderLen) // no backing name: extensions still end with the 0-marker
+		// No backing name: extensions still end with the 0-marker. Bound
+		// the parse at the fixed header length, or header_length if larger.
+		extEnd = uint64(qcow2HeaderLen)
+		if hdrLen > extEnd {
+			extEnd = hdrLen
+		}
 	}
 	// Extensions live in cluster 0 AFTER the fixed header, so hdrBuf
 	// (only qcow2HeaderLen bytes) does not cover them. Read the whole
-	// cluster 0 once, if it actually contains extensions.
+	// region once, if it actually contains extensions.
 	var extBuf []byte
 	if extEnd > uint64(qcow2HeaderLen) {
-		if extEnd < uint64(qcow2HeaderLen) || extEnd > q.clusterSize {
+		if extEnd > q.clusterSize {
 			f.Close()
 			return nil, fmt.Errorf("cow: invalid header extension region in %s (end=%#x)", path, extEnd)
 		}
@@ -539,8 +561,13 @@ func openGuestImage(path string) (guestImage, error) {
 			f.Close()
 			return nil, fmt.Errorf("cow: read header extensions of %s: %w", path, err)
 		}
+	} else if extEnd < hdrLen {
+		// A backing name that starts before header_length leaves no room
+		// for the extensions the header claims exist.
+		f.Close()
+		return nil, fmt.Errorf("cow: invalid header extension region in %s (end=%#x before header_length=%#x)", path, extEnd, hdrLen)
 	}
-	e := uint64(qcow2HeaderLen)
+	e := hdrLen
 	for e+8 <= extEnd {
 		var magic, elen uint32
 		if e+8 <= uint64(len(hdrBuf)) {

@@ -97,22 +97,32 @@ func ConvertToQcow2(ctx context.Context, srcPath, destPath string, opt OverlayOp
 	// the final rename is atomic on the same filesystem; a crash or failure
 	// leaves the original dest (if any) untouched. createQcow2 opens with
 	// O_TRUNC, so writing absDst directly would clobber it before we know the
-	// conversion succeeded.
-	tmp := absDst + ".convert.tmp"
-	_ = os.Remove(tmp)
-	tmpCreated := false
+	// conversion succeeded. os.CreateTemp gives a unique path per conversion
+	// (concurrent converts to the same dest cannot stomp each other's temp)
+	// and an exclusive create, so we never delete a pre-existing file that
+	// might belong to someone else. We only need the reserved path, so close
+	// the fd immediately; cleanup responsibility starts the moment the temp
+	// file exists, so even a createQcow2 failure removes the partial file.
+	tmpF, err := os.CreateTemp(filepath.Dir(absDst), ".convert-*.tmp")
+	if err != nil {
+		return fmt.Errorf("cow: convert: create temp in dest dir: %w", err)
+	}
+	tmp := tmpF.Name()
+	if err := tmpF.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("cow: convert: close temp placeholder: %w", err)
+	}
 	cleanupTmp := func() {
-		if tmpCreated {
-			_ = os.Remove(tmp)
-		}
+		// Best-effort: after a successful rename tmp no longer exists.
+		_ = os.Remove(tmp)
 	}
 	// Standalone qcow2 (no backing). Preallocated metadata is pointless for a
 	// conversion output and would bloat the dest; force it off unless the
 	// caller is explicit — opt.PreallocMetadata true keeps what they asked.
 	if err := createQcow2(tmp, virtualSize, "", "", opt); err != nil {
+		cleanupTmp()
 		return fmt.Errorf("cow: convert: create dest qcow2: %w", err)
 	}
-	tmpCreated = true
 
 	w, err := OpenWritable(tmp)
 	if err != nil {

@@ -150,13 +150,20 @@ func Compact(ctx context.Context, overlayFile string) (CompactStats, error) {
 	// Resource handling: close src and w on EVERY return path (success or
 	// error) via a single deferred helper, so no branch can leak an fd or
 	// double-close. rename only happens after a clean sync+close below.
+	// closeAll PROPAGATES close errors: a failed close (flush error, NFS)
+	// means the rebuilt file may not be durable, so the caller must NOT
+	// chmod/rename it over the original.
 	var w WritableBackend // set before any early return that closes it
-	closeAll := func() {
+	closeAll := func() error {
+		var err error
 		if w != nil {
-			w.Close()
+			err = w.Close()
 			w = nil
 		}
-		src.Close()
+		if serr := src.Close(); err == nil {
+			err = serr
+		}
+		return err
 	}
 	defer closeAll()
 
@@ -181,7 +188,12 @@ func Compact(ctx context.Context, overlayFile string) (CompactStats, error) {
 			cerr = fmt.Errorf("cow: compact: sync dest: %w", err)
 		}
 	}
-	closeAll() // close now (and nil w) so rename is not racing an open writer
+	// close now (and nil w) so rename is not racing an open writer; a close
+	// failure aborts BEFORE chmod/rename — the tmp file (already cleaned up
+	// by the deferred remove) never replaces the original image.
+	if clerr := closeAll(); clerr != nil && cerr == nil {
+		cerr = fmt.Errorf("cow: compact: close dest: %w", clerr)
+	}
 	if cerr != nil {
 		return stats, cerr
 	}
@@ -251,12 +263,12 @@ func compactWalk(ctx context.Context, src *qcow2Image, dst *qcow2Writable, stats
 			return fmt.Errorf("read L2 table at %#x: %w", l2Off, err)
 		}
 		if n < len(l2Table) {
-			// Clear any unread suffix so stale bytes from a prior L2 table
-			// cannot be re-interpreted. n < cs for a valid L2 table means
-		// the image is truncated/corrupt; we still clear so the walk
-			// proceeds with zero (unallocated) entries rather than bogus
-			// host offsets.
-			clear(l2Table[n:])
+			// A short read means the image is truncated/corrupt (a foreign
+			// writer may have shrunk it under us). The unread suffix holds
+			// UNKNOWN state, not zeros: treating it as unallocated would
+			// silently drop still-live clusters from the rebuilt image.
+			// Fail BEFORE any tmp-file replacement so the original survives.
+			return fmt.Errorf("read L2 table at %#x: got %d of %d bytes: %w", l2Off, n, len(l2Table), io.ErrUnexpectedEOF)
 		}
 		for j := uint64(0); j < l2Entries; j++ {
 			// Inner-loop cancellation: with 4 KiB clusters an L2 table holds

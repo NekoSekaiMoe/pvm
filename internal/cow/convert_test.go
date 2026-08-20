@@ -158,8 +158,12 @@ func TestConvert_FlattensLayeredOverlay(t *testing.T) {
 					t.Fatalf("WriteAt cluster %d: %v", sh.cluster, err)
 				}
 			}
-			w.Sync()
-			w.Close()
+			if err := w.Sync(); err != nil {
+				t.Fatalf("Sync overlay: %v", err)
+			}
+			if err := w.Close(); err != nil {
+				t.Fatalf("Close overlay: %v", err)
+			}
 
 			// Expected flattened view: base with shadowed clusters overwritten,
 			// zero-shadowed clusters zeroed.

@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -376,5 +377,99 @@ func TestCompact_RejectsZeroVirtualSize(t *testing.T) {
 
 	if _, err := Compact(context.Background(), img); err == nil {
 		t.Fatalf("Compact on zero-virtual-size image: expected error, got nil")
+	}
+}
+
+// TestQcow2_HeaderLength104 covers foreign images whose v3 header_length is
+// the spec minimum 104 (e.g. written by qemu-img): header extensions then
+// start at byte 104, not at our own qcow2HeaderLen (112). The parser must
+// honor the stored header_length — with a fixed 112 start it would skip the
+// first extension's magic/length, misread the length field as a magic, and
+// reject the image with a spurious overflow error.
+func TestQcow2_HeaderLength104(t *testing.T) {
+	dir := t.TempDir()
+	overlay, want := buildOverlayWithWrites(t, dir, []writeOp{
+		{1, patterned(0x42, clusterSize)},
+	})
+
+	// Rewrite cluster 0 so the extension block starts at 104: move the
+	// [112,bfOff) bytes (backing-format ext + end marker) down to 104 and
+	// set header_length=104. The backing name stays at bfOff (the gap
+	// between the end marker and the name is ignored by parsers).
+	f, err := os.OpenFile(overlay, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatalf("open overlay: %v", err)
+	}
+	cluster0 := make([]byte, clusterSize)
+	if _, err := f.ReadAt(cluster0, 0); err != nil {
+		t.Fatalf("read cluster 0: %v", err)
+	}
+	bfOff := int(binary.BigEndian.Uint64(cluster0[0x08:]))
+	ext := append([]byte(nil), cluster0[qcow2HeaderLen:bfOff]...)
+	copy(cluster0[qcow2V3HeaderLen:], ext)
+	clear(cluster0[qcow2V3HeaderLen+len(ext) : bfOff])
+	binary.BigEndian.PutUint32(cluster0[0x64:], qcow2V3HeaderLen)
+	if _, err := f.WriteAt(cluster0, 0); err != nil {
+		t.Fatalf("rewrite cluster 0: %v", err)
+	}
+	f.Close()
+
+	// Sanity: a backing-format extension really begins at 104 now.
+	if m := binary.BigEndian.Uint32(cluster0[qcow2V3HeaderLen:]); m != extBackingFormat {
+		t.Fatalf("extension magic at %d = %#x, want %#x", qcow2V3HeaderLen, m, extBackingFormat)
+	}
+
+	// Compact must parse the extension starting AT 104 and rebuild a valid
+	// overlay preserving the guest view.
+	if _, err := Compact(context.Background(), overlay); err != nil {
+		t.Fatalf("Compact on header_length=104 image: %v", err)
+	}
+	assertView(t, overlay, want)
+
+	// The rebuilt image (written by our own createQcow2) must still declare
+	// the backing format "raw" in the extension at qcow2HeaderLen.
+	rf, err := os.Open(overlay)
+	if err != nil {
+		t.Fatalf("open rebuilt overlay: %v", err)
+	}
+	defer rf.Close()
+	buf := make([]byte, 256)
+	if _, err := rf.ReadAt(buf, 0); err != nil {
+		t.Fatalf("read rebuilt header: %v", err)
+	}
+	if m := binary.BigEndian.Uint32(buf[qcow2HeaderLen:]); m != extBackingFormat {
+		t.Errorf("rebuilt extension magic = %#x, want %#x (backing format lost)", m, extBackingFormat)
+	}
+	if l := binary.BigEndian.Uint32(buf[qcow2HeaderLen+4:]); l != 3 {
+		t.Errorf("rebuilt extension length = %d, want 3 (\"raw\")", l)
+	} else if string(buf[qcow2HeaderLen+8:qcow2HeaderLen+11]) != "raw" {
+		t.Errorf("rebuilt backing format = %q, want %q", buf[qcow2HeaderLen+8:qcow2HeaderLen+11], "raw")
+	}
+}
+
+// TestQcow2_HeaderLengthInvalid rejects header_length below the fixed v3
+// header (104): no extension can start before the header ends.
+func TestQcow2_HeaderLengthInvalid(t *testing.T) {
+	dir := t.TempDir()
+	overlay, _ := buildOverlayWithWrites(t, dir, []writeOp{
+		{1, patterned(0x42, clusterSize)},
+	})
+	f, err := os.OpenFile(overlay, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatalf("open overlay: %v", err)
+	}
+	var b [4]byte
+	binary.BigEndian.PutUint32(b[:], 72) // < 104: impossible
+	if _, err := f.WriteAt(b[:], 0x64); err != nil {
+		t.Fatalf("forge header_length: %v", err)
+	}
+	f.Close()
+
+	_, err = Compact(context.Background(), overlay)
+	if err == nil {
+		t.Fatal("Compact on header_length=72 image: expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "header_length") {
+		t.Errorf("error should mention header_length, got: %v", err)
 	}
 }
