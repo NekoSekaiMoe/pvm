@@ -347,9 +347,6 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 				BlockDomains:   s.Network.EgressBlockDomains,
 				MaxRequestBody: s.Network.MaxRequestBodyBytes,
 			}
-			// Translate extended L7 rules (Cube parity) into the gateway's flat allow/block
-			// lists: an EgressRule with Allow==false becomes a block entry, otherwise allow.
-			// Port/scheme/path/method are logged for audit but not enforced at the bulk domain layer.
 			for _, r := range s.Network.EgressRules {
 				host := r.Host
 				if host == "" {
@@ -363,6 +360,14 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 				} else {
 					pol.AllowDomains = append(pol.AllowDomains, host)
 				}
+				// Also wire the full L7 rule so the gateway can enforce method/path/scheme and inject credentials.
+				var inj *egress.EgressInject
+				if r.Inject != nil {
+					inj = &egress.EgressInject{Header: r.Inject.Header, Format: r.Inject.Format, Secret: r.Inject.Secret}
+				}
+				pol.Rules = append(pol.Rules, egress.EgressRule{
+					Name: r.Name, Host: r.Host, SNI: r.SNI, Method: r.Method, Path: r.Path, Scheme: r.Scheme, Port: r.Port, Allow: r.Allow, Inject: inj,
+				})
 			}
 		m.Egress.SetPolicy(taskID, pol)
 		if lp, err := m.Egress.ListenForTask(ctx, taskID); err == nil {
