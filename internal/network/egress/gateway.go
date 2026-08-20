@@ -46,6 +46,30 @@ type Policy struct {
 	// ReviewHook is called for requests flagged as REVIEW (large POST, etc.).
 	// If nil, REVIEW is treated as BLOCK.
 	ReviewHook func(req *http.Request, bodySize int64) (allow bool, reason string)
+	// Rules is the extended L7 set (Cube parity: security-proxy.md). When
+	// non-empty it is evaluated before the flat AllowDomains/BlockDomains.
+	Rules []EgressRule
+}
+
+// EgressRule mirrors spec.EgressRule at the gateway layer to avoid an
+// import cycle (spec -> egress would be circular).
+type EgressRule struct {
+	Name   string
+	Host   string
+	SNI    string
+	Method []string
+	Path   string // exact or "/prefix/*"
+	Scheme string // "http" | "https"
+	Port   int
+	Allow  *bool
+	Inject *EgressInject
+}
+
+// EgressInject mirrors spec.EgressInject.
+type EgressInject struct {
+	Header string
+	Format string // e.g. "Bearer ${SECRET}"
+	Secret string
 }
 
 // Decision is the outcome for a request.
@@ -341,6 +365,8 @@ func (g *Gateway) handleHTTP(w http.ResponseWriter, r *http.Request, task string
 	// internal routing/audit identifier and must not leak to third parties;
 	// hop-by-hop headers per RFC 7230 §6.1 are connection-scoped.
 	outReq.Header = stripInternalHeaders(r.Header.Clone())
+	// Credential injection: if an allow rule carries Inject, add the header.
+	g.ApplyInject(outReq, host, pol)
 	// SSRF floor: dial through a custom transport whose DialContext rejects
 	// any IP that resolves to a private/loopback/link-local range. This mirrors
 	// the isPrivate() check on handleConnect's established connection. Tests
@@ -453,8 +479,28 @@ func stripInternalHeaders(hdr http.Header) http.Header {
 }
 
 // decideDomain applies block-over-allow with wildcard suffix matching.
+// When Policy.Rules is non-empty it is evaluated first (first-match-wins,
+// mirroring CubeEgress lua/access_phase.lua); flat lists are the fallback.
 func (g *Gateway) decideDomain(host string, pol *Policy) Decision {
 	host = strings.ToLower(stripPort(host))
+	if len(pol.Rules) > 0 {
+		for _, r := range pol.Rules {
+			h := r.Host
+			if h == "" {
+				h = r.SNI
+			}
+			if h == "" {
+				continue
+			}
+			if domainMatches(host, strings.ToLower(h)) {
+				if r.Allow != nil && !*r.Allow {
+					return DecisionBlock
+				}
+				return DecisionAllow
+			}
+		}
+		return DecisionBlock // no rule matched -> deny
+	}
 	for _, b := range pol.BlockDomains {
 		if domainMatches(host, strings.ToLower(b)) {
 			return DecisionBlock
@@ -466,6 +512,37 @@ func (g *Gateway) decideDomain(host string, pol *Policy) Decision {
 		}
 	}
 	return DecisionBlock // default deny
+}
+
+// ApplyInject adds credential headers from matching allow rules. Call after
+// decideDomain returned Allow; it mutates outReq.Header in place.
+func (g *Gateway) ApplyInject(outReq *http.Request, host string, pol *Policy) {
+	if len(pol.Rules) == 0 {
+		return
+	}
+	host = strings.ToLower(stripPort(host))
+	for _, r := range pol.Rules {
+		h := r.Host
+		if h == "" {
+			h = r.SNI
+		}
+		if h == "" || !domainMatches(host, strings.ToLower(h)) {
+			continue
+		}
+		if r.Inject == nil || r.Inject.Header == "" || r.Inject.Secret == "" {
+			continue
+		}
+		if r.Allow != nil && !*r.Allow {
+			continue
+		}
+		format := r.Inject.Format
+		if format == "" {
+			format = "${SECRET}"
+		}
+		val := strings.ReplaceAll(format, "${SECRET}", r.Inject.Secret)
+		outReq.Header.Set(r.Inject.Header, val)
+		return // first matching rule wins, like CubeEgress
+	}
 }
 
 // domainMatches supports exact and "*.suffix" wildcard.

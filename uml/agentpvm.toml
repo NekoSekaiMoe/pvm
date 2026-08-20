@@ -71,6 +71,20 @@ egress_block_domains = [
     "169.254.169.254",   # cloud metadata (also blocked by eBPF floor)
 ]
 
+# Extended L7 rules (Cube parity: docs/guide/security-proxy.md).
+# First match wins; each rule can carry credential injection.
+# Example: allow api.github.com with token injection:
+# [[network.egress_rules]]
+# name   = "github-api"
+# host   = "api.github.com"
+# scheme = "https"
+# method = ["GET", "POST"]
+# allow  = true
+# [network.egress_rules.inject]
+# header = "Authorization"
+# format = "Bearer ${SECRET}"
+# secret = "ghp_..."   # operator-side, never seen by sandbox
+
 # --- tool / policy gateway (plan.md §6) ---
 # First match wins; a default-deny catch-all is auto-appended.
 [[tools]]
@@ -124,3 +138,15 @@ paused     = false      # start in Suspended (checkpoint-on-start)
 max_retries = 2         # Failed -> Provisioning attempts
 on_anomaly  = "pause"   # "pause" (default) or "terminate"
 ttl         = "1h"      # overall task lifetime
+idle_timeout = ""       # e.g. "10m": freeze + Suspended after idle (single-host AutoPause)
+auto_resume  = false     # when true, next API activity thaws Suspended -> Running
+
+# --- volumes (Cube parity: persistent mounts) ---
+# Each entry is mounted via the volume plugin framework (internal/volume).
+# driver defaults to first registered plugin when omitted; read_only exposes
+# the mount as ro to the guest.
+# [[volumes]]
+# name      = "my-data"
+# path      = "/workspace"
+# driver    = "hostdir"
+# read_only = false
