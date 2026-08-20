@@ -76,7 +76,7 @@ jobs:
     - name: Build UML Kernel
       run: |
         chmod +x scripts/build_kernel.sh
-        sudo apt-get install -y build-essential libelf-dev pkg-config bc git
+        sudo apt-get install -y build-essential libelf-dev pkg-config bc git qemu-utils
         # LLVM=1 builds need ld.lld on PATH; the bare 'lld' package installs
         # it as /usr/lib/llvm-<n>/bin/ld.lld on some distro layouts. Export a
         # guaranteed-PATH location so kbuild's 'LD=ld.lld' resolves.
