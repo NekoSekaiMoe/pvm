@@ -15,14 +15,18 @@ import (
 	"uml-container/internal/approval"
 	"uml-container/internal/artifact"
 	"uml-container/internal/audit"
+	"uml-container/internal/cgroup"
 	"uml-container/internal/config"
 	"uml-container/internal/container"
 	"uml-container/internal/image"
+	"uml-container/internal/lifecycle"
 	"uml-container/internal/policy"
 	"uml-container/internal/pool"
 	"uml-container/internal/snapshot"
 	"uml-container/internal/spec"
 	"uml-container/internal/state"
+	"uml-container/internal/template"
+	"uml-container/internal/volume"
 	"uml-container/webui"
 
 	"github.com/labstack/echo/v4"
@@ -490,6 +494,158 @@ func StartE2BServer(port int) error {
 		return c.JSON(http.StatusOK, v)
 	})
 
+	// --- Volumes (Cube parity: POST/GET/DELETE /volumes) ---
+	volStore := volume.NewStore()
+	api.POST("/volumes", func(c echo.Context) error {
+		var req struct {
+			Name        string `json:"name"`
+			Driver      string `json:"driver"`
+			Token       string `json:"token"`
+			PrivateData string `json:"private_data"`
+		}
+		if err := c.Bind(&req); err != nil {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+		}
+		if req.Name == "" {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "name required"})
+		}
+		rec := volume.VolumeRecord{VolumeID: req.Name, Name: req.Name, Driver: req.Driver, Token: req.Token, PrivateData: req.PrivateData}
+		if err := volStore.Create(rec); err != nil {
+			return c.JSON(http.StatusConflict, map[string]string{"error": err.Error()})
+		}
+		got, _ := volStore.Get(req.Name)
+		return c.JSON(http.StatusCreated, got)
+	})
+	api.GET("/volumes", func(c echo.Context) error {
+		list, err := volStore.List()
+		if err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		}
+		if list == nil {
+			list = []volume.VolumeRecord{}
+		}
+		return c.JSON(http.StatusOK, list)
+	})
+	api.GET("/volumes/:id", func(c echo.Context) error {
+		id := c.Param("id")
+		rec, err := volStore.Get(id)
+		if err != nil {
+			return c.JSON(http.StatusNotFound, map[string]string{"error": err.Error()})
+		}
+		return c.JSON(http.StatusOK, rec)
+	})
+	api.DELETE("/volumes/:id", func(c echo.Context) error {
+		id := c.Param("id")
+		if err := volStore.Delete(id); err != nil {
+			if strings.Contains(err.Error(), "still mounted") {
+				return c.JSON(http.StatusConflict, map[string]string{"error": err.Error()})
+			}
+			return c.JSON(http.StatusNotFound, map[string]string{"error": err.Error()})
+		}
+		return c.NoContent(http.StatusNoContent)
+	})
+
+	// --- Templates (Cube parity: /templates) ---
+	tmplStore := template.NewStore("")
+	api.POST("/templates", func(c echo.Context) error {
+		var req struct {
+			ImageRef string `json:"image_ref"`
+			Alias    string `json:"alias"`
+		}
+		if err := c.Bind(&req); err != nil {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+		}
+		if req.ImageRef == "" {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "image_ref required"})
+		}
+		rec := template.Record{TemplateID: template.GenerateTemplateID(), Alias: req.Alias, ImageRef: req.ImageRef, Status: "READY", Kind: "template"}
+		if err := tmplStore.Create(rec); err != nil {
+			return c.JSON(http.StatusConflict, map[string]string{"error": err.Error()})
+		}
+		got, _ := tmplStore.Get(rec.TemplateID)
+		return c.JSON(http.StatusCreated, got)
+	})
+	api.GET("/templates", func(c echo.Context) error {
+		list, err := tmplStore.List()
+		if err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		}
+		if list == nil {
+			list = []template.Record{}
+		}
+		return c.JSON(http.StatusOK, list)
+	})
+	api.GET("/templates/:id", func(c echo.Context) error {
+		id := c.Param("id")
+		// Try direct id first, then alias resolution
+		rec, err := tmplStore.Get(id)
+		if err != nil {
+			if aliasRec, aerr := tmplStore.GetByAlias(id); aerr == nil {
+				return c.JSON(http.StatusOK, aliasRec)
+			}
+			return c.JSON(http.StatusNotFound, map[string]string{"error": err.Error()})
+		}
+		return c.JSON(http.StatusOK, rec)
+	})
+	api.POST("/templates/:id/alias", func(c echo.Context) error {
+		id := c.Param("id")
+		var req struct {
+			Alias string `json:"alias"`
+		}
+		if err := c.Bind(&req); err != nil {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+		}
+		if err := tmplStore.SetAlias(id, req.Alias); err != nil {
+			return c.JSON(http.StatusConflict, map[string]string{"error": err.Error()})
+		}
+		rec, _ := tmplStore.Get(id)
+		return c.JSON(http.StatusOK, rec)
+	})
+	api.DELETE("/templates/:id", func(c echo.Context) error {
+		id := c.Param("id")
+		if err := tmplStore.Delete(id); err != nil {
+			return c.JSON(http.StatusNotFound, map[string]string{"error": err.Error()})
+		}
+		return c.NoContent(http.StatusNoContent)
+	})
+
+	// --- AutoPause (Cube parity: POST /tasks/:id/pause|resume) ---
+	autoMgr := lifecycle.New(cgroup.NewManager())
+	api.POST("/tasks/:id/pause", func(c echo.Context) error {
+		id := c.Param("id")
+		if !idRegex.MatchString(id) {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid task id"})
+		}
+		st, err := state.LoadState(id)
+		if err != nil {
+			return c.JSON(http.StatusNotFound, map[string]string{"error": "task not found"})
+		}
+		if st.Status != state.StatusRunning {
+			return c.JSON(http.StatusConflict, map[string]string{"error": fmt.Sprintf("task not running (status=%s)", st.Status)})
+		}
+		cg := cgroup.NewManager()
+		if err := cg.Freeze(id); err != nil && !os.IsNotExist(err) {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		}
+		autoMgr.Disarm(id)
+		if err := st.Transition(state.StatusSuspended, state.ActorHuman, "manual pause"); err != nil {
+			return c.JSON(http.StatusConflict, map[string]string{"error": err.Error()})
+		}
+		_ = state.SaveState(id, st)
+		return c.NoContent(http.StatusNoContent)
+	})
+	api.POST("/tasks/:id/resume", func(c echo.Context) error {
+		id := c.Param("id")
+		if !idRegex.MatchString(id) {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid task id"})
+		}
+		if err := autoMgr.Resume(id); err != nil {
+			return c.JSON(http.StatusConflict, map[string]string{"error": err.Error()})
+		}
+		st, _ := state.LoadState(id)
+		return c.JSON(http.StatusOK, st)
+	})
+
 	// Serve the embedded Nuxt UI for all other routes
 	e.Use(middleware.StaticWithConfig(middleware.StaticConfig{
 		Root:       ".",
@@ -643,6 +799,9 @@ var (
 	globalPool      = pool.NewManager(16, nil)
 	planesMu        sync.RWMutex
 )
+
+// NewLifecycleManager exposes the lifecycle manager for external wiring (tests).
+func NewLifecycleManager() *lifecycle.Manager { return lifecycle.New(cgroup.NewManager()) }
 
 // RegisterApprovalManager lets the controller inject its own approval manager
 // (e.g. one wired to a real audit ledger) to replace the default.
