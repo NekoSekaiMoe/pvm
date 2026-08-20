@@ -406,18 +406,32 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 	// vhostBackend here. A compact failure must NOT flip a clean task to
 	// Failed — the task already exited — so it is logged + audited only.
 	if s.Workspace.CompactOnExit && overlayCreated {
+		// Close the vhost backend explicitly so it is not holding the overlay
+		// file open while we rename a rebuilt file over it. The deferred close
+		// at the top of StartTask becomes a no-op once we nil vhostBackend
+		// here. A close failure means the backend may still be holding the
+		// overlay: compacting would race that handle and could rebuild a
+		// half-flushed image, so SKIP compact, record the close failure as an
+		// audit constrain event, and leave vhostBackend non-nil so the
+		// deferred cleanup gets a chance to retry the close.
 		if vhostBackend != nil {
-			vhostBackend.Close()
-			vhostBackend = nil
+			if cerr := vhostBackend.Close(); cerr != nil {
+				fmt.Printf("Warning: vhost backend close for %s failed: %v (skipping overlay compaction)\n", taskID, cerr)
+				_ = ledger.Append(audit.Record{Phase: audit.PhaseExec, Subject: taskID, Action: "overlay_compact", Decision: audit.DecisionConstrain, Reason: "vhost backend close failed, compact skipped: " + cerr.Error()})
+			} else {
+				vhostBackend = nil
+			}
 		}
-		stats, cerr := cow.Compact(context.Background(), overlayPath)
-		if cerr != nil {
-			fmt.Printf("Warning: compact overlay for %s failed: %v\n", taskID, cerr)
-			_ = ledger.Append(audit.Record{Phase: audit.PhaseExec, Subject: taskID, Action: "overlay_compact", Decision: audit.DecisionConstrain, Reason: "compact failed: " + cerr.Error()})
-		} else {
-			fmt.Printf("Overlay compacted for %s: %d -> %d bytes (%d clusters copied, %d zeroed, %d dropped)\n",
-				taskID, stats.BeforeBytes, stats.AfterBytes, stats.ClustersCopied, stats.ClustersZeroed, stats.ClustersDropped)
-			_ = ledger.Append(audit.Record{Phase: audit.PhaseExec, Subject: taskID, Action: "overlay_compact", Decision: audit.DecisionAllow, Reason: fmt.Sprintf("overlay compacted: %d -> %d bytes", stats.BeforeBytes, stats.AfterBytes)})
+		if vhostBackend == nil {
+			stats, cerr := cow.Compact(context.Background(), overlayPath)
+			if cerr != nil {
+				fmt.Printf("Warning: compact overlay for %s failed: %v\n", taskID, cerr)
+				_ = ledger.Append(audit.Record{Phase: audit.PhaseExec, Subject: taskID, Action: "overlay_compact", Decision: audit.DecisionConstrain, Reason: "compact failed: " + cerr.Error()})
+			} else {
+				fmt.Printf("Overlay compacted for %s: %d -> %d bytes (%d clusters copied, %d zeroed, %d dropped)\n",
+					taskID, stats.BeforeBytes, stats.AfterBytes, stats.ClustersCopied, stats.ClustersZeroed, stats.ClustersDropped)
+				_ = ledger.Append(audit.Record{Phase: audit.PhaseExec, Subject: taskID, Action: "overlay_compact", Decision: audit.DecisionAllow, Reason: fmt.Sprintf("overlay compacted: %d -> %d bytes", stats.BeforeBytes, stats.AfterBytes)})
+			}
 		}
 	}
 	return waitErr

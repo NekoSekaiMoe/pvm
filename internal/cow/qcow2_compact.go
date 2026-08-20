@@ -107,9 +107,18 @@ func Compact(ctx context.Context, overlayFile string) (CompactStats, error) {
 	virtualSize := q.hdr.size
 	bits := q.clusterBits
 	backingAbs := q.backingAbs
-	backingFormat := "raw"
-	if backingAbs != "" && isQcow2(backingAbs) {
-		backingFormat = "qcow2"
+	// Prefer the backing format DECLARED in the source's header extension —
+	// it is what qemu-img (or our createQcow2) wrote and must be preserved.
+	// Fall back to probing with isQcow2 only when the header omitted it; never
+	// default an undetected qcow2 backing to raw, which would make the
+	// rebuilt overlay mis-read its own backing chain.
+	backingFormat := q.backingFormat
+	if backingFormat == "" && backingAbs != "" {
+		if isQcow2(backingAbs) {
+			backingFormat = "qcow2"
+		} else {
+			backingFormat = "raw"
+		}
 	}
 
 	// Build the replacement into a sibling temp file in the SAME directory so
@@ -138,9 +147,21 @@ func Compact(ctx context.Context, overlayFile string) (CompactStats, error) {
 		}
 	}
 
-	w, err := OpenWritable(tmp)
-	if err != nil {
+	// Resource handling: close src and w on EVERY return path (success or
+	// error) via a single deferred helper, so no branch can leak an fd or
+	// double-close. rename only happens after a clean sync+close below.
+	var w WritableBackend // set before any early return that closes it
+	closeAll := func() {
+		if w != nil {
+			w.Close()
+			w = nil
+		}
 		src.Close()
+	}
+	defer closeAll()
+
+	w, err = OpenWritable(tmp)
+	if err != nil {
 		return stats, fmt.Errorf("cow: compact: open dest: %w", err)
 	}
 	qw, ok := w.(*qcow2Writable)
@@ -149,8 +170,6 @@ func Compact(ctx context.Context, overlayFile string) (CompactStats, error) {
 		// would mean createQcow2 silently produced a raw file, which it
 		// cannot. This branch is unreachable but keeps the type assertion
 		// honest rather than panicking on a future variant.
-		w.Close()
-		src.Close()
 		return stats, fmt.Errorf("cow: compact: dest is not a qcow2 writable")
 	}
 
@@ -162,8 +181,7 @@ func Compact(ctx context.Context, overlayFile string) (CompactStats, error) {
 			cerr = fmt.Errorf("cow: compact: sync dest: %w", err)
 		}
 	}
-	w.Close()
-	src.Close()
+	closeAll() // close now (and nil w) so rename is not racing an open writer
 	if cerr != nil {
 		return stats, cerr
 	}
@@ -173,6 +191,14 @@ func Compact(ctx context.Context, overlayFile string) (CompactStats, error) {
 		return stats, fmt.Errorf("cow: compact: stat dest: %w", err)
 	}
 	stats.AfterBytes = uint64(st1.Size())
+	// Align the rebuilt file's mode to the original image before renaming:
+	// createQcow2 creates tmp with mode 0644, but the source (e.g. a
+	// mode-0600 overlay under a private task dir) may carry stricter
+	// permissions. A chmod failure is fatal — do NOT rename a file with the
+	// wrong mode and then pretend success.
+	if err := os.Chmod(tmp, st0.Mode()); err != nil {
+		return stats, fmt.Errorf("cow: compact: align dest mode: %w", err)
+	}
 	if err := os.Rename(tmp, abs); err != nil {
 		return stats, fmt.Errorf("cow: compact: rename into place: %w", err)
 	}
@@ -216,10 +242,33 @@ func compactWalk(ctx context.Context, src *qcow2Image, dst *qcow2Writable, stats
 			stats.ClustersDropped += int64(l2Entries)
 			continue
 		}
-		if _, err := src.f.ReadAt(l2Table, int64(l2Off)); err != nil && err != io.EOF {
+		// Use the byte count from ReadAt: a short read (truncated image,
+		// foreign writer) must not leave stale data from the PREVIOUS L2
+		// table in the unread suffix, or the binary.BigEndian read below
+		// would interpret stale entries as live clusters.
+		n, err := src.f.ReadAt(l2Table, int64(l2Off))
+		if err != nil && err != io.EOF {
 			return fmt.Errorf("read L2 table at %#x: %w", l2Off, err)
 		}
+		if n < len(l2Table) {
+			// Clear any unread suffix so stale bytes from a prior L2 table
+			// cannot be re-interpreted. n < cs for a valid L2 table means
+		// the image is truncated/corrupt; we still clear so the walk
+			// proceeds with zero (unallocated) entries rather than bogus
+			// host offsets.
+			clear(l2Table[n:])
+		}
 		for j := uint64(0); j < l2Entries; j++ {
+			// Inner-loop cancellation: with 4 KiB clusters an L2 table holds
+			// 512 entries, and a large image can iterate millions of them
+			// between L1 checks. Sample ctx.Err() at a fixed cadence so a
+			// cancellation during a big compact returns promptly rather
+			// than after the whole table.
+			if j&63 == 0 {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+			}
 			e := binary.BigEndian.Uint64(l2Table[j*8:])
 			if e == 0 {
 				stats.ClustersDropped++

@@ -50,7 +50,7 @@ const (
 // qcow2Header mirrors the on-disk v3 header layout.
 type qcow2Header struct {
 	size             uint64 // virtual disk size
-	backingFile      string
+	backingFile      string // original backing name as stored in the header (pre-Abs)
 	l1Offset         uint64
 	l1Size           uint32
 	refcountOffset   uint64
@@ -327,6 +327,12 @@ type qcow2Image struct {
 	// directory). Empty when the image is standalone. Compact uses it to
 	// rebuild an overlay that references the same backing.
 	backingAbs string
+	// backingFormat is the backing format parsed from the qcow2 header
+	// extension (extBackingFormat), if present. "" means the header did not
+	// carry one, so callers must probe (isQcow2) themselves. Compact passes
+	// this through to createQcow2 so a qcow2 backing is never accidentally
+	// defaulted to raw.
+	backingFormat string
 }
 
 func (q *qcow2Image) Size() uint64 { return q.hdr.size }
@@ -510,6 +516,53 @@ func openGuestImage(path string) (guestImage, error) {
 	}
 	bfOff := binary.BigEndian.Uint64(hdrBuf[0x08:])
 	bfSize := binary.BigEndian.Uint32(hdrBuf[0x10:])
+	// Header extensions live between the fixed header (qcow2HeaderLen) and
+	// the backing-file name (bfOff). Parse them to recover the stored
+	// backing format (extBackingFormat) instead of re-probing later — a
+	// probe can race or disagree with what qemu-img wrote, and Compact
+	// must rebuild with the SAME format the source declared.
+	extEnd := bfOff
+	if extEnd == 0 {
+		extEnd = uint64(qcow2HeaderLen) // no backing name: extensions still end with the 0-marker
+	}
+	// Extensions live in cluster 0 AFTER the fixed header, so hdrBuf
+	// (only qcow2HeaderLen bytes) does not cover them. Read the whole
+	// cluster 0 once, if it actually contains extensions.
+	var extBuf []byte
+	if extEnd > uint64(qcow2HeaderLen) {
+		if extEnd < uint64(qcow2HeaderLen) || extEnd > q.clusterSize {
+			f.Close()
+			return nil, fmt.Errorf("cow: invalid header extension region in %s (end=%#x)", path, extEnd)
+		}
+		extBuf = make([]byte, extEnd)
+		if _, err := f.ReadAt(extBuf, 0); err != nil && err != io.EOF {
+			f.Close()
+			return nil, fmt.Errorf("cow: read header extensions of %s: %w", path, err)
+		}
+	}
+	e := uint64(qcow2HeaderLen)
+	for e+8 <= extEnd {
+		var magic, elen uint32
+		if e+8 <= uint64(len(hdrBuf)) {
+			magic = binary.BigEndian.Uint32(hdrBuf[e:])
+			elen = binary.BigEndian.Uint32(hdrBuf[e+4:])
+		} else {
+			magic = binary.BigEndian.Uint32(extBuf[e:])
+			elen = binary.BigEndian.Uint32(extBuf[e+4:])
+		}
+		if magic == 0 { // end-of-extensions marker
+			break
+		}
+		dataOff := e + 8
+		if uint64(elen) > extEnd-dataOff {
+			f.Close()
+			return nil, fmt.Errorf("cow: header extension %#x overflows header in %s", magic, path)
+		}
+		if magic == extBackingFormat && elen > 0 {
+			q.backingFormat = string(extBuf[dataOff : dataOff+uint64(elen)])
+		}
+		e = dataOff + roundUp8(uint64(elen))
+	}
 	if bfSize > 0 {
 		if bfSize > 4096 {
 			f.Close()
@@ -521,8 +574,17 @@ func openGuestImage(path string) (guestImage, error) {
 			return nil, fmt.Errorf("cow: read backing name in %s: %w", path, err)
 		}
 		backingPath := string(name)
+		// Preserve the original backing name in the header (pre-Abs) so a
+		// rebuild can re-emit it verbatim; resolve a separate absolute copy
+		// for actually opening the file and for Compact's rebuild target.
+		q.hdr.backingFile = backingPath
+		absBacking, err := filepath.Abs(filepath.Join(filepath.Dir(path), backingPath))
+		if err != nil {
+			f.Close()
+			return nil, fmt.Errorf("cow: resolve backing path of %s: %w", path, err)
+		}
 		if !filepath.IsAbs(backingPath) {
-			backingPath = filepath.Join(filepath.Dir(path), backingPath)
+			backingPath = absBacking
 		}
 		backing, err := openGuestImage(backingPath)
 		if err != nil {
@@ -530,7 +592,7 @@ func openGuestImage(path string) (guestImage, error) {
 			return nil, fmt.Errorf("cow: open backing of %s: %w", path, err)
 		}
 		q.backing = backing
-		q.backingAbs = backingPath
+		q.backingAbs = backingPath // absolute; see filepath.Abs above
 	}
 	return q, nil
 }

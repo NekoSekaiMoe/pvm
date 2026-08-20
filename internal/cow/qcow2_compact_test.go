@@ -3,6 +3,9 @@ package cow
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -37,7 +40,7 @@ type writeOp struct {
 func buildOverlayWithWrites(t *testing.T, dir string, ops []writeOp) (overlay string, view []byte) {
 	t.Helper()
 	base := filepath.Join(dir, "base.img")
-	// Sparse nonzero backing: every byte = pattern, so a dropped cluster
+	// Nonzero backing: every byte = pattern, so a dropped cluster
 	// (reads-through-to-backing) is distinguishable from a zero cluster.
 	view = make([]byte, compactVirtual)
 	for i := range view {
@@ -73,7 +76,7 @@ func assertView(t *testing.T, path string, want []byte) {
 	defer img.Close()
 	got := make([]byte, len(want))
 	n, err := img.ReadAt(got, 0)
-	if err != nil && err.Error() != "EOF" {
+	if err != nil && !errors.Is(err, io.EOF) {
 		t.Fatalf("ReadAt: %v", err)
 	}
 	if n != len(want) {
@@ -87,42 +90,73 @@ func assertView(t *testing.T, path string, want []byte) {
 					i, i/clusterSize, got[i], want[i])
 			}
 		}
+		// Unreachable when bytes.Equal genuinely disagrees (the loop above
+		// must find the differing byte), but guard against a silent pass.
+		t.Fatalf("%s view differs from expected but no differing byte was localized", path)
 	}
 }
 
 // TestCompact_PreservesContent covers the core semantics across the write
 // patterns that matter: data writes, explicit zeros over nonzero backing,
 // untouched (backing-read-through) clusters, and a far cluster forcing a
-// second L2 table.
+// second L2 table. Each scenario is a t.Run row over a write-ops table.
 func TestCompact_PreservesContent(t *testing.T) {
-	dir := t.TempDir()
 	zeroCluster := make([]byte, clusterSize) // explicit zeros
-	ops := []writeOp{
-		{0, patterned(0x77, clusterSize)},   // data cluster, first L2 table
-		{5, zeroCluster},                    // ZERO cluster shadowing nonzero backing
-		{513, patterned(0x33, clusterSize)}, // data cluster, second L2 table
-		{514, zeroCluster},                  // ZERO cluster in the second L2 table
-	}
-	overlay, want := buildOverlayWithWrites(t, dir, ops)
+	totalClusters := compactVirtual / clusterSize
+	for _, tc := range []struct {
+		name         string
+		ops          []writeOp
+		wantCopied   int64
+		wantZeroed   int64
+		wantDropped  int64 // totalClusters - clusters touched by ops
+	}{
+		{
+			"mixed_first_and_second_l2",
+			[]writeOp{
+				{0, patterned(0x77, clusterSize)},   // data cluster, first L2 table
+				{5, zeroCluster},                    // ZERO cluster shadowing nonzero backing
+				{513, patterned(0x33, clusterSize)}, // data cluster, second L2 table
+				{514, zeroCluster},                  // ZERO cluster in the second L2 table
+			},
+			2, 2, int64(totalClusters) - 4,
+		},
+		{
+			"single_data_cluster",
+			[]writeOp{
+				{2, patterned(0x55, clusterSize)},
+			},
+			1, 0, int64(totalClusters) - 1,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			overlay, want := buildOverlayWithWrites(t, dir, tc.ops)
 
-	st0, _ := os.Stat(overlay)
-	stats, err := Compact(context.Background(), overlay)
-	if err != nil {
-		t.Fatalf("Compact: %v", err)
-	}
-	st1, _ := os.Stat(overlay)
-	t.Logf("before=%d after=%d stats=%+v", st0.Size(), st1.Size(), stats)
+			st0, _ := os.Stat(overlay)
+			stats, err := Compact(context.Background(), overlay)
+			if err != nil {
+				t.Fatalf("Compact: %v", err)
+			}
+			st1, _ := os.Stat(overlay)
+			t.Logf("before=%d after=%d stats=%+v", st0.Size(), st1.Size(), stats)
 
-	assertView(t, overlay, want)
+			assertView(t, overlay, want)
 
-	if stats.ClustersCopied != 2 {
-		t.Errorf("ClustersCopied = %d, want 2", stats.ClustersCopied)
-	}
-	if stats.ClustersZeroed != 2 {
-		t.Errorf("ClustersZeroed = %d, want 2", stats.ClustersZeroed)
-	}
-	if st1.Size() >= st0.Size() {
-		t.Errorf("size did not shrink: before=%d after=%d", st0.Size(), st1.Size())
+			if stats.ClustersCopied != tc.wantCopied {
+				t.Errorf("ClustersCopied = %d, want %d", stats.ClustersCopied, tc.wantCopied)
+			}
+			if stats.ClustersZeroed != tc.wantZeroed {
+				t.Errorf("ClustersZeroed = %d, want %d", stats.ClustersZeroed, tc.wantZeroed)
+			}
+			// Every cluster NOT written by the ops is unallocated and reads
+			// through to the backing, so it must be counted as dropped.
+			if stats.ClustersDropped != tc.wantDropped {
+				t.Errorf("ClustersDropped = %d, want %d", stats.ClustersDropped, tc.wantDropped)
+			}
+			if st1.Size() >= st0.Size() {
+				t.Errorf("size did not shrink: before=%d after=%d", st0.Size(), st1.Size())
+			}
+		})
 	}
 }
 
@@ -145,7 +179,7 @@ func TestCompact_ZeroClusterShadowsBacking(t *testing.T) {
 	// must report zero there post-compact.
 	img := openGuestImageFile(t, overlay)
 	got := make([]byte, clusterSize)
-	if _, err := img.ReadAt(got, int64(10)*int64(clusterSize)); err != nil && err.Error() != "EOF" {
+	if _, err := img.ReadAt(got, int64(10)*int64(clusterSize)); err != nil && !errors.Is(err, io.EOF) {
 		t.Fatalf("ReadAt: %v", err)
 	}
 	img.Close()
@@ -195,9 +229,9 @@ func TestCompact_PartialTrailingCluster(t *testing.T) {
 // zero, so the only thing to preserve is the written data.
 func TestCompact_StandaloneImage(t *testing.T) {
 	dir := t.TempDir()
-	// Build a standalone qcow2 by creating an overlay with no backing, then
-	// writing some clusters. createQcow2 rejects empty backing? No: it writes
-	// a standalone image when backingPath == "".
+	// Build a standalone qcow2 (no backing) by passing an empty backing
+	// path to createQcow2, then writing some clusters. An empty backingPath
+	// produces a standalone image.
 	img := filepath.Join(dir, "standalone.qcow2")
 	if err := createQcow2(img, compactVirtual, "", "", defaultOverlayOpt); err != nil {
 		t.Fatalf("createQcow2: %v", err)
@@ -279,5 +313,68 @@ func TestCompact_RejectsCompressed(t *testing.T) {
 
 	if _, err := Compact(context.Background(), overlay); err == nil {
 		t.Fatalf("Compact on compressed-cluster image: expected error, got nil")
+	}
+}
+
+// TestCompact_RejectsInternalSnapshots: an image whose header declares
+// internal snapshots (nb_snapshots > 0) must be rejected, because the L1
+// active-table walk would skip snapshot-only clusters and silently drop them.
+// We simulate a foreign image by poking the header's snapshots/
+// snapshots_offset fields directly (our own create path never writes them).
+func TestCompact_RejectsInternalSnapshots(t *testing.T) {
+	dir := t.TempDir()
+	base := filepath.Join(dir, "base.img")
+	mustWriteRaw(t, base, 0, patterned(0x10, 2*clusterSize))
+	overlay := filepath.Join(dir, "overlay.qcow2")
+	if err := CreateOverlay(context.Background(), base, overlay); err != nil {
+		t.Fatalf("CreateOverlay: %v", err)
+	}
+	w := openWritable(t, overlay)
+	qw := w.(*qcow2Writable)
+	// nb_snapshots at 0x3C (u32), snapshots_offset at 0x40 (u64). Set both to
+	// nonzero to trip the guard without pointing at real snapshot data.
+	var hdr [12]byte
+	binary.BigEndian.PutUint32(hdr[0:], 1)          // nb_snapshots = 1
+	binary.BigEndian.PutUint64(hdr[4:], 0x10000)    // snapshots_offset (nonzero)
+	if _, err := qw.f.WriteAt(hdr[:], 0x3C); err != nil {
+		w.Close()
+		t.Fatalf("poke header: %v", err)
+	}
+	if err := qw.Sync(); err != nil {
+		w.Close()
+		t.Fatalf("Sync: %v", err)
+	}
+	w.Close()
+
+	if _, err := Compact(context.Background(), overlay); err == nil {
+		t.Fatalf("Compact on image with internal snapshots: expected error, got nil")
+	}
+}
+
+// TestCompact_RejectsZeroVirtualSize: an image whose header reports a zero
+// virtual size must be rejected (nothing meaningful to compact; createQcow2
+// never produces one, but a foreign/corrupt image could). We craft it by
+// creating a valid image and then poking the size field (0x18) to 0.
+func TestCompact_RejectsZeroVirtualSize(t *testing.T) {
+	dir := t.TempDir()
+	img := filepath.Join(dir, "standalone.qcow2")
+	if err := createQcow2(img, uint64(clusterSize), "", "", defaultOverlayOpt); err != nil {
+		t.Fatalf("createQcow2: %v", err)
+	}
+	w := openWritable(t, img)
+	qw := w.(*qcow2Writable)
+	// virtual disk size at 0x18 (u64). Zero it.
+	if _, err := qw.f.WriteAt(make([]byte, 8), 0x18); err != nil {
+		w.Close()
+		t.Fatalf("poke header: %v", err)
+	}
+	if err := qw.Sync(); err != nil {
+		w.Close()
+		t.Fatalf("Sync: %v", err)
+	}
+	w.Close()
+
+	if _, err := Compact(context.Background(), img); err == nil {
+		t.Fatalf("Compact on zero-virtual-size image: expected error, got nil")
 	}
 }

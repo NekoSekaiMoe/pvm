@@ -65,6 +65,17 @@ func ConvertToQcow2(ctx context.Context, srcPath, destPath string, opt OverlayOp
 	if err != nil {
 		return fmt.Errorf("cow: resolve dest: %w", err)
 	}
+	// Same-file guard: creating the dest with O_TRUNC would truncate the
+	// source mid-read, destroying data before we ever finish converting. Use
+	// os.SameFile (handles symlinks/hardlinks/relative-vs-absolute) and reject
+	// without touching either file when src and dest resolve to the same inode.
+	if sf, dErr := os.Stat(absSrc); dErr == nil {
+		if df, dErr2 := os.Stat(absDst); dErr2 == nil {
+			if os.SameFile(sf, df) {
+				return fmt.Errorf("cow: convert: source and destination are the same file: %s", absDst)
+			}
+		}
+	}
 	if err := os.MkdirAll(filepath.Dir(absDst), 0755); err != nil {
 		return fmt.Errorf("cow: create dest dir: %w", err)
 	}
@@ -82,18 +93,39 @@ func ConvertToQcow2(ctx context.Context, srcPath, destPath string, opt OverlayOp
 	if opt.ClusterBits == 0 {
 		opt.ClusterBits = clusterBits
 	}
+	// Build into a sibling temp file in the SAME directory as the dest so
+	// the final rename is atomic on the same filesystem; a crash or failure
+	// leaves the original dest (if any) untouched. createQcow2 opens with
+	// O_TRUNC, so writing absDst directly would clobber it before we know the
+	// conversion succeeded.
+	tmp := absDst + ".convert.tmp"
+	_ = os.Remove(tmp)
+	tmpCreated := false
+	cleanupTmp := func() {
+		if tmpCreated {
+			_ = os.Remove(tmp)
+		}
+	}
 	// Standalone qcow2 (no backing). Preallocated metadata is pointless for a
 	// conversion output and would bloat the dest; force it off unless the
 	// caller is explicit — opt.PreallocMetadata true keeps what they asked.
-	if err := createQcow2(absDst, virtualSize, "", "", opt); err != nil {
+	if err := createQcow2(tmp, virtualSize, "", "", opt); err != nil {
 		return fmt.Errorf("cow: convert: create dest qcow2: %w", err)
 	}
+	tmpCreated = true
 
-	w, err := OpenWritable(absDst)
+	w, err := OpenWritable(tmp)
 	if err != nil {
+		cleanupTmp()
 		return fmt.Errorf("cow: convert: open dest: %w", err)
 	}
-	defer w.Close()
+	// closeAndCleanup closes w and removes tmp; called on every error return.
+	// Rename happens only after an explicit successful close below, so we do
+	// NOT defer w.Close() — that would close twice.
+	closeAndCleanup := func() {
+		w.Close()
+		cleanupTmp()
+	}
 
 	// Stream the source through in cluster-sized chunks (aligned to the dest
 	// cluster geometry so each write hits WriteAt's full-cluster fast path —
@@ -116,6 +148,7 @@ func ConvertToQcow2(ctx context.Context, srcPath, destPath string, opt OverlayOp
 	buf := make([]byte, bufLen)
 	for off := uint64(0); off < virtualSize; off += bufLen {
 		if err := ctx.Err(); err != nil {
+			closeAndCleanup()
 			return err
 		}
 		n := bufLen
@@ -134,6 +167,7 @@ func ConvertToQcow2(ctx context.Context, srcPath, destPath string, opt OverlayOp
 		chunk := buf[:n]
 		m, err := src.ReadAt(chunk, int64(off))
 		if err != nil && err != io.EOF {
+			closeAndCleanup()
 			return fmt.Errorf("cow: convert: read src at %#x: %w", off, err)
 		}
 		if uint64(m) < n {
@@ -143,13 +177,26 @@ func ConvertToQcow2(ctx context.Context, srcPath, destPath string, opt OverlayOp
 		for c := uint64(0); c < n; c += cs {
 			if !allZero(chunk[c : c+cs]) {
 				if _, err := w.WriteAt(chunk[c:c+cs], int64(off+c)); err != nil {
+					closeAndCleanup()
 					return fmt.Errorf("cow: convert: write dest at %#x: %w", off+c, err)
 				}
 			}
 		}
 	}
+	// Sync, then close BEFORE renaming: an open writer would race the rename
+	// and leave the replaced file with an unflushed buffer. A sync or close
+	// failure aborts and cleans up tmp, leaving absDst untouched.
 	if err := w.Sync(); err != nil {
+		closeAndCleanup()
 		return fmt.Errorf("cow: convert: sync dest: %w", err)
+	}
+	if err := w.Close(); err != nil {
+		cleanupTmp()
+		return fmt.Errorf("cow: convert: close dest: %w", err)
+	}
+	if err := os.Rename(tmp, absDst); err != nil {
+		cleanupTmp()
+		return fmt.Errorf("cow: convert: rename into place: %w", err)
 	}
 	return nil
 }
