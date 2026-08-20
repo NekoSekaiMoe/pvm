@@ -8,10 +8,12 @@ package cow
 import (
 	"context"
 	"encoding/binary"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // forgeCluster0 applies fn to cluster 0 of the image at path and writes it
@@ -135,9 +137,10 @@ func TestQcow2BackingNameRegionOutOfBounds(t *testing.T) {
 		{"crosses_cluster0", clusterSize - 2, 16},     // straddles the boundary
 		{"beyond_cluster0", 2 * clusterSize, 8},       // wholly outside
 		{"before_header", 32, 8},                      // inside the fixed header
-		{"end_at_cluster_edge", clusterSize - 4, 8},   // end == clusterSize allowed
-		{"end_past_cluster_edge", clusterSize - 4, 9}, // end == clusterSize+1 rejected
+		{"end_at_cluster_edge", clusterSize - 8, 8},   // bfOff+bfSize == clusterSize: allowed
+		{"end_past_cluster_edge", clusterSize - 4, 9}, // bfOff+bfSize > clusterSize: rejected
 	} {
+		wantErr := tc.bfOff < qcow2V3HeaderLen || tc.bfOff > clusterSize || uint64(tc.bfSize) > clusterSize-tc.bfOff
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
 			base := filepath.Join(dir, "base.img")
@@ -149,20 +152,42 @@ func TestQcow2BackingNameRegionOutOfBounds(t *testing.T) {
 			forgeCluster0(t, overlay, func(c0 []byte) {
 				binary.BigEndian.PutUint64(c0[0x08:], tc.bfOff)
 				binary.BigEndian.PutUint32(c0[0x10:], tc.bfSize)
+				if !wantErr {
+					// In-bounds regions must carry a REAL backing name that
+					// fits exactly in [bfOff, bfOff+bfSize), so the allowed
+					// boundary case exercises the successful open path
+					// (zero bytes would fail backing resolution instead of
+					// the boundary check under test).
+					copy(c0[tc.bfOff:], "base.img")
+				}
 			})
 
-			_, err := openGuestImage(overlay)
-			wantErr := tc.bfOff < qcow2V3HeaderLen || tc.bfOff > clusterSize || uint64(tc.bfSize) > clusterSize-tc.bfOff
+			img, err := openGuestImage(overlay)
 			if wantErr && err == nil {
 				t.Fatalf("bfOff=%#x bfSize=%d: expected rejection, got nil (backing name read out of bounds)", tc.bfOff, tc.bfSize)
 			}
-			if !wantErr && err != nil {
-				t.Fatalf("bfOff=%#x bfSize=%d: valid region rejected: %v", tc.bfOff, tc.bfSize, err)
+			if !wantErr {
+				if err != nil {
+					t.Fatalf("bfOff=%#x bfSize=%d: valid region rejected: %v", tc.bfOff, tc.bfSize, err)
+				}
+				// The in-bounds name resolved a live chain; assert it and
+				// close so the test never leaks the overlay+backing fds.
+				q, ok := img.(*qcow2Image)
+				if !ok {
+					t.Fatalf("openGuestImage returned %T, want *qcow2Image", img)
+				}
+				if q.backing == nil || !strings.HasSuffix(q.backingAbs, "base.img") {
+					t.Errorf("bfOff=%#x bfSize=%d: backing not resolved (backing=%v backingAbs=%q)", tc.bfOff, tc.bfSize, q.backing != nil, q.backingAbs)
+				}
+				if err := img.Close(); err != nil {
+					t.Errorf("close opened image: %v", err)
+				}
+				return
 			}
 			// Cases the older extension-region checks already catch are rejected
 			// with their own message; only boundary-straddling regions reach the
 			// new backing-name check.
-			if wantErr && err != nil && tc.bfOff >= qcow2V3HeaderLen && tc.bfOff <= clusterSize && !strings.Contains(err.Error(), "invalid backing name region") {
+			if err != nil && tc.bfOff >= qcow2V3HeaderLen && tc.bfOff <= clusterSize && !strings.Contains(err.Error(), "invalid backing name region") {
 				t.Errorf("bfOff=%#x bfSize=%d: error should mention invalid backing name region, got: %v", tc.bfOff, tc.bfSize, err)
 			}
 		})
@@ -201,5 +226,84 @@ func TestConvertDestModeMirrorsSource(t *testing.T) {
 		if st.Mode().Perm() != mode {
 			t.Errorf("source %o: dest mode = %o, want %o (CreateTemp 0600 leaked through rename?)", mode, st.Mode().Perm(), mode)
 		}
+	}
+}
+
+// TestConvertDestModeSurvivesSourcePathUnlink: the mode captured for the
+// chmod must come from the OPEN source descriptor, not a post-copy
+// os.Stat(srcPath). A symlink source unlinked (or replaced) mid-convert
+// keeps the conversion alive via its open fd, but the late path stat would
+// fail — previously the chmod was then silently skipped and the dest leaked
+// os.CreateTemp's 0600 through the rename.
+func TestConvertDestModeSurvivesSourcePathUnlink(t *testing.T) {
+	dir := t.TempDir()
+	// A deep overlay chain so the copy loop runs long enough for the
+	// unlink to land strictly between openGuestImage and the final chmod.
+	base := filepath.Join(dir, "base.img")
+	mustWriteRaw(t, base, 0, patterned(0x41, clusterSize))
+	prev := base
+	for i := 0; i < 30; i++ {
+		ov := filepath.Join(dir, fmt.Sprintf("ov%d.qcow2", i))
+		if err := CreateOverlay(context.Background(), prev, ov); err != nil {
+			t.Fatalf("CreateOverlay %d: %v", i, err)
+		}
+		if err := os.Chmod(ov, 0644); err != nil {
+			t.Fatal(err)
+		}
+		prev = ov
+	}
+	link := filepath.Join(dir, "link.qcow2")
+	if err := os.Symlink(prev, link); err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		time.Sleep(2 * time.Millisecond)
+		os.Remove(link) // open fd survives; only the path stat breaks
+	}()
+	dst := filepath.Join(dir, "dst.qcow2")
+	if err := ConvertToQcow2(context.Background(), link, dst, ConvertDefaultOpt); err != nil {
+		t.Fatalf("ConvertToQcow2 via open fd: %v", err)
+	}
+	st, err := os.Stat(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Mode().Perm() != 0644 {
+		t.Errorf("dest mode = %o, want 0644 (post-copy os.Stat(src) silently skipped the chmod?)", st.Mode().Perm())
+	}
+}
+
+// TestQcow2StandaloneTruncatedExtensionRegion: a standalone image whose file
+// ends before the cluster-0 extension region it declares must be rejected.
+// Previously the extension ReadAt tolerated io.EOF and scanned the zero
+// filled tail, where zeros parse as an end-of-extensions marker — silently
+// accepting a truncated (or hand-crafted undersized) image as well-formed.
+func TestQcow2StandaloneTruncatedExtensionRegion(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src.img")
+	mustWriteRaw(t, src, 0, patterned(0x43, 4*clusterSize))
+	img := filepath.Join(dir, "trunc.qcow2")
+	if err := ConvertToQcow2(context.Background(), src, img, ConvertDefaultOpt); err != nil {
+		t.Fatalf("ConvertToQcow2: %v", err)
+	}
+	// Rebuild cluster 0 as a foreign standalone image (bfOff=0 ⇒ extension
+	// region runs to clusterSize), then TRUNCATE the file mid-cluster so the
+	// region extends past EOF.
+	forgeCluster0(t, img, func(c0 []byte) {
+		clear(c0[qcow2V3HeaderLen:])
+		binary.BigEndian.PutUint32(c0[0x64:], qcow2V3HeaderLen)
+		binary.BigEndian.PutUint64(c0[0x08:], 0) // no backing name
+		binary.BigEndian.PutUint32(c0[0x10:], 0)
+	})
+	if err := os.Truncate(img, int64(clusterSize/2)); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := openGuestImage(img)
+	if err == nil {
+		t.Fatal("open image with truncated extension region: expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "read header extensions") {
+		t.Errorf("error should come from the extension read, got: %v", err)
 	}
 }

@@ -309,22 +309,31 @@ type guestImage interface {
 	// magic, used to cross-check a header-DECLARED backing format against
 	// what the backing file actually is.
 	Format() string
+	// Mode reports the permission bits of the opened file (from its fd, so
+	// it stays correct even if the path is replaced or unlinked after
+	// open). Convert mirrors it onto the destination before rename.
+	Mode() os.FileMode
 	Close() error
 }
 
 type rawImage struct {
 	f    *os.File
 	size uint64
+	// mode is the permission bits captured from the fd at open time (see
+	// guestImage.Mode).
+	mode os.FileMode
 }
 
 func (r *rawImage) ReadAt(p []byte, off int64) (int, error) { return r.f.ReadAt(p, off) }
 func (r *rawImage) Size() uint64                            { return r.size }
 func (r *rawImage) Format() string                          { return "raw" }
+func (r *rawImage) Mode() os.FileMode                       { return r.mode.Perm() }
 func (r *rawImage) Close() error                            { return r.f.Close() }
 
 type qcow2Image struct {
-	f   *os.File
-	hdr qcow2Header
+	f    *os.File
+	hdr  qcow2Header
+	mode os.FileMode // permission bits captured from the fd at open time (see guestImage.Mode)
 	// Cluster geometry is per-image (cluster_bits lives in the header at
 	// 0x14); images we created with other cluster sizes — or foreign images —
 	// must read with THEIR geometry, not the package default.
@@ -352,6 +361,12 @@ type qcow2Image struct {
 }
 
 func (q *qcow2Image) Size() uint64 { return q.hdr.size }
+func (q *qcow2Image) Mode() os.FileMode {
+	// Captured from the fd at open time, so a path swapped mid-convert
+	// cannot leak the wrong (or CreateTemp's default 0600) mode into the
+	// destination of a conversion.
+	return q.mode.Perm()
+}
 func (q *qcow2Image) Close() error {
 	err := q.f.Close()
 	if q.backing != nil {
@@ -492,7 +507,7 @@ func openGuestImage(path string) (guestImage, error) {
 			f.Close()
 			return nil, err
 		}
-		return &rawImage{f: f, size: uint64(st.Size())}, nil
+		return &rawImage{f: f, size: uint64(st.Size()), mode: st.Mode()}, nil
 	}
 
 	var hdrBuf [qcow2HeaderLen]byte
@@ -522,6 +537,11 @@ func openGuestImage(path string) (guestImage, error) {
 		clusterBits: cb,
 		clusterSize: uint64(1) << cb,
 		clusterMask: (uint64(1) << cb) - 1,
+	}
+	// Permission bits from the fd (see guestImage.Mode); captured before
+	// any parsing can fail so the field is always populated.
+	if st, err := f.Stat(); err == nil {
+		q.mode = st.Mode()
 	}
 	q.hdr = qcow2Header{
 		size:             binary.BigEndian.Uint64(hdrBuf[0x18:]),
@@ -584,8 +604,16 @@ func openGuestImage(path string) (guestImage, error) {
 			return nil, fmt.Errorf("cow: invalid header extension region in %s (end=%#x)", path, extEnd)
 		}
 		extBuf = make([]byte, extEnd)
-		if _, err := f.ReadAt(extBuf, 0); err != nil && err != io.EOF {
+		// The extension region must be fully present in the file: a short
+		// read (including io.EOF from a truncated/undersized image) would
+		// leave extBuf zero-filled, and zero-filled bytes parse as an
+		// end-of-extensions marker — silently accepting an image whose
+		// header was cut off. Require the full len(extBuf) bytes.
+		if n, err := f.ReadAt(extBuf, 0); err != nil || uint64(n) != extEnd {
 			f.Close()
+			if err == nil {
+				err = io.ErrUnexpectedEOF
+			}
 			return nil, fmt.Errorf("cow: read header extensions of %s: %w", path, err)
 		}
 	} else if extEnd < hdrLen {

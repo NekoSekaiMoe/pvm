@@ -122,6 +122,13 @@ func ConvertToQcow2(ctx context.Context, srcPath, destPath string, opt OverlayOp
 		return fmt.Errorf("cow: convert: open src: %w", err)
 	}
 	defer src.Close()
+	// Capture the source's permission bits from the ALREADY-OPEN descriptor
+	// right here, before any copying: statting the PATH after the copy would
+	// silently skip the chmod below whenever the path was replaced or
+	// unlinked mid-convert (the open fd keeps the conversion alive), leaking
+	// os.CreateTemp's 0600 through the final rename.
+	srcMode := src.Mode()
+
 	// Now that the chain is OPEN (and its backing inodes known), re-check
 	// the destination against every member: converting onto the overlay's
 	// own backing would let the final rename replace a file a live overlay
@@ -253,16 +260,14 @@ func ConvertToQcow2(ctx context.Context, srcPath, destPath string, opt OverlayOp
 	// creates it 0600 (umask cannot widen that), and createQcow2's O_CREATE
 	// open of the already-existing temp file does not change the mode, so
 	// without an explicit chmod the renamed result would keep 0600 no matter
-	// what the source allowed. Mirror the source's permission bits instead
-	// of a fixed constant — a source under a private (0600) task dir must
-	// stay 0600 — exactly the policy Compact already applies. A chmod
-	// failure is fatal: do NOT rename a file with the wrong mode and pretend
-	// success.
-	if st, serr := os.Stat(absSrc); serr == nil {
-		if err := os.Chmod(tmp, st.Mode().Perm()); err != nil {
-			cleanupTmp()
-			return fmt.Errorf("cow: convert: align dest mode: %w", err)
-		}
+	// what the source allowed. Mirror the permission bits captured from the
+	// source descriptor at open time (srcMode) — a source under a private
+	// (0600) task dir must stay 0600 — exactly the policy Compact applies.
+	// Unconditional: the mode is known by construction, and a chmod failure is
+	// fatal — do NOT rename a file with the wrong mode and pretend success.
+	if err := os.Chmod(tmp, srcMode); err != nil {
+		cleanupTmp()
+		return fmt.Errorf("cow: convert: align dest mode: %w", err)
 	}
 	if err := os.Rename(tmp, absDst); err != nil {
 		cleanupTmp()
