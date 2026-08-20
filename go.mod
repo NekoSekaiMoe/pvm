@@ -10,6 +10,8 @@ require (
 	golang.org/x/sys v0.30.0
 )
 
+require github.com/google/uuid v1.6.0 // indirect
+
 require (
 	github.com/BurntSushi/toml v1.2.1
 	github.com/containerd/stargz-snapshotter/estargz v0.14.3 // indirect

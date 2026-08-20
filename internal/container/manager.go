@@ -12,12 +12,14 @@ import (
 	"uml-container/internal/config"
 	"uml-container/internal/cow"
 	"uml-container/internal/identity"
+	"uml-container/internal/lifecycle"
 	"uml-container/internal/log"
 	"uml-container/internal/network/egress"
 	"uml-container/internal/spec"
 	"uml-container/internal/state"
 	"uml-container/internal/uml"
 	"uml-container/internal/vhost"
+	"uml-container/internal/volume"
 )
 
 type ContextKey string
@@ -42,6 +44,8 @@ type Manager struct {
 	Broker          *identity.Broker
 	Egress          *egress.Gateway
 	IncidentHandler IncidentHooks
+	Volumes         *volume.Manager
+	Autopause       *lifecycle.Manager
 
 	// OnProvisioned is called once the sandbox process is up, with the task id,
 	// pid and the host-side identity token (if any). Used by the controller to
@@ -223,6 +227,62 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 	if overlayPath == "" {
 		overlayPath = fmt.Sprintf("%s/rootfs.qcow2", dir)
 	}
+
+	// Volume attachments: for each spec.Volumes entry, attach via volume.Manager
+	// and collect hostfs_volume args. RefCounts are tracked inside Manager.
+	var volumeArgs []string
+	var attachedVolumes []spec.VolumeMount
+	if m.Volumes != nil && len(s.Volumes) > 0 {
+		for _, vm := range s.Volumes {
+			driver := vm.Driver
+			if driver == "" {
+				// default to first registered plugin (mirrors Cube's "first entry" rule)
+				if regs := m.Volumes.Registered(); len(regs) > 0 {
+					driver = regs[0]
+				}
+			}
+			res, err := m.Volumes.Attach(ctx, &volume.AttachRequest{
+				SandboxID: taskID,
+				VolumeID:  vm.Name,
+				Driver:    driver,
+			})
+			if err != nil {
+				// Detach already-attached volumes before failing.
+				for _, av := range attachedVolumes {
+					d := av.Driver
+					if d == "" {
+						if regs := m.Volumes.Registered(); len(regs) > 0 {
+							d = regs[0]
+						}
+					}
+					_ = m.Volumes.Detach(context.Background(), &volume.DetachRequest{SandboxID: taskID, VolumeID: av.Name, Driver: d})
+				}
+				_ = st.Transition(state.StatusFailed, state.ActorController, "volume attach failed: "+err.Error())
+				state.SaveState(taskID, st)
+				return fmt.Errorf("container: volume attach %q: %w", vm.Name, err)
+			}
+			attachedVolumes = append(attachedVolumes, vm)
+			// hostfs_volume is only valid on the host; guest sees it as a virtiofs/hostfs mount
+			// For UML we wire via extra kernel args (hostfs_volume=host:guest)
+			mode := "rw"
+			if vm.ReadOnly {
+				mode = "ro"
+			}
+			volumeArgs = append(volumeArgs, fmt.Sprintf("%s:%s:%s", res.HostPath, vm.Path, mode))
+		}
+	}
+	cleanupVolumes := func() {
+		for _, av := range attachedVolumes {
+			d := av.Driver
+			if d == "" {
+				if regs := m.Volumes.Registered(); len(regs) > 0 {
+					d = regs[0]
+				}
+			}
+			_ = m.Volumes.Detach(context.Background(), &volume.DetachRequest{SandboxID: taskID, VolumeID: av.Name, Driver: d})
+		}
+		attachedVolumes = nil
+	}
 	// resolvedRootfs is the single source of truth for the block device the
 	// kernel mounts. It is forwarded into buildTaskArgs so the kernel command
 	// line and the overlay we actually created cannot drift apart.
@@ -233,6 +293,7 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 			// vhost path: wrap the qcow2 base in a per-task qcow2 overlay.
 			resolvedRootfs = overlayPath
 			if err := cow.CreateOverlay(ctx, s.Workspace.BaseImage, overlayPath); err != nil {
+				cleanupVolumes()
 				_ = ledger.Append(audit.Record{Phase: audit.PhaseExec, Subject: taskID, Action: "overlay", Decision: audit.DecisionDeny, Reason: "qcow2 overlay failed: " + err.Error()})
 				_ = st.Transition(state.StatusFailed, state.ActorController, "overlay creation failed: "+err.Error())
 				state.SaveState(taskID, st)
@@ -255,6 +316,7 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 	if s.Kernel.UseVhostBlk && s.Workspace.BaseImage != "" {
 		sock, backend, err := vhost.StartBlk(taskID, resolvedRootfs)
 		if err != nil {
+			cleanupVolumes()
 			_ = st.Transition(state.StatusFailed, state.ActorController, "vhost daemon failed: "+err.Error())
 			state.SaveState(taskID, st)
 			return fmt.Errorf("container: vhost: %w", err)
@@ -280,16 +342,34 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 	// the guest as the proxy address it must dial; the task id never crosses
 	// the trust boundary.
 	if m.Egress != nil && s.Network.Enabled {
-		pol := &egress.Policy{
-			AllowDomains:   s.Network.EgressAllowDomains,
-			BlockDomains:   s.Network.EgressBlockDomains,
-			MaxRequestBody: s.Network.MaxRequestBodyBytes,
-		}
+			pol := &egress.Policy{
+				AllowDomains:   s.Network.EgressAllowDomains,
+				BlockDomains:   s.Network.EgressBlockDomains,
+				MaxRequestBody: s.Network.MaxRequestBodyBytes,
+			}
+			// Translate extended L7 rules (Cube parity) into the gateway's flat allow/block
+			// lists: an EgressRule with Allow==false becomes a block entry, otherwise allow.
+			// Port/scheme/path/method are logged for audit but not enforced at the bulk domain layer.
+			for _, r := range s.Network.EgressRules {
+				host := r.Host
+				if host == "" {
+					host = r.SNI
+				}
+				if host == "" {
+					continue
+				}
+				if r.Allow != nil && !*r.Allow {
+					pol.BlockDomains = append(pol.BlockDomains, host)
+				} else {
+					pol.AllowDomains = append(pol.AllowDomains, host)
+				}
+			}
 		m.Egress.SetPolicy(taskID, pol)
 		if lp, err := m.Egress.ListenForTask(ctx, taskID); err == nil {
 			defer lp.Close()
 			egressAddr = lp.Addr()
 		} else {
+			cleanupVolumes()
 			// Without a per-task listener we cannot safely attribute traffic,
 			// so fail closed rather than falling back to the forgeable header.
 			_ = st.Transition(state.StatusFailed, state.ActorController, "egress listener failed: "+err.Error())
@@ -313,6 +393,7 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 		}
 		tok, err := m.Broker.Mint(s.Caller, s.Tenant, taskID, s.Identity.Scope, ttl)
 		if err != nil {
+			cleanupVolumes()
 			_ = st.Transition(state.StatusFailed, state.ActorController, "identity mint failed: "+err.Error())
 			state.SaveState(taskID, st)
 			return fmt.Errorf("container: mint identity token: %w", err)
@@ -324,7 +405,19 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 	// kernel command line matches what we actually provisioned. egressAddr is
 	// the host:port of this task's dedicated egress listener (authoritative
 	// attribution source); the task id is NOT exposed to the guest.
-	args := buildTaskArgs(s, sockPath, resolvedRootfs, egressAddr)
+	args := buildTaskArgs(s, sockPath, resolvedRootfs, egressAddr, volumeArgs)
+
+	// Arm single-host AutoPause (if lifecycle.idle_timeout is set).
+	if m.Autopause != nil && s.Lifecycle.IdleTimeout != "" {
+		if d, err := time.ParseDuration(s.Lifecycle.IdleTimeout); err == nil && d > 0 {
+			m.Autopause.Arm(taskID, d)
+		}
+	}
+	defer func() {
+		if m.Autopause != nil {
+			m.Autopause.Disarm(taskID)
+		}
+	}()
 
 	// Non-interactive (agent sandbox) => log to file under the task dir.
 	logFile, _ := log.SetupConsoleLog(taskID)
@@ -339,6 +432,7 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 	pid, p, err := m.Launcher.Start(ctx, s.Kernel.Path, args, logFile)
 	st.PID = pid
 	if err != nil {
+		cleanupVolumes()
 		_ = st.Transition(state.StatusFailed, state.ActorController, "launch failed: "+err.Error())
 		state.SaveState(taskID, st)
 		return err
@@ -387,6 +481,8 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 
 	// Block until the kernel exits.
 	waitErr := m.Launcher.Wait(p)
+
+	cleanupVolumes()
 
 	if waitErr != nil {
 		_ = st.Transition(state.StatusFailed, state.ActorAgent, "exited with error: "+waitErr.Error())
@@ -525,7 +621,7 @@ func buildLegacyArgs(ctx context.Context, cfg *config.ContainerConfig) []string 
 // guest so the guest dials it as its HTTP proxy. The task id is deliberately
 // NOT passed: the guest cannot be trusted with its own attribution id, and
 // the per-task listener binds the id by closure on the host side instead.
-func buildTaskArgs(s *spec.TaskSpec, vhostSock, resolvedRootfs, egressAddr string) []string {
+func buildTaskArgs(s *spec.TaskSpec, vhostSock, resolvedRootfs, egressAddr string, volumeArgs []string) []string {
 	args := []string{
 		fmt.Sprintf("init=%s", s.Workspace.Init),
 		fmt.Sprintf("mem=%s", s.Runtime.Memory),
@@ -563,6 +659,9 @@ func buildTaskArgs(s *spec.TaskSpec, vhostSock, resolvedRootfs, egressAddr strin
 	// not by any id the guest could forge. See StartTask for the lifecycle.
 	if egressAddr != "" {
 		args = append(args, fmt.Sprintf("egress_proxy=%s", egressAddr))
+	}
+	for _, v := range volumeArgs {
+		args = append(args, fmt.Sprintf("hostfs_volume=%s", v))
 	}
 	return args
 }
