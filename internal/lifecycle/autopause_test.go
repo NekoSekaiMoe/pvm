@@ -8,8 +8,10 @@ import (
 )
 
 // TestAutopause_StaleCallbackCannotPause is the regression test for the
-// timer race: a callback that fired just before a Reset must not pause the
-// task afterwards, and pause() must not delete a newer schedule.
+// timer race: a callback that fired just before a Reset (or after a Disarm)
+// must not pause the task, and pause() must not delete a newer schedule.
+// It drives pause() directly with a stale generation instead of racing real
+// timers, so the result is deterministic.
 func TestAutopause_StaleCallbackCannotPause(t *testing.T) {
 	dir := t.TempDir()
 	origRoot := state.RootDir
@@ -24,14 +26,12 @@ func TestAutopause_StaleCallbackCannotPause(t *testing.T) {
 	}
 
 	m := New(nil)
-	fired := make(chan struct{})
-	// Simulate a stale callback racing with a Reset: capture the behavior by
-	// arming a very short timer, then immediately bumping the schedule.
-	m.Arm(id, 1*time.Millisecond)
-	m.Reset(id, time.Hour) // supersede before the 1ms callback runs its work
-	close(fired)
-	time.Sleep(50 * time.Millisecond)
+	m.Arm(id, time.Hour)   // generation 1
+	m.Reset(id, time.Hour) // generation 2 supersedes it
 
+	// Simulate the generation-1 callback that fired right before the Reset
+	// completed: it must be a no-op.
+	m.pause(id, 1)
 	loaded, err := state.LoadState(id)
 	if err != nil {
 		t.Fatalf("load: %v", err)
@@ -39,12 +39,22 @@ func TestAutopause_StaleCallbackCannotPause(t *testing.T) {
 	if loaded.Status != state.StatusRunning {
 		t.Fatalf("stale callback paused the task: status=%q", loaded.Status)
 	}
-	// The new schedule must still be disarmable (not deleted by pause()).
+
+	// The live (generation-2) schedule must still work: an authorized pause
+	// transitions, and afterwards Disarm leaves nothing behind.
+	m.pause(id, 2)
+	loaded2, _ := state.LoadState(id)
+	if loaded2.Status != state.StatusSuspended {
+		t.Fatalf("current-generation callback failed to pause: status=%q", loaded2.Status)
+	}
 	m.Disarm(id)
-	select {
-	case <-fired:
-	default:
-		t.Fatalf("setup error")
+
+	// After Disarm there is no valid generation left: even the current one
+	// must be a no-op (a callback racing Disarm).
+	m.pause(id, 2)
+	loaded3, _ := state.LoadState(id)
+	if loaded3.Status != state.StatusSuspended {
+		t.Fatalf("unexpected state change after disarm: %q", loaded3.Status)
 	}
 }
 
