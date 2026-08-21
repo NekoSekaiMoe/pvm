@@ -100,11 +100,13 @@ func (m *Manager) Registered() []string {
 }
 
 // Attach provisions (or reuses) the host path for volumeID on behalf of
-// sandboxID. The Manager validates the ids, reserves the refcount and fills
-// RefCount/VolumeBaseDir/NodeRefFirstAttach under one lock (so concurrent
-// Attaches for the same volume cannot both observe the pre-attach count),
-// delegates to the plugin, and rolls the reservation back if the plugin or
-// the HostPath containment check fails.
+// sandboxID. The Manager validates the ids, takes the per-volume lifecycle
+// lock FIRST, and only then reserves the refcount and fills
+// RefCount/VolumeBaseDir/NodeRefFirstAttach — so the reservation order and
+// the plugin call order can never disagree (the caller that reserved count 0
+// is always the first plugin call), and no concurrent Detach can interleave
+// its teardown between the reservation and the plugin call. The reservation
+// is rolled back if the plugin or the HostPath containment check fails.
 func (m *Manager) Attach(ctx context.Context, req *AttachRequest) (*AttachResult, error) {
 	if req == nil {
 		return nil, fmt.Errorf("volume: nil AttachRequest")
@@ -117,23 +119,25 @@ func (m *Manager) Attach(ctx context.Context, req *AttachRequest) (*AttachResult
 	}
 	m.mu.Lock()
 	plugin, ok := m.plugins[req.Driver]
+	m.mu.Unlock()
 	if !ok {
-		m.mu.Unlock()
 		return nil, fmt.Errorf("volume: no plugin registered for driver %q", req.Driver)
 	}
-	// Reserve the count and compute first-attach under the same lock.
+
+	// Serialize the whole lifecycle for this volume BEFORE reading the
+	// refcount: reservation, plugin call and commit/rollback all happen
+	// under vlock, in that order, for every caller.
+	vlock := m.lockFor(req.VolumeID)
+	vlock.Lock()
+	defer vlock.Unlock()
+
+	// Reserve the count and compute first-attach under one lock.
+	m.mu.Lock()
 	req.RefCount = m.refCounts[req.VolumeID]
 	m.refCounts[req.VolumeID]++
 	req.NodeRefFirstAttach = req.RefCount == 0
 	req.VolumeBaseDir = m.baseDir
 	m.mu.Unlock()
-
-	// Serialize the whole lifecycle for this volume: the plugin call below
-	// must not interleave with a concurrent Detach's teardown for the same
-	// volume.
-	vlock := m.lockFor(req.VolumeID)
-	vlock.Lock()
-	defer vlock.Unlock()
 
 	// Roll back the reservation on any failure below.
 	rollback := func() {
@@ -196,10 +200,19 @@ func (m *Manager) Detach(ctx context.Context, req *DetachRequest) error {
 	}
 	m.mu.Lock()
 	plugin, ok := m.plugins[req.Driver]
+	m.mu.Unlock()
 	if !ok {
-		m.mu.Unlock()
 		return fmt.Errorf("volume: no plugin registered for driver %q", req.Driver)
 	}
+
+	// Take the per-volume lifecycle lock before touching the refcount (same
+	// vlock -> mu ordering as Attach) so a racing second Detach or Attach
+	// cannot observe or reserve a half-committed transition.
+	vlock := m.lockFor(req.VolumeID)
+	vlock.Lock()
+	defer vlock.Unlock()
+
+	m.mu.Lock()
 	cur := m.refCounts[req.VolumeID]
 	if cur == 0 {
 		m.mu.Unlock()
@@ -209,8 +222,7 @@ func (m *Manager) Detach(ctx context.Context, req *DetachRequest) error {
 	req.RefCount = post
 	req.NodeRefLastDetach = post == 0
 	// Reserve the detach: store post NOW so a racing second Detach (serialized
-	// by the per-volume lock below, but not before this read) cannot reserve
-	// the same transition twice.
+	// by the per-volume lock above) cannot reserve the same transition twice.
 	m.refCounts[req.VolumeID] = post
 	// Replay the metadata from the last Attach so the plugin can locate
 	// resources.
@@ -220,10 +232,6 @@ func (m *Manager) Detach(ctx context.Context, req *DetachRequest) error {
 		}
 	}
 	m.mu.Unlock()
-
-	vlock := m.lockFor(req.VolumeID)
-	vlock.Lock()
-	defer vlock.Unlock()
 
 	if err := plugin.Detach(ctx, req); err != nil {
 		// Roll back only this call's reservation; the previous state stands.

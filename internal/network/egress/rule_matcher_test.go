@@ -70,20 +70,35 @@ func TestApplyInject_FirstFullMatchOnly(t *testing.T) {
 			Inject: &EgressInject{Header: "Authorization", Format: "Bearer ${SECRET}", Secret: "s3cret"}},
 	}}
 
-	// Request matches the narrow rule first -> broad rule's secret must NOT
-	// be injected.
-	req := mustReq(t, "POST", "http://api.example.com/v1/run")
-	g := &Gateway{}
-	g.ApplyInject(req, viewFromHTTP(req), pol)
-	if got := req.Header.Get("Authorization"); got != "" {
-		t.Fatalf("broader rule leaked its credential: %q", got)
+	// Table of credential-injection scenarios: the first fully matching
+	// rule must decide alone — a later, broader rule may neither inject into
+	// a request the narrow rule already matched nor be skipped when it is
+	// the only match.
+	tests := []struct {
+		name       string
+		url        string
+		wantHeader string // expected Authorization value ("" = none)
+	}{
+		{
+			name:       "narrow rule matches first, broad must not inject",
+			url:        "http://api.example.com/v1/run",
+			wantHeader: "",
+		},
+		{
+			name:       "only broad rule matches, injects",
+			url:        "http://api.example.com/v2/other",
+			wantHeader: "Bearer s3cret",
+		},
 	}
-
-	// A request that only matches the broad rule still gets the injection.
-	req2 := mustReq(t, "POST", "http://api.example.com/v2/other")
-	g.ApplyInject(req2, viewFromHTTP(req2), pol)
-	if got := req2.Header.Get("Authorization"); got != "Bearer s3cret" {
-		t.Fatalf("broad rule should inject for unmatched-by-narrow request, got %q", got)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := mustReq(t, "POST", tt.url)
+			g := &Gateway{}
+			g.ApplyInject(req, viewFromHTTP(req), pol)
+			if got := req.Header.Get("Authorization"); got != tt.wantHeader {
+				t.Fatalf("Authorization = %q, want %q", got, tt.wantHeader)
+			}
+		})
 	}
 }
 
@@ -159,9 +174,12 @@ func TestPathNormalizationAndViewConsistency(t *testing.T) {
 		t.Fatalf("glob semantics broken")
 	}
 	pol := &Policy{Rules: []EgressRule{{Host: "a.com", Path: "/v1/*", Allow: &allow}}}
-	// Root path ("/") must not match a "/v1/*" rule.
-	if d := (&Gateway{}).decideDomain(viewFromHTTP(mustReq(t, "GET", "http://a.com")), pol); d != DecisionBlock {
-		t.Fatalf("root path must not match /v1/* rule, got %v", d)
+	// Root path ("/") must not match a "/v1/*" rule: build the view and the
+	// decision separately so a failure points at the decision itself.
+	requestView := viewFromHTTP(mustReq(t, "GET", "http://a.com"))
+	decision := (&Gateway{}).decideDomain(requestView, pol)
+	if decision != DecisionBlock {
+		t.Fatalf("root path must not match /v1/* rule, got %v", decision)
 	}
 }
 

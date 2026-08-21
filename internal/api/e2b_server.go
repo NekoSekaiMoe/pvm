@@ -53,6 +53,13 @@ func StartE2BServer(port int) error {
 	// pause/resume and activity endpoints below instead of separate instances.
 	cgMgr := cgroup.NewManager()
 	autoMgr := lifecycle.New(cgMgr)
+	// Autopause timers live in process memory: tasks persisted as Running
+	// by a previous server process have no timers after a restart. Re-arm
+	// them from the persisted IdleTimeout so an idle task still suspends
+	// without waiting for the next lifecycleActivity request. The idle
+	// window restarts at its full duration (persisting the exact deadline
+	// across restarts is not tracked).
+	rearmAllAutopause(autoMgr)
 
 	e.Use(middleware.Logger())
 	e.Use(middleware.Recover())
@@ -797,6 +804,25 @@ func StartE2BServer(port int) error {
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
 	fmt.Printf("E2B-compatible API & WebUI Server listening on %s\n", addr)
 	return e.Start(addr)
+}
+
+// rearmAllAutopause restores autopause timers for every persisted RUNNING
+// task with a valid idle_timeout, mirroring what StartTask does for fresh
+// tasks. Best effort: unparseable/below-zero timeouts are skipped.
+func rearmAllAutopause(autoMgr *lifecycle.Manager) {
+	sts, err := state.ListAll()
+	if err != nil {
+		// No state dir (fresh install) or unreadable state: nothing to arm.
+		return
+	}
+	for _, st := range sts {
+		if st.Status != state.StatusRunning || st.IdleTimeout == "" {
+			continue
+		}
+		if d, derr := time.ParseDuration(st.IdleTimeout); derr == nil && d > 0 {
+			autoMgr.Arm(st.ID, d)
+		}
+	}
 }
 
 // lifecycleActivity applies the task's lifecycle policy on API activity:

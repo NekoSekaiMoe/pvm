@@ -164,16 +164,25 @@ func TestStore_AliasIndex_MoveAndRelease(t *testing.T) {
 }
 
 // TestStore_CreateRejectsInvalidStatusKind verifies explicit Status/Kind
-// values are validated before persistence.
+// values are validated before persistence; each invalid variant is its own
+// case asserting the error AND that nothing was persisted.
 func TestStore_CreateRejectsInvalidStatusKind(t *testing.T) {
-	s := NewStore(t.TempDir())
-	if err := s.Create(Record{TemplateID: GenerateTemplateID(), Status: "BOGUS"}); err == nil {
-		t.Fatalf("invalid status accepted")
+	cases := []struct {
+		name string
+		rec  Record
+	}{
+		{"invalid status", Record{TemplateID: GenerateTemplateID(), Status: "BOGUS"}},
+		{"invalid kind", Record{TemplateID: GenerateTemplateID(), Kind: "mystery"}},
 	}
-	if err := s.Create(Record{TemplateID: GenerateTemplateID(), Kind: "mystery"}); err == nil {
-		t.Fatalf("invalid kind accepted")
-	}
-	if list, _ := s.List(); len(list) != 0 {
-		t.Fatalf("invalid records were persisted: %+v", list)
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s := NewStore(t.TempDir())
+			if err := s.Create(c.rec); err == nil {
+				t.Fatalf("invalid %s accepted", c.name)
+			}
+			if list, _ := s.List(); len(list) != 0 {
+				t.Fatalf("invalid record was persisted: %+v", list)
+			}
+		})
 	}
 }

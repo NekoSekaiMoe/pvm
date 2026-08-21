@@ -287,46 +287,65 @@ func TestStore_InvalidID(t *testing.T) {
 }
 
 // TestManager_ConcurrentAttachDetach drives concurrent Attach and Detach for
-// the same volume: the per-volume lifecycle serialization must keep the
-// refcount exact (no lost decrements, no duplicate teardown of the last
-// detach) and the final count must return to 0.
+// the same volume across several widths: the per-volume lifecycle
+// serialization must keep the refcount exact (no lost decrements, no
+// duplicate teardown of the last detach) and the final count must return
+// to 0 with the persisted attachment state cleared.
 func TestManager_ConcurrentAttachDetach(t *testing.T) {
-	base := t.TempDir()
-	m := NewManager(base)
-	ctx := context.Background()
-	if err := m.Register(ctx, PluginConfig{Name: "demo", Type: PluginTypeBuiltin}, NewBuiltin("demo")); err != nil {
-		t.Fatalf("register: %v", err)
-	}
-
-	const n = 16
-	// n attaches
-	for i := 0; i < n; i++ {
-		if _, err := m.Attach(ctx, &AttachRequest{SandboxID: fmt.Sprintf("sb-%d", i), VolumeID: "vol-race", Driver: "demo"}); err != nil {
-			t.Fatalf("attach %d: %v", i, err)
-		}
-	}
-	// concurrent detaches: all must succeed and drive the count exactly to 0
-	var wg sync.WaitGroup
-	errs := make(chan error, n)
-	for i := 0; i < n; i++ {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			if err := m.Detach(ctx, &DetachRequest{SandboxID: fmt.Sprintf("sb-%d", i), VolumeID: "vol-race", Driver: "demo"}); err != nil {
-				errs <- err
+	for _, n := range []int{1, 4, 16} {
+		n := n
+		t.Run(fmt.Sprintf("width_%d", n), func(t *testing.T) {
+			base := t.TempDir()
+			m := NewManager(base)
+			ctx := context.Background()
+			if err := m.Register(ctx, PluginConfig{Name: "demo", Type: PluginTypeBuiltin}, NewBuiltin("demo")); err != nil {
+				t.Fatalf("register: %v", err)
 			}
-		}(i)
-	}
-	wg.Wait()
-	close(errs)
-	for err := range errs {
-		t.Fatalf("concurrent detach: %v", err)
-	}
-	if got := m.RefCount("vol-race"); got != 0 {
-		t.Fatalf("refcount after concurrent detaches = %d, want 0", got)
-	}
-	if m.HostPath("vol-race") != "" {
-		t.Fatalf("attached state must be cleared at count 0")
+
+			// n attaches (concurrent — the reservation order is irrelevant here,
+			// only the exact final count matters)
+			var awg sync.WaitGroup
+			for i := 0; i < n; i++ {
+				awg.Add(1)
+				go func(i int) {
+					defer awg.Done()
+					if _, err := m.Attach(ctx, &AttachRequest{SandboxID: fmt.Sprintf("sb-%d", i), VolumeID: "vol-race", Driver: "demo"}); err != nil {
+						t.Errorf("attach %d: %v", i, err)
+					}
+				}(i)
+			}
+			awg.Wait()
+			if got := m.RefCount("vol-race"); got != int64(n) {
+				t.Fatalf("refcount after attaches = %d, want %d", got, n)
+			}
+			if m.HostPath("vol-race") == "" {
+				t.Fatalf("attachment state must persist while refcount > 0")
+			}
+
+			// concurrent detaches: all must succeed and drive the count exactly to 0
+			var wg sync.WaitGroup
+			errs := make(chan error, n)
+			for i := 0; i < n; i++ {
+				wg.Add(1)
+				go func(i int) {
+					defer wg.Done()
+					if err := m.Detach(ctx, &DetachRequest{SandboxID: fmt.Sprintf("sb-%d", i), VolumeID: "vol-race", Driver: "demo"}); err != nil {
+						errs <- err
+					}
+				}(i)
+			}
+			wg.Wait()
+			close(errs)
+			for err := range errs {
+				t.Fatalf("concurrent detach: %v", err)
+			}
+			if got := m.RefCount("vol-race"); got != 0 {
+				t.Fatalf("refcount after concurrent detaches = %d, want 0", got)
+			}
+			if m.HostPath("vol-race") != "" {
+				t.Fatalf("attached state must be cleared at count 0")
+			}
+		})
 	}
 }
 

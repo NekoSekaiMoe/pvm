@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"uml-container/internal/lifecycle"
 	"uml-container/internal/policy"
 	"uml-container/internal/state"
 )
@@ -161,3 +162,52 @@ func TestServer_RejectsInvalidContainerID(t *testing.T) {
 }
 
 var _ = context.Background
+
+// TestRearmAllAutopause covers the server-restart restore: tasks persisted
+// as RUNNING with a valid idle_timeout must get their autopause timer back
+// (observable by the task actually suspending), while suspended tasks,
+// running tasks without a timeout, and unparseable timeouts stay untouched.
+func TestRearmAllAutopause(t *testing.T) {
+	origRoot := state.RootDir
+	state.RootDir = t.TempDir()
+	t.Cleanup(func() { state.RootDir = origRoot })
+	t.Setenv("PVM_CGROUP_ROOT", t.TempDir())
+
+	save := func(id string, status state.Status, idle string) {
+		t.Helper()
+		st := &state.ContainerState{ID: id, Name: id, Status: status, IdleTimeout: idle}
+		if err := state.SaveState(id, st); err != nil {
+			t.Fatalf("save %s: %v", id, err)
+		}
+	}
+	save("run-timeout", state.StatusRunning, "10ms")              // must arm
+	save("run-notimeout", state.StatusRunning, "")                // nothing to arm
+	save("run-badtimeout", state.StatusRunning, "not-a-duration") // skipped
+	save("suspended", state.StatusSuspended, "10ms")              // not Running
+
+	rearmAllAutopause(lifecycle.New(nil))
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		st, err := state.LoadState("run-timeout")
+		if err == nil && st.Status == state.StatusSuspended {
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	if st, _ := state.LoadState("run-timeout"); st == nil || st.Status != state.StatusSuspended {
+		t.Fatalf("running task with idle_timeout was not re-armed: %+v", st)
+	}
+	for _, id := range []string{"run-notimeout", "run-badtimeout", "suspended"} {
+		st, err := state.LoadState(id)
+		if err != nil {
+			t.Fatalf("load %s: %v", id, err)
+		}
+		if st.Status != state.StatusRunning && id != "suspended" {
+			t.Fatalf("%s unexpectedly changed: %q", id, st.Status)
+		}
+		if id == "suspended" && st.Status != state.StatusSuspended {
+			t.Fatalf("suspended task unexpectedly resumed")
+		}
+	}
+}

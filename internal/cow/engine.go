@@ -245,9 +245,14 @@ func (e *Qcow2Engine) ListSnapshots(volumeName string) ([]Snapshot, error) {
 		// Walk the qcow2 backing chain to the root origin: for snapshot-of-
 		// snapshot chains (vol -> snapA -> snapB) the direct backing file is
 		// another snapshot, so keep following until the backing name stops
-		// resolving to a snapshot (best-effort; unresolvable links stop the walk).
-		origin := volumeName
-		if qi, ok := img.(*qcow2Image); ok {
+		// resolving to a snapshot (best-effort). When the chain cannot be
+		// resolved — a missing intermediate snapshot, a non-qcow2 hop, or a
+		// cycle — origin stays EMPTY rather than falling back to volumeName:
+		// self-attributing would report the snapshot as its own origin (and,
+		// when filtering, wrongly claim it for that volume), while "" marks
+		// the origin as unknown so callers cannot mis-route it.
+		origin := "" // stays empty unless the walk resolves a root volume
+		if qi, ok := img.(*qcow2Image); ok && qi.backingName != "" {
 			backing := qi.backingName
 			for hop := 0; hop < 64 && backing != ""; hop++ {
 				base := filepath.Base(backing)
@@ -258,7 +263,7 @@ func (e *Qcow2Engine) ListSnapshots(volumeName string) ([]Snapshot, error) {
 					// backing is another snapshot; follow ITS backing file.
 					next, oerr := openGuestImage(filepath.Join(e.root, filepath.Base(backing)))
 					if oerr != nil {
-						break
+						break // unresolvable link: origin stays unknown
 					}
 					nq, ok2 := next.(*qcow2Image)
 					if !ok2 || nq.backingName == "" {
