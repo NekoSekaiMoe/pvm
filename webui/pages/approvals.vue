@@ -59,27 +59,27 @@
       <p class="muted" style="font-size:0.8rem;margin-bottom:1rem;">Manually inject an approval ticket to test operator decision workflows.</p>
       <div class="form-row">
         <div>
-          <label class="section-title">Task ID</label>
-          <input v-model="form.task_id" placeholder="e.g. agent-task-01" />
+          <label class="section-title" for="approval-task-id">Task ID</label>
+          <input id="approval-task-id" v-model="form.task_id" placeholder="e.g. agent-task-01" />
         </div>
         <div>
-          <label class="section-title">Tool Name</label>
-          <input v-model="form.tool" placeholder="e.g. send_email, deploy_app" />
+          <label class="section-title" for="approval-tool">Tool Name</label>
+          <input id="approval-tool" v-model="form.tool" placeholder="e.g. send_email, deploy_app" />
         </div>
       </div>
       <div class="form-row">
         <div>
-          <label class="section-title">Target</label>
-          <input v-model="form.target" placeholder="e.g. production-smtp" />
+          <label class="section-title" for="approval-target">Target</label>
+          <input id="approval-target" v-model="form.target" placeholder="e.g. production-smtp" />
         </div>
         <div>
-          <label class="section-title">Justification (Why)</label>
-          <input v-model="form.why" placeholder="e.g. user requested quarterly report" />
+          <label class="section-title" for="approval-why">Justification (Why)</label>
+          <input id="approval-why" v-model="form.why" placeholder="e.g. user requested quarterly report" />
         </div>
       </div>
       <div class="form-row full">
-        <label class="section-title">Parameters (JSON)</label>
-        <input v-model="form.params" placeholder='{"recipient": "alex@company.com", "subject": "Report"}' />
+        <label class="section-title" for="approval-params">Parameters (JSON)</label>
+        <input id="approval-params" v-model="form.params" placeholder='{"recipient": "alex@company.com", "subject": "Report"}' />
       </div>
       
       <div style="margin-top:1rem;">
@@ -134,7 +134,7 @@ const create = async () => {
 const decide = async (id, approved) => {
   if (!confirm(`${approved ? 'Approve' : 'Reject'} ticket ${id.slice(0,16)}…?`)) return
   try {
-    await apiFetch(`/api/approvals/${id}/decide`, { method: 'POST', body: { approved, by: 'ui-operator' } })
+    await apiFetch(`/api/approvals/${id}/decide`, { method: 'POST', body: { approved } })
     refresh()
   } catch (e) { error.value = e.message }
 }

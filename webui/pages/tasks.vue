@@ -99,9 +99,9 @@
     </div>
 
     <!-- Transition modal -->
-    <div v-if="selected" class="modal-backdrop">
+    <div v-if="selected" class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="fsm-modal-title" @keydown.esc="selected = null">
       <div class="modal-box">
-        <h3>FSM Transitions — {{ selected.id }}</h3>
+        <h3 id="fsm-modal-title">FSM Transitions — {{ selected.id }}</h3>
         <div class="timeline">
           <div v-for="(tr, i) in selected.transitions || []" :key="i" class="timeline-item">
             <span class="badge" :class="tr.to">{{ tr.to }}</span>
@@ -113,10 +113,10 @@
           <div v-if="!selected.transitions || selected.transitions.length === 0" class="muted">No transitions recorded.</div>
         </div>
         <div class="input-group" style="margin-top:1.5rem;">
-          <select v-model="newTo" style="background:rgba(0,0,0,0.3);color:white;border:1px solid var(--glass-border);padding:0.75rem;border-radius:0.5rem;flex:0.6;">
+          <select v-model="newTo" aria-label="Target State" style="background:rgba(0,0,0,0.3);color:white;border:1px solid var(--glass-border);padding:0.75rem;border-radius:0.5rem;flex:0.6;">
             <option v-for="s in states" :key="s" :value="s">{{ s }}</option>
           </select>
-          <input v-model="newReason" placeholder="transition reason" />
+          <input v-model="newReason" placeholder="transition reason" aria-label="Transition Reason" />
           <button class="btn btn-primary" @click="transition(selected.id)">Apply</button>
           <button class="btn btn-danger" @click="selected = null">Close</button>
         </div>

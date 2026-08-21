@@ -17,7 +17,7 @@ The egress filter attaches to the Traffic Control (TC) subsystem's `clsact` qdis
    - Private RFC 1918 Class B: `172.16.0.0/12`
    - Private RFC 1918 Class C: `192.168.0.0/16`
 2. **BPF Whitelist Hash Map (`whitelist_map`)**: Allows dynamic runtime insertion of explicitly authorized destination IPv4 addresses.
-3. **Default Egress Action**: Unmatched non-whitelisted outbound packets are dropped (`TC_ACT_SHOT`) or routed through the local L7 egress proxy.
+3. **Default Egress Action**: Unmatched non-whitelisted outbound packets are dropped (`TC_ACT_SHOT`).
 
 ---
 

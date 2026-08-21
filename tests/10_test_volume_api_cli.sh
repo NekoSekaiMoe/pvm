@@ -83,14 +83,18 @@ echo "   duplicate conflict 409 ✓"
 echo "--- 5. GET /api/volumes lists created volumes"
 LIST=$(req GET /volumes)
 echo "$LIST" | jq -e 'map(select(.volume_id == "vol-data1")) | length == 1' >/dev/null || fail "vol-data1 not in list: $LIST"
-echo "   volume list contains vol-data1 ✓"
+LIST_HAS_SENSITIVE=$(echo "$LIST" | jq '.. | select(type == "object") | (has("token") or has("private_data"))' | grep -q true && echo "true" || echo "false")
+[ "$LIST_HAS_SENSITIVE" = "false" ] || fail "sensitive tokens leaked in list response: $LIST"
+echo "   volume list contains vol-data1 and credentials stripped ✓"
 
 echo "--- 6. GET /api/volumes/:id fetches volume detail"
 DETAIL=$(req GET /volumes/vol-data1)
 [ "$(echo "$DETAIL" | jq -r .name)" = "vol-data1" ] || fail "detail mismatch: $DETAIL"
+DETAIL_HAS_SENSITIVE=$(echo "$DETAIL" | jq '.. | select(type == "object") | (has("token") or has("private_data"))' | grep -q true && echo "true" || echo "false")
+[ "$DETAIL_HAS_SENSITIVE" = "false" ] || fail "sensitive tokens leaked in detail response: $DETAIL"
 STATUS=$(req_status GET /volumes/non-existent-vol)
 [ "$STATUS" = "404" ] || fail "expected 404 for non-existent volume, got $STATUS"
-echo "   volume detail & 404 ✓"
+echo "   volume detail credentials stripped & 404 ✓"
 
 echo "--- 7. DELETE /api/volumes/:id deletes volume"
 STATUS=$(req_status DELETE /volumes/vol-data1)

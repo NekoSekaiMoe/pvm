@@ -41,7 +41,7 @@ Using **`pnpm`**:
 cd webui
 pnpm install
 
-# 2. Start development server (http://localhost:3000)
+# 2. Start development server (http://localhost:3000, run in a separate terminal)
 pnpm run dev
 
 # 3. Build static assets for Go embedding

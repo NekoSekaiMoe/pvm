@@ -59,24 +59,24 @@
         <p class="muted" style="font-size:0.85rem;margin-bottom:1rem;">Register a storage volume backed by builtin hostfs or external driver plugin.</p>
         
         <div class="form-row full">
-          <label class="section-title">Volume Name / ID</label>
-          <input v-model="form.name" placeholder="e.g. workspace-data-1" />
+          <label class="section-title" for="vol-name">Volume Name / ID</label>
+          <input id="vol-name" v-model="form.name" placeholder="e.g. workspace-data-1" />
         </div>
         <div class="form-row full">
-          <label class="section-title">Driver Type</label>
-          <select v-model="form.driver" style="background:rgba(0,0,0,0.3);color:white;border:1px solid var(--glass-border);padding:0.75rem;border-radius:0.5rem;width:100%;">
+          <label class="section-title" for="vol-driver">Driver Type</label>
+          <select id="vol-driver" v-model="form.driver" style="background:rgba(0,0,0,0.3);color:white;border:1px solid var(--glass-border);padding:0.75rem;border-radius:0.5rem;width:100%;">
             <option value="builtin">builtin (hostfs directory)</option>
             <option value="nfs">nfs (external plugin)</option>
             <option value="s3">s3 (cloud bucket)</option>
           </select>
         </div>
         <div class="form-row full">
-          <label class="section-title">Auth Token (Optional, masked in API)</label>
-          <input v-model="form.token" type="password" placeholder="Access token for remote storage plugin" />
+          <label class="section-title" for="vol-token">Auth Token (Optional, masked in API)</label>
+          <input id="vol-token" v-model="form.token" type="password" placeholder="Access token for remote storage plugin" />
         </div>
         <div class="form-row full">
-          <label class="section-title">Private Configuration Data (Optional)</label>
-          <input v-model="form.private_data" placeholder="JSON or config string for plugin" />
+          <label class="section-title" for="vol-private-data">Private Configuration Data (Optional)</label>
+          <input id="vol-private-data" v-model="form.private_data" placeholder="JSON or config string for plugin" />
         </div>
 
         <div v-if="errorMsg" class="callout err">{{ errorMsg }}</div>

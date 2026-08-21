@@ -52,11 +52,17 @@ QC_CONV="$TMP/convert.qcow2"
 "$TMP/agentpvm" cow -to-qcow2 "$RAW_IN" -overlay "$QC_CONV" >/dev/null
 head -c 4 "$QC_CONV" | grep -q $'QFI\xfb' || fail "converted file is not qcow2"
 
+# Negative case: converting onto the same file must fail and preserve source
+OUT=$("$TMP/agentpvm" cow -to-raw "$QC_CONV" -overlay "$QC_CONV" 2>&1 || true)
+echo "$OUT" | grep -qi "same file\|failed" || fail "same source and overlay path not rejected: $OUT"
+head -c 4 "$QC_CONV" | grep -q $'QFI\xfb' || fail "source image corrupted by rejected conversion"
+echo "   same-path conversion rejected without modifying source ✓"
+
 RAW_OUT="$TMP/convert_out.img"
 "$TMP/agentpvm" cow -to-raw "$QC_CONV" -overlay "$RAW_OUT" >/dev/null
 
-# Compare the non-zero region
-if ! cmp -s <(dd if="$RAW_IN" bs=1 skip=4096 count=24 2>/dev/null) <(dd if="$RAW_OUT" bs=1 skip=4096 count=24 2>/dev/null); then
+# Compare the complete raw images byte-for-byte
+if ! cmp -s "$RAW_IN" "$RAW_OUT"; then
     fail "convert round-trip content mismatch"
 fi
 echo "   convert raw<->qcow2 round-trip byte-identical ✓"

@@ -122,23 +122,23 @@ echo "   round trip identical ✓"
 
 # --- 8. invalid container ids are rejected on both directions ---
 echo "--- snapshot: invalid ids rejected"
-OUT=$("$TMP/agentpvm" snapshot export '../evil' "$TMP/x.tgz" 2>&1)
+OUT=$("$TMP/agentpvm" snapshot export '../evil' "$TMP/x.tgz" 2>&1) && fail "export traversal should exit 1"
 echo "$OUT" | grep -q "Export failed: invalid container ID" || fail "export traversal not rejected: $OUT"
-OUT=$("$TMP/agentpvm" snapshot import 'a/b' "$TMP/src01.tgz" 2>&1)
+OUT=$("$TMP/agentpvm" snapshot import 'a/b' "$TMP/src01.tgz" 2>&1) && fail "import bad id should exit 1"
 echo "$OUT" | grep -q "Import failed: invalid container ID" || fail "import bad id not rejected: $OUT"
 [ ! -e "$PVM_STATE_ROOT/evil" ] || fail "traversal id created a directory"
 echo "   invalid ids rejected ✓"
 
 # --- 9. import onto an existing id is refused (no silent overlay) ---
 echo "--- snapshot: import onto existing id refused"
-OUT=$("$TMP/agentpvm" snapshot import dst02 "$TMP/src01.tgz" 2>&1)
+OUT=$("$TMP/agentpvm" snapshot import dst02 "$TMP/src01.tgz" 2>&1) && fail "re-import should exit 1"
 echo "$OUT" | grep -q "Import failed: container directory already exists" \
     || fail "re-import not refused: $OUT"
 echo "   existing id refused ✓"
 
 # --- 10. usage line with no args ---
 echo "--- snapshot: usage"
-OUT=$("$TMP/agentpvm" snapshot 2>&1)
+OUT=$("$TMP/agentpvm" snapshot 2>&1) && fail "snapshot with no args should exit 1"
 echo "$OUT" | grep -q "Usage: agentpvm snapshot" || fail "expected usage line: $OUT"
 echo "   usage ✓"
 

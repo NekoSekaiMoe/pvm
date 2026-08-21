@@ -24,14 +24,22 @@ AUTH="Authorization: Bearer secret"
 
 fail() { echo "❌ $1"; exit 1; }
 
+run_fail() {
+    set +e
+    OUT=$("$@" 2>&1)
+    local code=$?
+    set -e
+    [ "$code" -ne 0 ] || fail "expected non-zero exit code for: $*"
+}
+
 echo "==> building binaries"
 go build -o "$TMP/agentpvm" ./cmd/agentpvm
 go build -o "$TMP/umlctl"   ./cmd/umlctl
 
-echo "--- 1. umlctl image pull CLI argument parsing"
-OUT=$("$TMP/umlctl" image 2>&1 || true)
+echo "--- 1. umlctl image pull CLI argument parsing and nonzero exit"
+run_fail "$TMP/umlctl" image
 echo "$OUT" | grep -q "Usage: umlctl image pull" || fail "expected usage message: $OUT"
-echo "   umlctl image usage verified ✓"
+echo "   umlctl image usage verified and failed ✓"
 
 echo "==> starting server on :$PORT"
 "$TMP/agentpvm" api -port "$PORT" &>"$TMP/server.log" &
@@ -44,10 +52,10 @@ done
 curl -sf -H "$AUTH" "$API/containers" >/dev/null || fail "server failed to start: $(cat "$TMP/server.log")"
 
 echo "--- 2. POST /api/images/pull rejects invalid/non-existent image gracefully (500)"
-# Pulling non-existent image repository
-STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$API/images/pull" \
+# Pulling non-existent image with timeout protection
+STATUS=$(curl -s --max-time 8 -o /dev/null -w "%{http_code}" -X POST "$API/images/pull" \
   -H "$AUTH" -H "Content-Type: application/json" \
-  -d '{"image":"nonexistent-domain.invalid/no-such-image:tag123"}')
+  -d '{"image":"127.0.0.1:1/no-such-image:tag123"}')
 [ "$STATUS" = "500" ] || fail "expected 500 for non-existent image, got: $STATUS"
 echo "   non-existent image gracefully rejected 500 ✓"
 

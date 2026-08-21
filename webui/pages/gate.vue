@@ -20,8 +20,8 @@
       <h3>Artifact Bundle Payload</h3>
       <div class="form-row">
         <div>
-          <label class="section-title">Task ID</label>
-          <input v-model="bundle.task_id" placeholder="e.g. task-release-01" />
+          <label class="section-title" for="gate-task-id">Task ID</label>
+          <input id="gate-task-id" v-model="bundle.task_id" placeholder="e.g. task-release-01" />
         </div>
         <div style="display:flex;align-items:center;padding-top:1.5rem;">
           <label style="display:flex;align-items:center;gap:0.5rem;cursor:pointer;">
@@ -33,23 +33,23 @@
 
       <div class="form-row">
         <div>
-          <label class="section-title">Git Diff</label>
-          <textarea v-model="bundle.diff" placeholder="--- a/main.go&#10;+++ b/main.go&#10;..." style="min-height:140px;"></textarea>
+          <label class="section-title" for="gate-diff">Git Diff</label>
+          <textarea id="gate-diff" v-model="bundle.diff" placeholder="--- a/main.go&#10;+++ b/main.go&#10;..." style="min-height:140px;"></textarea>
         </div>
         <div>
-          <label class="section-title">Build &amp; Test Log</label>
-          <textarea v-model="bundle.build_log" placeholder="=== RUN TestAll&#10;--- PASS: TestAll (0.02s)&#10;PASS" style="min-height:140px;"></textarea>
+          <label class="section-title" for="gate-build-log">Build &amp; Test Log</label>
+          <textarea id="gate-build-log" v-model="bundle.build_log" placeholder="=== RUN TestAll&#10;--- PASS: TestAll (0.02s)&#10;PASS" style="min-height:140px;"></textarea>
         </div>
       </div>
 
       <div class="form-row">
         <div>
-          <label class="section-title">Execution Trace (comma separated)</label>
-          <input v-model="traceInput" placeholder="go build ./..., go test ./..." />
+          <label class="section-title" for="gate-trace">Execution Trace (comma separated)</label>
+          <input id="gate-trace" v-model="traceInput" placeholder="go build ./..., go test ./..." />
         </div>
         <div>
-          <label class="section-title">Declared Files (JSON key: base64)</label>
-          <input v-model="filesJson" placeholder='{"out.txt": "aGVsbG8="}' />
+          <label class="section-title" for="gate-files">Declared Files (JSON key: base64)</label>
+          <input id="gate-files" v-model="filesJson" placeholder='{"out.txt": "aGVsbG8="}' />
         </div>
       </div>
 

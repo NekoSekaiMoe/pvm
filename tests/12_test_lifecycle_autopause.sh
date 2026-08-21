@@ -96,5 +96,53 @@ STATUS=$(req_status POST "/tasks/non-existent/resume")
 [ "$STATUS" = "404" ] || fail "expected 404 for resume non-existent, got: $STATUS"
 echo "   non-existent pause/resume 404 ✓"
 
+echo "--- 7. Autopause on idle_timeout and AutoResume on API activity"
+TASK_ID2="t-auto-02"
+mkdir -p "$PVM_STATE_ROOT/$TASK_ID2" "$PVM_CGROUP_ROOT/$TASK_ID2"
+echo "0" > "$PVM_CGROUP_ROOT/$TASK_ID2/cgroup.freeze"
+cat > "$PVM_STATE_ROOT/$TASK_ID2/state.json" <<EOF
+{
+  "id": "$TASK_ID2",
+  "name": "$TASK_ID2",
+  "status": "running",
+  "pid": 99998,
+  "idle_timeout": "600ms",
+  "auto_resume": true
+}
+EOF
+
+# Restart server to trigger rearmAllAutopause with the short timeout
+kill "$SRV" 2>/dev/null || true
+"$TMP/agentpvm" api -port "$PORT" &>"$TMP/server.log" &
+SRV=$!
+for _ in $(seq 1 40); do
+    if curl -sf -H "$AUTH" "$API/containers" >/dev/null 2>&1; then break; fi
+    sleep 0.25
+done
+
+# Wait for idle_timeout (600ms) to trigger autopause
+AUTOPAUSED=false
+for _ in $(seq 1 20); do
+    STATE=$(curl -s "$API/tasks/$TASK_ID2" -H "$AUTH" | jq -r .status)
+    if [ "$STATE" = "suspended" ]; then
+        AUTOPAUSED=true
+        break
+    fi
+    sleep 0.15
+done
+[ "$AUTOPAUSED" = "true" ] || fail "task did not auto-pause after idle_timeout; state=$STATE"
+FROZEN=$(cat "$PVM_CGROUP_ROOT/$TASK_ID2/cgroup.freeze")
+[ "$FROZEN" = "1" ] || fail "expected cgroup.freeze=1 after autopause, got: $FROZEN"
+echo "   idle_timeout triggered autopause -> status=suspended, cgroup.freeze=1 ✓"
+
+# Trigger API activity via /api/exec which triggers auto_resume
+curl -s -X POST "$API/exec?task=$TASK_ID2" -H "$AUTH" -H "Content-Type: application/json" -d '{"cmd":"help"}' >/dev/null || true
+STATE=$(curl -s "$API/tasks/$TASK_ID2" -H "$AUTH" | jq -r .status)
+[ "$STATE" = "running" ] || fail "task did not auto-resume on API activity; state=$STATE"
+THAWED=$(cat "$PVM_CGROUP_ROOT/$TASK_ID2/cgroup.freeze")
+[ "$THAWED" = "0" ] || fail "expected cgroup.freeze=0 after autoresume, got: $THAWED"
+echo "   API activity triggered autoresume -> status=running, cgroup.freeze=0 ✓"
+
 echo ""
 echo "✅ 12_test_lifecycle_autopause: ALL PASS"
+

@@ -66,5 +66,19 @@ STATUS=$(req_status GET "/policy/tk-unregistered")
 [ "$STATUS" = "404" ] || fail "expected 404 for non-existent policy, got: $STATUS"
 echo "   non-existent policy 404 ✓"
 
+echo "--- 5. Register policy gateway with action=approve and execute command with quoted spaces (202)"
+REG_STATUS=$(req_status POST "/policy/tk-approve" '{"rules":[{"name":"send_msg","action":"approve"}]}')
+[ "$REG_STATUS" = "200" ] || fail "failed to register policy rules for tk-approve: $REG_STATUS"
+EXEC_STATUS=$(req_status POST "/exec?task=tk-approve" '{"cmd":"send_msg to=\"security-team\" message=\"hello world space test\""}')
+[ "$EXEC_STATUS" = "202" ] || fail "expected 202 for approve action, got: $EXEC_STATUS"
+echo "   approval required command with quoted spaces returned 202 ✓"
+
+echo "--- 6. Register policy gateway with action=deny and execute command with quoted spaces (403)"
+REG_STATUS=$(req_status POST "/policy/tk-deny" '{"rules":[{"name":"rm_file","action":"deny"}]}')
+[ "$REG_STATUS" = "200" ] || fail "failed to register policy rules for tk-deny: $REG_STATUS"
+EXEC_STATUS=$(req_status POST "/exec?task=tk-deny" '{"cmd":"rm_file path=\"/var/log/my test file.log\""}')
+[ "$EXEC_STATUS" = "403" ] || fail "expected 403 for deny action, got: $EXEC_STATUS"
+echo "   denied command with quoted spaces returned 403 ✓"
+
 echo ""
 echo "✅ 14_test_policy_gateway: ALL PASS"

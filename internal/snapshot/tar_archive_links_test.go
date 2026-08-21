@@ -96,3 +96,31 @@ func TestImport_UnsupportedEntryErrors(t *testing.T) {
 		t.Fatalf("half-imported dir left behind after failure: %v", statErr)
 	}
 }
+
+// TestImport_SymlinkPivotRejection verifies that a symlink pivot pointing outside
+// the destination directory or file writes traversing a symlink directory are rejected.
+func TestImport_SymlinkPivotRejection(t *testing.T) {
+	root := t.TempDir()
+	state.RootDir = root
+
+	outsideDir := t.TempDir()
+
+	// 1. Test symlink escaping destination root is rejected
+	tgzEscape := filepath.Join(t.TempDir(), "escape.tgz")
+	writeTgz(t, tgzEscape, []tar.Header{
+		{Name: "pivot", Typeflag: tar.TypeSymlink, Linkname: outsideDir, Mode: 0777},
+	})
+	if err := Import(tgzEscape, "c-escape"); err == nil {
+		t.Fatalf("Import should have failed for symlink escaping target dir")
+	}
+
+	// 2. Test relative symlink escaping destination root
+	tgzRelEscape := filepath.Join(t.TempDir(), "relescape.tgz")
+	writeTgz(t, tgzRelEscape, []tar.Header{
+		{Name: "sub", Typeflag: tar.TypeDir, Mode: 0755},
+		{Name: "sub/pivot", Typeflag: tar.TypeSymlink, Linkname: "../../outside", Mode: 0777},
+	})
+	if err := Import(tgzRelEscape, "c-relescape"); err == nil {
+		t.Fatalf("Import should have failed for relative symlink escaping target dir")
+	}
+}

@@ -86,7 +86,7 @@ echo "   pending list drained ✓"
 
 # --- 5. usage line with no args ---
 echo "--- approval: usage"
-OUT=$("$TMP/agentpvm" approval 2>&1)
+OUT=$("$TMP/agentpvm" approval 2>&1) && fail "approval with no args should exit 1"
 echo "$OUT" | grep -q "Usage: agentpvm approval" || fail "expected usage line: $OUT"
 echo "   usage ✓"
 
@@ -116,13 +116,13 @@ echo "   ready=2 claimed=0 total=2 ✓"
 
 # --- 9. `pool warm` over HTTP is explicitly not implemented yet ---
 echo "--- pool warm: documents the CLI gap"
-OUT=$("$TMP/agentpvm" pool warm alpine 2 2>&1)
+OUT=$("$TMP/agentpvm" pool warm alpine 2 2>&1) && fail "unsupported pool warm subcommand should exit 1"
 echo "$OUT" | grep -q "unknown subcommand: warm" || fail "unexpected output: $OUT"
 echo "   warm gap documented ✓"
 
 # --- 10. usage line with no args ---
 echo "--- pool: usage"
-OUT=$("$TMP/agentpvm" pool 2>&1)
+OUT=$("$TMP/agentpvm" pool 2>&1) && fail "pool with no args should exit 1"
 echo "$OUT" | grep -q "Usage: agentpvm pool" || fail "expected usage line: $OUT"
 echo "   usage ✓"
 

@@ -36,8 +36,9 @@ This directory contains shell-based integration and end-to-end (E2E) suites vali
 ## Running the Suites
 
 ```bash
-# Run all CI-safe suites serially
-for s in tests/*.sh; do
+# Run all unprivileged CI-safe suites (fails fast on first error)
+set -e
+for s in tests/{05,06,07,08,10,11,12,13,14,15,16,17,18,19,20,21,22}_*.sh; do
     echo "Running $s..."
     ./"$s"
 done

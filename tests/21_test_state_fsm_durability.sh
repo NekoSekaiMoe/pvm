@@ -70,6 +70,17 @@ transition "$TASK" "completed" "human" "approved" >/dev/null
 [ "$(curl -s "$API/tasks/$TASK" -H "$AUTH" | jq -r .status)" = "completed" ] || fail "failed completed"
 echo "   happy path lifecycle verified ✓"
 
+echo "--- 2b. Durability across server restart: verify state persisted after service restart"
+kill "$SRV" 2>/dev/null || true
+"$TMP/agentpvm" api -port "$PORT" &>"$TMP/server.log" &
+SRV=$!
+for _ in $(seq 1 40); do
+    if curl -sf -H "$AUTH" "$API/containers" >/dev/null 2>&1; then break; fi
+    sleep 0.25
+done
+[ "$(curl -s "$API/tasks/$TASK" -H "$AUTH" | jq -r .status)" = "completed" ] || fail "task state not preserved across restart"
+echo "   persisted state verified across service restart ✓"
+
 echo "--- 3. Terminal state completed rejects outgoing transitions (409)"
 STATUS=$(transition_status "$TASK" "running" "human" "retry")
 [ "$STATUS" = "409" ] || fail "expected 409 when transitioning from terminal completed, got: $STATUS"
@@ -83,13 +94,23 @@ STATUS=$(transition_status "$TASK2" "completed" "human" "skip")
 [ "$STATUS" = "409" ] || fail "expected 409 for illegal edge provisioning->completed, got: $STATUS"
 echo "   illegal edge rejected 409 ✓"
 
-echo "--- 5. Quarantine transition from running status"
+echo "--- 5. Quarantine transition from running status and idempotent re-application"
 TASK3="t-fsm-03"
 mkdir -p "$PVM_STATE_ROOT/$TASK3"
 echo "{\"id\":\"$TASK3\",\"name\":\"$TASK3\",\"status\":\"running\"}" > "$PVM_STATE_ROOT/$TASK3/state.json"
-transition "$TASK3" "quarantined" "incident" "anomaly detected" >/dev/null
-[ "$(curl -s "$API/tasks/$TASK3" -H "$AUTH" | jq -r .status)" = "quarantined" ] || fail "failed quarantine transition"
-echo "   quarantine transition verified ✓"
+STATUS=$(transition_status "$TASK3" "quarantined" "incident" "anomaly detected")
+[ "$STATUS" = "200" ] || fail "failed quarantine transition: $STATUS"
+[ "$(curl -s "$API/tasks/$TASK3" -H "$AUTH" | jq -r .status)" = "quarantined" ] || fail "failed quarantine status check"
+COUNT1=$(curl -s "$API/tasks/$TASK3" -H "$AUTH" | jq -r '.transitions | length')
+[ "$COUNT1" = "1" ] || fail "expected 1 transition, got: $COUNT1"
+
+# Repeated submission of the same valid transition (idempotent from==to edge)
+STATUS2=$(transition_status "$TASK3" "quarantined" "incident" "repeated notice")
+[ "$STATUS2" = "200" ] || fail "expected 200 for idempotent transition, got: $STATUS2"
+[ "$(curl -s "$API/tasks/$TASK3" -H "$AUTH" | jq -r .status)" = "quarantined" ] || fail "status changed unexpectedly after idempotent transition"
+COUNT2=$(curl -s "$API/tasks/$TASK3" -H "$AUTH" | jq -r '.transitions | length')
+[ "$COUNT2" = "2" ] || fail "expected 2 recorded transitions, got: $COUNT2"
+echo "   quarantine transition and idempotent re-transition verified ✓"
 
 echo ""
 echo "✅ 21_test_state_fsm_durability: ALL PASS"

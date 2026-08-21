@@ -113,16 +113,16 @@ func main() {
 		}
 
 		cfg := &config.ContainerConfig{
-			ID:         *name,
-			Name:       *name,
-			Kernel:     *kernel,
-			Rootfs:     *rootfs,
-			Memory:     *mem,
+			ID:          *name,
+			Name:        *name,
+			Kernel:      *kernel,
+			Rootfs:      *rootfs,
+			Memory:      *mem,
 			MemoryBytes: memBytes,
-			CPU:        *cpu,
-			UseVirtio:  *virtio,
-			Init:       *initCmd,
-			NetworkTap: *netTap,
+			CPU:         *cpu,
+			UseVirtio:   *virtio,
+			Init:        *initCmd,
+			NetworkTap:  *netTap,
 		}
 
 		if *overlay {
@@ -140,7 +140,7 @@ func main() {
 		}
 
 		manager := container.NewManager(&uml.DefaultLauncher{})
-		
+
 		// If interactive mode, we instruct the manager to not intercept logs
 		// We'll pass it in context or adjust manager interface for MVP
 		ctx := context.Background()
@@ -165,7 +165,7 @@ func main() {
 
 		fmt.Printf("Starting container %s...\n", *name)
 		err = manager.Start(ctx, cfg)
-		
+
 		if *rm {
 			fmt.Println("Cleaning up container state and files (--rm)...")
 			dir, err := state.ContainerDir(*name)
@@ -191,11 +191,13 @@ func main() {
 			fmt.Printf("Pulling docker image %s...\n", baseName)
 			if err := image.Pull(baseName); err != nil {
 				fmt.Printf("Failed to pull image: %v\n", err)
+				os.Exit(1)
 			} else {
 				fmt.Printf("Image %s pulled successfully.\n", baseName)
 			}
 		} else {
 			fmt.Println("Usage: umlctl image pull <docker-image-name>")
+			os.Exit(1)
 		}
 
 	case "network":
@@ -209,6 +211,7 @@ func main() {
 				err := network.SetupBridge(name, "", "10.0.0.1/24")
 				if err != nil {
 					fmt.Printf("Error creating network: %v\n", err)
+					os.Exit(1)
 				} else {
 					fmt.Printf("Network %s created.\n", name)
 				}
@@ -216,37 +219,40 @@ func main() {
 				err := network.DeleteBridge(name, "")
 				if err != nil {
 					fmt.Printf("Error deleting network: %v\n", err)
+					os.Exit(1)
 				} else {
 					fmt.Printf("Network %s deleted.\n", name)
 				}
 			} else {
 				fmt.Printf("Unknown network subcommand: %s\n", subcmd)
 				fmt.Println("Usage: umlctl network [create|rm] <name>")
+				os.Exit(1)
 			}
 		} else {
 			fmt.Println("Usage: umlctl network [create|rm] <name>")
+			os.Exit(1)
 		}
 
 	case "logs":
 		if len(os.Args) < 3 {
 			fmt.Println("Usage: umlctl logs <container-id>")
-			return
+			os.Exit(1)
 		}
 		id := os.Args[2]
 		if !idRegex.MatchString(id) {
 			fmt.Printf("Invalid container ID: %s\n", id)
-			return
+			os.Exit(1)
 		}
 		dir, err := state.ContainerDir(id)
 		if err != nil {
 			fmt.Printf("Failed to get container dir: %v\n", err)
-			return
+			os.Exit(1)
 		}
 		logPath := filepath.Join(dir, "logs", "console.log")
 		file, err := os.Open(logPath)
 		if err != nil {
 			fmt.Printf("Failed to open logs for %s: %v\n", id, err)
-			return
+			os.Exit(1)
 		}
 		defer file.Close()
 		io.Copy(os.Stdout, file)
@@ -255,7 +261,7 @@ func main() {
 		dirs, err := os.ReadDir(state.RootDir)
 		if err != nil {
 			fmt.Printf("Failed to read containers directory: %v\n", err)
-			return
+			os.Exit(1)
 		}
 		fmt.Printf("%-15s %-15s %-10s\n", "CONTAINER ID", "STATUS", "PID")
 		for _, d := range dirs {
@@ -269,5 +275,6 @@ func main() {
 
 	default:
 		fmt.Printf("Command %s not recognized\n", cmd)
+		os.Exit(1)
 	}
 }

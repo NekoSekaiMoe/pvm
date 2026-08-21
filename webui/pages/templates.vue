@@ -67,12 +67,8 @@
         <p class="muted" style="font-size:0.85rem;margin-bottom:1rem;">Register a base image reference to produce a reusable template.</p>
         
         <div class="form-row full">
-          <label class="section-title">Image Reference (Docker Hub / rootfs)</label>
-          <input v-model="createForm.image_ref" placeholder="e.g. alpine:3.19 or ubuntu:22.04" />
-        </div>
-        <div class="form-row full">
-          <label class="section-title">Initial Alias (Optional)</label>
-          <input v-model="createForm.alias" placeholder="e.g. python-default" />
+          <label class="section-title" for="template-image-ref">Image Reference (Docker Hub / rootfs)</label>
+          <input id="template-image-ref" v-model="createForm.image_ref" placeholder="e.g. alpine:3.19 or ubuntu:22.04" />
         </div>
 
         <div v-if="createError" class="callout err">{{ createError }}</div>
@@ -91,8 +87,8 @@
         <p class="muted" style="font-size:0.85rem;margin-bottom:1rem;">Template: <span class="mono">{{ selectedTemplate.template_id }}</span></p>
         
         <div class="form-row full">
-          <label class="section-title">New Alias (e.g. <code>stable</code>, <code>v1</code>)</label>
-          <input v-model="aliasInput" placeholder="Enter alphanumeric alias..." />
+          <label class="section-title" for="template-new-alias">New Alias (e.g. <code>stable</code>, <code>v1</code>)</label>
+          <input id="template-new-alias" v-model="aliasInput" placeholder="Enter alphanumeric alias..." />
         </div>
 
         <div v-if="aliasError" class="callout err">{{ aliasError }}</div>
@@ -114,7 +110,7 @@ const templates = ref([])
 const searchQuery = ref('')
 const showCreateModal = ref(false)
 const createError = ref('')
-const createForm = ref({ image_ref: '', alias: '' })
+const createForm = ref({ image_ref: '' })
 
 const selectedTemplate = ref(null)
 const aliasInput = ref('')
@@ -154,7 +150,7 @@ const createTemplate = async () => {
       body: createForm.value
     })
     showCreateModal.value = false
-    createForm.value = { image_ref: '', alias: '' }
+    createForm.value = { image_ref: '' }
     refresh()
   } catch (e) {
     createError.value = e.message

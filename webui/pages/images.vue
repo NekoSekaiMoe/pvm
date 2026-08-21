@@ -6,7 +6,7 @@
     <!-- Quick Presets -->
     <div class="glass-card">
       <h3>Quick Pull Presets</h3>
-      <p class="muted" style="margin-bottom:1rem;">Click any popular base image to pre-populate and pull:</p>
+      <p class="muted" style="margin-bottom:1rem;">Click any popular base image to pre-populate:</p>
       
       <div style="display:flex;gap:0.5rem;flex-wrap:wrap;">
         <button class="btn btn-primary" style="font-size:0.85rem;" @click="selectPreset('alpine:3.19')">Alpine 3.19</button>

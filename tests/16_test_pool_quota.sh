@@ -79,5 +79,16 @@ RESP=$(req POST /pool/quota '{"tenant":"qa-team","quota":{"MaxConcurrent":5,"Max
 [ "$(echo "$RESP" | jq -r .status)" = "ok" ] || fail "expected status=ok, got: $RESP"
 echo "   tenant quota configured ✓"
 
+echo "--- 5. POST /api/pool/quota input validation error cases (400)"
+STATUS=$(req_status POST /pool/quota '{"tenant":"../invalid","quota":{"MaxConcurrent":5}}')
+[ "$STATUS" = "400" ] || fail "expected 400 for path traversal tenant, got: $STATUS"
+STATUS=$(req_status POST /pool/quota '{"tenant":"","quota":{"MaxConcurrent":5}}')
+[ "$STATUS" = "400" ] || fail "expected 400 for empty tenant, got: $STATUS"
+STATUS=$(req_status POST /pool/quota '{"tenant":"qa-team","quota":{"MaxConcurrent":-1}}')
+[ "$STATUS" = "400" ] || fail "expected 400 for negative quota, got: $STATUS"
+STATUS=$(req_status POST /pool/quota '{"tenant":"qa-team","quota":{"MaxConcurrent":"bad_type"}}')
+[ "$STATUS" = "400" ] || fail "expected 400 for bad quota type, got: $STATUS"
+echo "   invalid quota requests rejected 400 ✓"
+
 echo ""
 echo "✅ 16_test_pool_quota: ALL PASS"

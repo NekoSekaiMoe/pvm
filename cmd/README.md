@@ -14,7 +14,7 @@ The agent sandbox control plane binary. It owns TaskSpec-driven sandbox lifecycl
 Launch an isolated AI agent sandbox driven by a TaskSpec TOML configuration.
 ```bash
 agentpvm run -config ./uml/agentpvm.toml
-agentpvm run -name my-task -rootfs alpine.img -kernel ./bin/linux -mem 512M -net
+agentpvm run -name my-task -rootfs alpine.img -kernel ./bin/linux -net
 ```
 
 #### `agentpvm api`
@@ -90,7 +90,6 @@ The thin UML container management CLI. Modeled after Docker CLI for rapid develo
   - `-cpu <millicpu>`: CPU limit (e.g. `1000` = 1 core).
   - `-init <path>`: Guest init path (default: `/sbin/init`).
   - `-volume <host:guest>`: Host directory bind mount via hostfs.
-  - `-virtio`: Enable virtio-blk via vhost-user.
   - `-overlay`: Create and attach temporary CoW overlay.
   - `-rm`: Automatically remove container upon exit.
   - `-it`: Allocate interactive stdio console.

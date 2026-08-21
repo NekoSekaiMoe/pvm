@@ -6,7 +6,7 @@ The `internal/` directory contains the core Go packages implementing PVM's kerne
 
 ## Package Map
 
-```
+```text
 internal/
 ├── api/             # E2B-compatible REST API (Echo), WebUI handler, and /exec gateway
 ├── approval/        # Human-in-the-loop governance ticket manager (approve/reject)
@@ -53,7 +53,7 @@ internal/
 ### 2. Governance & Control Plane
 - **`identity/`**: Mints ephemeral HMAC-SHA256 tokens bounded by capability scopes and expiration TTLs. Verifies token integrity and supports atomic single/bulk revocation.
 - **`policy/`**: Evaluates tool execution requests against declarative rules (`allow`, `constrain`, `approve`, `deny`). Scrubs matched secrets from tool arguments before execution.
-- **`artifact/`**: Verifies agent release bundles across 4 steps: execution replay, test assertion, secret pattern scanning, and immutable canonical hashing.
+- **`artifact/`**: Verifies agent release bundles (defaulting to immutable canonical hashing and secret pattern scanning, with pluggable execution replay and test verifiers).
 - **`approval/`**: Manages human approval tickets for high-impact actions, complete with timeout deadlines and operator identity binding.
 - **`incident/`**: Monitors anomaly counters and executes automated containment actions (Block, Pause, Quarantine, Terminate) following a 4-tier matrix.
 - **`audit/`**: Enforces strict hash-chaining across all lifecycle, tool, approval, and incident events using locked JSONL append-only ledgers.

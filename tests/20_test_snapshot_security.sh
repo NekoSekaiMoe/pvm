@@ -17,6 +17,14 @@ mkdir -p "$PVM_STATE_ROOT" "$PVM_AUDIT_ROOT" "$PVM_CGROUP_ROOT"
 
 fail() { echo "❌ $1"; exit 1; }
 
+run_fail() {
+    set +e
+    OUT=$("$@" 2>&1)
+    local code=$?
+    set -e
+    [ "$code" -ne 0 ] || fail "expected non-zero exit code for: $*"
+}
+
 echo "==> building agentpvm"
 go build -o "$TMP/agentpvm" ./cmd/agentpvm
 
@@ -37,18 +45,33 @@ echo "$OUT" | grep -q "Snapshot imported successfully" || fail "import failed: $
 diff -r "$PVM_STATE_ROOT/c-source" "$PVM_STATE_ROOT/c-restored" >/dev/null || fail "imported files differ from source"
 echo "   imported structure matches source ✓"
 
-echo "--- 3. Invalid IDs rejected on export and import"
-OUT=$("$TMP/agentpvm" snapshot export '../escape' "$TMP/x.tgz" 2>&1 || true)
+echo "--- 3. Invalid IDs rejected on export and import (and fail with non-zero exit)"
+run_fail "$TMP/agentpvm" snapshot export '../escape' "$TMP/x.tgz"
 echo "$OUT" | grep -qi "invalid container ID" || fail "export traversal not rejected: $OUT"
 
-OUT=$("$TMP/agentpvm" snapshot import 'bad/id' "$TMP/snap1.tgz" 2>&1 || true)
+run_fail "$TMP/agentpvm" snapshot import 'bad/id' "$TMP/snap1.tgz"
 echo "$OUT" | grep -qi "invalid container ID" || fail "import bad id not rejected: $OUT"
-echo "   invalid ID checks passed ✓"
+echo "   invalid ID checks passed and failed with non-zero exit ✓"
 
 echo "--- 4. Import onto existing container ID is refused (no overwrite)"
-OUT=$("$TMP/agentpvm" snapshot import c-restored "$TMP/snap1.tgz" 2>&1 || true)
+run_fail "$TMP/agentpvm" snapshot import c-restored "$TMP/snap1.tgz"
 echo "$OUT" | grep -qi "already exists" || fail "import overwrite not refused: $OUT"
-echo "   existing ID overwrite prevented ✓"
+echo "   existing ID overwrite prevented and failed with non-zero exit ✓"
+
+echo "--- 5. Symlink pivot directory traversal attack rejected"
+OUTSIDE="$TMP/outside_target"
+mkdir -p "$OUTSIDE"
+ATTACK_DIR="$TMP/attack"
+mkdir -p "$ATTACK_DIR"
+ln -s "$OUTSIDE" "$ATTACK_DIR/pivot"
+echo "evil_content" > "$ATTACK_DIR/pivot/evil.txt" || true
+# Create malicious tarball with pivot symlink pointing to OUTSIDE
+tar -czf "$TMP/pivot_attack.tgz" -C "$ATTACK_DIR" .
+rm -f "$OUTSIDE/evil.txt"
+
+run_fail "$TMP/agentpvm" snapshot import c-attack "$TMP/pivot_attack.tgz"
+[ ! -f "$OUTSIDE/evil.txt" ] || fail "symlink pivot wrote file to outside directory!"
+echo "   symlink pivot import rejected and outside directory unpolluted ✓"
 
 echo ""
 echo "✅ 20_test_snapshot_security: ALL PASS"
