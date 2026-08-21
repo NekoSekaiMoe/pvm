@@ -17,12 +17,12 @@ const DefaultVolumeBaseDir = "/var/lib/uml-container/volumes"
 // ref counts (node-local, single-host). It mirrors
 // Cubelet/plugins/volume.Manager at single-host scale.
 type Manager struct {
-	mu         sync.Mutex
-	plugins    map[string]VolumePlugin // driver -> plugin
-	baseDir    string
-	refCounts  map[string]int64            // volumeID -> current count
-	attached   map[string]*AttachResult    // volumeID -> last AttachResult (for Detach metadata)
-	extraMeta  map[string]map[string]string // volumeID -> user metadata passthrough
+	mu        sync.Mutex
+	plugins   map[string]VolumePlugin // driver -> plugin
+	baseDir   string
+	refCounts map[string]int64             // volumeID -> current count
+	attached  map[string]*AttachResult     // volumeID -> last AttachResult (for Detach metadata)
+	extraMeta map[string]map[string]string // volumeID -> user metadata passthrough
 }
 
 // NewManager creates a Manager. baseDir defaults to DefaultVolumeBaseDir

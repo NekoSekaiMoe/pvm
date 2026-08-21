@@ -495,7 +495,7 @@ func StartE2BServer(port int) error {
 	})
 
 	// --- Volumes (Cube parity: POST/GET/DELETE /volumes) ---
-	volStore := volume.NewStore()
+	volStore := volume.NewStore("")
 	api.POST("/volumes", func(c echo.Context) error {
 		var req struct {
 			Name        string `json:"name"`

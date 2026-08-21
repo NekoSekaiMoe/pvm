@@ -21,7 +21,7 @@ func NewBinary(name, binaryPath string) *BinaryPlugin {
 	return &BinaryPlugin{name: name, binaryPath: binaryPath}
 }
 
-func (p *BinaryPlugin) Name() string            { return p.name }
+func (p *BinaryPlugin) Name() string           { return p.name }
 func (p *BinaryPlugin) PluginType() PluginType { return PluginTypeBinary }
 
 func (p *BinaryPlugin) Init(_ context.Context, cfg PluginConfig) error {

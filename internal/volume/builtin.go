@@ -22,7 +22,7 @@ func NewBuiltin(name string) *BuiltinPlugin {
 	return &BuiltinPlugin{name: name}
 }
 
-func (p *BuiltinPlugin) Name() string       { return p.name }
+func (p *BuiltinPlugin) Name() string           { return p.name }
 func (p *BuiltinPlugin) PluginType() PluginType { return PluginTypeBuiltin }
 
 func (p *BuiltinPlugin) Init(_ context.Context, cfg PluginConfig) error {

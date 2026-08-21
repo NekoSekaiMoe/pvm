@@ -19,9 +19,12 @@ go_test(
     srcs = [
         "compact_helpers_test.go",
         "convert_test.go",
+        "engine_test.go",
         "manager_test.go",
         "qcow2_compact_test.go",
+        "qcow2_header_boundary_test.go",
         "qcow2_test.go",
+        "qcow2_write_edge_test.go",
         "qcow2_write_test.go",
     ],
     embed = [":cow"],

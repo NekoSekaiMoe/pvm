@@ -1,0 +1,43 @@
+// Package fsjson provides crash-safe atomic JSON file persistence.
+//
+// Write serializes a value to a temporary file in the target directory,
+// fsyncs and closes it (propagating errors), and finally renames it over
+// the destination. Readers therefore never observe a partial file, and a
+// crash mid-write leaves the previous contents intact.
+package fsjson
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+)
+
+// Write atomically persists v as pretty-printed JSON at path. The temporary
+// file is synced and closed before the rename; on any failure the temporary
+// file is removed and path is left untouched.
+func Write(path string, v any) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+"-*.tmp")
+	if err != nil {
+		return err
+	}
+	name := tmp.Name()
+	enc := json.NewEncoder(tmp)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(v); err != nil {
+		tmp.Close()
+		os.Remove(name)
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		os.Remove(name)
+		return fmt.Errorf("fsjson: sync %s: %w", name, err)
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(name)
+		return fmt.Errorf("fsjson: close %s: %w", name, err)
+	}
+	return os.Rename(name, path)
+}
