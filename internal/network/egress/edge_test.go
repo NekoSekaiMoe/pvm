@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -13,7 +14,10 @@ import (
 )
 
 // Echo backend that records the request so tests can assert what reached it.
+// The mutex makes reqs safe to read from the test goroutine while the
+// backend handler appends concurrently.
 type recordingBackend struct {
+	mu   sync.Mutex
 	reqs []string
 	srv  *httptest.Server
 }
@@ -21,11 +25,23 @@ type recordingBackend struct {
 func newRecordingBackend(t *testing.T) *recordingBackend {
 	rb := &recordingBackend{}
 	rb.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		rb.reqs = append(rb.reqs, r.Method+" "+r.URL.Path)
+		rb.record(r.Method + " " + r.URL.Path)
 		io.WriteString(w, "ok")
 	}))
 	t.Cleanup(rb.srv.Close)
 	return rb
+}
+
+func (rb *recordingBackend) record(req string) {
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
+	rb.reqs = append(rb.reqs, req)
+}
+
+func (rb *recordingBackend) recorded() []string {
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
+	return append([]string(nil), rb.reqs...)
 }
 
 func startGatewayWithPolicy(t *testing.T, pol *Policy) *Gateway {
@@ -78,14 +94,53 @@ func TestDomainMatch_WildcardBoundary(t *testing.T) {
 		{"evil.com", "*.github.com", false},
 		{"a.b.github.com", "*.github.com", true}, // multi-level sub
 		{"github.com", "github.com", true},
-		{"GITHUB.COM", "github.com", true},                 // case-insensitive at decide layer
+		{"GITHUB.COM", "github.com", true},                 // case handled at the decide layer
 		{"api.github.com.evil.com", "*.github.com", false}, // suffix hijack
 	}
 	for _, c := range cases {
-		got := domainMatches(strings.ToLower(c.host), c.rule) // decideDomain lowercases
+		// Drive the host through viewFromHTTP + decideDomain so mixed-case
+		// inputs exercise the decision layer's own lowercasing. Pre-lowering
+		// the host here (the old domainMatches-only form) would mask a
+		// decision-layer case-handling regression.
+		v := viewFromHTTP(mustReq(t, "GET", "http://"+c.host+"/x"))
+		pol := &Policy{AllowDomains: []string{c.rule}}
+		got := (&Gateway{}).decideDomain(v, pol) == DecisionAllow
 		if got != c.want {
-			t.Errorf("domainMatches(%q,%q) = %v, want %v", c.host, c.rule, got, c.want)
+			t.Errorf("decideDomain(host=%q, allow=%q) allowed = %v, want %v", c.host, c.rule, got, c.want)
 		}
+	}
+}
+
+// --- forwarded path must match the policy view ---
+
+// TestForwardedPathNormalized verifies handleHTTP forwards the SAME
+// normalized path the policy evaluated (viewFromHTTP/normalizePath): a
+// request whose raw path is "//a/../b" is both judged — and forwarded — as
+// "/b". Without the fix, the policy matched "/b" while the upstream
+// received the raw "//a/../b".
+func TestForwardedPathNormalized(t *testing.T) {
+	rb := newRecordingBackend(t)
+	backendHost := stripPort(strings.TrimPrefix(rb.srv.URL, "http://"))
+	allow := true
+	pol := &Policy{Rules: []EgressRule{
+		{Name: "b-only", Host: backendHost, Path: "/b", Allow: &allow},
+	}}
+	g := startGatewayWithPolicy(t, pol)
+	c := clientVia(g)
+
+	// "//a/../b" cleans to "/b": the rule matches ONLY the cleaned path, and
+	// the upstream must receive the cleaned path too.
+	resp := do(c, "GET", rb.srv.URL+"//a/../b", "")
+	if resp == nil || resp.StatusCode != 200 {
+		t.Fatalf("expected 200, got %+v", resp)
+	}
+	resp.Body.Close()
+	reqs := rb.recorded()
+	if len(reqs) == 0 {
+		t.Fatal("no request reached backend")
+	}
+	if got := reqs[0]; got != "GET /b" {
+		t.Fatalf("upstream received %q, want %q (policy-normalized path)", got, "GET /b")
 	}
 }
 

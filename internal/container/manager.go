@@ -242,32 +242,45 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 		state.SaveState(taskID, st)
 		return fmt.Errorf("container: task %s requests %d volumes but no volume manager is configured", taskID, len(s.Volumes))
 	}
+	// Guest mount points are embedded verbatim into the kernel cmdline as
+	// hostfs_volume=<host>:<guest>:<mode>; whitespace/":"/"," would corrupt
+	// that parameter. spec.Validate already rejects them, but StartTask is a
+	// public entry point and must not trust that its caller validated — the
+	// same defense-in-depth rule the task id check above follows.
+	for _, vm := range s.Volumes {
+		if err := spec.ValidateMountPath(vm.Path); err != nil {
+			_ = st.Transition(state.StatusFailed, state.ActorController, "invalid volume mount path: "+err.Error())
+			state.SaveState(taskID, st)
+			return fmt.Errorf("container: volume %q: %w", vm.Name, err)
+		}
+	}
 	var volumeArgs []string
 	var attachedVolumes []spec.VolumeMount
 	if m.Volumes != nil && len(s.Volumes) > 0 {
 		for _, vm := range s.Volumes {
-			driver := vm.Driver
-			if driver == "" {
-				// default to first registered plugin (mirrors Cube's "first entry" rule)
+			// Resolve the driver ONCE at the attach point: an empty Driver means
+			// "first registered plugin" (mirrors Cube's "first entry" rule).
+			// Recording the resolved name on the mount copy (vm is a copy of the
+			// spec entry, so the spec itself is not mutated) lets the rollback
+			// and cleanupVolumes paths below detach through the SAME driver the
+			// volume was attached with, instead of re-deriving the default —
+			// which could pick a different plugin if registrations changed
+			// mid-task.
+			if vm.Driver == "" {
 				if regs := m.Volumes.Registered(); len(regs) > 0 {
-					driver = regs[0]
+					vm.Driver = regs[0]
 				}
 			}
 			res, err := m.Volumes.Attach(ctx, &volume.AttachRequest{
 				SandboxID: taskID,
 				VolumeID:  vm.Name,
-				Driver:    driver,
+				Driver:    vm.Driver,
 			})
 			if err != nil {
-				// Detach already-attached volumes before failing.
+				// Detach already-attached volumes through their recorded drivers
+				// before failing.
 				for _, av := range attachedVolumes {
-					d := av.Driver
-					if d == "" {
-						if regs := m.Volumes.Registered(); len(regs) > 0 {
-							d = regs[0]
-						}
-					}
-					_ = m.Volumes.Detach(context.Background(), &volume.DetachRequest{SandboxID: taskID, VolumeID: av.Name, Driver: d})
+					_ = m.Volumes.Detach(context.Background(), &volume.DetachRequest{SandboxID: taskID, VolumeID: av.Name, Driver: av.Driver})
 				}
 				_ = st.Transition(state.StatusFailed, state.ActorController, "volume attach failed: "+err.Error())
 				state.SaveState(taskID, st)
@@ -284,14 +297,10 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 		}
 	}
 	cleanupVolumes := func() {
+		// av.Driver was resolved at attach time (see the loop above); reuse
+		// the recorded name rather than re-deriving the default plugin here.
 		for _, av := range attachedVolumes {
-			d := av.Driver
-			if d == "" {
-				if regs := m.Volumes.Registered(); len(regs) > 0 {
-					d = regs[0]
-				}
-			}
-			_ = m.Volumes.Detach(context.Background(), &volume.DetachRequest{SandboxID: taskID, VolumeID: av.Name, Driver: d})
+			_ = m.Volumes.Detach(context.Background(), &volume.DetachRequest{SandboxID: taskID, VolumeID: av.Name, Driver: av.Driver})
 		}
 		attachedVolumes = nil
 	}

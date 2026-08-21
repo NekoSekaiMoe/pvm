@@ -110,6 +110,7 @@ go_test(
     srcs = [
         "bridge_internal_test.go",
         "network_test.go",
+        "policy_test.go",
     ],
     embed = [":network"],
 )

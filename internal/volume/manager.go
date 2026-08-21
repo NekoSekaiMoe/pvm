@@ -24,20 +24,49 @@ type Manager struct {
 	refCounts map[string]int64             // volumeID -> current count
 	attached  map[string]*AttachResult     // volumeID -> last AttachResult (for Detach metadata)
 	extraMeta map[string]map[string]string // volumeID -> user metadata passthrough
-	volLocks  map[string]*sync.Mutex       // volumeID -> per-volume lifecycle lock
-	volLocksM sync.Mutex                   // guards volLocks
+	volLocks  map[string]*volumeLock       // volumeID -> per-volume lifecycle lock
+	volLocksM sync.Mutex                   // guards volLocks and volumeLock.holders
 }
 
-// lockFor returns the per-volume lifecycle lock, creating it on first use.
-// Attach and Detach for the SAME volume serialize on it so plugin calls and
-// count updates cannot interleave.
-func (m *Manager) lockFor(volumeID string) *sync.Mutex {
+// volumeLock pairs a per-volume lifecycle mutex with a holder count so the
+// volLocks entry can be reclaimed once the last holder releases it — without
+// reclamation the map would grow without bound (one entry per volume ID ever
+// seen) on a long-lived host.
+type volumeLock struct {
+	sync.Mutex
+	holders int // guarded by Manager.volLocksM
+}
+
+// lockFor registers the caller as a holder and returns the per-volume
+// lifecycle lock, creating it on first use. Attach and Detach for the SAME
+// volume serialize on it so plugin calls and count updates cannot interleave.
+// The holder count is incremented while volLocksM is held and BEFORE the
+// caller can touch the mutex, so a concurrent unlockFor can never observe a
+// spurious zero and delete an entry another goroutine still waits on.
+func (m *Manager) lockFor(volumeID string) *volumeLock {
 	m.volLocksM.Lock()
 	defer m.volLocksM.Unlock()
-	if m.volLocks[volumeID] == nil {
-		m.volLocks[volumeID] = &sync.Mutex{}
+	l, ok := m.volLocks[volumeID]
+	if !ok {
+		l = &volumeLock{}
+		m.volLocks[volumeID] = l
 	}
-	return m.volLocks[volumeID]
+	l.holders++
+	return l
+}
+
+// unlockFor releases the lifecycle lock and drops the caller's holder
+// registration, deleting the volLocks entry when the last holder is gone.
+// Callers must pair exactly one unlockFor with each lockFor after a
+// successful Lock.
+func (m *Manager) unlockFor(volumeID string, l *volumeLock) {
+	l.Unlock()
+	m.volLocksM.Lock()
+	l.holders--
+	if l.holders <= 0 {
+		delete(m.volLocks, volumeID)
+	}
+	m.volLocksM.Unlock()
 }
 
 // NewManager creates a Manager. baseDir defaults to DefaultVolumeBaseDir
@@ -52,7 +81,7 @@ func NewManager(baseDir string) *Manager {
 		refCounts: make(map[string]int64),
 		attached:  make(map[string]*AttachResult),
 		extraMeta: make(map[string]map[string]string),
-		volLocks:  make(map[string]*sync.Mutex),
+		volLocks:  make(map[string]*volumeLock),
 	}
 }
 
@@ -129,7 +158,7 @@ func (m *Manager) Attach(ctx context.Context, req *AttachRequest) (*AttachResult
 	// under vlock, in that order, for every caller.
 	vlock := m.lockFor(req.VolumeID)
 	vlock.Lock()
-	defer vlock.Unlock()
+	defer m.unlockFor(req.VolumeID, vlock)
 
 	// Reserve the count and compute first-attach under one lock.
 	m.mu.Lock()
@@ -210,7 +239,7 @@ func (m *Manager) Detach(ctx context.Context, req *DetachRequest) error {
 	// cannot observe or reserve a half-committed transition.
 	vlock := m.lockFor(req.VolumeID)
 	vlock.Lock()
-	defer vlock.Unlock()
+	defer m.unlockFor(req.VolumeID, vlock)
 
 	m.mu.Lock()
 	cur := m.refCounts[req.VolumeID]

@@ -21,14 +21,16 @@ func TestBuiltinAttach_Detach_RefCount(t *testing.T) {
 	}
 
 	var first *AttachResult
-	attach := func(sb string) *AttachResult {
+	attach := func(t *testing.T, sb string) *AttachResult {
+		t.Helper()
 		r, err := m.Attach(ctx, &AttachRequest{SandboxID: sb, VolumeID: "vol-1", Driver: "demo"})
 		if err != nil {
 			t.Fatalf("attach %s: %v", sb, err)
 		}
 		return r
 	}
-	detach := func(sb string) {
+	detach := func(t *testing.T, sb string) {
+		t.Helper()
 		if err := m.Detach(ctx, &DetachRequest{SandboxID: sb, VolumeID: "vol-1", Driver: "demo"}); err != nil {
 			t.Fatalf("detach %s: %v", sb, err)
 		}
@@ -36,24 +38,27 @@ func TestBuiltinAttach_Detach_RefCount(t *testing.T) {
 
 	steps := []struct {
 		name       string
-		op         func()
+		op         func(t *testing.T)
 		wantRefCnt int64
 		hostExists bool // whether the first attach's host path must exist after the op
 	}{
-		{"first attach creates host path", func() { first = attach("sb-1") }, 1, true},
-		{"second sandbox reuses host path", func() {
-			if got := attach("sb-2"); got.HostPath != first.HostPath {
+		{"first attach creates host path", func(t *testing.T) { first = attach(t, "sb-1") }, 1, true},
+		{"second sandbox reuses host path", func(t *testing.T) {
+			if got := attach(t, "sb-2"); got.HostPath != first.HostPath {
 				t.Fatalf("HostPath mismatch: %q vs %q", got.HostPath, first.HostPath)
 			}
 		}, 2, true},
-		{"non-last detach keeps host path", func() { detach("sb-1") }, 1, true},
-		{"last detach drops bookkeeping", func() { detach("sb-2") }, 0, true},
+		{"non-last detach keeps host path", func(t *testing.T) { detach(t, "sb-1") }, 1, true},
+		{"last detach drops bookkeeping", func(t *testing.T) { detach(t, "sb-2") }, 0, true},
 	}
 	for _, st := range steps {
 		t.Run(st.name, func(t *testing.T) {
-			st.op()
+			st.op(t)
 			if got := m.RefCount("vol-1"); got != st.wantRefCnt {
 				t.Fatalf("refCount = %d, want %d", got, st.wantRefCnt)
+			}
+			if first == nil {
+				t.Fatalf("first attach result is nil")
 			}
 			_, err := os.Stat(first.HostPath)
 			if st.hostExists && err != nil {
@@ -346,6 +351,146 @@ func TestManager_ConcurrentAttachDetach(t *testing.T) {
 				t.Fatalf("attached state must be cleared at count 0")
 			}
 		})
+	}
+}
+
+// TestManager_VolLocksReclaimed verifies the per-volume lock entries are
+// reclaimed once the last in-flight holder releases them (review: volLocks
+// must not grow without bound), that a volume with an in-flight operation
+// keeps its entry alive, and that concurrent operations on the same volume
+// share ONE lock entry (lifecycle stays serialized).
+func TestManager_VolLocksReclaimed(t *testing.T) {
+	base := t.TempDir()
+	m := NewManager(base)
+	ctx := context.Background()
+	if err := m.Register(ctx, PluginConfig{Name: "demo", Type: PluginTypeBuiltin}, NewBuiltin("demo")); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	volLocksLen := func() int {
+		m.volLocksM.Lock()
+		defer m.volLocksM.Unlock()
+		return len(m.volLocks)
+	}
+	if got := volLocksLen(); got != 0 {
+		t.Fatalf("fresh manager volLocks len = %d, want 0", got)
+	}
+
+	// Repeated attach/detach cycles on the same id must not leak entries:
+	// entries live only while an operation holds them.
+	for i := 0; i < 3; i++ {
+		if _, err := m.Attach(ctx, &AttachRequest{SandboxID: "sb", VolumeID: "vol-lock", Driver: "demo"}); err != nil {
+			t.Fatalf("cycle %d attach: %v", i, err)
+		}
+		if err := m.Detach(ctx, &DetachRequest{SandboxID: "sb", VolumeID: "vol-lock", Driver: "demo"}); err != nil {
+			t.Fatalf("cycle %d detach: %v", i, err)
+		}
+		if got := volLocksLen(); got != 0 {
+			t.Fatalf("cycle %d volLocks len after detach = %d, want 0 (entry must be reclaimed)", i, got)
+		}
+	}
+
+	// Concurrent attach cycles on distinct volumes must also leave the map
+	// empty once every cycle completes.
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			id := fmt.Sprintf("vol-c%d", i)
+			if _, err := m.Attach(ctx, &AttachRequest{SandboxID: "sb", VolumeID: id, Driver: "demo"}); err != nil {
+				t.Errorf("attach %s: %v", id, err)
+				return
+			}
+			if err := m.Detach(ctx, &DetachRequest{SandboxID: "sb", VolumeID: id, Driver: "demo"}); err != nil {
+				t.Errorf("detach %s: %v", id, err)
+			}
+		}(i)
+	}
+	wg.Wait()
+	if got := volLocksLen(); got != 0 {
+		t.Fatalf("volLocks len after concurrent cycles = %d, want 0", got)
+	}
+}
+
+// blockingPlugin blocks inside Attach until released, letting the test
+// observe volLocks state while an operation is in flight and prove that a
+// second operation on the same volume waits on the same lock.
+type blockingPlugin struct {
+	entered  chan struct{} // signaled on every plugin Attach entry
+	release  chan struct{} // closed to let all in-flight Attaches proceed
+	hostPath string
+}
+
+func (b *blockingPlugin) Name() string                                 { return "blocking" }
+func (b *blockingPlugin) PluginType() PluginType                       { return PluginTypeBuiltin }
+func (b *blockingPlugin) Init(_ context.Context, _ PluginConfig) error { return nil }
+func (b *blockingPlugin) Attach(_ context.Context, req *AttachRequest) (*AttachResult, error) {
+	b.entered <- struct{}{}
+	<-b.release
+	return &AttachResult{VolumeID: req.VolumeID, HostPath: b.hostPath}, nil
+}
+func (b *blockingPlugin) Detach(_ context.Context, _ *DetachRequest) error { return nil }
+func (b *blockingPlugin) Close() error                                     { return nil }
+
+// TestManager_VolLocksSharedWhileInFlight proves the reclamation is safe:
+// while a holder is in flight the entry cannot be reclaimed, and a second
+// Attach for the same volume serializes on the same entry (exactly one
+// volLocks record) instead of racing on two different locks.
+func TestManager_VolLocksSharedWhileInFlight(t *testing.T) {
+	base := t.TempDir()
+	m := NewManager(base)
+	ctx := context.Background()
+	p := &blockingPlugin{
+		entered:  make(chan struct{}, 2),
+		release:  make(chan struct{}),
+		hostPath: filepath.Join(base, "blocked-vol"),
+	}
+	if err := m.Register(ctx, PluginConfig{Name: "blocking", Type: PluginTypeBuiltin}, p); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	volLocksLen := func() int {
+		m.volLocksM.Lock()
+		defer m.volLocksM.Unlock()
+		return len(m.volLocks)
+	}
+
+	attach := func(i int) chan error {
+		errc := make(chan error, 1)
+		go func() {
+			_, err := m.Attach(ctx, &AttachRequest{SandboxID: "sb", VolumeID: "vol-share", Driver: "blocking"})
+			errc <- err
+		}()
+		return errc
+	}
+
+	// First attach enters the plugin and blocks, holding the volLocks entry.
+	first := attach(0)
+	<-p.entered
+	// Second attach for the same volume registers as another holder but must
+	// NOT enter the plugin (it waits on the same lock) and must NOT create a
+	// second entry.
+	second := attach(1)
+	if got := volLocksLen(); got != 1 {
+		t.Fatalf("volLocks len with two in-flight holders = %d, want 1 (shared entry)", got)
+	}
+	select {
+	case <-p.entered:
+		t.Fatalf("second attach entered plugin while first still held the volume lock")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// Release: first finishes, then the second acquires the SAME lock and
+	// enters the plugin; after both complete the entry is reclaimed.
+	close(p.release)
+	if err := <-first; err != nil {
+		t.Fatalf("first attach: %v", err)
+	}
+	<-p.entered
+	if err := <-second; err != nil {
+		t.Fatalf("second attach: %v", err)
+	}
+	if got := volLocksLen(); got != 0 {
+		t.Fatalf("volLocks len after both holders finished = %d, want 0 (reclaimed)", got)
 	}
 }
 

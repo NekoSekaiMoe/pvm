@@ -90,11 +90,24 @@ func TestAutopause_RetryDoesNotClobberReset(t *testing.T) {
 	}
 
 	// End to end: with an unchanged epoch the retry still arms (the happy
-	// retry path from TestAutopause_FreezeFailureRetriesWithoutPausing),
-	// observable through the epoch guard itself.
+	// retry path from TestAutopause_FreezeFailureRetriesWithoutPausing).
+	// Assert on the schedule IDENTITY, not mere timer existence: Arm alone
+	// leaves a timer in place, so a no-op rearmRetry would pass a
+	// timers[id] != nil check. The retry must bump the epoch, install a
+	// fresh generation, and replace the timer object.
 	m.Arm(id, time.Hour)
-	m.rearmRetry(id, m.epochs[id])
-	if m.timers[id] == nil {
-		t.Fatalf("unchanged epoch must allow the retry")
+	beforeEpoch := m.epochs[id]
+	beforeGen := m.gens[id]
+	beforeTimer := m.timers[id]
+	m.rearmRetry(id, beforeEpoch)
+	if m.epochs[id] != beforeEpoch+1 {
+		t.Fatalf("retry must bump the epoch: got %d, want %d", m.epochs[id], beforeEpoch+1)
 	}
+	if m.gens[id] == beforeGen || m.gens[id] == 0 {
+		t.Fatalf("retry must install a fresh generation: got %d, replacing %d", m.gens[id], beforeGen)
+	}
+	if m.timers[id] == nil || m.timers[id] == beforeTimer {
+		t.Fatalf("retry must replace the timer, not keep the armed one")
+	}
+	m.Disarm(id) // stop the 30s retry timer before the test binary continues
 }

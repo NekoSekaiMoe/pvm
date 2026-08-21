@@ -1,15 +1,18 @@
 // Package network — policy hardening mirroring CubeNet/cubevs/netpolicy.go
 // at single-host scale.
 //
-// This is a pure-Go LPM-trie planner that runs before programming the
-// eBPF whitelist_map. It rejects always-denied CIDRs, validates entry
-// counts against maxNetPolicyEntries, and expands the allow list into
-// /32s for the current hash-map backend.
+// BuildNetPolicyPlan is a pure-Go planner that runs before programming the
+// eBPF whitelist_map. It validates allow/deny entries (CIDRs or bare IPs),
+// deduplicates them via string sets, rejects allow entries that fall
+// inside an always-denied range, appends the always-denied CIDRs to the
+// deny set, caps each set at maxNetPolicyEntries, and returns both slices
+// sorted for deterministic output.
 package network
 
 import (
 	"fmt"
 	"net"
+	"sort"
 	"strings"
 )
 
@@ -25,7 +28,9 @@ var alwaysDeniedCIDRs = []string{
 
 // BuildNetPolicyPlan validates and merges user allow/deny CIDRs with the
 // always-denied set. It returns the effective allow and deny slices after
-// deduplication, or an error if limits are exceeded or CIDRs are malformed.
+// deduplication (each sorted for deterministic output), or an error if
+// limits are exceeded, entries are malformed, or an allow entry falls
+// inside an always-denied range.
 func BuildNetPolicyPlan(allowOut, denyOut []string) (allow []string, deny []string, err error) {
 	allowSet := make(map[string]struct{})
 	for _, cidr := range allowOut {
@@ -38,6 +43,9 @@ func BuildNetPolicyPlan(allowOut, denyOut []string) (allow []string, deny []stri
 			if ip := net.ParseIP(trimmed); ip == nil {
 				return nil, nil, fmt.Errorf("network: invalid allow CIDR/IP %q", cidr)
 			}
+		}
+		if IsAlwaysDenied(trimmed) {
+			return nil, nil, fmt.Errorf("network: allow CIDR/IP %q falls inside an always-denied range", cidr)
 		}
 		allowSet[trimmed] = struct{}{}
 	}
@@ -64,21 +72,55 @@ func BuildNetPolicyPlan(allowOut, denyOut []string) (allow []string, deny []stri
 	if len(denySet) > maxNetPolicyEntries {
 		return nil, nil, fmt.Errorf("network: deny_out exceeds %d entries (%d)", maxNetPolicyEntries, len(denySet))
 	}
+	allow = make([]string, 0, len(allowSet))
 	for k := range allowSet {
 		allow = append(allow, k)
 	}
+	sort.Strings(allow)
+	deny = make([]string, 0, len(denySet))
 	for k := range denySet {
 		deny = append(deny, k)
 	}
+	sort.Strings(deny)
 	return allow, deny, nil
 }
 
-// IsAlwaysDenied reports whether cidr/ip is in the always-denied set.
+// IsAlwaysDenied reports whether cidr falls inside one of the
+// always-denied ranges. cidr may be a CIDR or a bare IP (interpreted as a
+// host route, /32 for IPv4 or /128 for IPv6). Containment is a range
+// check via net.IPNet.Contains rather than a string comparison, so
+// narrower subnets of an always-denied range (e.g. 10.1.2.0/24 inside
+// 10.0.0.0/8) are also reported as denied.
 func IsAlwaysDenied(cidr string) bool {
+	entry, ok := parseNetEntry(strings.TrimSpace(cidr))
+	if !ok {
+		return false
+	}
 	for _, d := range alwaysDeniedCIDRs {
-		if d == strings.TrimSpace(cidr) {
+		_, denied, err := net.ParseCIDR(d)
+		if err != nil {
+			continue // Unreachable: alwaysDeniedCIDRs are valid constants.
+		}
+		if denied.Contains(entry.IP) {
 			return true
 		}
 	}
 	return false
+}
+
+// parseNetEntry parses s as a CIDR, falling back to a bare IP interpreted
+// as a host route (/32 for IPv4, /128 for IPv6). ok is false when s is
+// neither a valid CIDR nor a valid IP.
+func parseNetEntry(s string) (entry *net.IPNet, ok bool) {
+	if _, ipNet, err := net.ParseCIDR(s); err == nil {
+		return ipNet, true
+	}
+	ip := net.ParseIP(s)
+	if ip == nil {
+		return nil, false
+	}
+	if v4 := ip.To4(); v4 != nil {
+		return &net.IPNet{IP: v4, Mask: net.CIDRMask(32, 32)}, true
+	}
+	return &net.IPNet{IP: ip, Mask: net.CIDRMask(128, 128)}, true
 }

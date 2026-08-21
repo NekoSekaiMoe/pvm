@@ -96,6 +96,78 @@ func TestAutopause_FiresAndResume(t *testing.T) {
 	}
 }
 
+// TestAutopause_ResumeRearmsIdleTimer is the regression test for the resume
+// path: a task with a positive idle_timeout that gets suspended and resumed
+// must fall back to Suspended when it goes idle AGAIN — before the fix,
+// Resume never re-armed the idle timer, so one suspend/resume cycle
+// permanently exempted the task from autopause.
+func TestAutopause_ResumeRearmsIdleTimer(t *testing.T) {
+	dir := t.TempDir()
+	origRoot := state.RootDir
+	state.RootDir = dir
+	t.Cleanup(func() { state.RootDir = origRoot })
+	t.Setenv("PVM_CGROUP_ROOT", t.TempDir())
+
+	id := "resume-rearm"
+	st := &state.ContainerState{ID: id, Name: id, Status: state.StatusSuspended, IdleTimeout: "30ms"}
+	if err := state.SaveState(id, st); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	m := New(nil)
+	if err := m.Resume(id); err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	if loaded, _ := state.LoadState(id); loaded.Status != state.StatusRunning {
+		t.Fatalf("status after resume = %q, want running", mustStatus(t, id))
+	}
+	// The re-armed idle timer must fire again: same polling rationale as
+	// TestAutopause_FiresAndResume (timers never fire early, so waiting for
+	// the second suspension cannot false-pass).
+	if !waitForStatus(t, id, state.StatusSuspended, 2*time.Second) {
+		t.Fatalf("task did not auto-pause again after resume: status=%q", mustStatus(t, id))
+	}
+}
+
+// TestAutopause_ResumeWithoutTimeoutStaysUnarmed pins the other half of the
+// contract: a task with no (or non-positive) idle_timeout must not gain an
+// idle timer from Resume — invalid/unset timeouts keep the pre-existing
+// "never armed" behavior.
+func TestAutopause_ResumeWithoutTimeoutStaysUnarmed(t *testing.T) {
+	dir := t.TempDir()
+	origRoot := state.RootDir
+	state.RootDir = dir
+	t.Cleanup(func() { state.RootDir = origRoot })
+	t.Setenv("PVM_CGROUP_ROOT", t.TempDir())
+
+	id := "resume-notimeout"
+	for _, idle := range []string{"", "not-a-duration", "0s", "-5s"} {
+		st := &state.ContainerState{ID: id, Name: id, Status: state.StatusSuspended, IdleTimeout: idle}
+		if err := state.SaveState(id, st); err != nil {
+			t.Fatalf("save: %v", err)
+		}
+		m := New(nil)
+		if err := m.Resume(id); err != nil {
+			t.Fatalf("resume (idle=%q): %v", idle, err)
+		}
+		m.mu.Lock()
+		_, armed := m.timers[id]
+		m.mu.Unlock()
+		if armed {
+			t.Fatalf("resume with idle_timeout=%q must not arm a timer", idle)
+		}
+		// back to Suspended for the next iteration
+		loaded, err := state.LoadState(id)
+		if err != nil {
+			t.Fatalf("load: %v", err)
+		}
+		loaded.Status = state.StatusSuspended
+		if err := state.SaveState(id, loaded); err != nil {
+			t.Fatalf("re-save: %v", err)
+		}
+	}
+}
+
 // waitForStatus polls until the task reaches the wanted status or the
 // deadline passes; it returns whether the status was reached.
 func waitForStatus(t *testing.T, id string, want state.Status, within time.Duration) bool {

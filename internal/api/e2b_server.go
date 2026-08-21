@@ -254,7 +254,9 @@ func StartE2BServer(port int) error {
 		}
 		// API activity counts for lifecycle policy: bump the idle timer of a
 		// Running task, or auto-resume a Suspended one when its config allows.
-		lifecycleActivity(taskID, autoMgr)
+		// st is nil here: /exec does not need the state itself, so the helper
+		// loads it once internally.
+		lifecycleActivity(taskID, autoMgr, nil)
 		gw := gateways.get(taskID)
 		if gw == nil {
 			return c.JSON(http.StatusForbidden, map[string]string{"error": "no policy gateway registered for task"})
@@ -323,11 +325,17 @@ func StartE2BServer(port int) error {
 		mu := taskLock(id)
 		mu.Lock()
 		defer mu.Unlock()
-		lifecycleActivity(id, autoMgr)
 		st, err := state.LoadState(id)
 		if err != nil {
 			return c.JSON(http.StatusNotFound, map[string]string{"error": "task not found"})
 		}
+		// API activity bumps a RUNNING task's idle deadline — reusing the
+		// state already loaded above so the request pays one synchronous disk
+		// read instead of two. Unlike /exec's lifecycleActivity this NEVER
+		// auto-resumes: an explicit transition on a Suspended task must be
+		// validated by the FSM below (and rejected for invalid edges), not
+		// silently turned into a resume.
+		bumpIdleTimer(st, autoMgr)
 		if err := st.Transition(state.Status(req.To), state.Actor(req.Actor), req.Reason); err != nil {
 			return c.JSON(http.StatusConflict, map[string]string{"error": err.Error()})
 		}
@@ -623,7 +631,11 @@ func StartE2BServer(port int) error {
 		if req.ImageRef == "" {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": "image_ref required"})
 		}
-		rec := template.Record{TemplateID: template.GenerateTemplateID(), Alias: req.Alias, ImageRef: req.ImageRef, Status: "READY", Kind: "template"}
+		// Creation starts a template's lifecycle in PENDING: a record becomes
+		// READY (and may claim an alias — see Store.SetAlias/Create) only after
+		// its image build completes, so a freshly registered template must not
+		// be handed to sandbox launches yet.
+		rec := template.Record{TemplateID: template.GenerateTemplateID(), Alias: req.Alias, ImageRef: req.ImageRef, Status: "PENDING", Kind: "template"}
 		if err := tmplStore.Create(rec); err != nil {
 			switch {
 			case errors.Is(err, template.ErrInvalid):
@@ -677,7 +689,21 @@ func StartE2BServer(port int) error {
 		if err := c.Bind(&req); err != nil {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
 		}
-		if err := tmplStore.SetAlias(id, req.Alias); err != nil {
+		// Resolve the path param first so BOTH raw ids and aliases work here
+		// (mirrors GET /templates/:id); SetAlias/Delete then operate on the
+		// canonical template id.
+		resolved, err := tmplStore.ResolveIdentifier(id)
+		if err != nil {
+			switch {
+			case errors.Is(err, template.ErrInvalid):
+				return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+			case errors.Is(err, template.ErrNotFound):
+				return c.JSON(http.StatusNotFound, map[string]string{"error": err.Error()})
+			default:
+				return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			}
+		}
+		if err := tmplStore.SetAlias(resolved, req.Alias); err != nil {
 			switch {
 			case errors.Is(err, template.ErrInvalid):
 				return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
@@ -689,7 +715,7 @@ func StartE2BServer(port int) error {
 				return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
 			}
 		}
-		rec, err := tmplStore.Get(id)
+		rec, err := tmplStore.Get(resolved)
 		if err != nil {
 			return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		}
@@ -697,7 +723,19 @@ func StartE2BServer(port int) error {
 	})
 	api.DELETE("/templates/:id", func(c echo.Context) error {
 		id := c.Param("id")
-		if err := tmplStore.Delete(id); err != nil {
+		// Resolve aliases to template ids first (mirrors GET /templates/:id).
+		resolved, err := tmplStore.ResolveIdentifier(id)
+		if err != nil {
+			switch {
+			case errors.Is(err, template.ErrInvalid):
+				return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+			case errors.Is(err, template.ErrNotFound):
+				return c.JSON(http.StatusNotFound, map[string]string{"error": err.Error()})
+			default:
+				return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			}
+		}
+		if err := tmplStore.Delete(resolved); err != nil {
 			switch {
 			case errors.Is(err, template.ErrInvalid):
 				return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
@@ -770,24 +808,20 @@ func StartE2BServer(port int) error {
 		mu := taskLock(id)
 		mu.Lock()
 		defer mu.Unlock()
-		st, err := state.LoadState(id)
-		if err != nil {
+		if _, err := state.LoadState(id); err != nil {
 			return c.JSON(http.StatusNotFound, map[string]string{"error": "task not found"})
 		}
-		// Explicit resume honors the task's auto_resume configuration: when
-		// disabled, the task must stay Suspended until the config changes.
-		if !st.AutoResume {
-			return c.JSON(http.StatusConflict, map[string]string{
-				"error": "auto_resume is disabled for this task",
-			})
-		}
+		// An explicit operator resume is NOT gated on the task's auto_resume
+		// config: that flag only governs the automatic resume path in
+		// lifecycleActivity (API activity). A request to this endpoint means
+		// an operator decided the task must run again.
 		if err := autoMgr.Resume(id); err != nil {
 			if errors.Is(err, state.ErrInvalidTransition) || errors.Is(err, state.ErrTerminal) {
 				return c.JSON(http.StatusConflict, map[string]string{"error": err.Error()})
 			}
 			return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		}
-		st, err = state.LoadState(id)
+		st, err := state.LoadState(id)
 		if err != nil {
 			return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		}
@@ -825,14 +859,32 @@ func rearmAllAutopause(autoMgr *lifecycle.Manager) {
 	}
 }
 
+// bumpIdleTimer applies the activity half of the lifecycle policy: a
+// Running task's idle timer is bumped (Reset) when an idle_timeout is
+// configured. It takes state the caller has already loaded (e.g. /transition)
+// so a request pays one synchronous disk read, not two.
+func bumpIdleTimer(st *state.ContainerState, autoMgr *lifecycle.Manager) {
+	if st.Status != state.StatusRunning || st.IdleTimeout == "" {
+		return
+	}
+	if d, derr := time.ParseDuration(st.IdleTimeout); derr == nil && d > 0 {
+		autoMgr.Reset(st.ID, d)
+	}
+}
+
 // lifecycleActivity applies the task's lifecycle policy on API activity:
 // a Suspended task with AutoResume=true is resumed, and a Running task's
-// idle timer is bumped (Reset) when an idle_timeout is configured. Best
-// effort: failures never fail the calling endpoint.
-func lifecycleActivity(taskID string, autoMgr *lifecycle.Manager) {
-	st, err := state.LoadState(taskID)
-	if err != nil {
-		return
+// idle timer is bumped (Reset) when an idle_timeout is configured. Callers
+// that already loaded the task's state pass it in st (avoiding a second
+// synchronous disk read); nil makes this load it. Best effort: failures
+// never fail the calling endpoint.
+func lifecycleActivity(taskID string, autoMgr *lifecycle.Manager, st *state.ContainerState) {
+	if st == nil {
+		loaded, err := state.LoadState(taskID)
+		if err != nil {
+			return
+		}
+		st = loaded
 	}
 	switch st.Status {
 	case state.StatusSuspended:
@@ -840,11 +892,7 @@ func lifecycleActivity(taskID string, autoMgr *lifecycle.Manager) {
 			_ = autoMgr.Resume(taskID)
 		}
 	case state.StatusRunning:
-		if st.IdleTimeout != "" {
-			if d, derr := time.ParseDuration(st.IdleTimeout); derr == nil && d > 0 {
-				autoMgr.Reset(taskID, d)
-			}
-		}
+		bumpIdleTimer(st, autoMgr)
 	}
 }
 
