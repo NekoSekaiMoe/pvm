@@ -39,5 +39,23 @@ func Write(path string, v any) error {
 		os.Remove(name)
 		return fmt.Errorf("fsjson: close %s: %w", name, err)
 	}
-	return os.Rename(name, path)
+	if err := os.Rename(name, path); err != nil {
+		os.Remove(name)
+		return fmt.Errorf("fsjson: rename %s -> %s: %w", name, path, err)
+	}
+	// fsync the parent directory so the rename itself (a directory entry
+	// update) survives a crash; syncing only the file would leave the new
+	// name uncommitted on some filesystems (e.g. ext4 with delayed allocation).
+	d, err := os.Open(dir)
+	if err != nil {
+		return fmt.Errorf("fsjson: open dir %s: %w", dir, err)
+	}
+	if err := d.Sync(); err != nil {
+		d.Close()
+		return fmt.Errorf("fsjson: sync dir %s: %w", dir, err)
+	}
+	if err := d.Close(); err != nil {
+		return fmt.Errorf("fsjson: close dir %s: %w", dir, err)
+	}
+	return nil
 }

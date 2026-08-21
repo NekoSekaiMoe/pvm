@@ -87,9 +87,6 @@ func (e *Qcow2Engine) snapshotPath(name string) string {
 
 // CreateVolume creates a standalone qcow2 volume of sizeBytes.
 func (e *Qcow2Engine) CreateVolume(name string, sizeBytes uint64) (string, error) {
-	if name == "" {
-		return "", fmt.Errorf("cow: volume name required")
-	}
 	if err := validateName("volume", name); err != nil {
 		return "", err
 	}
@@ -174,9 +171,6 @@ func (e *Qcow2Engine) ListVolumes() ([]Volume, error) {
 }
 
 func (e *Qcow2Engine) CreateSnapshot(sourceName, snapshotName string) (string, error) {
-	if sourceName == "" || snapshotName == "" {
-		return "", fmt.Errorf("cow: source and snapshot names required")
-	}
 	if err := validateName("source", sourceName); err != nil {
 		return "", err
 	}

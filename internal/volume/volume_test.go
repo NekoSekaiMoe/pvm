@@ -2,6 +2,7 @@ package volume
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -70,15 +71,32 @@ func TestManager_HostPathContainment(t *testing.T) {
 	m := NewManager(base)
 	ctx := context.Background()
 
-	// A rogue plugin returning a path outside baseDir must be rejected.
-	rogue := &roguePlugin{hostPath: "/tmp/evil"}
-	if err := m.Register(ctx, PluginConfig{Name: "rogue", Type: PluginTypeBuiltin}, rogue); err != nil {
-		t.Fatalf("register rogue: %v", err)
+	// Rogue plugins returning paths outside baseDir must be rejected. The
+	// sibling-prefix case (base+"-evil") is the adversarial one: it shares
+	// base's string prefix but is NOT inside base, so a naive
+	// strings.HasPrefix(clean, base) check (or deprecated filepath.HasPrefix)
+	// would wrongly accept it.
+	rogues := []struct {
+		name     string
+		hostPath string
+	}{
+		{name: "rogue-abs", hostPath: "/tmp/evil"},
+		{name: "rogue-sibling", hostPath: base + "-evil"},
 	}
-	_, err := m.Attach(ctx, &AttachRequest{SandboxID: "sb-1", VolumeID: "vol-x", Driver: "rogue"})
-	if err == nil {
-		t.Fatalf("expected containment error, got nil")
+	for _, rg := range rogues {
+		if err := m.Register(ctx, PluginConfig{Name: rg.name, Type: PluginTypeBuiltin}, &roguePlugin{hostPath: rg.hostPath}); err != nil {
+			t.Fatalf("register %s: %v", rg.name, err)
+		}
 	}
+	for _, rg := range rogues {
+		t.Run(rg.name, func(t *testing.T) {
+			_, err := m.Attach(ctx, &AttachRequest{SandboxID: "sb-1", VolumeID: "vol-x", Driver: rg.name})
+			if err == nil {
+				t.Fatalf("expected containment error for HostPath %q, got nil", rg.hostPath)
+			}
+		})
+	}
+
 	// valid path under baseDir is OK (reuse builtin to prove)
 	m2 := NewManager(base)
 	if err := m2.Register(ctx, PluginConfig{Name: "ok", Type: PluginTypeBuiltin}, NewBuiltin("ok")); err != nil {
@@ -91,8 +109,6 @@ func TestManager_HostPathContainment(t *testing.T) {
 	}
 	// Mirror Manager.validateHostPath exactly: after cleaning both paths,
 	// accept only an exact base match or a prefix followed by filepath.Separator.
-	// (filepath.HasPrefix would wrongly accept sibling prefixes like /tmp/abc
-	// for base /tmp/a.)
 	clean := filepath.Clean(res.HostPath)
 	baseClean := filepath.Clean(base)
 	if clean != baseClean && !strings.HasPrefix(clean, baseClean+string(filepath.Separator)) {
@@ -190,7 +206,7 @@ func TestStore_Lifecycle(t *testing.T) {
 		if err == nil {
 			t.Fatalf("expected refcount-blocked delete error")
 		}
-		if !strings.Contains(err.Error(), "still mounted") {
+		if !errors.Is(err, ErrStillMounted) {
 			t.Fatalf("unexpected error: %v", err)
 		}
 		// volume still present after blocked delete
