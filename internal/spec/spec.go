@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/BurntSushi/toml"
@@ -396,14 +397,19 @@ func (s *TaskSpec) Validate() error {
 	if s.Artifacts.BlockSecrets && len(s.Artifacts.Declared) == 0 {
 		// not fatal — a task may declare no outputs.
 	}
+	seenPaths := make(map[string]bool)
 	for i, vm := range s.Volumes {
 		if vm.Name == "" {
 			errs = append(errs, fmt.Errorf("spec: volumes[%d].name is required", i))
 		}
 		if vm.Path == "" {
 			errs = append(errs, fmt.Errorf("spec: volumes[%d].path is required", i))
-		} else if vm.Path[0] != '/' {
+		} else if !filepath.IsAbs(vm.Path) {
 			errs = append(errs, fmt.Errorf("spec: volumes[%d].path %q must be absolute", i, vm.Path))
+		} else if seenPaths[vm.Path] {
+			errs = append(errs, fmt.Errorf("spec: volumes[%d].path %q duplicates an earlier mount", i, vm.Path))
+		} else {
+			seenPaths[vm.Path] = true
 		}
 	}
 	if s.Lifecycle.IdleTimeout != "" {

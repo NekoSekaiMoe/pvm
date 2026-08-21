@@ -432,12 +432,6 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 	// attribution source); the task id is NOT exposed to the guest.
 	args := buildTaskArgs(s, sockPath, resolvedRootfs, egressAddr, volumeArgs)
 
-	// Arm single-host AutoPause (if lifecycle.idle_timeout is set).
-	if m.Autopause != nil && s.Lifecycle.IdleTimeout != "" {
-		if d, err := time.ParseDuration(s.Lifecycle.IdleTimeout); err == nil && d > 0 {
-			m.Autopause.Arm(taskID, d)
-		}
-	}
 	defer func() {
 		if m.Autopause != nil {
 			m.Autopause.Disarm(taskID)
@@ -510,6 +504,15 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 
 	if m.OnProvisioned != nil {
 		m.OnProvisioned(taskID, pid, tokenStr)
+	}
+
+	// Arm AutoPause only after StatusRunning is persisted AND the task:start
+	// audit evidence is on disk: an armed timer for a task that never became
+	// authoritatively Running would pause (or interfere with) a failed launch.
+	if m.Autopause != nil && s.Lifecycle.IdleTimeout != "" {
+		if d, err := time.ParseDuration(s.Lifecycle.IdleTimeout); err == nil && d > 0 {
+			m.Autopause.Arm(taskID, d)
+		}
 	}
 
 	// Block until the kernel exits.

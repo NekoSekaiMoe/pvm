@@ -43,11 +43,11 @@ func TestFSM_ValidTransitions(t *testing.T) {
 
 func TestFSM_InvalidTransitions(t *testing.T) {
 	cases := []struct{ from, to Status }{
-		{StatusPending, StatusRunning},       // must provision first
-		{StatusRunning, StatusReady},         // can't un-start
-		{StatusCompleted, StatusRunning},     // terminal
-		{StatusDestroy, StatusPending},       // terminal
-		{StatusReady, StatusCompleted},       // must run + review
+		{StatusPending, StatusRunning},   // must provision first
+		{StatusRunning, StatusReady},     // can't un-start
+		{StatusCompleted, StatusRunning}, // terminal
+		{StatusDestroy, StatusPending},   // terminal
+		{StatusReady, StatusCompleted},   // must run + review
 	}
 	for _, c := range cases {
 		if canTransition(c.from, c.to) {
@@ -148,5 +148,28 @@ func TestListAll_SkipsCorrupt(t *testing.T) {
 	}
 	if len(all) != 1 || all[0].ID != "good" {
 		t.Errorf("expected only [good], got %+v", all)
+	}
+}
+
+// TestSaveState_PersistsLifecycleFields is the regression test for
+// snapshotLocked dropping fields: IdleTimeout/AutoResume set on the state
+// must survive a Save -> Load round trip (the API activity endpoints read
+// them to honor auto_resume / idle policy).
+func TestSaveState_PersistsLifecycleFields(t *testing.T) {
+	origRoot := RootDir
+	RootDir = t.TempDir()
+	t.Cleanup(func() { RootDir = origRoot })
+
+	id := "lifecycle-fields"
+	st := &ContainerState{ID: id, Name: id, Status: StatusRunning, IdleTimeout: "10m", AutoResume: true}
+	if err := SaveState(id, st); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	got, err := LoadState(id)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if got.IdleTimeout != "10m" || !got.AutoResume {
+		t.Fatalf("lifecycle fields lost in round trip: idle_timeout=%q auto_resume=%v", got.IdleTimeout, got.AutoResume)
 	}
 }

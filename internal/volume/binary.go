@@ -47,6 +47,14 @@ func (p *BinaryPlugin) Init(_ context.Context, cfg PluginConfig) error {
 	return nil
 }
 
+// pluginInput is the private payload piped to the plugin process over stdin:
+// credentials (PrivateData, Metadata) never appear in argv, which is world-
+// readable via /proc/<pid>/cmdline.
+type pluginInput struct {
+	PrivateData string            `json:"private_data,omitempty"`
+	Metadata    map[string]string `json:"metadata,omitempty"`
+}
+
 func (p *BinaryPlugin) Attach(ctx context.Context, req *AttachRequest) (*AttachResult, error) {
 	args := []string{
 		"--op", "attach",
@@ -58,10 +66,8 @@ func (p *BinaryPlugin) Attach(ctx context.Context, req *AttachRequest) (*AttachR
 		"--node-ref-first-attach", strconv.FormatBool(req.NodeRefFirstAttach),
 		"--volume-base-dir", req.VolumeBaseDir,
 	}
-	if req.PrivateData != "" {
-		args = append(args, "--private-data", req.PrivateData)
-	}
-	out, err := p.run(ctx, args)
+	in := pluginInput{PrivateData: req.PrivateData}
+	out, err := p.run(ctx, args, in)
 	if err != nil {
 		return nil, err
 	}
@@ -84,7 +90,7 @@ func (p *BinaryPlugin) Attach(ctx context.Context, req *AttachRequest) (*AttachR
 }
 
 func (p *BinaryPlugin) Detach(ctx context.Context, req *DetachRequest) error {
-	metaJSON, _ := json.Marshal(req.Metadata)
+	in := pluginInput{Metadata: req.Metadata}
 	args := []string{
 		"--op", "detach",
 		"--sandbox-id", req.SandboxID,
@@ -93,9 +99,8 @@ func (p *BinaryPlugin) Detach(ctx context.Context, req *DetachRequest) error {
 		"--driver", req.Driver,
 		"--ref-count", fmt.Sprintf("%d", req.RefCount),
 		"--node-ref-last-detach", strconv.FormatBool(req.NodeRefLastDetach),
-		"--metadata", string(metaJSON),
 	}
-	out, err := p.run(ctx, args)
+	out, err := p.run(ctx, args, in)
 	if err != nil {
 		return err
 	}
@@ -117,7 +122,7 @@ func (p *BinaryPlugin) Detach(ctx context.Context, req *DetachRequest) error {
 
 func (p *BinaryPlugin) Close() error { return nil }
 
-func (p *BinaryPlugin) run(ctx context.Context, args []string) ([]byte, error) {
+func (p *BinaryPlugin) run(ctx context.Context, args []string, in pluginInput) ([]byte, error) {
 	// Bound execution even when the caller supplied context.Background().
 	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
 		var cancel context.CancelFunc
@@ -125,12 +130,33 @@ func (p *BinaryPlugin) run(ctx context.Context, args []string) ([]byte, error) {
 		defer cancel()
 	}
 	cmd := exec.CommandContext(ctx, p.binaryPath, args...)
-	out, err := cmd.Output()
+	// Pipe the private payload over stdin: argv is world-readable via
+	// /proc/<pid>/cmdline, so credentials must never be arguments.
+	stdin, err := cmd.StdinPipe()
 	if err != nil {
+		return nil, fmt.Errorf("volume binary %q: stdin pipe: %w", p.binaryPath, err)
+	}
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = nil // captured via ExitError only when set
+	// Note: PrivateData/Metadata values are deliberately NOT included in any
+	// error message below.
+	if err := cmd.Start(); err != nil {
+		stdin.Close()
+		return nil, fmt.Errorf("volume binary %q: %w", p.binaryPath, err)
+	}
+	raw, _ := json.Marshal(in)
+	if _, werr := stdin.Write(append(raw, '\n')); werr != nil {
+		_ = cmd.Process.Kill()
+		stdin.Close()
+		return nil, fmt.Errorf("volume binary %q: write stdin: %w", p.binaryPath, werr)
+	}
+	stdin.Close()
+	if err := cmd.Wait(); err != nil {
 		if ee, ok := err.(*exec.ExitError); ok {
-			return nil, fmt.Errorf("volume binary %q %v: %s: %w", p.binaryPath, args, string(ee.Stderr), err)
+			return nil, fmt.Errorf("volume binary %q %v: stderr: %w", p.binaryPath, args, ee)
 		}
 		return nil, fmt.Errorf("volume binary %q: %w", p.binaryPath, err)
 	}
-	return bytes.TrimSpace(out), nil
+	return bytes.TrimSpace(stdout.Bytes()), nil
 }

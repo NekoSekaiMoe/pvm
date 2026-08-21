@@ -150,7 +150,9 @@ func (c *Client) GetTemplate(ctx context.Context, id string) (*TemplateInfo, err
 func (c *Client) SetTemplateAlias(ctx context.Context, id, alias string) (*TemplateInfo, error) {
 	payload := map[string]string{"alias": alias}
 	var out TemplateInfo
-	if err := c.doJSON(ctx, http.MethodPost, "/api/templates/"+url.PathEscape(id)+"/alias", payload, &out); err != nil {
+	err := c.doJSON(ctx, http.MethodPost,
+		"/api/templates/"+url.PathEscape(id)+"/alias", payload, &out)
+	if err != nil {
 		return nil, err
 	}
 	return &out, nil

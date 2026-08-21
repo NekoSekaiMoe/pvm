@@ -24,6 +24,20 @@ type Manager struct {
 	refCounts map[string]int64             // volumeID -> current count
 	attached  map[string]*AttachResult     // volumeID -> last AttachResult (for Detach metadata)
 	extraMeta map[string]map[string]string // volumeID -> user metadata passthrough
+	volLocks  map[string]*sync.Mutex       // volumeID -> per-volume lifecycle lock
+	volLocksM sync.Mutex                   // guards volLocks
+}
+
+// lockFor returns the per-volume lifecycle lock, creating it on first use.
+// Attach and Detach for the SAME volume serialize on it so plugin calls and
+// count updates cannot interleave.
+func (m *Manager) lockFor(volumeID string) *sync.Mutex {
+	m.volLocksM.Lock()
+	defer m.volLocksM.Unlock()
+	if m.volLocks[volumeID] == nil {
+		m.volLocks[volumeID] = &sync.Mutex{}
+	}
+	return m.volLocks[volumeID]
 }
 
 // NewManager creates a Manager. baseDir defaults to DefaultVolumeBaseDir
@@ -38,6 +52,7 @@ func NewManager(baseDir string) *Manager {
 		refCounts: make(map[string]int64),
 		attached:  make(map[string]*AttachResult),
 		extraMeta: make(map[string]map[string]string),
+		volLocks:  make(map[string]*sync.Mutex),
 	}
 }
 
@@ -113,6 +128,13 @@ func (m *Manager) Attach(ctx context.Context, req *AttachRequest) (*AttachResult
 	req.VolumeBaseDir = m.baseDir
 	m.mu.Unlock()
 
+	// Serialize the whole lifecycle for this volume: the plugin call below
+	// must not interleave with a concurrent Detach's teardown for the same
+	// volume.
+	vlock := m.lockFor(req.VolumeID)
+	vlock.Lock()
+	defer vlock.Unlock()
+
 	// Roll back the reservation on any failure below.
 	rollback := func() {
 		m.mu.Lock()
@@ -186,8 +208,12 @@ func (m *Manager) Detach(ctx context.Context, req *DetachRequest) error {
 	post := cur - 1
 	req.RefCount = post
 	req.NodeRefLastDetach = post == 0
+	// Reserve the detach: store post NOW so a racing second Detach (serialized
+	// by the per-volume lock below, but not before this read) cannot reserve
+	// the same transition twice.
+	m.refCounts[req.VolumeID] = post
 	// Replay the metadata from the last Attach so the plugin can locate
-	// resources. State is NOT mutated yet.
+	// resources.
 	if req.Metadata == nil {
 		if meta, ok := m.extraMeta[req.VolumeID]; ok {
 			req.Metadata = meta
@@ -195,12 +221,19 @@ func (m *Manager) Detach(ctx context.Context, req *DetachRequest) error {
 	}
 	m.mu.Unlock()
 
+	vlock := m.lockFor(req.VolumeID)
+	vlock.Lock()
+	defer vlock.Unlock()
+
 	if err := plugin.Detach(ctx, req); err != nil {
-		return err // state untouched
+		// Roll back only this call's reservation; the previous state stands.
+		m.mu.Lock()
+		m.refCounts[req.VolumeID] = cur
+		m.mu.Unlock()
+		return err
 	}
 
 	m.mu.Lock()
-	m.refCounts[req.VolumeID] = post
 	if post == 0 {
 		delete(m.attached, req.VolumeID)
 		delete(m.extraMeta, req.VolumeID)

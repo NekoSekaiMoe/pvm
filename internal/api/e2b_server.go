@@ -519,7 +519,13 @@ func StartE2BServer(port int) error {
 		CreatedAt time.Time `json:"created_at"`
 	}
 	toVolumeResponse := func(r volume.VolumeRecord) volumeResponse {
-		return volumeResponse{VolumeID: r.VolumeID, Name: r.Name, Driver: r.Driver, RefCount: r.RefCount, CreatedAt: r.CreatedAt}
+		return volumeResponse{
+			VolumeID:  r.VolumeID,
+			Name:      r.Name,
+			Driver:    r.Driver,
+			RefCount:  r.RefCount,
+			CreatedAt: r.CreatedAt,
+		}
 	}
 	api.POST("/volumes", func(c echo.Context) error {
 		var req struct {
@@ -725,15 +731,24 @@ func StartE2BServer(port int) error {
 			return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		}
 		autoMgr.Disarm(id)
+		// reArmAfterFailedPause restores the idle timer after a rollback: the
+		// task is back to Running, so autopause must keep watching it.
+		reArm := func() {
+			if d, derr := time.ParseDuration(st.IdleTimeout); derr == nil && d > 0 {
+				autoMgr.Arm(id, d)
+			}
+		}
 		if err := st.Transition(state.StatusSuspended, state.ActorHuman, "manual pause"); err != nil {
 			// Roll back the freeze so runtime and persisted state stay in sync
 			// (disk still says Running).
 			_ = cgMgr.Thaw(id)
+			reArm()
 			return c.JSON(http.StatusConflict, map[string]string{"error": err.Error()})
 		}
 		if err := state.SaveState(id, st); err != nil {
 			// Same rollback: the transition was not persisted.
 			_ = cgMgr.Thaw(id)
+			reArm()
 			return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		}
 		return c.NoContent(http.StatusNoContent)
@@ -755,7 +770,9 @@ func StartE2BServer(port int) error {
 		// Explicit resume honors the task's auto_resume configuration: when
 		// disabled, the task must stay Suspended until the config changes.
 		if !st.AutoResume {
-			return c.JSON(http.StatusConflict, map[string]string{"error": "auto_resume is disabled for this task"})
+			return c.JSON(http.StatusConflict, map[string]string{
+				"error": "auto_resume is disabled for this task",
+			})
 		}
 		if err := autoMgr.Resume(id); err != nil {
 			if errors.Is(err, state.ErrInvalidTransition) || errors.Is(err, state.ErrTerminal) {
