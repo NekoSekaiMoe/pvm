@@ -61,7 +61,7 @@
 
 ### 4. Modern Glassmorphic Web Dashboard
 Embedded Vue 3 & Nuxt 3 frontend bundled directly into the Go binary (`embed.go`), providing dedicated views for:
-- Containers (`/`), Images (`/images`), Tasks (`/tasks`), Volumes (`/volumes`), Templates (`/templates`), Pool & Quota (`/pool`), Tool Terminal (`/terminal`), Approvals (`/approvals`), Policy (`/policy`), Artifact Gate (`/gate`), Audit (`/audit`), Network & Egress (`/network`), Incidents (`/incidents`), and Identity & Tokens (`/identity`).
+- Containers (`/`), Images (`/images`), Tasks (`/tasks`), Volumes (`/volumes`), Templates (`/templates`), Pool & Quota (`/pool`), Approvals (`/approvals`), Policy (`/policy`), Artifact Gate (`/gate`), Audit (`/audit`), Network & Egress (`/network`), Incidents (`/incidents`), and Identity & Tokens (`/identity`).
 
 ---
 

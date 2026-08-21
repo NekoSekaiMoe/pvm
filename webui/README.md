@@ -19,7 +19,6 @@ The UI utilizes a **Glassmorphism** dark mode design system (`assets/css/main.cs
 - **Volumes (`/volumes`)**: Persistent storage registry, hostfs/plugin driver selection, and mount refcounting guards.
 - **Templates (`/templates`)**: Immutable base image catalog, status indicators (PENDING/READY/FAILED), and dynamic alias resolution.
 - **Pool & Quota (`/pool`)**: Warm sandbox capacity dashboard, template pre-warming, and tenant quota controls.
-- **Tool Terminal (`/terminal`)**: Interactive tool execution console routed through the host-side Policy Gateway.
 - **Console Logs (`/logs/:id`)**: Real-time console log viewer with text search, auto-scroll toggle, clipboard copy, and file download.
 
 ### Governance & Security Views

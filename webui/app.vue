@@ -10,7 +10,6 @@
         <NuxtLink to="/volumes" class="nav-link">Volumes</NuxtLink>
         <NuxtLink to="/templates" class="nav-link">Templates</NuxtLink>
         <NuxtLink to="/pool" class="nav-link">Pool &amp; Quota</NuxtLink>
-        <NuxtLink to="/terminal" class="nav-link">Tool Terminal</NuxtLink>
         
         <div class="section-title" style="margin-top: 1rem;">Governance &amp; Security</div>
         <NuxtLink to="/approvals" class="nav-link">Approvals</NuxtLink>
