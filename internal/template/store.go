@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"uml-container/internal/fsjson"
 )
 
 var idRe = regexp.MustCompile(`^(tpl|snap)-[a-f0-9]{24}$`)
@@ -29,17 +30,21 @@ type Record struct {
 	TemplateID  string    `json:"template_id"`
 	Alias       string    `json:"alias,omitempty"`
 	DisplayName string    `json:"display_name,omitempty"`
-	Kind        string    `json:"kind"` // "template" | "snapshot"
+	Kind        string    `json:"kind"`   // "template" | "snapshot"
 	Status      string    `json:"status"` // "READY" | "PENDING" | "FAILED"
 	ImageRef    string    `json:"image_ref,omitempty"`
 	ImagePath   string    `json:"image_path,omitempty"`
 	CreatedAt   time.Time `json:"created_at"`
 }
 
-// Store is a file-backed template registry.
+// Store is a file-backed template registry. It keeps an in-memory
+// alias→templateID index (initialized from disk at construction and maintained
+// by Create/SetAlias/Delete) so alias resolution is O(1) instead of scanning
+// and parsing every meta.json.
 type Store struct {
-	mu   sync.Mutex
-	root string
+	mu      sync.Mutex
+	root    string
+	aliases map[string]string // alias -> templateID
 }
 
 func resolveRoot() string {
@@ -53,7 +58,37 @@ func NewStore(root string) *Store {
 	if root == "" {
 		root = resolveRoot()
 	}
-	return &Store{root: root}
+	s := &Store{root: root, aliases: make(map[string]string)}
+	s.loadAliases()
+	return s
+}
+
+// loadAliases populates the alias index from records already on disk so
+// GetByAlias/ResolveIdentifier work immediately for pre-existing templates.
+// Best-effort: on an unreadable root the index starts empty.
+func (s *Store) loadAliases() {
+	entries, err := os.ReadDir(s.root)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(s.root, e.Name(), "meta.json"))
+		if err != nil {
+			continue
+		}
+		var rec Record
+		if err := json.Unmarshal(data, &rec); err != nil {
+			continue
+		}
+		if rec.Alias != "" {
+			if _, ok := s.aliases[rec.Alias]; !ok {
+				s.aliases[rec.Alias] = rec.TemplateID
+			}
+		}
+	}
 }
 
 func generateTemplateID() string {
@@ -128,13 +163,23 @@ func (s *Store) Create(rec Record) error {
 			rec.Kind = "template"
 		}
 	}
-	return writeMeta(dir, rec)
+	if err := writeMeta(dir, rec); err != nil {
+		return err
+	}
+	if rec.Alias != "" {
+		s.aliases[rec.Alias] = rec.TemplateID
+	}
+	return nil
 }
 
 // Get returns the record for id.
 func (s *Store) Get(id string) (*Record, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.getLocked(id)
+}
+
+func (s *Store) getLocked(id string) (*Record, error) {
 	dir, err := s.dir(id)
 	if err != nil {
 		return nil, err
@@ -161,28 +206,17 @@ func (s *Store) getByAliasLocked(alias string) (*Record, error) {
 	if alias == "" {
 		return nil, fmt.Errorf("template: empty alias")
 	}
-	entries, err := os.ReadDir(s.root)
-	if err != nil {
+	id, ok := s.aliases[alias]
+	if !ok {
 		return nil, fmt.Errorf("template: alias %q not found", alias)
 	}
-	for _, e := range entries {
-		if !e.IsDir() {
-			continue
-		}
-		data, err := os.ReadFile(filepath.Join(s.root, e.Name(), "meta.json"))
-		if err != nil {
-			continue
-		}
-		var rec Record
-		if err := json.Unmarshal(data, &rec); err != nil {
-			continue
-		}
-		if rec.Alias == alias {
-			cp := rec
-			return &cp, nil
-		}
+	rec, err := s.getLocked(id)
+	if err != nil {
+		// Record vanished on disk (deleted externally); drop the stale entry.
+		delete(s.aliases, alias)
+		return nil, fmt.Errorf("template: alias %q not found", alias)
 	}
-	return nil, fmt.Errorf("template: alias %q not found", alias)
+	return rec, nil
 }
 
 // ResolveIdentifier returns the template ID for either a raw id (tpl-/snap-)
@@ -232,8 +266,18 @@ func (s *Store) SetAlias(templateID, alias string) error {
 			return fmt.Errorf("template: alias %q already claimed by %s", alias, existing.TemplateID)
 		}
 	}
+	oldAlias := rec.Alias
 	rec.Alias = alias
-	return writeMeta(dir, rec)
+	if err := writeMeta(dir, rec); err != nil {
+		return err
+	}
+	if oldAlias != "" && s.aliases[oldAlias] == templateID {
+		delete(s.aliases, oldAlias)
+	}
+	if alias != "" {
+		s.aliases[alias] = templateID
+	}
+	return nil
 }
 
 // List returns all template records sorted by CreatedAt desc.
@@ -266,7 +310,7 @@ func (s *Store) List() ([]Record, error) {
 	return out, nil
 }
 
-// Delete removes the template directory.
+// Delete removes the template directory and drops its alias index entry.
 func (s *Store) Delete(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -274,25 +318,23 @@ func (s *Store) Delete(id string) error {
 	if err != nil {
 		return err
 	}
-	if _, err := os.Stat(filepath.Join(dir, "meta.json")); err != nil {
+	data, err := os.ReadFile(filepath.Join(dir, "meta.json"))
+	if err != nil {
 		return fmt.Errorf("template: not found %q", id)
 	}
-	return os.RemoveAll(dir)
+	var rec Record
+	if err := json.Unmarshal(data, &rec); err != nil {
+		return err
+	}
+	if err := os.RemoveAll(dir); err != nil {
+		return err
+	}
+	if rec.Alias != "" && s.aliases[rec.Alias] == id {
+		delete(s.aliases, rec.Alias)
+	}
+	return nil
 }
 
 func writeMeta(dir string, rec Record) error {
-	tmp, err := os.CreateTemp(dir, ".meta-*.json.tmp")
-	if err != nil {
-		return err
-	}
-	name := tmp.Name()
-	enc := json.NewEncoder(tmp)
-	enc.SetIndent("", "  ")
-	if err := enc.Encode(rec); err != nil {
-		tmp.Close()
-		os.Remove(name)
-		return err
-	}
-	tmp.Close()
-	return os.Rename(name, filepath.Join(dir, "meta.json"))
+	return fsjson.Write(filepath.Join(dir, "meta.json"), rec)
 }

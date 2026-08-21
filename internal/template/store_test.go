@@ -74,3 +74,72 @@ func TestStore_SetAlias(t *testing.T) {
 		t.Fatalf("clear alias: %v", err)
 	}
 }
+
+// TestStore_AliasIndex_InitFromDisk verifies that the alias index is
+// populated from records already on disk, so a fresh Store resolves aliases
+// and enforces uniqueness without a directory scan.
+func TestStore_AliasIndex_InitFromDisk(t *testing.T) {
+	root := t.TempDir()
+	s1 := NewStore(root)
+	id := GenerateTemplateID()
+	if err := s1.Create(Record{TemplateID: id, Alias: "warm"}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	s2 := NewStore(root)
+	got, err := s2.GetByAlias("warm")
+	if err != nil {
+		t.Fatalf("fresh store must resolve disk alias: %v", err)
+	}
+	if got.TemplateID != id {
+		t.Fatalf("alias resolved to %q, want %q", got.TemplateID, id)
+	}
+	if err := s2.Create(Record{TemplateID: GenerateTemplateID(), Alias: "warm"}); err == nil {
+		t.Fatalf("fresh store must enforce alias uniqueness")
+	}
+}
+
+// TestStore_AliasIndex_MoveAndRelease verifies the index is maintained on
+// SetAlias (old alias freed, moved-off alias claimable) and Delete (alias
+// released).
+func TestStore_AliasIndex_MoveAndRelease(t *testing.T) {
+	root := t.TempDir()
+	s := NewStore(root)
+	id := GenerateTemplateID()
+	if err := s.Create(Record{TemplateID: id, Alias: "x"}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	// move alias x -> y
+	if err := s.SetAlias(id, "y"); err != nil {
+		t.Fatalf("set alias: %v", err)
+	}
+	if _, err := s.GetByAlias("x"); err == nil {
+		t.Fatalf("old alias still resolvable after move")
+	}
+	if got, err := s.GetByAlias("y"); err != nil || got.TemplateID != id {
+		t.Fatalf("new alias not resolvable: got %+v err %v", got, err)
+	}
+
+	// alias moved off ("x") is claimable by another template
+	id2 := GenerateTemplateID()
+	if err := s.Create(Record{TemplateID: id2, Alias: "x"}); err != nil {
+		t.Fatalf("moved-off alias not claimable: %v", err)
+	}
+
+	// delete drops the index entry; the alias becomes reusable
+	if err := s.Delete(id2); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if _, err := s.GetByAlias("x"); err == nil {
+		t.Fatalf("alias still resolvable after template delete")
+	}
+	if err := s.Create(Record{TemplateID: GenerateTemplateID(), Alias: "x"}); err != nil {
+		t.Fatalf("alias not released after delete: %v", err)
+	}
+
+	// empty-alias error preserved
+	if _, err := s.GetByAlias(""); err == nil {
+		t.Fatalf("empty alias must error")
+	}
+}

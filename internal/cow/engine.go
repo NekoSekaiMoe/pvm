@@ -11,8 +11,21 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sync"
 )
+
+// nameRe constrains volume and snapshot names so they cannot traverse out of
+// the engine root (mirrors internal/volume volumeIDRe; "/" and "." are
+// rejected, defeating "../" and absolute-path escapes in filepath.Join).
+var nameRe = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,128}$`)
+
+func validateName(kind, name string) error {
+	if !nameRe.MatchString(name) {
+		return fmt.Errorf("cow: invalid %s name %q (must match %s)", kind, name, nameRe.String())
+	}
+	return nil
+}
 
 // Volume mirrors cubecow::Volume / Cubelet/pkg/cubecow.Volume.
 type Volume struct {
@@ -77,6 +90,9 @@ func (e *Qcow2Engine) CreateVolume(name string, sizeBytes uint64) (string, error
 	if name == "" {
 		return "", fmt.Errorf("cow: volume name required")
 	}
+	if err := validateName("volume", name); err != nil {
+		return "", err
+	}
 	if sizeBytes == 0 {
 		return "", fmt.Errorf("cow: volume size must be > 0")
 	}
@@ -96,6 +112,9 @@ func (e *Qcow2Engine) CreateVolume(name string, sizeBytes uint64) (string, error
 }
 
 func (e *Qcow2Engine) DeleteVolume(name string) error {
+	if err := validateName("volume", name); err != nil {
+		return err
+	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	path := e.volumePath(name)
@@ -106,13 +125,21 @@ func (e *Qcow2Engine) DeleteVolume(name string) error {
 }
 
 func (e *Qcow2Engine) GetVolumeInfo(name string) (*Volume, error) {
+	if err := validateName("volume", name); err != nil {
+		return nil, err
+	}
 	path := e.volumePath(name)
 	img, err := openGuestImage(path)
 	if err != nil {
 		return nil, fmt.Errorf("cow: volume %q not found: %w", name, err)
 	}
 	defer img.Close()
-	st, _ := os.Stat(path)
+	// The file may be deleted concurrently (GetVolumeInfo runs without the
+	// engine lock; DeleteVolume removes it). A nil st must not panic.
+	st, err := os.Stat(path)
+	if err != nil {
+		return nil, fmt.Errorf("cow: stat volume %q: %w", name, err)
+	}
 	return &Volume{
 		Name:       name,
 		SizeBytes:  img.Size(),
@@ -150,6 +177,12 @@ func (e *Qcow2Engine) CreateSnapshot(sourceName, snapshotName string) (string, e
 	if sourceName == "" || snapshotName == "" {
 		return "", fmt.Errorf("cow: source and snapshot names required")
 	}
+	if err := validateName("source", sourceName); err != nil {
+		return "", err
+	}
+	if err := validateName("snapshot", snapshotName); err != nil {
+		return "", err
+	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	srcPath := e.volumePath(sourceName)
@@ -174,6 +207,9 @@ func (e *Qcow2Engine) CreateSnapshot(sourceName, snapshotName string) (string, e
 }
 
 func (e *Qcow2Engine) DeleteSnapshot(snapshotName string) error {
+	if err := validateName("snapshot", snapshotName); err != nil {
+		return err
+	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	path := e.snapshotPath(snapshotName)
@@ -184,6 +220,12 @@ func (e *Qcow2Engine) DeleteSnapshot(snapshotName string) error {
 }
 
 func (e *Qcow2Engine) ListSnapshots(volumeName string) ([]Snapshot, error) {
+	// volumeName is an optional filter (empty lists all).
+	if volumeName != "" {
+		if err := validateName("volume", volumeName); err != nil {
+			return nil, err
+		}
+	}
 	// PVM snapshots are global (snap-*.qcow2) and carry backing chain;
 	// filter by resolving backing.
 	entries, err := os.ReadDir(e.root)
@@ -206,7 +248,12 @@ func (e *Qcow2Engine) ListSnapshots(volumeName string) ([]Snapshot, error) {
 		}
 		size := img.Size()
 		img.Close()
-		st, _ := os.Stat(path)
+		// Best-effort created-at: the file may vanish between open and stat
+		// (concurrent DeleteSnapshot); use a zero timestamp instead of panicking.
+		var created string
+		if st, err := os.Stat(path); err == nil {
+			created = st.ModTime().UTC().Format("2006-01-02T15:04:05Z")
+		}
 		origin := volumeName // best-effort; qcow2 header carries backing name
 		if q, err := openGuestImage(path); err == nil {
 			if qi, ok := q.(*qcow2Image); ok && qi.backingName != "" {
@@ -228,7 +275,7 @@ func (e *Qcow2Engine) ListSnapshots(volumeName string) ([]Snapshot, error) {
 			SizeBytes:    size,
 			DevicePath:   path,
 			OriginVolume: origin,
-			CreatedAt:    st.ModTime().UTC().Format("2006-01-02T15:04:05Z"),
+			CreatedAt:    created,
 		})
 	}
 	return out, nil

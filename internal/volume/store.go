@@ -9,6 +9,8 @@ import (
 	"sort"
 	"sync"
 	"time"
+
+	"uml-container/internal/fsjson"
 )
 
 var volumeIDRe = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,128}$`)
@@ -25,29 +27,38 @@ type VolumeRecord struct {
 	CreatedAt   time.Time `json:"created_at"`
 }
 
-// volumeRoot is the on-disk root for volume records.
-var volumeRoot = resolveVolumeRoot()
-
+// resolveVolumeRoot resolves the default volume root. It is overridable via
+// PVM_VOLUME_ROOT and otherwise falls back to the shared DefaultVolumeBaseDir
+// constant (defined in manager.go).
 func resolveVolumeRoot() string {
 	if v := os.Getenv("PVM_VOLUME_ROOT"); v != "" {
 		return v
 	}
-	return "/var/lib/uml-container/volumes"
+	return DefaultVolumeBaseDir
 }
 
-func volumeDir(id string) (string, error) {
+// Store persists VolumeRecords as <root>/<id>/meta.json.
+type Store struct {
+	mu   sync.Mutex
+	root string
+}
+
+// NewStore creates a Store rooted at root. An empty root falls back to
+// resolveVolumeRoot (PVM_VOLUME_ROOT / DefaultVolumeBaseDir).
+func NewStore(root string) *Store {
+	if root == "" {
+		root = resolveVolumeRoot()
+	}
+	return &Store{root: root}
+}
+
+// volumeDir validates id and returns the record directory under s.root.
+func (s *Store) volumeDir(id string) (string, error) {
 	if !volumeIDRe.MatchString(id) {
 		return "", fmt.Errorf("volume: invalid id %q (must match %s)", id, volumeIDRe.String())
 	}
-	return filepath.Join(volumeRoot, id), nil
+	return filepath.Join(s.root, id), nil
 }
-
-// Store persists VolumeRecords as <volumeRoot>/<id>/meta.json.
-type Store struct {
-	mu sync.Mutex
-}
-
-func NewStore() *Store { return &Store{} }
 
 // Create inserts a new record. Returns an error if the id already exists.
 func (s *Store) Create(rec VolumeRecord) error {
@@ -62,7 +73,10 @@ func (s *Store) Create(rec VolumeRecord) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	dir, _ := volumeDir(rec.VolumeID)
+	dir, err := s.volumeDir(rec.VolumeID)
+	if err != nil {
+		return err
+	}
 	if _, err := os.Stat(filepath.Join(dir, "meta.json")); err == nil {
 		return fmt.Errorf("volume: %q already exists", rec.VolumeID)
 	}
@@ -79,7 +93,7 @@ func (s *Store) Create(rec VolumeRecord) error {
 func (s *Store) Get(id string) (*VolumeRecord, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	dir, err := volumeDir(id)
+	dir, err := s.volumeDir(id)
 	if err != nil {
 		return nil, err
 	}
@@ -98,7 +112,7 @@ func (s *Store) Get(id string) (*VolumeRecord, error) {
 func (s *Store) List() ([]VolumeRecord, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	entries, err := os.ReadDir(volumeRoot)
+	entries, err := os.ReadDir(s.root)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil
@@ -110,7 +124,7 @@ func (s *Store) List() ([]VolumeRecord, error) {
 		if !e.IsDir() {
 			continue
 		}
-		data, err := os.ReadFile(filepath.Join(volumeRoot, e.Name(), "meta.json"))
+		data, err := os.ReadFile(filepath.Join(s.root, e.Name(), "meta.json"))
 		if err != nil {
 			continue
 		}
@@ -129,7 +143,7 @@ func (s *Store) List() ([]VolumeRecord, error) {
 func (s *Store) Delete(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	dir, err := volumeDir(id)
+	dir, err := s.volumeDir(id)
 	if err != nil {
 		return err
 	}
@@ -151,7 +165,7 @@ func (s *Store) Delete(id string) error {
 func (s *Store) IncRef(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	dir, err := volumeDir(id)
+	dir, err := s.volumeDir(id)
 	if err != nil {
 		return err
 	}
@@ -171,7 +185,7 @@ func (s *Store) IncRef(id string) error {
 func (s *Store) DecRef(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	dir, err := volumeDir(id)
+	dir, err := s.volumeDir(id)
 	if err != nil {
 		return err
 	}
@@ -190,18 +204,5 @@ func (s *Store) DecRef(id string) error {
 }
 
 func writeMeta(dir string, rec VolumeRecord) error {
-	tmp, err := os.CreateTemp(dir, ".meta-*.json.tmp")
-	if err != nil {
-		return err
-	}
-	name := tmp.Name()
-	enc := json.NewEncoder(tmp)
-	enc.SetIndent("", "  ")
-	if err := enc.Encode(rec); err != nil {
-		tmp.Close()
-		os.Remove(name)
-		return err
-	}
-	tmp.Close()
-	return os.Rename(name, filepath.Join(dir, "meta.json"))
+	return fsjson.Write(filepath.Join(dir, "meta.json"), rec)
 }
