@@ -165,8 +165,55 @@ func (m *Manager) pause(taskID string, gen uint64) {
 		m.rearmRetry(taskID, epoch)
 		return
 	}
-	_ = st.Transition(state.StatusSuspended, state.ActorSystem, "idle timeout")
-	_ = state.SaveState(taskID, st)
+	m.commitPause(taskID, epoch, st)
+}
+
+// commitPause persists the Suspended transition for an already-frozen task.
+// Two hazards are reconciled on the way in:
+//
+//   - A Reset/Disarm that landed while the freeze was running bumped the
+//     cancel epoch; the task must stay running. Thaw (the freeze above may
+//     have succeeded) and let the new schedule govern.
+//   - A transition or persistence failure must not leave the task frozen
+//     while on disk it is still Running with no timer armed — that state
+//     never self-heals. Thaw and schedule a retry via rearmRetry (which
+//     skips the retry if the epoch moved on).
+func (m *Manager) commitPause(taskID string, epoch uint64, st *state.ContainerState) {
+	if !m.epochCurrent(taskID, epoch) {
+		m.thawBestEffort(taskID)
+		return
+	}
+	if err := st.Transition(state.StatusSuspended, state.ActorSystem, "idle timeout"); err != nil {
+		m.abortPause(taskID, epoch)
+		return
+	}
+	if err := state.SaveState(taskID, st); err != nil {
+		m.abortPause(taskID, epoch)
+	}
+}
+
+// epochCurrent reports whether the task's cancel epoch still equals epoch,
+// i.e. no Arm/Reset/Disarm has intervened since the pause snapshot.
+func (m *Manager) epochCurrent(taskID string, epoch uint64) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.epochs[taskID] == epoch
+}
+
+// abortPause unwinds a pause that froze the task but could not commit
+// Suspended (FSM conflict or state persistence failure): thaw so the task
+// is not left frozen-but-Running, then retry later — rearmRetry re-checks
+// the epoch under one lock hold, so a newer schedule is never clobbered.
+func (m *Manager) abortPause(taskID string, epoch uint64) {
+	m.thawBestEffort(taskID)
+	m.rearmRetry(taskID, epoch)
+}
+
+// thawBestEffort releases the freezer for taskID. A missing cgroup (task
+// exited, tests) is fine; other errors have no remedy at this layer — the
+// retry path or an explicit resume is the recovery route.
+func (m *Manager) thawBestEffort(taskID string) {
+	_ = m.cg.Thaw(taskID)
 }
 
 // rearmRetry schedules a pause retry for a failed freeze, but only if the
