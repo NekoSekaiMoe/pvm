@@ -16,6 +16,9 @@ go_library(
 
 go_test(
     name = "volume_test",
-    srcs = ["volume_test.go"],
+    srcs = [
+        "binary_test.go",
+        "volume_test.go",
+    ],
     embed = [":volume"],
 )
