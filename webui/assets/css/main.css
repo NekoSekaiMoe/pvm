@@ -320,3 +320,73 @@ textarea:focus { border-color: var(--primary); }
 
 /* Pagination/loading hint */
 .muted { color: var(--text-muted); }
+
+/* Tabs */
+.tabs {
+  display: flex;
+  gap: 0.5rem;
+  margin-bottom: 1.5rem;
+  border-bottom: 1px solid var(--glass-border);
+  padding-bottom: 0.5rem;
+}
+.tab {
+  padding: 0.5rem 1rem;
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  font-weight: 600;
+  cursor: pointer;
+  border-radius: 0.5rem;
+  transition: all 0.2s ease;
+}
+.tab:hover { color: var(--text-main); background: rgba(255,255,255,0.05); }
+.tab.active { color: var(--primary); background: rgba(59, 130, 246, 0.15); }
+
+/* Toolbar & Filters */
+.toolbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 1rem;
+  margin-bottom: 1rem;
+  flex-wrap: wrap;
+}
+.search-input {
+  max-width: 320px;
+}
+
+/* Modal dialogs */
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.6);
+  backdrop-filter: blur(4px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+.modal-box {
+  background: var(--bg-color);
+  border: 1px solid var(--glass-border);
+  border-radius: 1rem;
+  padding: 2rem;
+  max-width: 600px;
+  width: 90%;
+  max-height: 85vh;
+  overflow-y: auto;
+  box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.5);
+}
+
+/* Code & Pre blocks */
+pre.code-block {
+  background: rgba(0, 0, 0, 0.4);
+  border: 1px solid var(--glass-border);
+  padding: 1rem;
+  border-radius: 0.5rem;
+  font-family: ui-monospace, monospace;
+  font-size: 0.85rem;
+  color: #e2e8f0;
+  overflow-x: auto;
+}
+

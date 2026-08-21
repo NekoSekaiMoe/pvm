@@ -257,14 +257,14 @@ func StartE2BServer(port int) error {
 		// st is nil here: /exec does not need the state itself, so the helper
 		// loads it once internally.
 		lifecycleActivity(taskID, autoMgr, nil)
-		gw := gateways.get(taskID)
-		if gw == nil {
-			return c.JSON(http.StatusForbidden, map[string]string{"error": "no policy gateway registered for task"})
-		}
 		// Parse "name arg=val arg2=val2 ..." into a ToolRequest.
 		treq, err := parseExecCommand(req.Command)
 		if err != nil {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+		}
+		gw := gateways.get(taskID)
+		if gw == nil {
+			return c.JSON(http.StatusForbidden, map[string]string{"error": "no policy gateway registered for task"})
 		}
 		resp, err := gw.Execute(treq)
 		if err != nil {
@@ -664,12 +664,19 @@ func StartE2BServer(port int) error {
 	})
 	api.GET("/templates/:id", func(c echo.Context) error {
 		id := c.Param("id")
-		// Try direct id first, then alias resolution
-		rec, err := tmplStore.Get(id)
+		resolved, err := tmplStore.ResolveIdentifier(id)
 		if err != nil {
-			if aliasRec, aerr := tmplStore.GetByAlias(id); aerr == nil {
-				return c.JSON(http.StatusOK, aliasRec)
+			switch {
+			case errors.Is(err, template.ErrInvalid):
+				return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+			case errors.Is(err, template.ErrNotFound):
+				return c.JSON(http.StatusNotFound, map[string]string{"error": err.Error()})
+			default:
+				return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
 			}
+		}
+		rec, err := tmplStore.Get(resolved)
+		if err != nil {
 			switch {
 			case errors.Is(err, template.ErrInvalid):
 				return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})

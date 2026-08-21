@@ -1,82 +1,117 @@
 <template>
   <div>
-    <h1>Approvals</h1>
-    <p class="muted">Human-in-the-loop gate (plan.md §10). Side-effectful actions pause here until a bound ticket is decided.</p>
+    <div class="toolbar">
+      <div>
+        <h1>Human Approvals Inbox</h1>
+        <p class="muted">Human-in-the-loop governance (plan.md §10). Side-effectful actions (e.g. <code>pay</code>, <code>deploy</code>, <code>send</code>) pause until approved.</p>
+      </div>
+    </div>
 
     <div v-if="error" class="callout err">{{ error }}</div>
 
     <div class="glass-card">
+      <div class="toolbar">
+        <input v-model="filterTask" placeholder="Filter by Task ID..." class="search-input" />
+        <span class="muted" style="font-size:0.875rem;">Pending Tickets: {{ filteredTickets.length }}</span>
+      </div>
+
       <div class="table-container">
         <table>
           <thead>
             <tr>
-              <th>Ticket</th>
+              <th>Ticket ID</th>
               <th>Task</th>
               <th>Tool</th>
               <th>Target</th>
-              <th>Params</th>
-              <th>Why</th>
+              <th>Bound Parameters</th>
+              <th>Why / Reason</th>
               <th>Deadline</th>
               <th>Actions</th>
             </tr>
           </thead>
           <tbody>
-            <tr v-for="t in tickets" :key="t.id">
-              <td class="mono" :title="t.id">{{ t.id.slice(0, 16) }}…</td>
+            <tr v-for="t in filteredTickets" :key="t.id">
+              <td class="mono" :title="t.id"><strong>{{ t.id.slice(0, 16) }}…</strong></td>
               <td class="mono">{{ t.task_id }}</td>
               <td><code>{{ t.tool }}</code></td>
-              <td>{{ t.target || '—' }}</td>
-              <td class="mono" style="max-width:240px;overflow:hidden;text-overflow:ellipsis;">
+              <td><span class="pill allow">{{ t.target || '—' }}</span></td>
+              <td class="mono" style="max-width:280px;overflow:hidden;text-overflow:ellipsis;" :title="JSON.stringify(t.params)">
                 {{ JSON.stringify(t.params) }}
               </td>
               <td>{{ t.why || '—' }}</td>
               <td class="timeline-meta">{{ fmt(t.deadline) }}</td>
               <td>
-                <button class="btn btn-primary" @click="decide(t.id, true)" style="background:var(--success);">Approve</button>
-                <button class="btn btn-danger" @click="decide(t.id, false)" style="margin-left:0.4rem;">Reject</button>
+                <button class="btn btn-primary" @click="decide(t.id, true)" style="background:var(--success);font-size:0.8rem;margin-right:0.3rem;">Approve</button>
+                <button class="btn btn-danger" @click="decide(t.id, false)" style="font-size:0.8rem;">Reject</button>
               </td>
             </tr>
-            <tr v-if="!tickets || tickets.length === 0">
-              <td colspan="8" class="muted" style="text-align:center;padding:2rem;">No pending tickets.</td>
+            <tr v-if="filteredTickets.length === 0">
+              <td colspan="8" class="muted" style="text-align:center;padding:2rem;">No pending approval tickets.</td>
             </tr>
           </tbody>
         </table>
       </div>
     </div>
 
+    <!-- Create Test Ticket Form -->
     <div class="glass-card">
-      <h3>Create test ticket</h3>
-      <p class="muted" style="font-size:0.8rem;margin-bottom:0.75rem;">For exercising the flow without a real agent attached.</p>
+      <h3>Create Test Ticket</h3>
+      <p class="muted" style="font-size:0.8rem;margin-bottom:1rem;">Manually inject an approval ticket to test operator decision workflows.</p>
       <div class="form-row">
-        <input v-model="form.task_id" placeholder="task id" />
-        <input v-model="form.tool" placeholder="tool name" />
+        <div>
+          <label class="section-title">Task ID</label>
+          <input v-model="form.task_id" placeholder="e.g. agent-task-01" />
+        </div>
+        <div>
+          <label class="section-title">Tool Name</label>
+          <input v-model="form.tool" placeholder="e.g. send_email, deploy_app" />
+        </div>
       </div>
       <div class="form-row">
-        <input v-model="form.target" placeholder="target (e.g. prod-mailer)" />
-        <input v-model="form.why" placeholder="why" />
+        <div>
+          <label class="section-title">Target</label>
+          <input v-model="form.target" placeholder="e.g. production-smtp" />
+        </div>
+        <div>
+          <label class="section-title">Justification (Why)</label>
+          <input v-model="form.why" placeholder="e.g. user requested quarterly report" />
+        </div>
       </div>
       <div class="form-row full">
-        <input v-model="form.params" placeholder='params as JSON: {"to":"x@y.com"}' />
+        <label class="section-title">Parameters (JSON)</label>
+        <input v-model="form.params" placeholder='{"recipient": "alex@company.com", "subject": "Report"}' />
       </div>
-      <button class="btn btn-primary" @click="create">Create Ticket</button>
-      <div v-if="createMsg" class="callout ok" style="margin-top:0.75rem;">{{ createMsg }}</div>
-      <div v-if="createErr" class="callout err" style="margin-top:0.75rem;">{{ createErr }}</div>
+      
+      <div style="margin-top:1rem;">
+        <button class="btn btn-primary" @click="create">Create Ticket</button>
+      </div>
+
+      <div v-if="createMsg" class="callout ok" style="margin-top:1rem;">{{ createMsg }}</div>
+      <div v-if="createErr" class="callout err" style="margin-top:1rem;">{{ createErr }}</div>
     </div>
   </div>
 </template>
 
 <script setup>
-import { ref } from 'vue'
+import { ref, computed } from 'vue'
 import { apiFetch, usePoll } from '~/composables/useApi'
 
 const tickets = ref([])
+const filterTask = ref('')
 const error = ref(null)
+
 const { refresh } = usePoll(async () => {
   tickets.value = await apiFetch('/api/approvals')
   return tickets.value
 }, 2500)
 
-const form = ref({ task_id: 'demo', tool: 'send_email', target: 'prod', why: '', params: '{}' })
+const filteredTickets = computed(() => {
+  if (!filterTask.value) return tickets.value || []
+  const q = filterTask.value.toLowerCase()
+  return (tickets.value || []).filter(t => t.task_id && t.task_id.toLowerCase().includes(q))
+})
+
+const form = ref({ task_id: 'demo-task', tool: 'send_email', target: 'prod-smtp', why: 'sending notification', params: '{"to":"admin@example.com"}' })
 const createMsg = ref('')
 const createErr = ref('')
 
