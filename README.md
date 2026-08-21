@@ -1,176 +1,99 @@
 # PVM (Pico VM)
 
-[![Go Version](https://img.shields.io/badge/go-1.22+-blue.svg)](https://golang.org)
-[![License](https://img.shields.io/badge/license-Apache--2.0-green.svg)](LICENSE)
-[![Nuxt 3](https://img.shields.io/badge/Nuxt-3-00DC82.svg)](https://nuxt.com)
+[![Go Version](https://img.shields.io/badge/Go-1.22+-00ADD8?style=flat&logo=go)](https://golang.org)
+[![Nuxt 3](https://img.shields.io/badge/Nuxt-3-00DC82?style=flat&logo=nuxtdotjs)](https://nuxt.com)
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
-**PVM** is a lightweight, User-Mode Linux (UML)-based container management system and hardened autonomous AI agent sandbox. It provides VM-level hardware-assisted isolation for untrusted processes and code execution using virtualized Linux kernels, paired with block-level Copy-on-Write (CoW) overlays, multi-tenant resource quotas, fine-grained L7/eBPF egress security, human-in-the-loop approval workflows, and an embedded glassmorphic Nuxt 3 WebUI.
+**PVM (Pico VM)** 是一个基于 User-Mode Linux (UML) 的轻量级虚拟化容器管理器与**加固型自主 AI Agent 代码执行沙箱**。
 
----
-
-## 🌟 Key Architecture & Capabilities
-
-```
-                                      HOST LAYER
-+-----------------------------------------------------------------------------------------+
-|                                    PVM Control Plane                                    |
-|                                                                                         |
-|  +-------------------+  +-------------------+  +-------------------+  +--------------+  |
-|  |  Identity Broker  |  |  Tool / Policy GW |  |   Artifact Gate   |  |   Approval   |  |
-|  |  (HMAC Scopes)    |  |  (Exec Sandbox)   |  |   (Secret Scan)   |  |   Tickets    |  |
-|  +-------------------+  +-------------------+  +-------------------+  +--------------+  |
-|  +-------------------+  +-------------------+  +-------------------+  +--------------+  |
-|  |  Lifecycle / FSM  |  |  Incident Engine  |  |  Warm Pool/Quota  |  |  Audit Log   |  |
-|  |  (AutoPause/Thaw) |  |  (Quarantine)     |  |  (Tenant Budgets) |  |  (SHA Chain) |  |
-|  +-------------------+  +-------------------+  +-------------------+  +--------------+  |
-|                                                                                         |
-|  +---------------------------------------+   +---------------------------------------+  |
-|  |  Storage: Pure-Go qcow2 CoW Engine    |   |  Network: L7 Egress Proxy + eBPF TC   |  |
-|  |  (Overlay, In-Place Compact, Convert) |   |  (SSRF IP-Floor, Domain Allow/Deny)   |  |
-|  +---------------------------------------+   +---------------------------------------+  |
-|                     |                                            |                      |
-|         vhost-user-blk (UNIX Socket)                  TAP Device (vec0 / L2 Bridge)     |
-+---------------------|--------------------------------------------|----------------------+
-                      |                                            |
-                      v                                            v
-+-----------------------------------------------------------------------------------------+
-|                              GUEST SANDBOX (UML KERNEL)                                 |
-|                                                                                         |
-|   /dev/vda (ext4 rootfs)                            vec0 (10.0.0.x network)             |
-|   In-Guest cgroup v2 (memory.max, pids.max)         Ephemeral scoped token in env       |
-+-----------------------------------------------------------------------------------------+
-```
-
-### 1. Dual Execution Modes
-- **`agentpvm run` (Hardened Agent Sandbox)**: Full TaskSpec-driven runtime with all 12 control planes active (Identity, L7 Egress, Tool Gateway, Artifact Gate, Approvals, Incident Controller, Warm Pool & Quotas, Volumes, Templates, AutoPause Lifecycle, CoW Overlays, and Tamper-Evident Audit Ledger).
-- **`umlctl start` (Thin Container Launcher)**: Low-overhead UML instance launcher for simple container workflows and developer testing.
-
-### 2. Storage & Block-Level Copy-on-Write
-- **Pure-Go qcow2 Engine (`internal/cow`)**: Creates, mounts, inspects, and compacts qcow2 overlays in pure Go without requiring `qemu-img` at runtime.
-- **In-Process vhost-user-blk Server (`internal/vhost/vu`)**: Serves qcow2 overlays directly over UNIX domain sockets into the UML guest's `virtio-blk` device.
-- **Zero-Cluster Dropping & In-Place Compaction**: Transparently converts zeroed blocks to unallocated clusters upon sandbox termination (`CompactOnExit`).
-
-### 3. Comprehensive Governance & Security Plane
-- **Credential Broker (`internal/identity`)**: Mints short-lived, scope-bounded HMAC tokens; long-lived credentials never enter the guest sandbox.
-- **Tool / Policy Gateway (`internal/policy`)**: Intercepts `/api/exec` calls, evaluates `allow`/`constrain`/`approve`/`deny` rule matrices, and scrubs sensitive API keys.
-- **Artifact Gate (`internal/artifact`)**: 4-step verification pipeline (Reproducibility Replay, Test & Secret Scan, Sensitive-Diff Check, and SHA-256 Fingerprint Binding) before code or output release.
-- **Human-in-the-Loop Approvals (`internal/approval`)**: Pauses side-effectful actions (`pay`, `deploy`, `send`) until an operator reviews parameter bindings.
-- **Automated Incident Response (`internal/incident`)**: 4-tier response matrix (Block, Pause, Quarantine, Terminate) with automatic anomaly escalation.
-- **Tamper-Evident Audit Ledger (`internal/audit`)**: Merkle-style SHA-256 hash-chained JSONL records stored outside the container, verifiable via `/api/audit/:id/verify`.
-- **Egress & SSRF Protection (`internal/network/egress`, `bpf/egress.c`)**: L7 domain filtering with eBPF TC kernel enforcement blocking all private (RFC 1918), loopback (`127.0.0.0/8`), and cloud metadata (`169.254.169.254`) traffic.
-
-### 4. Modern Glassmorphic Web Dashboard
-Embedded Vue 3 & Nuxt 3 frontend bundled directly into the Go binary (`embed.go`), providing dedicated views for:
-- Containers (`/`), Images (`/images`), Tasks (`/tasks`), Volumes (`/volumes`), Templates (`/templates`), Pool & Quota (`/pool`), Approvals (`/approvals`), Policy (`/policy`), Artifact Gate (`/gate`), Audit (`/audit`), Network & Egress (`/network`), Incidents (`/incidents`), and Identity & Tokens (`/identity`).
+它在进程级别提供真正的独立 Linux 内核级硬件虚拟化隔离，兼备 Docker 级秒级启动速度与虚拟机级强安全边界，专为不可信代码执行、自主 AI 编程代理与多租户环境设计。
 
 ---
 
-## 🚀 Quick Start
+## 🎯 核心用途 (Use Cases)
 
-### Build & Run
+1. **AI Agent 安全沙箱**：为 LLM / Agent 代码解释器提供内核级隔离环境，防止容器逃逸、提权与破坏宿主机。
+2. **凭证隔离与防泄露**：长效 Secret 永不注入沙箱，仅下发短期 HMAC 凭证，并在宿主机代理层按需附带凭据。
+3. **出站网络与 SSRF 防御**：L7 HTTP/HTTPS 域名白名单 + eBPF TC 底层硬阻断（私网 RFC1918、回环 127.0.0.0/8、云元数据 169.254.169.254）。
+4. **轻量级容器与快照**：纯 Go 原生 qcow2 驱动实现秒级 CoW 差异盘、原位压缩与快照归档，无外部重型依赖。
+5. **人机协同治理与审计**：高危动作（支付/外发/部署）自动拦截进审批流，全程记录基于 SHA-256 默克尔哈希链的防篡改审计日志。
+
+---
+
+## ⚡ 快速上手 (Quick Start)
+
+### 1. 环境准备与构建
+
+确保本地已安装 **Go 1.22+** 和 **pnpm**：
 
 ```bash
-# 1. Build the frontend (using pnpm)
+# 克隆仓库
+git clone https://github.com/NekoSekaiMoe/pvm.git
+cd pvm
+
+# 构建 WebUI 静态前端资源
 cd webui && pnpm install && pnpm run generate && cd ..
 
-# 2. Build binaries
+# 构建 CLI 与管理控制面二进制
 go build -o agentpvm ./cmd/agentpvm
 go build -o bin/umlctl ./cmd/umlctl
+```
 
-# 3. Start the WebUI and REST API server (accessible at http://localhost:3000)
+### 2. 启动嵌入式 WebUI 仪表盘
+
+PVM 将 Nuxt 3 前端静态资源直接内嵌至 Go 二进制中，一条命令即可启动带有 E2B 兼容 REST API 与控制台的面板：
+
+```bash
 ./agentpvm webui --port 3000
+```
+浏览器访问 `http://localhost:3000` 即可查看沙箱、存储卷、模板中心、审批流及审计日志。
 
-# 4. Launch an agent sandbox from TaskSpec TOML
+### 3. 运行 Agent 沙箱任务
+
+使用 TaskSpec 配置文件启动完整治理周期的 Agent 沙箱：
+
+```bash
 ./agentpvm run -config uml/agentpvm.toml
+```
 
-# 5. Or launch a standalone UML container with umlctl
-./bin/umlctl start -name my-node -rootfs alpine.img -mem 512M
+### 4. 或启动独立 UML 容器
+
+使用轻量 CLI `umlctl` 快速启动单个容器实例：
+
+```bash
+./bin/umlctl start -name demo-node -rootfs alpine.img -mem 512M
 ```
 
 ---
 
-## 💻 CLI Subcommands Reference
+## 🛠️ CLI 常用速查
 
-### `agentpvm`
-- `agentpvm run [-config <spec.toml>] [-name <id>] [-rootfs <base.img>] [-net]`: Launch hardened agent sandbox.
-- `agentpvm api [-port 8080]`: Start E2B-compatible REST API server.
-- `agentpvm webui [-port 3000]`: Start embedded Nuxt 3 dashboard + API server.
-- `agentpvm cow -backing <base> -overlay <overlay.qcow2>`: Create qcow2 CoW overlay.
-- `agentpvm cow -compact <overlay.qcow2>`: Rebuild and compact overlay in place.
-- `agentpvm cow -to-raw <src> [-overlay <dst.img>]`: Convert qcow2 to raw image.
-- `agentpvm cow -to-qcow2 <src> [-overlay <dst.qcow2>]`: Convert raw image to standalone qcow2.
-- `agentpvm snapshot [export|import] <id> <file.tgz>`: Export or restore container archive.
-- `agentpvm cgroup [freeze|thaw] <id>`: Freeze or thaw sandbox cgroup v2 hierarchy.
-- `agentpvm gate -bundle <bundle.json>`: Offline Artifact Gate verification.
-- `agentpvm approval [list]`: Query live pending approval tickets.
-- `agentpvm pool [stats]`: Query warm pool readiness and tenant quota statistics.
-
-### `umlctl`
-- `umlctl start [-name <id>] [-rootfs <img.img>] [-mem <512M>] [-cpu <1000>] [-config <spec.toml>]`: Start UML container.
-- `umlctl ps`: List running and stopped containers.
-- `umlctl logs <container-id>`: Print console logs.
-- `umlctl image pull <docker-image>`: Pull and export Docker image as ext4 rootfs.
-- `umlctl network [create|rm] <bridge-name>`: Manage host bridge and NAT networking.
+| 命令 | 用途 |
+|:---|:---|
+| `agentpvm run [-config <spec.toml>]` | 启动 TaskSpec 驱动的加固 Agent 沙箱 |
+| `agentpvm webui [--port 3000]` | 启动嵌入式 Nuxt 3 Web 仪表盘与 REST API 服务 |
+| `agentpvm api [-port 8080]` | 启动 E2B 兼容的 REST API 服务端 |
+| `agentpvm cow -compact <overlay.qcow2>` | 原位压缩 qcow2 差异盘并释放零簇 |
+| `agentpvm snapshot [export\|import]` | 归档导出或解包还原容器状态 |
+| `umlctl start -name <id> -rootfs <img.img>` | 启动独立轻量 UML 容器 |
+| `umlctl ps` / `umlctl logs <id>` | 查看容器运行状态与控制台日志 |
 
 ---
 
-## 📡 REST API Summary (E2B SDK Compatible)
+## 🧪 自动化测试
 
-All API calls under `/api` require `Authorization: Bearer <API_SECRET>` (default: `secret`).
-
-| Endpoint | Method | Description |
-|:---|:---|:---|
-| `/api/containers` | `GET` | List all containers and their status |
-| `/api/containers/start` | `POST` | Launch a container (`name`, `rootfs`, `mem`, `cpu`) |
-| `/api/containers/:id/logs` | `GET` | Retrieve console output |
-| `/api/containers/:id` | `DELETE` | Terminate container and clean state |
-| `/api/containers/:id/snapshot` | `POST` | Export container snapshot archive |
-| `/api/containers/:id/restore` | `POST` | Restore container from snapshot |
-| `/api/images/pull` | `POST` | Pull Docker image into ext4 rootfs |
-| `/api/exec` | `POST` | Route tool execution through Policy Gateway |
-| `/api/tasks` | `GET` | List all tasks and lifecycle FSM states |
-| `/api/tasks/:id` | `GET` | Get task state, transitions, and fingerprint |
-| `/api/tasks/:id/transition` | `POST` | Manually trigger FSM state transition |
-| `/api/tasks/:id/pause` | `POST` | Pause / freeze sandbox cgroup runtime |
-| `/api/tasks/:id/resume` | `POST` | Resume / thaw suspended sandbox |
-| `/api/tasks/load-spec` | `POST` | Validate TaskSpec TOML & compute SHA fingerprint |
-| `/api/volumes` | `GET`, `POST` | List and create persistent volumes |
-| `/api/volumes/:id` | `GET`, `DELETE` | Retrieve details or delete volume (with refcount guard) |
-| `/api/templates` | `GET`, `POST` | List and register base templates (PENDING status) |
-| `/api/templates/:id` | `GET`, `DELETE` | Lookup by ID/Alias or delete template |
-| `/api/templates/:id/alias` | `POST` | Assign alias to READY template |
-| `/api/approvals` | `GET`, `POST` | List pending tickets or create test ticket |
-| `/api/approvals/:id/decide` | `POST` | Approve or reject human approval ticket |
-| `/api/gate/verify` | `POST` | Run 4-step Artifact Gate verification |
-| `/api/policy/:task` | `GET` | Inspect compiled tool rules for task |
-| `/api/pool/stats` | `GET` | Get warm pool ready, claimed, and total stats |
-| `/api/pool/warm` | `POST` | Pre-warm N sandboxes from template |
-| `/api/pool/quota` | `POST` | Configure tenant resource quotas |
-| `/api/audit/:id` | `GET` | Retrieve complete audit ledger records |
-| `/api/audit/:id/verify` | `GET` | Cryptographically verify audit hash chain integrity |
-
----
-
-## 🧪 Testing
-
-PVM includes 22 end-to-end integration shell suites in `tests/` alongside comprehensive Go unit and security test suites:
+仓库提供完善的单元测试与 18 个 CI-Safe 端到端 Shell 测试套件：
 
 ```bash
-# Run all Go unit and integration tests
+# 运行 Go 单元测试与对抗安全测试
 go test -v ./...
 
-# Run all CI-safe end-to-end shell suites serially
+# 运行所有端到端 Shell 集成测试
 for s in tests/*.sh; do ./"$s"; done
 ```
 
 ---
 
-## 📁 Repository Structure
+## 📄 许可证 (License)
 
-- [`cmd/`](./cmd/): Main executable entry points (`agentpvm`, `umlctl`).
-- [`internal/`](./internal/): Core Go packages (25+ packages covering runtime, control planes, storage, and APIs).
-- [`bpf/`](./bpf/): eBPF C program (`egress.c`) for SSRF IP-floor filtering.
-- [`webui/`](./webui/): Nuxt 3 & Vue 3 frontend source code.
-- [`tests/`](./tests/): Numbered end-to-end integration shell test suites (`01` through `22`).
-- [`scripts/`](./scripts/): Kernel compilation and I/O performance benchmarking scripts.
-- [`sdk/go/`](./sdk/go/): Typed Go client SDK for PVM REST APIs.
+本项目采用 [Apache License 2.0](http://www.apache.org/licenses/LICENSE-2.0) 开源许可证。
