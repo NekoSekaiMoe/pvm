@@ -4,8 +4,15 @@
 // Hooks split into Controller side (Create/Destroy) and Node side
 // (Attach/Detach). In PVM's single-host UML mode the Controller is
 // collapsed into the local Manager but the same four hooks and the
-// refCount/volumeBaseDir containment rules are preserved so
-// binary/rpc plugins from ref/examples/volume can be reused.
+// refCount/volumeBaseDir containment rules are preserved.
+//
+// Binary plugins speak an explicitly versioned wire protocol (see
+// binary.go): the hardened default pipes credentials over stdin (v2,
+// "stdin"), while unmodified ref/examples/volume plugins such as
+// cube-volume-cos.sh — which parse strict argv and never read stdin —
+// are supported via the byte-compatible "argv-v1" opt-in:
+//
+//	extra = { protocol = "argv-v1" }
 package volume
 
 import (

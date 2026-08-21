@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os/exec"
 	"path/filepath"
 	"strconv"
@@ -16,13 +17,46 @@ import (
 // attach/detach path forever.
 const binaryPluginTimeout = 30 * time.Second
 
-// BinaryPlugin forks an external process per hook, speaking the
-// newline-delimited JSON wire protocol over stdin/stdout — mirroring
-// Cubelet/plugins/volume/binary.Driver.
+// BinaryPlugin forks an external process per hook, mirroring
+// Cubelet/plugins/volume/binary.Driver from ref.
+//
+// # Wire protocol versions
+//
+// Two explicit, versioned calling conventions are supported; the plugin
+// picks one via PluginConfig.Extra["protocol"] at Init time:
+//
+//	protocol = "stdin"    (default, v2 — PVM hardening)
+//	protocol = "argv-v1"  (ref Cubelet byte-compatible)
+//
+// v2 (default) keeps credentials OUT of argv, because /proc/<pid>/cmdline
+// is world-readable: argv carries only non-secret fields and the private
+// payload is piped as a single JSON line over stdin:
+//
+//	attach argv: --op attach --sandbox-id --namespace --volume-id
+//	             --driver --ref-count --node-ref-first-attach
+//	             --volume-base-dir
+//	detach argv: --op detach --sandbox-id --namespace --volume-id
+//	             --driver --ref-count --node-ref-last-detach
+//	stdin line:  {"private_data":"..."}   (attach)
+//	             {"metadata":{...}}        (detach)
+//
+// v1 ("argv-v1") reproduces ref Cubelet's exact flag set so unmodified
+// plugins from ref/examples/volume (e.g. cube-volume-cos.sh, whose strict
+// parser dies on unknown flags and which never reads stdin) keep working:
+//
+//	attach argv: --op attach --sandbox-id --namespace --volume-id
+//	             --ref-count --volume-base-dir [--private-data <str>]
+//	             (--private-data omitted when empty, as in ref)
+//	detach argv: --op detach --sandbox-id --namespace --volume-id
+//	             --ref-count --metadata <json-object>
+//
+// Both versions exchange a single JSON object on stdout; exit code 0 plus
+// an empty "error" field means success.
 type BinaryPlugin struct {
 	name       string
 	binaryPath string
 	cfg        PluginConfig
+	legacyArgv bool // v1 "argv-v1": ref Cubelet wire format
 }
 
 func NewBinary(name, binaryPath string) *BinaryPlugin {
@@ -44,6 +78,18 @@ func (p *BinaryPlugin) Init(_ context.Context, cfg PluginConfig) error {
 	if !filepath.IsAbs(p.binaryPath) {
 		return fmt.Errorf("volume binary: binary_path must be absolute, got %q", p.binaryPath)
 	}
+	// Explicit protocol versioning (see the wire-protocol block above):
+	// "stdin" is the hardened default; "argv-v1" opts into the ref Cubelet
+	// wire format. Unknown values fail fast instead of guessing.
+	switch cfg.Extra["protocol"] {
+	case "", "stdin":
+		p.legacyArgv = false
+	case "argv-v1":
+		p.legacyArgv = true
+	default:
+		return fmt.Errorf("volume binary: unknown protocol %q (want %q or %q)",
+			cfg.Extra["protocol"], "stdin", "argv-v1")
+	}
 	return nil
 }
 
@@ -56,17 +102,35 @@ type pluginInput struct {
 }
 
 func (p *BinaryPlugin) Attach(ctx context.Context, req *AttachRequest) (*AttachResult, error) {
-	args := []string{
-		"--op", "attach",
-		"--sandbox-id", req.SandboxID,
-		"--namespace", req.Namespace,
-		"--volume-id", req.VolumeID,
-		"--driver", req.Driver,
-		"--ref-count", fmt.Sprintf("%d", req.RefCount),
-		"--node-ref-first-attach", strconv.FormatBool(req.NodeRefFirstAttach),
-		"--volume-base-dir", req.VolumeBaseDir,
-	}
 	in := pluginInput{PrivateData: req.PrivateData}
+	var args []string
+	if p.legacyArgv {
+		// v1: ref Cubelet byte-compatibility. PrivateData rides argv (the
+		// documented v1 trade-off) and is omitted when empty, like ref;
+		// nothing is written to stdin.
+		args = []string{
+			"--op", "attach",
+			"--sandbox-id", req.SandboxID,
+			"--namespace", req.Namespace,
+			"--volume-id", req.VolumeID,
+			"--ref-count", fmt.Sprintf("%d", req.RefCount),
+			"--volume-base-dir", req.VolumeBaseDir,
+		}
+		if req.PrivateData != "" {
+			args = append(args, "--private-data", req.PrivateData)
+		}
+	} else {
+		args = []string{
+			"--op", "attach",
+			"--sandbox-id", req.SandboxID,
+			"--namespace", req.Namespace,
+			"--volume-id", req.VolumeID,
+			"--driver", req.Driver,
+			"--ref-count", fmt.Sprintf("%d", req.RefCount),
+			"--node-ref-first-attach", strconv.FormatBool(req.NodeRefFirstAttach),
+			"--volume-base-dir", req.VolumeBaseDir,
+		}
+	}
 	out, err := p.run(ctx, args, in)
 	if err != nil {
 		return nil, err
@@ -91,14 +155,32 @@ func (p *BinaryPlugin) Attach(ctx context.Context, req *AttachRequest) (*AttachR
 
 func (p *BinaryPlugin) Detach(ctx context.Context, req *DetachRequest) error {
 	in := pluginInput{Metadata: req.Metadata}
-	args := []string{
-		"--op", "detach",
-		"--sandbox-id", req.SandboxID,
-		"--namespace", req.Namespace,
-		"--volume-id", req.VolumeID,
-		"--driver", req.Driver,
-		"--ref-count", fmt.Sprintf("%d", req.RefCount),
-		"--node-ref-last-detach", strconv.FormatBool(req.NodeRefLastDetach),
+	var args []string
+	if p.legacyArgv {
+		// v1: ref Cubelet byte-compatibility; Metadata rides argv as a JSON
+		// object, stdin stays closed.
+		metaJSON, err := json.Marshal(req.Metadata)
+		if err != nil {
+			return fmt.Errorf("volume binary detach: metadata: %w", err)
+		}
+		args = []string{
+			"--op", "detach",
+			"--sandbox-id", req.SandboxID,
+			"--namespace", req.Namespace,
+			"--volume-id", req.VolumeID,
+			"--ref-count", fmt.Sprintf("%d", req.RefCount),
+			"--metadata", string(metaJSON),
+		}
+	} else {
+		args = []string{
+			"--op", "detach",
+			"--sandbox-id", req.SandboxID,
+			"--namespace", req.Namespace,
+			"--volume-id", req.VolumeID,
+			"--driver", req.Driver,
+			"--ref-count", fmt.Sprintf("%d", req.RefCount),
+			"--node-ref-last-detach", strconv.FormatBool(req.NodeRefLastDetach),
+		}
 	}
 	out, err := p.run(ctx, args, in)
 	if err != nil {
@@ -130,31 +212,42 @@ func (p *BinaryPlugin) run(ctx context.Context, args []string, in pluginInput) (
 		defer cancel()
 	}
 	cmd := exec.CommandContext(ctx, p.binaryPath, args...)
-	// Pipe the private payload over stdin: argv is world-readable via
-	// /proc/<pid>/cmdline, so credentials must never be arguments.
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		return nil, fmt.Errorf("volume binary %q: stdin pipe: %w", p.binaryPath, err)
+	// v2 pipes the private payload over stdin: argv is world-readable via
+	// /proc/<pid>/cmdline, so credentials must never be arguments. In v1
+	// (argv-v1) the payload rides argv per the ref protocol and stdin is
+	// never written — legacy plugins do not read it.
+	var stdin io.WriteCloser
+	if !p.legacyArgv {
+		var err error
+		stdin, err = cmd.StdinPipe()
+		if err != nil {
+			return nil, fmt.Errorf("volume binary %q: stdin pipe: %w", p.binaryPath, err)
+		}
 	}
 	var stdout bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = nil // captured via ExitError only when set
 	// Note: PrivateData/Metadata values are deliberately NOT included in any
-	// error message below.
+	// error message below — in v1 they are part of args, so args themselves
+	// must not be printed either.
 	if err := cmd.Start(); err != nil {
-		stdin.Close()
+		if stdin != nil {
+			stdin.Close()
+		}
 		return nil, fmt.Errorf("volume binary %q: %w", p.binaryPath, err)
 	}
-	raw, _ := json.Marshal(in)
-	if _, werr := stdin.Write(append(raw, '\n')); werr != nil {
-		_ = cmd.Process.Kill()
+	if stdin != nil {
+		raw, _ := json.Marshal(in)
+		if _, werr := stdin.Write(append(raw, '\n')); werr != nil {
+			_ = cmd.Process.Kill()
+			stdin.Close()
+			return nil, fmt.Errorf("volume binary %q: write stdin: %w", p.binaryPath, werr)
+		}
 		stdin.Close()
-		return nil, fmt.Errorf("volume binary %q: write stdin: %w", p.binaryPath, werr)
 	}
-	stdin.Close()
 	if err := cmd.Wait(); err != nil {
 		if ee, ok := err.(*exec.ExitError); ok {
-			return nil, fmt.Errorf("volume binary %q %v: stderr: %w", p.binaryPath, args, ee)
+			return nil, fmt.Errorf("volume binary %q: %w", p.binaryPath, ee)
 		}
 		return nil, fmt.Errorf("volume binary %q: %w", p.binaryPath, err)
 	}
