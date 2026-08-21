@@ -41,6 +41,8 @@ func TestValidateMatrix(t *testing.T) {
 		{"bad lifecycle ttl", func(s *TaskSpec) { s.Lifecycle.TTL = "never" }, "lifecycle.ttl"},
 		{"bad on_anomaly", func(s *TaskSpec) { s.Lifecycle.OnAnomaly = "pray" }, "on_anomaly"},
 		{"bad approval timeout", func(s *TaskSpec) { s.Approval.Timeout = "soon" }, "approval.timeout"},
+		{"idle timeout zero", func(s *TaskSpec) { s.Lifecycle.IdleTimeout = "0s" }, "idle_timeout must be positive"},
+		{"idle timeout negative", func(s *TaskSpec) { s.Lifecycle.IdleTimeout = "-1s" }, "idle_timeout must be positive"},
 		{"version mismatch", func(s *TaskSpec) { s.Version = 999 }, "version mismatch"},
 		{"volume path relative", func(s *TaskSpec) {
 			s.Volumes = []VolumeMount{{Name: "v", Path: "data"}}
@@ -51,6 +53,15 @@ func TestValidateMatrix(t *testing.T) {
 		{"volume path duplicate via dotdot", func(s *TaskSpec) {
 			s.Volumes = []VolumeMount{{Name: "a", Path: "/a/../data"}, {Name: "b", Path: "/data"}}
 		}, "duplicates an earlier mount"},
+		{"volume path with space", func(s *TaskSpec) {
+			s.Volumes = []VolumeMount{{Name: "v", Path: "/work space"}}
+		}, "contains whitespace"},
+		{"volume path with colon", func(s *TaskSpec) {
+			s.Volumes = []VolumeMount{{Name: "v", Path: "/work:guest"}}
+		}, "contains separator"},
+		{"volume path with comma", func(s *TaskSpec) {
+			s.Volumes = []VolumeMount{{Name: "v", Path: "/a,b"}}
+		}, "contains separator"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

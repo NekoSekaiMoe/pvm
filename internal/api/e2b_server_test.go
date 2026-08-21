@@ -12,6 +12,7 @@ import (
 	"uml-container/internal/lifecycle"
 	"uml-container/internal/policy"
 	"uml-container/internal/state"
+	"uml-container/internal/template"
 )
 
 // freePort returns a TCP port that is currently free, or skips the test.
@@ -198,16 +199,196 @@ func TestRearmAllAutopause(t *testing.T) {
 	if st, _ := state.LoadState("run-timeout"); st == nil || st.Status != state.StatusSuspended {
 		t.Fatalf("running task with idle_timeout was not re-armed: %+v", st)
 	}
-	for _, id := range []string{"run-notimeout", "run-badtimeout", "suspended"} {
-		st, err := state.LoadState(id)
-		if err != nil {
-			t.Fatalf("load %s: %v", id, err)
-		}
-		if st.Status != state.StatusRunning && id != "suspended" {
-			t.Fatalf("%s unexpectedly changed: %q", id, st.Status)
-		}
-		if id == "suspended" && st.Status != state.StatusSuspended {
-			t.Fatalf("suspended task unexpectedly resumed")
-		}
+	// Tasks that must NOT be touched by the restart re-arm, as table-driven
+	// subtests: each keeps the status it was persisted with (the suspended
+	// one in particular must not be resumed by the re-arm pass).
+	untouched := []struct {
+		id   string
+		want state.Status
+	}{
+		{"run-notimeout", state.StatusRunning},
+		{"run-badtimeout", state.StatusRunning},
+		{"suspended", state.StatusSuspended},
+	}
+	for _, tc := range untouched {
+		tc := tc
+		t.Run(tc.id, func(t *testing.T) {
+			st, err := state.LoadState(tc.id)
+			if err != nil {
+				t.Fatalf("load %s: %v", tc.id, err)
+			}
+			if st.Status != tc.want {
+				t.Fatalf("%s: status = %q, want %q (must stay untouched by re-arm)", tc.id, st.Status, tc.want)
+			}
+		})
+	}
+}
+
+// seedLifecycleTask saves a task with explicit lifecycle config so tests can
+// pin the auto_resume / idle_timeout behavior of the endpoints.
+func seedLifecycleTask(t *testing.T, id string, status state.Status, idle string, autoResume bool) {
+	t.Helper()
+	st := &state.ContainerState{ID: id, Name: id, Status: status, IdleTimeout: idle, AutoResume: autoResume}
+	if err := state.SaveState(id, st); err != nil {
+		t.Fatalf("seed %s: %v", id, err)
+	}
+}
+
+// TestServer_ResumeNotGatedOnAutoResume is the regression test for the
+// explicit resume endpoint: an operator's POST /tasks/:id/resume must always
+// resume a Suspended task. The auto_resume flag only governs the AUTOMATIC
+// resume path (lifecycleActivity on /exec activity), so with AutoResume=false
+// the old handler wrongly answered 409.
+func TestServer_ResumeNotGatedOnAutoResume(t *testing.T) {
+	// Point the server's cgroup manager at a temp root: Thaw then fails
+	// with ENOENT, which Manager.Resume tolerates (task never had a cgroup).
+	t.Setenv("PVM_CGROUP_ROOT", t.TempDir())
+	base := bootServer(t)
+
+	seedLifecycleTask(t, "tk-resume", state.StatusSuspended, "", false)
+	resp, out := doJSON(t, "POST", base, "/api/tasks/tk-resume/resume", nil)
+	if resp.StatusCode != 200 {
+		t.Fatalf("explicit resume with auto_resume=false: status=%d body=%v", resp.StatusCode, out)
+	}
+	if st, _ := state.LoadState("tk-resume"); st == nil || st.Status != state.StatusRunning {
+		t.Fatalf("task must be Running after explicit resume, got %+v", st)
+	}
+}
+
+// TestAPI_Transition_DoesNotAutoResumeSuspended pins the /transition
+// behavior: API activity on the transition endpoint only bumps a RUNNING
+// task's idle timer — a Suspended task goes through the plain FSM validation.
+// An invalid edge (suspended -> running) must be a 409 with the task left
+// Suspended, NOT an implicit resume that turns the request into a success;
+// a VALID edge (suspended -> quarantined) still applies as requested.
+func TestAPI_Transition_DoesNotAutoResumeSuspended(t *testing.T) {
+	t.Setenv("PVM_CGROUP_ROOT", t.TempDir())
+	base := bootServer(t)
+
+	seedLifecycleTask(t, "tk-tr-susp", state.StatusSuspended, "", true)
+	resp, out := doJSON(t, "POST", base, "/api/tasks/tk-tr-susp/transition",
+		map[string]string{"to": "running", "actor": "controller"})
+	if resp.StatusCode != 409 {
+		t.Fatalf("implicit resume via /transition must be rejected, got %d body=%v", resp.StatusCode, out)
+	}
+	if st, _ := state.LoadState("tk-tr-susp"); st == nil || st.Status != state.StatusSuspended {
+		t.Fatalf("suspended task must stay suspended after rejected transition, got %+v", st)
+	}
+
+	// A valid explicit edge from Suspended still works (no resume involved).
+	resp, out = doJSON(t, "POST", base, "/api/tasks/tk-tr-susp/transition",
+		map[string]string{"to": "quarantined", "actor": "controller", "reason": "incident"})
+	if resp.StatusCode != 200 {
+		t.Fatalf("valid transition from suspended: status=%d body=%v", resp.StatusCode, out)
+	}
+	if st, _ := state.LoadState("tk-tr-susp"); st == nil || st.Status != state.StatusQuarantined {
+		t.Fatalf("task must be quarantined after valid transition, got %+v", st)
+	}
+}
+
+// TestServer_ExecAutoResumeStillWorks protects the /exec activity path after
+// the /transition change: API activity on /exec still honors auto_resume —
+// a Suspended task with AutoResume=true is resumed by the request and the
+// gateway call proceeds; with AutoResume=false the task stays Suspended
+// (but the gateway still serves the call).
+func TestServer_ExecAutoResumeStillWorks(t *testing.T) {
+	t.Setenv("PVM_CGROUP_ROOT", t.TempDir())
+	base := bootServer(t)
+
+	gw := policy.NewGateway([]policy.Rule{
+		{Name: "read_file", Action: policy.ActionAllow},
+	}, nil)
+	RegisterPolicyGateway("tk-exec-resume", gw)
+	RegisterPolicyGateway("tk-exec-norsm", gw)
+	t.Cleanup(func() {
+		UnregisterPolicyGateway("tk-exec-resume")
+		UnregisterPolicyGateway("tk-exec-norsm")
+	})
+
+	seedLifecycleTask(t, "tk-exec-resume", state.StatusSuspended, "", true)
+	resp, out := doJSON(t, "POST", base, "/api/exec?task=tk-exec-resume", map[string]string{"cmd": "read_file"})
+	if resp.StatusCode != 200 {
+		t.Fatalf("exec on auto-resumable task: status=%d body=%v", resp.StatusCode, out)
+	}
+	if st, _ := state.LoadState("tk-exec-resume"); st == nil || st.Status != state.StatusRunning {
+		t.Fatalf("suspended task with auto_resume=true must be resumed by activity, got %+v", st)
+	}
+
+	seedLifecycleTask(t, "tk-exec-norsm", state.StatusSuspended, "", false)
+	resp, out = doJSON(t, "POST", base, "/api/exec?task=tk-exec-norsm", map[string]string{"cmd": "read_file"})
+	if resp.StatusCode != 200 {
+		t.Fatalf("exec must still run for a suspended task (no auto-resume): status=%d body=%v", resp.StatusCode, out)
+	}
+	if st, _ := state.LoadState("tk-exec-norsm"); st == nil || st.Status != state.StatusSuspended {
+		t.Fatalf("suspended task with auto_resume=false must stay suspended, got %+v", st)
+	}
+}
+
+// TestAPI_TemplateCreate_IsPending pins the template lifecycle at creation:
+// POST /templates registers a PENDING record (READY — and with it alias
+// eligibility — is reached only after the image build completes), and an
+// alias supplied at creation is rejected per the store's READY-only rule.
+func TestAPI_TemplateCreate_IsPending(t *testing.T) {
+	t.Setenv("PVM_TEMPLATE_ROOT", t.TempDir())
+	base := bootServer(t)
+
+	resp, out := doJSON(t, "POST", base, "/api/templates", map[string]string{"image_ref": "alpine:3"})
+	if resp.StatusCode != 201 {
+		t.Fatalf("create template: status=%d body=%v", resp.StatusCode, out)
+	}
+	if out["status"] != "PENDING" {
+		t.Fatalf("created template status = %v, want PENDING", out["status"])
+	}
+
+	// The store enforces aliases-on-READY: claiming an alias at creation of
+	// a (still PENDING) template must be a 400, not a silent success.
+	resp, out = doJSON(t, "POST", base, "/api/templates", map[string]string{"image_ref": "alpine:3", "alias": "nope"})
+	if resp.StatusCode != 400 {
+		t.Fatalf("alias at creation must be rejected for PENDING template, got %d body=%v", resp.StatusCode, out)
+	}
+}
+
+// TestAPI_TemplateAliasAndDeleteByAlias covers identifier resolution on the
+// mutating template endpoints: SetAlias and DELETE accept BOTH raw template
+// ids and aliases in the path, mirroring GET /templates/:id.
+func TestAPI_TemplateAliasAndDeleteByAlias(t *testing.T) {
+	tplRoot := t.TempDir()
+	t.Setenv("PVM_TEMPLATE_ROOT", tplRoot)
+	base := bootServer(t)
+
+	// Seed a READY template directly in the store root: SetAlias requires
+	// READY, while POST /templates (correctly) creates PENDING records.
+	seedStore := template.NewStore(tplRoot)
+	readyID := template.GenerateTemplateID()
+	if err := seedStore.Create(template.Record{TemplateID: readyID, ImageRef: "alpine", Status: "READY", Kind: "template"}); err != nil {
+		t.Fatalf("seed READY template: %v", err)
+	}
+
+	// Claim an alias by raw id.
+	resp, out := doJSON(t, "POST", base, "/api/templates/"+readyID+"/alias", map[string]string{"alias": "mytpl"})
+	if resp.StatusCode != 200 {
+		t.Fatalf("SetAlias by id: status=%d body=%v", resp.StatusCode, out)
+	}
+	if out["alias"] != "mytpl" {
+		t.Fatalf("alias after set = %v, want mytpl", out["alias"])
+	}
+
+	// Re-set the alias addressing the template BY its current alias.
+	resp, out = doJSON(t, "POST", base, "/api/templates/mytpl/alias", map[string]string{"alias": "mytpl2"})
+	if resp.StatusCode != 200 {
+		t.Fatalf("SetAlias by alias: status=%d body=%v", resp.StatusCode, out)
+	}
+	if out["alias"] != "mytpl2" {
+		t.Fatalf("alias after re-set = %v, want mytpl2", out["alias"])
+	}
+
+	// DELETE addressing the template by its alias.
+	resp, _ = doJSON(t, "DELETE", base, "/api/templates/mytpl2", nil)
+	if resp.StatusCode != 204 {
+		t.Fatalf("DELETE by alias: status=%d", resp.StatusCode)
+	}
+	resp, _ = doJSON(t, "GET", base, "/api/templates/"+readyID, nil)
+	if resp.StatusCode != 404 {
+		t.Fatalf("template must be gone after delete, got %d", resp.StatusCode)
 	}
 }

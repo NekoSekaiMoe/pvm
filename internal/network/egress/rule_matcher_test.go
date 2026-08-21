@@ -73,7 +73,8 @@ func TestApplyInject_FirstFullMatchOnly(t *testing.T) {
 	// Table of credential-injection scenarios: the first fully matching
 	// rule must decide alone — a later, broader rule may neither inject into
 	// a request the narrow rule already matched nor be skipped when it is
-	// the only match.
+	// the only match. Injection additionally requires HTTPS: credentials
+	// must never ride a plaintext request.
 	tests := []struct {
 		name       string
 		url        string
@@ -81,13 +82,18 @@ func TestApplyInject_FirstFullMatchOnly(t *testing.T) {
 	}{
 		{
 			name:       "narrow rule matches first, broad must not inject",
-			url:        "http://api.example.com/v1/run",
+			url:        "https://api.example.com/v1/run",
 			wantHeader: "",
 		},
 		{
-			name:       "only broad rule matches, injects",
-			url:        "http://api.example.com/v2/other",
+			name:       "only broad rule matches, injects over https",
+			url:        "https://api.example.com/v2/other",
 			wantHeader: "Bearer s3cret",
+		},
+		{
+			name:       "plaintext http never receives credentials",
+			url:        "http://api.example.com/v2/other",
+			wantHeader: "",
 		},
 	}
 	for _, tt := range tests {
@@ -99,6 +105,31 @@ func TestApplyInject_FirstFullMatchOnly(t *testing.T) {
 				t.Fatalf("Authorization = %q, want %q", got, tt.wantHeader)
 			}
 		})
+	}
+}
+
+// TestApplyInject_PlaintextHTTPRefused is the credential-leak regression:
+// a secret must never be written onto a plaintext HTTP request, even when
+// the rule fully matches and carries no Scheme constraint of its own (the
+// rule is scheme-agnostic; the transport is not).
+func TestApplyInject_PlaintextHTTPRefused(t *testing.T) {
+	allow := true
+	pol := &Policy{Rules: []EgressRule{
+		{Name: "broad", Host: "api.example.com", Allow: &allow,
+			Inject: &EgressInject{Header: "Authorization", Format: "Bearer ${SECRET}", Secret: "s3cret"}},
+	}}
+	g := &Gateway{}
+
+	plain := mustReq(t, "POST", "http://api.example.com/v1/run")
+	g.ApplyInject(plain, viewFromHTTP(plain), pol)
+	if got := plain.Header.Get("Authorization"); got != "" {
+		t.Fatalf("plaintext request must not receive credentials, got %q", got)
+	}
+
+	secure := mustReq(t, "POST", "https://api.example.com/v1/run")
+	g.ApplyInject(secure, viewFromHTTP(secure), pol)
+	if got := secure.Header.Get("Authorization"); got != "Bearer s3cret" {
+		t.Fatalf("https request should receive credentials, got %q", got)
 	}
 }
 
@@ -176,8 +207,9 @@ func TestPathNormalizationAndViewConsistency(t *testing.T) {
 	pol := &Policy{Rules: []EgressRule{{Host: "a.com", Path: "/v1/*", Allow: &allow}}}
 	// Root path ("/") must not match a "/v1/*" rule: build the view and the
 	// decision separately so a failure points at the decision itself.
-	requestView := viewFromHTTP(mustReq(t, "GET", "http://a.com"))
-	decision := (&Gateway{}).decideDomain(requestView, pol)
+	// (Named v, not requestView, to avoid shadowing the requestView type.)
+	v := viewFromHTTP(mustReq(t, "GET", "http://a.com"))
+	decision := (&Gateway{}).decideDomain(v, pol)
 	if decision != DecisionBlock {
 		t.Fatalf("root path must not match /v1/* rule, got %v", decision)
 	}

@@ -72,18 +72,19 @@ egress_block_domains = [
 ]
 
 # Extended L7 rules (Cube parity: docs/guide/security-proxy.md).
-# First match wins; each rule can carry credential injection.
-# Example: allow api.github.com with token injection:
+# First match wins. Example: read-only api.github.com access, no credentials:
 # [[network.egress_rules]]
 # name   = "github-api"
 # host   = "api.github.com"
 # scheme = "https"
-# method = ["GET", "POST"]
+# method = ["GET"]
 # allow  = true
-# [network.egress_rules.inject]
-# header = "Authorization"
-# format = "Bearer ${SECRET}"
-# secret = "ghp_..."   # operator-side, never seen by sandbox
+#
+# Credential injection (the egress_rules.inject block and its plaintext
+# `secret` field) is deliberately NOT documented here: inline secrets in
+# config files are how tokens leak. Examples will be provided once injection
+# is fed from a secure external credential source (the Credential Broker)
+# instead of spec-embedded secrets.
 
 # --- tool / policy gateway (plan.md §6) ---
 # First match wins; a default-deny catch-all is auto-appended.
@@ -143,10 +144,14 @@ auto_resume  = false     # when true, next API activity thaws Suspended -> Runni
 
 # --- volumes (Cube parity: persistent mounts) ---
 # Each entry is mounted via the volume plugin framework (internal/volume).
-# driver defaults to first registered plugin when omitted; read_only exposes
-# the mount as ro to the guest.
+# driver defaults to the first registered plugin when omitted; with the
+# stock wiring that is "builtin" (the always-registered built-in
+# host-directory driver — extra binary drivers come from
+# PVM_VOLUME_PLUGINS). read_only exposes the mount as ro to the guest.
+# path must be absolute and must not contain whitespace, ":" or ","
+# (it is embedded verbatim in the hostfs_volume= kernel argument).
 # [[volumes]]
 # name      = "my-data"
 # path      = "/workspace"
-# driver    = "hostdir"
+# driver    = "builtin"
 # read_only = false

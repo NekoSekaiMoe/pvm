@@ -360,7 +360,15 @@ func (g *Gateway) handleHTTP(w http.ResponseWriter, r *http.Request, task string
 		}
 		bodyReader = &io.LimitedReader{R: r.Body, N: pol.MaxRequestBody + 1}
 	}
-	outReq, err := http.NewRequest(r.Method, r.URL.String(), bodyReader)
+	// Forward the SAME path the policy view evaluated (viewFromHTTP /
+	// normalizePath): whatever cleaning the policy saw, the upstream must
+	// receive too — the proxy must not forward a raw "//a/../b" that the
+	// policy judged as "/b". RawQuery is preserved; empty path forwards as
+	// root ("/").
+	outURL := *r.URL
+	outURL.Path = normalizePath(outURL.Path)
+	outURL.RawPath = "" // re-encode from the normalized Path
+	outReq, err := http.NewRequest(r.Method, outURL.String(), bodyReader)
 	if err != nil {
 		http.Error(w, "egress: bad request", http.StatusBadRequest)
 		return
@@ -495,8 +503,9 @@ type requestView struct {
 }
 
 // viewFromHTTP builds the view for a plain HTTP proxy request. The path is
-// normalized with path.Clean so the policy view and the forwarded request
-// agree ("//a/../b" and "/b" match the same rules); an empty path means root.
+// normalized by normalizePath — the same function handleHTTP uses to build
+// the forwarded URL — so the policy view and the upstream always see the
+// same resource; an empty path means root.
 func viewFromHTTP(r *http.Request) requestView {
 	scheme := r.URL.Scheme
 	if scheme == "" {
@@ -511,17 +520,24 @@ func viewFromHTTP(r *http.Request) requestView {
 			port = "80"
 		}
 	}
-	p := r.URL.Path
-	if p == "" {
-		p = "/"
-	}
 	return requestView{
 		method: r.Method,
 		host:   strings.ToLower(host),
-		path:   path.Clean(p),
+		path:   normalizePath(r.URL.Path),
 		scheme: strings.ToLower(scheme),
 		port:   port,
 	}
+}
+
+// normalizePath canonicalizes a request path for BOTH the policy view
+// (viewFromHTTP) and the forwarded request (handleHTTP), so the gateway can
+// never allow one path and forward another ("//a/../b" and "/b" are one
+// resource). An empty path means root ("/").
+func normalizePath(p string) string {
+	if p == "" {
+		return "/"
+	}
+	return path.Clean(p)
 }
 
 // viewFromConnect builds the (partial) view for a CONNECT tunnel: the target
@@ -620,12 +636,19 @@ func (g *Gateway) decideDomain(v requestView, pol *Policy) Decision {
 }
 
 // ApplyInject adds credential headers from the FIRST fully matching rule.
-// Call after decideDomain returned Allow; it mutates outReq.Header in place.
-// A rule that matches but carries no Inject stops the walk: a later, broader
-// rule must never leak its credentials into this request.
+// Credentials are injected ONLY when the request travels over HTTPS
+// (v.scheme == "https"): writing a secret onto a plaintext HTTP request
+// would leak it to every hop on the wire, so even a rule with no Scheme
+// constraint of its own must not inject over http. Call after decideDomain
+// returned Allow; it mutates outReq.Header in place. A rule that matches but
+// carries no Inject stops the walk: a later, broader rule must never leak
+// its credentials into this request.
 func (g *Gateway) ApplyInject(outReq *http.Request, v requestView, pol *Policy) {
 	if len(pol.Rules) == 0 {
 		return
+	}
+	if !strings.EqualFold(v.scheme, "https") {
+		return // plaintext request: never attach credentials
 	}
 	for _, r := range pol.Rules {
 		if !ruleMatches(r, v) {

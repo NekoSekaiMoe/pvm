@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+	"unicode"
 
 	"github.com/BurntSushi/toml"
 )
@@ -253,13 +254,35 @@ type ArtifactsSpec struct {
 //	[[volumes]]
 //	name = "my-data"
 //	path = "/workspace"
-//	driver = "hostdir"   # optional, defaults to first registered plugin
+//	driver = "builtin"    # optional, defaults to first registered plugin
 //	read_only = true
 type VolumeMount struct {
 	Name     string `toml:"name" json:"name"`
 	Path     string `toml:"path" json:"path"`
 	Driver   string `toml:"driver" json:"driver"`
 	ReadOnly bool   `toml:"read_only" json:"read_only"`
+}
+
+// ValidateMountPath rejects guest mount points that would corrupt the
+// hostfs_volume kernel argument. The path is embedded verbatim as
+// hostfs_volume=<host>:<guest>:<mode>, so whitespace splits the kernel
+// command line while ":" and "," are field/list separators — any of them
+// turns one mount into a garbage parameter. TaskSpec.Validate enforces this
+// rule, and container.StartTask re-checks it before attaching (a public
+// entry point must not assume its caller validated).
+func ValidateMountPath(path string) error {
+	if path == "" {
+		return fmt.Errorf("volume path is required")
+	}
+	for _, r := range path {
+		switch {
+		case unicode.IsSpace(r):
+			return fmt.Errorf("volume path %q contains whitespace (breaks hostfs_volume=<host>:<guest>:<mode>)", path)
+		case r == ':' || r == ',':
+			return fmt.Errorf("volume path %q contains separator %q (breaks hostfs_volume=<host>:<guest>:<mode>)", path, r)
+		}
+	}
+	return nil
 }
 
 // LifecycleSpec is the task lifecycle policy (plan.md §8, §11).
@@ -406,19 +429,25 @@ func (s *TaskSpec) Validate() error {
 		}
 		if vm.Path == "" {
 			errs = append(errs, fmt.Errorf("spec: volumes[%d].path is required", i))
+			continue
+		}
+		// The guest mount point is embedded verbatim in the kernel cmdline as
+		// hostfs_volume=<host>:<guest>:<mode>; whitespace/":"/"," would
+		// corrupt that parameter (see ValidateMountPath).
+		if err := ValidateMountPath(vm.Path); err != nil {
+			errs = append(errs, fmt.Errorf("spec: volumes[%d].path: %w", i, err))
+		}
+		// Normalize before validation so equivalent spellings of the same
+		// mount point (trailing slashes, interior "..") are caught as
+		// duplicates and share one absolute-path check. The error messages
+		// keep the original spelling.
+		clean := filepath.Clean(vm.Path)
+		if !filepath.IsAbs(clean) {
+			errs = append(errs, fmt.Errorf("spec: volumes[%d].path %q must be absolute", i, vm.Path))
+		} else if seenPaths[clean] {
+			errs = append(errs, fmt.Errorf("spec: volumes[%d].path %q duplicates an earlier mount", i, vm.Path))
 		} else {
-			// Normalize before validation so equivalent spellings of the same
-			// mount point (trailing slashes, interior "..") are caught as
-			// duplicates and share one absolute-path check. The error messages
-			// keep the original spelling.
-			clean := filepath.Clean(vm.Path)
-			if !filepath.IsAbs(clean) {
-				errs = append(errs, fmt.Errorf("spec: volumes[%d].path %q must be absolute", i, vm.Path))
-			} else if seenPaths[clean] {
-				errs = append(errs, fmt.Errorf("spec: volumes[%d].path %q duplicates an earlier mount", i, vm.Path))
-			} else {
-				seenPaths[clean] = true
-			}
+			seenPaths[clean] = true
 		}
 	}
 	if s.Lifecycle.IdleTimeout != "" {

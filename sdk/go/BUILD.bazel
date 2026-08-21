@@ -1,8 +1,14 @@
-load("@rules_go//go:def.bzl", "go_library")
+load("@rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
     name = "go",
     srcs = ["client.go"],
     importpath = "uml-container/sdk/go",
     visibility = ["//visibility:public"],
+)
+
+go_test(
+    name = "go_test",
+    srcs = ["client_test.go"],
+    embed = [":go"],
 )

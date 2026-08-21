@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"sync"
 )
 
@@ -89,6 +90,15 @@ func (e *Qcow2Engine) snapshotPath(name string) string {
 func (e *Qcow2Engine) CreateVolume(name string, sizeBytes uint64) (string, error) {
 	if err := validateName("volume", name); err != nil {
 		return "", err
+	}
+	// The "snap-" prefix is reserved for snapshot files: volumePath(name) is
+	// <root>/<name>.qcow2 while snapshotPath(name) is <root>/snap-<name>.qcow2,
+	// so a volume named "snap-x" would collide with snapshot "x"'s file and
+	// DeleteSnapshot("x") could delete the volume. Snapshot names are
+	// unaffected: snapshot "snap-x" maps to snap-snap-x.qcow2, which cannot
+	// collide with any volume name.
+	if strings.HasPrefix(name, "snap-") {
+		return "", fmt.Errorf("cow: volume name %q must not start with %q (reserved for snapshots)", name, "snap-")
 	}
 	if sizeBytes == 0 {
 		return "", fmt.Errorf("cow: volume size must be > 0")

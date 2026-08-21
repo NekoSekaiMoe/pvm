@@ -122,7 +122,19 @@ func (m *Manager) Resume(taskID string) error {
 	if err := st.Transition(state.StatusRunning, state.ActorController, "resumed"); err != nil {
 		return err
 	}
-	return state.SaveState(taskID, st)
+	if err := state.SaveState(taskID, st); err != nil {
+		return err
+	}
+	// The task is Running again: restart its idle countdown so a resumed
+	// task auto-pauses once more when it goes idle. Without this, one
+	// suspend/resume cycle permanently exempted the task from autopause.
+	// Tasks without a positive idle_timeout stay unarmed, as everywhere
+	// else. st is the freshly saved Running state, so IdleTimeout is the
+	// persisted lifecycle config for this task.
+	if d, derr := time.ParseDuration(st.IdleTimeout); derr == nil && d > 0 {
+		m.Arm(taskID, d)
+	}
+	return nil
 }
 
 // pauseRetryDelay is how long autopause waits before retrying after a

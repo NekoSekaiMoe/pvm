@@ -7,18 +7,34 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"os"
 	"strings"
+	"time"
+)
+
+const (
+	// DefaultTimeout is the http.Client timeout applied when Config.Timeout
+	// is zero.
+	DefaultTimeout = 30 * time.Second
+
+	// maxResponseBodyBytes bounds every response body read (error bodies and
+	// JSON decoding alike) so a hostile endpoint cannot exhaust memory.
+	maxResponseBodyBytes = 1 << 20 // 1 MiB
 )
 
 type Config struct {
 	APIURL     string
 	APIKey     string
 	TemplateID string
+
+	// Timeout is the per-request http.Client timeout. Zero means
+	// DefaultTimeout (30s); a positive value takes precedence.
+	Timeout time.Duration
 }
 
 func NewConfigFromEnv() Config {
@@ -48,7 +64,11 @@ func NewClient(cfg Config) *Client {
 	// Normalize: a trailing slash would produce double slashes in every
 	// joined path (e.g. "http://h:1//api/volumes").
 	cfg.APIURL = strings.TrimRight(cfg.APIURL, "/")
-	return &Client{cfg: cfg, http: &http.Client{}}
+	timeout := cfg.Timeout
+	if timeout <= 0 {
+		timeout = DefaultTimeout
+	}
+	return &Client{cfg: cfg, http: &http.Client{Timeout: timeout}}
 }
 
 func (c *Client) Close() error {
@@ -76,11 +96,11 @@ type CreateVolumeOptions struct {
 // deliberately absent: they are mount-plugin credentials and the API never
 // returns them.
 type VolumeInfo struct {
-	VolumeID  string `json:"volume_id"`
-	Name      string `json:"name"`
-	Driver    string `json:"driver"`
-	RefCount  int    `json:"refcount"`
-	CreatedAt string `json:"created_at"`
+	VolumeID  string    `json:"volume_id"`
+	Name      string    `json:"name"`
+	Driver    string    `json:"driver"`
+	RefCount  int       `json:"refcount"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
 func (c *Client) CreateVolume(ctx context.Context, opts CreateVolumeOptions) (*VolumeInfo, error) {
@@ -114,12 +134,12 @@ func (c *Client) DeleteVolume(ctx context.Context, id string) error {
 // --- Templates ---
 
 type TemplateInfo struct {
-	TemplateID string `json:"template_id"`
-	Alias      string `json:"alias"`
-	Kind       string `json:"kind"`
-	Status     string `json:"status"`
-	ImageRef   string `json:"image_ref"`
-	CreatedAt  string `json:"created_at"`
+	TemplateID string    `json:"template_id"`
+	Alias      string    `json:"alias"`
+	Kind       string    `json:"kind"`
+	Status     string    `json:"status"`
+	ImageRef   string    `json:"image_ref"`
+	CreatedAt  time.Time `json:"created_at"`
 }
 
 func (c *Client) CreateTemplate(ctx context.Context, imageRef, alias string) (*TemplateInfo, error) {
@@ -188,13 +208,21 @@ func (c *Client) doJSON(ctx context.Context, method, path string, body any, out 
 		return err
 	}
 	defer resp.Body.Close()
+	// Bound every body read so a hostile endpoint cannot stream unbounded
+	// bytes into memory (error messages included).
+	respBody := io.LimitReader(resp.Body, maxResponseBodyBytes)
 	if resp.StatusCode >= 400 {
-		b, _ := io.ReadAll(resp.Body)
+		b, _ := io.ReadAll(respBody)
 		return fmt.Errorf("sdk: %s %s -> %d: %s", method, path, resp.StatusCode, string(b))
 	}
 	if out != nil {
-		return json.NewDecoder(resp.Body).Decode(out)
+		// Decode returns io.EOF for an empty (2xx) body — treat that as a
+		// successful empty response, not a decode failure.
+		if err := json.NewDecoder(respBody).Decode(out); err != nil && !errors.Is(err, io.EOF) {
+			return err
+		}
+		return nil
 	}
-	io.Copy(io.Discard, resp.Body)
+	io.Copy(io.Discard, respBody)
 	return nil
 }

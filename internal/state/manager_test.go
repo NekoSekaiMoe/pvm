@@ -154,22 +154,39 @@ func TestListAll_SkipsCorrupt(t *testing.T) {
 // TestSaveState_PersistsLifecycleFields is the regression test for
 // snapshotLocked dropping fields: IdleTimeout/AutoResume set on the state
 // must survive a Save -> Load round trip (the API activity endpoints read
-// them to honor auto_resume / idle policy).
+// them to honor auto_resume / idle policy). Each combination gets its own
+// state root so subtests are fully independent.
 func TestSaveState_PersistsLifecycleFields(t *testing.T) {
 	origRoot := RootDir
-	RootDir = t.TempDir()
 	t.Cleanup(func() { RootDir = origRoot })
 
-	id := "lifecycle-fields"
-	st := &ContainerState{ID: id, Name: id, Status: StatusRunning, IdleTimeout: "10m", AutoResume: true}
-	if err := SaveState(id, st); err != nil {
-		t.Fatalf("save: %v", err)
+	tests := []struct {
+		name        string
+		idleTimeout string
+		autoResume  bool
+	}{
+		{"idle set, auto resume on", "10m", true},
+		{"idle set, auto resume off", "10m", false},
+		{"idle unset, auto resume on", "", true},
+		{"idle unset, auto resume off", "", false},
+		{"long idle, auto resume on", "1h30m", true},
 	}
-	got, err := LoadState(id)
-	if err != nil {
-		t.Fatalf("load: %v", err)
-	}
-	if got.IdleTimeout != "10m" || !got.AutoResume {
-		t.Fatalf("lifecycle fields lost in round trip: idle_timeout=%q auto_resume=%v", got.IdleTimeout, got.AutoResume)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			RootDir = t.TempDir()
+			id := "lifecycle-fields"
+			st := &ContainerState{ID: id, Name: id, Status: StatusRunning, IdleTimeout: tt.idleTimeout, AutoResume: tt.autoResume}
+			if err := SaveState(id, st); err != nil {
+				t.Fatalf("save: %v", err)
+			}
+			got, err := LoadState(id)
+			if err != nil {
+				t.Fatalf("load: %v", err)
+			}
+			if got.IdleTimeout != tt.idleTimeout || got.AutoResume != tt.autoResume {
+				t.Fatalf("lifecycle fields lost in round trip: idle_timeout=%q (want %q) auto_resume=%v (want %v)",
+					got.IdleTimeout, tt.idleTimeout, got.AutoResume, tt.autoResume)
+			}
+		})
 	}
 }
