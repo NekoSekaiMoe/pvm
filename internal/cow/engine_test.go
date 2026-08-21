@@ -168,52 +168,39 @@ func TestEngine_VolumeSnapshotLifecycle(t *testing.T) {
 		}
 	})
 
-	// Origin stays empty when the backing-chain walk cannot resolve a root
-	// volume. Deleting any link makes the overlay unopenable (openGuestImage
-	// validates the chain transitively, so the snapshot is skipped entirely),
-	// so the reachable walk failure is the hop limit: a chain DEEPER than the
-	// walk's 64-hop bound ends without finding the root volume.
-	t.Run("chain deeper than walk limit leaves origin unknown", func(t *testing.T) {
+	// The backing chain is bounded at OPEN time (maxBackingChainDepth): a
+	// chain deeper than 32 levels is rejected when the snapshot that would
+	// extend it is created, so runaway overlay chains can neither be opened
+	// nor grown further.
+	t.Run("chain deeper than open limit is rejected", func(t *testing.T) {
 		e := NewEngine(t.TempDir())
 		if _, err := e.CreateVolume("data", 1<<20); err != nil {
 			t.Fatalf("create volume: %v", err)
 		}
-		// vol -> s1 -> ... -> s65: s65 needs 65 hops, one past the limit.
+		// vol -> s1 -> ... -> s33 opens fine (33 files, depths 0..32);
+		// creating s34 on top must fail because opening s33's chain would
+		// exceed the bound.
 		src := "data"
-		for i := 1; i <= 65; i++ {
+		for i := 1; i <= 33; i++ {
 			name := fmt.Sprintf("s%d", i)
 			if _, err := e.CreateSnapshot(src, name); err != nil {
 				t.Fatalf("create %s: %v", name, err)
 			}
 			src = name
 		}
+		if _, err := e.CreateSnapshot(src, "s34"); err == nil {
+			t.Fatal("snapshot beyond the 32-level backing-chain limit must be rejected")
+		} else if !strings.Contains(err.Error(), "backing chain") {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		// The legal prefix of the chain still resolves its root volume.
 		all, err := e.ListSnapshots("")
 		if err != nil {
 			t.Fatalf("list snapshots(all): %v", err)
 		}
-		byName := map[string]Snapshot{}
 		for _, s := range all {
-			byName[s.Name] = s
-		}
-		// s64 resolves within the hop budget; s65 exhausts it.
-		if got := byName["s64"]; got.OriginVolume != "data" {
-			t.Fatalf("s64 origin = %q, want data", got.OriginVolume)
-		}
-		s65, ok := byName["s65"]
-		if !ok {
-			t.Fatalf("s65 missing from listing")
-		}
-		if s65.OriginVolume != "" {
-			t.Fatalf("unresolvable chain must report empty origin, got %q", s65.OriginVolume)
-		}
-		// An unknown origin must not be claimed by any volume filter.
-		filtered, err := e.ListSnapshots("data")
-		if err != nil {
-			t.Fatalf("list snapshots(data): %v", err)
-		}
-		for _, s := range filtered {
-			if s.Name == "s65" {
-				t.Fatalf("s65 with unknown origin must not be claimed by volume filter")
+			if s.OriginVolume != "data" {
+				t.Fatalf("snapshot %s origin = %q, want data", s.Name, s.OriginVolume)
 			}
 		}
 	})

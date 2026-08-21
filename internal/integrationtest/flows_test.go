@@ -57,10 +57,16 @@ func (l *noOpLauncher) Wait(*uml.Process) error { return nil }
 
 func TestFlow_SpecToTaskToAudit(t *testing.T) {
 	setupIsolatedRoots(t)
+	// The ubd path mounts BaseImage directly, so a minimal on-disk base is
+	// required: buildTaskArgs now rejects an empty rootfs (nothing to mount).
+	base := filepath.Join(t.TempDir(), "base.img")
+	if err := os.WriteFile(base, make([]byte, 4096), 0600); err != nil {
+		t.Fatal(err)
+	}
 	s := &spec.TaskSpec{
 		Version: 1, Caller: "alice", Tenant: "eng",
 		Runtime:   spec.RuntimeSpec{Name: "flow1", CPU: 1, Memory: "256M"},
-		Workspace: spec.WorkspaceSpec{Init: "/sbin/init"},
+		Workspace: spec.WorkspaceSpec{Init: "/sbin/init", BaseImage: base},
 		Kernel:    spec.KernelSpec{Path: "/usr/lib/uml/linux"},
 		Network:   spec.NetworkSpec{Enabled: false},
 		Lifecycle: spec.LifecycleSpec{OnAnomaly: "pause"},

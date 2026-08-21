@@ -95,3 +95,143 @@ func TestDeleteBridge_ValidCIDRTeardown(t *testing.T) {
 		t.Errorf("teardown commands mismatch:\n got: %q\nwant: %q", *calls, want)
 	}
 }
+
+// resetForwardState normalizes the package-level ip_forward bookkeeping so
+// refcount assertions are deterministic regardless of test order.
+func resetForwardState(t *testing.T) {
+	t.Helper()
+	ipForwardMu.Lock()
+	ipForwardRefCount = 0
+	ipForwardOriginal = ""
+	ipForwardMu.Unlock()
+	t.Cleanup(func() {
+		ipForwardMu.Lock()
+		ipForwardRefCount = 0
+		ipForwardOriginal = ""
+		ipForwardMu.Unlock()
+	})
+}
+
+// stubReadIPForward pins the sysctl read to "0" (SetupBridge then records it
+// as the original value to restore).
+func stubReadIPForward(t *testing.T) {
+	t.Helper()
+	orig := readIPForward
+	readIPForward = func() (string, error) { return "0", nil }
+	t.Cleanup(func() { readIPForward = orig })
+}
+
+// failOn returns an execRun stub that succeeds for every command except
+// those whose joined invocation contains substr.
+func failOn(t *testing.T, substr string, calls *[]string) {
+	t.Helper()
+	orig := execRun
+	execRun = func(name string, args ...string) error {
+		inv := name + " " + strings.Join(args, " ")
+		*calls = append(*calls, inv)
+		if strings.Contains(inv, substr) {
+			return errors.New("injected failure: " + inv)
+		}
+		return nil
+	}
+	t.Cleanup(func() { execRun = orig })
+}
+
+// TestSetupBridge_RollbackBeforeRefcount asserts that a failure BEFORE the
+// ip_forward refcount is incremented rolls back the bridge (and nothing
+// else): the refcount must stay at 0 — the old code's rollback path called
+// DeleteBridge, which decremented a count it did not own.
+func TestSetupBridge_RollbackBeforeRefcount(t *testing.T) {
+	resetForwardState(t)
+	stubReadIPForward(t)
+	calls := stubExecRun(t)
+	failOn(t, "ip addr add", calls) // fail before NAT setup and refcount++
+
+	err := SetupBridge("pvmbr0", "", "10.0.0.1/24")
+	if err == nil {
+		t.Fatal("SetupBridge expected to fail on injected ip addr add error")
+	}
+	ipForwardMu.Lock()
+	got := ipForwardRefCount
+	ipForwardMu.Unlock()
+	if got != 0 {
+		t.Fatalf("ip_forward refcount = %d after rollback, want 0", got)
+	}
+	gotCalls := strings.Join(*calls, "\n")
+	if !strings.Contains(gotCalls, "ip link delete pvmbr0 type bridge") {
+		t.Errorf("rollback did not delete the bridge:\n%s", gotCalls)
+	}
+	if strings.Contains(gotCalls, "iptables") {
+		t.Errorf("rollback ran iptables cleanup although NAT was never set up:\n%s", gotCalls)
+	}
+	if strings.Contains(gotCalls, "sysctl -w") {
+		t.Errorf("rollback restored ip_forward although it was never enabled:\n%s", gotCalls)
+	}
+}
+
+// TestSetupBridge_RollbackAfterRefcount asserts that a failure AFTER the
+// refcount increment decrements it exactly once (the old code decremented
+// twice: once via DeleteBridge and once via the ipForwardRegistered branch)
+// and tears down the NAT rules for the derived subnet.
+func TestSetupBridge_RollbackAfterRefcount(t *testing.T) {
+	resetForwardState(t)
+	stubReadIPForward(t)
+	calls := stubExecRun(t)
+	failOn(t, "sysctl -w", calls) // fail after refcount++
+
+	err := SetupBridge("pvmbr1", "", "10.0.0.1/24")
+	if err == nil {
+		t.Fatal("SetupBridge expected to fail on injected sysctl -w error")
+	}
+	ipForwardMu.Lock()
+	got := ipForwardRefCount
+	orig := ipForwardOriginal
+	ipForwardMu.Unlock()
+	if got != 0 {
+		t.Fatalf("ip_forward refcount = %d after rollback, want 0 (exactly-once decrement)", got)
+	}
+	if orig != "0" {
+		t.Fatalf("ipForwardOriginal = %q, want preserved original \"0\"", orig)
+	}
+	gotCalls := strings.Join(*calls, "\n")
+	for _, want := range []string{
+		"iptables -t nat -D POSTROUTING -s 10.0.0.0/24",
+		"iptables -D FORWARD -s 10.0.0.0/24 -j ACCEPT",
+		"ip link delete pvmbr1 type bridge",
+	} {
+		if !strings.Contains(gotCalls, want) {
+			t.Errorf("rollback missing %q in:\n%s", want, gotCalls)
+		}
+	}
+}
+
+// TestDeleteBridge_EmptyGatewayIPStillTeardowns pins that DeleteBridge with
+// an empty gatewayIP (the `umlctl network rm` path) still performs the link
+// teardown and the refcount decrement; with the bridge gone there is simply
+// no subnet to clean up, so no iptables call may happen.
+func TestDeleteBridge_EmptyGatewayIPStillTeardowns(t *testing.T) {
+	resetForwardState(t)
+	calls := stubExecRun(t)
+	if err := DeleteBridge("pvmtest-gone0", ""); err != nil {
+		t.Fatalf("DeleteBridge returned error: %v", err)
+	}
+	got := strings.Join(*calls, "\n")
+	if strings.Contains(got, "iptables") {
+		t.Errorf("iptables cleanup ran for a nonexistent bridge (no subnet derivable):\n%s", got)
+	}
+	if !strings.Contains(got, "ip link delete pvmtest-gone0 type bridge") {
+		t.Errorf("missing link teardown:\n%s", got)
+	}
+}
+
+// TestSetupQoS_RejectsNonRateArg pins the tc rate whitelist: only
+// ^\d+[kmgKMG]bit$ may reach tc, so a crafted value cannot smuggle extra
+// tc arguments.
+func TestSetupQoS_RejectsNonRateArg(t *testing.T) {
+	for _, bad := range []string{"10 mbit", "10mbit burst 32kbit", "", "abc", "10Gbps", "10mbit,32kbit"} {
+		err := SetupQoS("tap0", bad)
+		if err == nil || !strings.Contains(err.Error(), "invalid QoS rate") {
+			t.Errorf("SetupQoS(rate %q) = %v, want invalid-rate error", bad, err)
+		}
+	}
+}

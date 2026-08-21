@@ -18,6 +18,7 @@ go_test(
     name = "vu_test",
     srcs = [
         "e2e_test.go",
+        "proto_hardening_test.go",
         "vu_test.go",
     ],
     embed = [":vu"],

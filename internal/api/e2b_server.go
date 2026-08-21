@@ -3,8 +3,10 @@ package api
 import (
 	"bufio"
 	"context"
+	"crypto/subtle"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -69,12 +71,20 @@ func StartE2BServer(port int) error {
 
 	// API Group
 	api := e.Group("/api")
+	// API_SECRET is REQUIRED: there is no hardcoded fallback. A missing
+	// secret is a configuration error (we never want to silently
+	// authenticate everyone who guesses "secret" — the CLI side already
+	// refuses the symmetric default, see cmd/agentpvm approvalCmd).
+	apiSecret := os.Getenv("API_SECRET")
+	if apiSecret == "" {
+		return errors.New("API_SECRET environment variable is required (refusing to start the API with no authentication)")
+	}
+	apiSecretBytes := []byte(apiSecret)
 	api.Use(middleware.KeyAuth(func(key string, c echo.Context) (bool, error) {
-		expected := os.Getenv("API_SECRET")
-		if expected == "" {
-			expected = "secret"
-		}
-		if key == expected {
+		// Constant-time compare: the secret guards every control-plane
+		// endpoint (approvals, policy, quota), so timing side channels are
+		// worth closing even on loopback.
+		if subtle.ConstantTimeCompare([]byte(key), apiSecretBytes) == 1 {
 			c.Set("actor", "api-user")
 			return true, nil
 		}
@@ -118,6 +128,14 @@ func StartE2BServer(port int) error {
 		if req.CPU < 0 || req.CPU > 1024 {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": "CPU limit must be between 0 and 1024"})
 		}
+		// Rootfs is interpolated into the UML kernel command line (ubd0=<path>).
+		// The kernel re-splits argv on whitespace, so an unvalidated value can
+		// inject arbitrary kernel parameters (hostfs_volume=/:/mnt, init=...)
+		// or point the sandbox at another task's disk. Constrain it to an
+		// absolute path inside the image root, with no traversal/whitespace.
+		if err := validateAPIRootfs(req.Rootfs); err != nil {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+		}
 
 		mgr := container.NewManager(nil)
 		mgr.Autopause = autoMgr
@@ -130,12 +148,16 @@ func StartE2BServer(port int) error {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
 		}
 		cfg := &config.ContainerConfig{
-			ID:          req.Name,
-			Name:        req.Name,
-			Rootfs:      req.Rootfs,
-			Kernel:      "./bin/linux",
-			Init:        "/init.sh",
-			Memory:      mem,
+			ID:     req.Name,
+			Name:   req.Name,
+			Rootfs: req.Rootfs,
+			Kernel: "./bin/linux",
+			Init:   "/init.sh",
+			// Canonical numeric form ONLY: ParseMemory (Sscanf %d%s) ignores
+			// trailing input, so "512M init=/bin/sh" would pass parsing and the
+			// raw string would land on the kernel command line. Never forward
+			// the caller's original spelling.
+			Memory:      strconv.FormatInt(memBytes, 10),
 			MemoryBytes: memBytes,
 			CPU:         req.CPU,
 		}
@@ -326,9 +348,8 @@ func StartE2BServer(port int) error {
 		}
 		// Hold the per-task mutex across Load -> Transition -> Save so concurrent
 		// transitions on the SAME task serialize instead of clobbering each other.
-		mu := taskLock(id)
-		mu.Lock()
-		defer mu.Unlock()
+		release := taskLock(id)
+		defer release()
 		st, err := state.LoadState(id)
 		if err != nil {
 			return c.JSON(http.StatusNotFound, map[string]string{"error": "task not found"})
@@ -362,7 +383,25 @@ func StartE2BServer(port int) error {
 		var s *spec.TaskSpec
 		var err error
 		if req.Path != "" {
-			s, err = spec.LoadFile(req.Path)
+			// Arbitrary host paths are an information disclosure (any file the
+			// daemon can read gets parsed and echoed back, secrets included).
+			// Constrain path loads to the operator-designated spec root.
+			root := os.Getenv("PVM_SPEC_ROOT")
+			if root == "" {
+				return c.JSON(http.StatusBadRequest, map[string]string{"error": "path loading disabled: set PVM_SPEC_ROOT or send content"})
+			}
+			absRoot, err := filepath.Abs(root)
+			if err != nil {
+				return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+			}
+			abs, err := filepath.Abs(req.Path)
+			if err != nil {
+				return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+			}
+			if abs != absRoot && !strings.HasPrefix(abs, absRoot+string(filepath.Separator)) {
+				return c.JSON(http.StatusBadRequest, map[string]string{"error": "path must stay inside PVM_SPEC_ROOT"})
+			}
+			s, err = spec.LoadFile(abs)
 		} else if req.Content != "" {
 			s, err = spec.LoadString(req.Content)
 		} else {
@@ -480,11 +519,25 @@ func StartE2BServer(port int) error {
 		}
 		var req struct {
 			Rules []policy.Rule `json:"rules"`
+			Force bool          `json:"force"`
 		}
 		if err := c.Bind(&req); err != nil {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
 		}
-		gw := policy.NewGateway(req.Rules, nil)
+		// Replacing a task's gateway silently de-registers its audit trail
+		// (a nil ledger) and swaps its tool policy. Require an explicit force
+		// to override an existing registration.
+		if gateways.get(task) != nil && !req.Force {
+			return c.JSON(http.StatusConflict, map[string]string{"error": "policy gateway already registered for task; send force=true to override"})
+		}
+		// Keep decisions auditable: open the task's ledger instead of nil.
+		// Degrade to nil (gate still runs) only if the ledger cannot open.
+		l, lerr := audit.Open(task)
+		if lerr != nil {
+			log.Printf("api: policy gateway for %s runs WITHOUT audit ledger: %v", task, lerr)
+			l = nil
+		}
+		gw := policy.NewGateway(req.Rules, l)
 		RegisterPolicyGateway(task, gw)
 		return c.JSON(http.StatusOK, map[string]interface{}{"status": "registered", "rules": gw.Rules()})
 	})
@@ -542,6 +595,12 @@ func StartE2BServer(port int) error {
 		var b artifact.Bundle
 		if err := c.Bind(&b); err != nil {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+		}
+		// TaskID reaches audit.Open (directory construction): the same
+		// idRegex the /api/audit/:id endpoints enforce. Without it a
+		// "../../..." id writes ledgers outside the audit root.
+		if b.TaskID != "" && !idRegex.MatchString(b.TaskID) {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid task id"})
 		}
 		l, err := audit.Open(b.TaskID)
 		if err != nil {
@@ -795,9 +854,8 @@ func StartE2BServer(port int) error {
 		// Hold the per-task mutex across Load -> Freeze -> Transition -> Save
 		// so concurrent transitions on the SAME task serialize (cf. /transition)
 		// and a racing resume cannot clobber the persisted SUSPENDED state.
-		mu := taskLock(id)
-		mu.Lock()
-		defer mu.Unlock()
+		release := taskLock(id)
+		defer release()
 		st, err := state.LoadState(id)
 		if err != nil {
 			return c.JSON(http.StatusNotFound, map[string]string{"error": "task not found"})
@@ -843,9 +901,8 @@ func StartE2BServer(port int) error {
 		}
 		// Same per-task lock as pause: Load -> Thaw -> Transition -> Save must
 		// serialize against concurrent pause/transition requests.
-		mu := taskLock(id)
-		mu.Lock()
-		defer mu.Unlock()
+		release := taskLock(id)
+		defer release()
 		if _, err := state.LoadState(id); err != nil {
 			return c.JSON(http.StatusNotFound, map[string]string{"error": "task not found"})
 		}
@@ -1090,6 +1147,33 @@ func policyErrApproval() error { return policy.ErrApprovalRequired }
 // idRegex is the shared container/task id validator.
 var idRegex = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 
+// validateAPIRootfs constrains the caller-supplied rootfs of the legacy
+// /api/containers/start endpoint. The value is interpolated verbatim into the
+// UML kernel command line (ubd0=<path>) and the kernel re-splits argv on
+// whitespace, so anything but a plain absolute path inside the image root is
+// an injection primitive (extra kernel parameters, another task's disk, ...).
+func validateAPIRootfs(rootfs string) error {
+	if rootfs == "" {
+		return errors.New("rootfs is required")
+	}
+	if strings.ContainsAny(rootfs, " \t\n\r,") || strings.Contains(rootfs, ":") {
+		return errors.New("rootfs must not contain whitespace, comma, or colon")
+	}
+	if !filepath.IsAbs(rootfs) {
+		return errors.New("rootfs must be an absolute path")
+	}
+	clean := filepath.Clean(rootfs)
+	for _, part := range strings.Split(clean, string(filepath.Separator)) {
+		if part == ".." {
+			return errors.New("rootfs must not contain '..'")
+		}
+	}
+	if clean != image.DefaultDir && !strings.HasPrefix(clean, image.DefaultDir+string(filepath.Separator)) {
+		return fmt.Errorf("rootfs must live under %s", image.DefaultDir)
+	}
+	return nil
+}
+
 // taskTransitionMu gives per-task mutual exclusion for the /transition
 // endpoint (and any other handler that does LoadState -> mutate -> SaveState).
 // Without it, two concurrent transitions on the same task each load the same
@@ -1097,21 +1181,42 @@ var idRegex = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 // transition. Different tasks still proceed in parallel.
 var (
 	taskTransitionMu    sync.Mutex
-	taskTransitionLocks = map[string]*sync.Mutex{}
+	taskTransitionLocks = map[string]*taskLockEntry{}
 )
 
-// taskLock returns the mutex guarding transitions for id, creating it on
-// first use. The outer mutex is held only briefly to look up/create the
-// per-task mutex.
-func taskLock(id string) *sync.Mutex {
+// taskLockEntry couples a per-task mutex with its holder count so the map
+// entry is deleted once the last holder releases — long-running servers with
+// many short tasks would otherwise grow the map forever.
+type taskLockEntry struct {
+	mu      sync.Mutex
+	holders int
+}
+
+// taskLock acquires the mutex guarding transitions for id and returns a
+// release function. The outer mutex is held only briefly to look up / create
+// the entry and bump its holder count; the last releaser deletes the entry.
+func taskLock(id string) (release func()) {
 	taskTransitionMu.Lock()
-	defer taskTransitionMu.Unlock()
-	mu, ok := taskTransitionLocks[id]
+	entry, ok := taskTransitionLocks[id]
 	if !ok {
-		mu = &sync.Mutex{}
-		taskTransitionLocks[id] = mu
+		entry = &taskLockEntry{}
+		taskTransitionLocks[id] = entry
 	}
-	return mu
+	entry.holders++
+	taskTransitionMu.Unlock()
+	entry.mu.Lock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			entry.mu.Unlock()
+			taskTransitionMu.Lock()
+			entry.holders--
+			if entry.holders == 0 {
+				delete(taskTransitionLocks, id)
+			}
+			taskTransitionMu.Unlock()
+		})
+	}
 }
 
 // Package-level singletons for the control planes exposed via the REST API.

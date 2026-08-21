@@ -56,7 +56,7 @@ func TestManager_Start(t *testing.T) {
 		ID:         "1234",
 		Name:       "test",
 		Kernel:     "/usr/lib/uml/linux",
-		Rootfs:     "rootfs.img",
+		Rootfs:     "/var/lib/uml/rootfs.img",
 		Memory:     "512M",
 		CPU:        2,
 		Init:       "/sbin/init",
@@ -68,7 +68,7 @@ func TestManager_Start(t *testing.T) {
 		t.Fatalf("Start failed: %v", err)
 	}
 
-	expectedArgs := []string{"ubd0=rootfs.img", "root=/dev/ubda", "init=/sbin/init", "mem=512M", "vec0:transport=tap,ifname=tap0,depth=128,gro=1"}
+	expectedArgs := []string{"ubd0=/var/lib/uml/rootfs.img", "root=/dev/ubda", "init=/sbin/init", "mem=512M", "vec0:transport=tap,ifname=tap0,depth=128,gro=1"}
 	for _, arg := range expectedArgs {
 		if !contains(mock.lastArgs, arg) {
 			t.Errorf("expected arg %s, but missing", arg)
@@ -99,7 +99,7 @@ func TestManager_Start_Virtio(t *testing.T) {
 		ID:         "1235",
 		Name:       "test-virtio",
 		Kernel:     "/usr/lib/uml/linux",
-		Rootfs:     "rootfs.img",
+		Rootfs:     "/var/lib/uml/rootfs.img",
 		Memory:     "512M",
 		UseVirtio:  true,
 		Init:       "/sbin/init",
@@ -111,7 +111,7 @@ func TestManager_Start_Virtio(t *testing.T) {
 		t.Fatalf("Start failed: %v", err)
 	}
 
-	expectedArgs := []string{"ubd0=rootfs.img", "root=/dev/ubda", "init=/sbin/init", "mem=512M", "vec0:transport=tap,ifname=tap0,depth=128,gro=1"}
+	expectedArgs := []string{"ubd0=/var/lib/uml/rootfs.img", "root=/dev/ubda", "init=/sbin/init", "mem=512M", "vec0:transport=tap,ifname=tap0,depth=128,gro=1"}
 	for _, arg := range expectedArgs {
 		if !contains(mock.lastArgs, arg) {
 			t.Errorf("expected arg %s, but missing", arg)

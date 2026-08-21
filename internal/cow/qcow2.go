@@ -24,6 +24,24 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
+	"syscall"
+)
+
+const (
+	// maxVirtualSize caps the virtual size parsed from a (possibly hostile)
+	// qcow2 header at 16 TiB. Without it a header-driven allocation/layout
+	// computation could wrap or attempt absurd metadata sizing.
+	maxVirtualSize = uint64(16) << 40
+
+	// maxBackingChainDepth bounds backing-chain recursion on OPEN (ListSnapshots
+	// had hop<64; the main open path had none).
+	maxBackingChainDepth = 32
+
+	// l2CacheMaxBytes caps the total memory held by cached L2 tables
+	// (see qcow2Image.l2cache). 32 MiB ≈ 4M entries ≈ 2 GiB of guest coverage
+	// per pass at 4 KiB clusters — far above any working set our workloads hit.
+	l2CacheMaxBytes = 32 << 20
 )
 
 const (
@@ -122,18 +140,30 @@ func computeQcow2Layout(virtualSize uint64, bits uint32, prealloc bool) (*qcow2L
 	if bits < 9 || bits > 21 {
 		return nil, fmt.Errorf("cow: cluster_bits %d out of qcow2 range 9..21", bits)
 	}
+	if virtualSize > maxVirtualSize {
+		return nil, fmt.Errorf("cow: virtual size %d exceeds the %d TiB cap", virtualSize, maxVirtualSize>>40)
+	}
 	cs := uint64(1) << bits
 	l2Entries := cs / 8
-	l1Size := (virtualSize + l2Entries*cs - 1) / (l2Entries * cs)
+	l1Size, err := divCeil(virtualSize, l2Entries*cs)
+	if err != nil {
+		return nil, fmt.Errorf("cow: L1 table sizing overflow for virtual size %d", virtualSize)
+	}
 	if l1Size > 0xFFFFFFFF {
 		return nil, fmt.Errorf("cow: L1 table too large for virtual size %d", virtualSize)
 	}
-	l1Clusters := (l1Size*8 + cs - 1) / cs
+	l1Clusters, err := divCeil(l1Size*8, cs)
+	if err != nil {
+		return nil, fmt.Errorf("cow: L1 cluster sizing overflow for virtual size %d", virtualSize)
+	}
 	var l2Count uint64
 	if prealloc {
 		l2Count = l1Size
 	}
-	dataClusters := (virtualSize + cs - 1) / cs
+	dataClusters, err := divCeil(virtualSize, cs)
+	if err != nil {
+		return nil, fmt.Errorf("cow: data cluster sizing overflow for virtual size %d", virtualSize)
+	}
 
 	// Refblocks are preallocated for the WORST CASE (every data cluster
 	// allocated): 0.05% of the virtual size at 4 KiB clusters. Without this,
@@ -157,7 +187,10 @@ func computeQcow2Layout(virtualSize uint64, bits uint32, prealloc bool) (*qcow2L
 			// Only the first 2*physMeta bytes of the refblock region are
 			// nonzero (one u16 per create-time metadata cluster); the rest is
 			// streamed zeros at write time.
-			l.refUsedCls = (2*physMeta + cs - 1) / cs
+			l.refUsedCls, err = divCeil(2*physMeta, cs)
+			if err != nil {
+				return nil, fmt.Errorf("cow: refblock sizing overflow for virtual size %d", virtualSize)
+			}
 			l.reftableOff = cs
 			l.refblockOff = (1 + reftableCls) * cs
 			l.l1Off = l.refblockOff + refblockCnt*cs
@@ -248,7 +281,7 @@ func createQcow2(path string, virtualSize uint64, backingPath, backingFormat str
 	// otherwise all zero = every cluster reads from backing. Written after
 	// the zero-streamed refblock remainder, one cluster at a time. ---
 
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC|syscall.O_NOFOLLOW, 0644)
 	if err != nil {
 		return fmt.Errorf("cow: create %s: %w", path, err)
 	}
@@ -294,6 +327,23 @@ func createQcow2(path string, virtualSize uint64, backingPath, backingFormat str
 }
 
 func roundUp8(v uint64) uint64 { return (v + 7) &^ 7 }
+
+// divCeil is an overflow-safe ceil(a/b): the naive (a+b-1)/b wraps when a is
+// within b-1 of 2^64 (attacker-controlled header sizes can hit exactly that).
+// Returns an error instead of a wrapped quotient.
+func divCeil(a, b uint64) (uint64, error) {
+	if b == 0 {
+		return 0, errors.New("cow: division by zero in layout computation")
+	}
+	q, r := a/b, a%b
+	if r > 0 {
+		if q == ^uint64(0) {
+			return 0, fmt.Errorf("cow: ceiling division overflow: %d/%d", a, b)
+		}
+		q++
+	}
+	return q, nil
+}
 
 // ---------------------------------------------------------------------------
 // Reading (for convertToRaw)
@@ -358,6 +408,17 @@ type qcow2Image struct {
 	// this through to createQcow2 so a qcow2 backing is never accidentally
 	// defaulted to raw.
 	backingFormat string
+
+	// l1 holds the FULL L1 table in memory, loaded once at open. Typical
+	// size is 1 KiB; reads then resolve L1 without a pread per cluster.
+	// Only entries covering the virtual size are loaded (foreign writers may
+	// declare extra slots that no reachable cluster can index).
+	l1 []uint64
+	// mu guards the L2 table cache below. Readers take RLock to fetch one
+	// entry; the write path takes Lock to insert/update tables.
+	mu           sync.RWMutex
+	l2cache      map[uint64][]uint64 // keyed by L2 table host offset
+	l2cacheBytes int                 // total bytes held by cached tables
 }
 
 func (q *qcow2Image) Size() uint64 { return q.hdr.size }
@@ -439,19 +500,15 @@ func (q *qcow2Image) resolve(guest, want uint64) (host uint64, fromBacking bool,
 	l2Entries := q.clusterSize / 8
 	l1Idx := clusterIdx / l2Entries
 	l2Idx := clusterIdx % l2Entries
-	if l1Idx >= uint64(q.hdr.l1Size) {
+	if l1Idx >= uint64(len(q.l1)) {
 		return 0, false, 0, fmt.Errorf("cow: guest offset %#x beyond L1 table", guest)
 	}
-	var l1e uint64
-	if err := q.readUint64At(&l1e, q.hdr.l1Offset+l1Idx*8); err != nil {
-		return 0, false, 0, err
-	}
-	l2Off := l1e & l1eOffsetMask
+	l2Off := q.l1[l1Idx] & l1eOffsetMask
 	if l2Off == 0 {
 		return q.backingOrZero(guest, n)
 	}
-	var l2e uint64
-	if err := q.readUint64At(&l2e, l2Off+l2Idx*8); err != nil {
+	l2e, err := q.l2EntryAt(l2Off, l2Idx)
+	if err != nil {
 		return 0, false, 0, err
 	}
 	if l2e&oflagCompressed != 0 {
@@ -479,6 +536,80 @@ func (q *qcow2Image) backingOrZero(guest, n uint64) (uint64, bool, uint64, error
 	return 0, true, n, nil
 }
 
+// l1Entry returns the raw L1 entry for l1Idx from the in-memory table.
+// Callers must apply l1eOffsetMask themselves.
+func (q *qcow2Image) l1Entry(l1Idx uint64) (uint64, error) {
+	if l1Idx >= uint64(len(q.l1)) {
+		return 0, fmt.Errorf("cow: L1 index %d beyond loaded L1 table (%d entries)", l1Idx, len(q.l1))
+	}
+	return q.l1[l1Idx], nil
+}
+
+// l2EntryAt returns the raw L2 entry at index l2Idx of the table stored at
+// host offset l2Off, serving hits from the in-memory cache and loading the
+// whole table on a miss. One cached table replaces clusterSize/8 preads per
+// pass with zero; entries are returned by value so the write path can mutate
+// the cached slice under the same lock without racing readers.
+func (q *qcow2Image) l2EntryAt(l2Off, l2Idx uint64) (uint64, error) {
+	q.mu.RLock()
+	tbl, ok := q.l2cache[l2Off]
+	if ok {
+		e := tbl[l2Idx]
+		q.mu.RUnlock()
+		return e, nil
+	}
+	q.mu.RUnlock()
+
+	entries := int(q.clusterSize / 8)
+	buf := make([]byte, q.clusterSize)
+	if _, err := q.f.ReadAt(buf, int64(l2Off)); err != nil {
+		return 0, fmt.Errorf("cow: read qcow2 L2 table at %#x: %w", l2Off, err)
+	}
+	loaded := make([]uint64, entries)
+	for i := range loaded {
+		loaded[i] = binary.BigEndian.Uint64(buf[i*8:])
+	}
+	q.mu.Lock()
+	if q.l2cache == nil {
+		q.l2cache = make(map[uint64][]uint64)
+	}
+	// Simple eviction: when adding this table would exceed the byte budget,
+	// drop the whole cache and keep only the table being inserted. Amortized
+	// O(1), bounded memory, and self-correcting for any access pattern.
+	if q.l2cacheBytes+int(q.clusterSize) > l2CacheMaxBytes && len(q.l2cache) > 0 {
+		q.l2cache = make(map[uint64][]uint64)
+		q.l2cacheBytes = 0
+	}
+	if existing, ok2 := q.l2cache[l2Off]; ok2 {
+		// Another goroutine inserted it while we were reading.
+		q.mu.Unlock()
+		return existing[l2Idx], nil
+	}
+	q.l2cache[l2Off] = loaded
+	q.l2cacheBytes += len(loaded) * 8
+	q.mu.Unlock()
+	return loaded[l2Idx], nil
+}
+
+// updateL2Cache writes val into the cached copy of the table at l2Off (if it
+// is currently cached). The disk write is done by the caller.
+func (q *qcow2Image) updateL2Cache(l2Off, l2Idx, val uint64) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if tbl, ok := q.l2cache[l2Off]; ok {
+		tbl[l2Idx] = val
+	}
+}
+
+// invalidateL2Cache drops the cached copy of the table at l2Off, if any.
+func (q *qcow2Image) invalidateL2Cache(l2Off uint64) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if _, ok := q.l2cache[l2Off]; ok {
+		delete(q.l2cache, l2Off)
+	}
+}
+
 func (q *qcow2Image) readUint64At(dst *uint64, off uint64) error {
 	var b [8]byte
 	if _, err := q.f.ReadAt(b[:], int64(off)); err != nil {
@@ -489,25 +620,54 @@ func (q *qcow2Image) readUint64At(dst *uint64, off uint64) error {
 }
 
 // openGuestImage sniffs the magic and opens path as raw or qcow2, opening
-// the backing chain recursively. baseDir resolves relative backing names the
-// way qcow2 specifies: relative to the image's own directory.
+// the backing chain recursively (bounded: see maxBackingChainDepth and the
+// visited-inode cycle check in openGuestImageDepth).
 func openGuestImage(path string) (guestImage, error) {
+	return openGuestImageDepth(path, 0, map[chainKey]bool{})
+}
+
+// chainKey identifies an opened file by device+inode, so a backing cycle
+// (A -> B -> A, possibly through different path spellings or hardlinks) is
+// detected even when names differ.
+type chainKey struct {
+	dev uint64
+	ino uint64
+}
+
+func chainKeyOf(fi os.FileInfo) chainKey {
+	if st, ok := fi.Sys().(*syscall.Stat_t); ok {
+		return chainKey{dev: uint64(st.Dev), ino: uint64(st.Ino)}
+	}
+	return chainKey{}
+}
+
+func openGuestImageDepth(path string, depth int, visited map[chainKey]bool) (guestImage, error) {
+	if depth > maxBackingChainDepth {
+		return nil, fmt.Errorf("cow: backing chain deeper than %d levels (loop or runaway overlay chain) at %s", maxBackingChainDepth, path)
+	}
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
+	fi, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	key := chainKeyOf(fi)
+	if visited[key] {
+		f.Close()
+		return nil, fmt.Errorf("cow: backing chain cycle detected at %s", path)
+	}
+	visited[key] = true
+
 	var magic [4]byte
 	if _, err := f.ReadAt(magic[:], 0); err != nil {
 		f.Close()
 		return nil, fmt.Errorf("cow: read magic of %s: %w", path, err)
 	}
 	if string(magic[:]) != qcow2Magic {
-		st, err := f.Stat()
-		if err != nil {
-			f.Close()
-			return nil, err
-		}
-		return &rawImage{f: f, size: uint64(st.Size()), mode: st.Mode()}, nil
+		return &rawImage{f: f, size: uint64(fi.Size()), mode: fi.Mode()}, nil
 	}
 
 	var hdrBuf [qcow2HeaderLen]byte
@@ -551,6 +711,13 @@ func openGuestImage(path string) (guestImage, error) {
 		refcountClusters: binary.BigEndian.Uint32(hdrBuf[0x38:]),
 		snapshots:        binary.BigEndian.Uint32(hdrBuf[0x3C:]),
 		snapshotsOffset:  binary.BigEndian.Uint64(hdrBuf[0x40:]),
+	}
+	// Header-driven virtual size is capped: beyond it, layout/allocation
+	// math (and any consumer sizing a buffer from it) becomes absurd or
+	// overflow-prone. A hostile header claiming exabytes must not be opened.
+	if q.hdr.size > maxVirtualSize {
+		f.Close()
+		return nil, fmt.Errorf("cow: qcow2 virtual size %d in %s exceeds the %d TiB cap", q.hdr.size, path, maxVirtualSize>>40)
 	}
 	// v3 header_length (offset 0x64) is where header extensions START —
 	// not necessarily our own qcow2HeaderLen. The spec minimum is 104 (the
@@ -686,6 +853,18 @@ func openGuestImage(path string) (guestImage, error) {
 			return nil, fmt.Errorf("cow: read backing name in %s: %w", path, err)
 		}
 		backingPath := string(name)
+		// The header-embedded backing name is attacker-controlled when the
+		// image comes from outside. Validate it like every other path this
+		// package accepts, then require the RESOLVED target to stay inside
+		// one of the storage roots PVM manages (engine root, image store,
+		// container state root, the image's own directory, or a root we
+		// registered when creating an overlay onto it ourselves). A crafted
+		// image can therefore never pull /etc/shadow — or any other file
+		// outside those roots — into the guest as disk data.
+		if err := validateBackingName(backingPath); err != nil {
+			f.Close()
+			return nil, fmt.Errorf("cow: backing name in %s rejected: %w", path, err)
+		}
 		// Preserve the original name (pre-Abs) for Compact to re-emit
 		// verbatim in rebuilt overlays — a relative name stays relative, so
 		// the overlay+backing pair stays relocatable. A separate absolute
@@ -699,7 +878,11 @@ func openGuestImage(path string) (guestImage, error) {
 		if !filepath.IsAbs(backingPath) {
 			backingPath = absBacking
 		}
-		backing, err := openGuestImage(backingPath)
+		if err := backingPathAllowed(path, backingPath); err != nil {
+			f.Close()
+			return nil, err
+		}
+		backing, err := openGuestImageDepth(backingPath, depth+1, visited)
 		if err != nil {
 			f.Close()
 			return nil, fmt.Errorf("cow: open backing of %s: %w", path, err)
@@ -717,6 +900,34 @@ func openGuestImage(path string) (guestImage, error) {
 		}
 		q.backing = backing
 		q.backingAbs = backingPath // absolute; see filepath.Abs above
+	}
+	// Load the full L1 table into memory once at open: reads then resolve L1
+	// with no pread per cluster. Only entries covering the virtual size are
+	// loaded — foreign writers may declare extra slots that no reachable
+	// cluster can index (resolve clamps via len(q.l1)).
+	l2Entries := q.clusterSize / 8
+	needed, err := divCeil(q.hdr.size, l2Entries*q.clusterSize)
+	if err != nil || needed > 0xFFFFFFFF {
+		f.Close()
+		return nil, fmt.Errorf("cow: inconsistent virtual size %d vs cluster size %d in %s", q.hdr.size, q.clusterSize, path)
+	}
+	if uint64(q.hdr.l1Size) < needed {
+		f.Close()
+		return nil, fmt.Errorf("cow: L1 table (%d entries) too small for virtual size %d in %s (need %d)", q.hdr.l1Size, q.hdr.size, path, needed)
+	}
+	load := needed
+	if q.hdr.l1Offset%q.clusterSize != 0 {
+		f.Close()
+		return nil, fmt.Errorf("cow: L1 offset %#x not cluster-aligned in %s", q.hdr.l1Offset, path)
+	}
+	q.l1 = make([]uint64, load)
+	l1buf := make([]byte, load*8)
+	if _, err := f.ReadAt(l1buf, int64(q.hdr.l1Offset)); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("cow: read L1 table of %s: %w", path, err)
+	}
+	for i := range q.l1 {
+		q.l1[i] = binary.BigEndian.Uint64(l1buf[i*8:])
 	}
 	return q, nil
 }
@@ -739,6 +950,13 @@ func convertToRaw(ctx context.Context, srcPath, destPath string) error {
 	out, err := os.OpenFile(destPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
 	if err != nil {
 		return fmt.Errorf("cow: create dest: %w", err)
+	}
+	// Mirror the source's permission bits (captured from the open fd),
+	// matching ConvertToQcow2/Compact: a 0600 source must not become a
+	// world-readable raw image just because 0644 was the create default.
+	if err := out.Chmod(img.Mode()); err != nil {
+		out.Close()
+		return fmt.Errorf("cow: align dest mode: %w", err)
 	}
 	defer out.Close()
 
@@ -786,8 +1004,17 @@ func convertToRaw(ctx context.Context, srcPath, destPath string) error {
 	return nil
 }
 
+// allZero reports whether b is all zero bytes. It compares 8-byte words
+// (byte-order irrelevant for zero detection) and handles the tail byte-wise,
+// so sequential-scan converts skip zero regions several times faster.
 func allZero(b []byte) bool {
-	for _, v := range b {
+	n := len(b) / 8
+	for i := 0; i < n; i++ {
+		if binary.BigEndian.Uint64(b[i*8:]) != 0 {
+			return false
+		}
+	}
+	for _, v := range b[n*8:] {
 		if v != 0 {
 			return false
 		}

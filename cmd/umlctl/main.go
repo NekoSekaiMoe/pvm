@@ -24,6 +24,12 @@ import (
 // keeps its own precompiled symbol to avoid an import cycle via a shared helper.
 var idRegex = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 
+// netNameRegex validates bridge names for `umlctl network create/rm`:
+// letters/digits/dot/underscore/dash, 1..15 chars (the kernel's IFNAMSIZ
+// limit minus the NUL). Anything else would either fail deep inside
+// iproute2 or smuggle extra arguments into the invoked commands.
+var netNameRegex = regexp.MustCompile(`^[a-zA-Z0-9._-]{1,15}$`)
+
 // loadLaunchConfig loads a TaskSpec TOML but returns only the launch-relevant
 // subset. umlctl is a thin UML launcher: it deliberately ignores the control
 // planes (identity/egress/tools/approval/artifacts/lifecycle) which belong to
@@ -207,7 +213,14 @@ func main() {
 		if len(args) >= 2 {
 			subcmd := args[0]
 			name := args[1]
+			if !netNameRegex.MatchString(name) {
+				fmt.Printf("Invalid network name %q (want ^[a-zA-Z0-9._-]{1,15}$)\n", name)
+				os.Exit(1)
+			}
 			if subcmd == "create" {
+				// TODO(subnet-design): the gateway/subnet is hardcoded until a
+				// subnet allocator exists; concurrent bridges on distinct
+				// subnets need an allocation scheme first.
 				err := network.SetupBridge(name, "", "10.0.0.1/24")
 				if err != nil {
 					fmt.Printf("Error creating network: %v\n", err)

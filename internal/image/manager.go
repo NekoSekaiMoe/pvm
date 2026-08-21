@@ -1,6 +1,8 @@
 package image
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
@@ -9,19 +11,95 @@ import (
 	"strings"
 	"uml-container/internal/filesystem"
 	"uml-container/internal/state"
+	"uml-container/internal/tarutil"
 
 	"github.com/google/go-containerregistry/pkg/crane"
 )
 
+// defaultRegistryAllowlist is used when PVM_REGISTRY_ALLOWLIST is unset.
+// localhost/127.0.0.1 (any port) are included so local development registries
+// keep working; "*" anywhere in the list allows everything.
+const defaultRegistryAllowlist = "docker.io,ghcr.io,gcr.io,quay.io,registry.k8s.io,localhost:*,127.0.0.1:*,[::1]:*"
+
+// registryAllowed reports whether imageRef's registry is on the configured
+// allowlist (env PVM_REGISTRY_ALLOWLIST, comma-separated hosts, optionally
+// with a ":port" or ":*" suffix; "*" allows all).
+func registryAllowed(imageRef string) bool {
+	spec := os.Getenv("PVM_REGISTRY_ALLOWLIST")
+	if spec == "" {
+		spec = defaultRegistryAllowlist
+	}
+	if spec == "*" {
+		return true
+	}
+	reg := registryHost(imageRef)
+	for _, ent := range strings.Split(spec, ",") {
+		ent = strings.TrimSpace(ent)
+		if ent == "" {
+			continue
+		}
+		if ent == "*" {
+			return true
+		}
+		if host, port, ok := strings.Cut(ent, ":"); ok && port == "*" {
+			// Wildcard-port entry like "localhost:*": match that host on any port.
+			if h, _, ok2 := strings.Cut(reg, ":"); ok2 && h == host {
+				return true
+			}
+		}
+		if ent == reg || strings.Trim(ent, "[]") == strings.Trim(reg, "[]") {
+			return true
+		}
+	}
+	return false
+}
+
+// registryHost extracts the registry host from an OCI image reference.
+// Per the distribution-spec convention, the component before the first "/"
+// is a registry only when it contains a "." or ":" or equals "localhost";
+// otherwise the reference uses the default registry (docker.io).
+func registryHost(imageRef string) string {
+	i := strings.IndexByte(imageRef, '/')
+	if i < 0 {
+		// No slash: the whole ref is <repo>[:<tag>] against the default
+		// registry ("alpine" -> docker.io/library/alpine). A bare host would
+		// name no repository and cannot be pulled.
+		return "docker.io"
+	}
+	first := imageRef[:i]
+	if strings.ContainsAny(first, ".:") || first == "localhost" {
+		return first
+	}
+	return "docker.io"
+}
+
+// imageName maps an image reference to its on-disk file name. The raw ref
+// cannot be used directly (two different refs can sanitize to the same name:
+// "a/b:1" and "a_b_1" would both become a_b_1.img), so the store name is the
+// SHA-256 of the reference — collision-free by construction. The original
+// reference stays visible in logs.
+func imageName(imageRef string) string {
+	sum := sha256.Sum256([]byte(imageRef))
+	return hex.EncodeToString(sum[:]) + ".img"
+}
+
+// DefaultDir is the on-disk root under which pulled images live. The API
+// layer constrains caller-supplied rootfs paths to this tree.
+const DefaultDir = "/var/lib/uml-container/images"
+
 // Pull downloads an image (either Docker or tarball) and extracts it into a new ext4 image
 func Pull(imageRef string) error {
-	imgDir := "/var/lib/uml-container/images"
+	// Registry allowlist: refuse references outside the configured set before
+	// any network or disk activity.
+	if !registryAllowed(imageRef) {
+		return fmt.Errorf("image %q: registry %q is not on the allowlist (PVM_REGISTRY_ALLOWLIST)", imageRef, registryHost(imageRef))
+	}
+	imgDir := DefaultDir
 	os.MkdirAll(imgDir, 0755)
 
-	// Format name
-	safeName := strings.ReplaceAll(imageRef, "/", "_")
-	safeName = strings.ReplaceAll(safeName, ":", "_")
-	imgPath := filepath.Join(imgDir, safeName+".img")
+	// Collision-free store name: sha256(imageRef). See imageName.
+	safeName := strings.TrimSuffix(imageName(imageRef), ".img")
+	imgPath := filepath.Join(imgDir, imageName(imageRef))
 
 	if _, err := os.Stat(imgPath); err == nil {
 		fmt.Printf("Image %s already exists\n", imageRef)
@@ -93,11 +171,21 @@ func Pull(imageRef string) error {
 	}
 	f.Close()
 
-	cmd := exec.Command("sudo", "tar", "-xf", tarFile, "-C", mnt)
-	if out, err := cmd.CombinedOutput(); err != nil {
+	// Extract the exported layer tarball with the hardened tarutil extractor
+	// instead of `sudo tar -xf`: traversal/symlink/device-node members are
+	// rejected, special permission bits are stripped, and resource limits bound
+	// a malicious archive. No root helper is involved in extraction.
+	tf, err := os.Open(tarFile)
+	if err != nil {
 		cleanup()
-		return fmt.Errorf("failed to extract tar: %v, out: %s", err, string(out))
+		return fmt.Errorf("failed to open layer tar: %v", err)
 	}
+	if err := tarutil.Extract(tf, mnt, tarutil.DefaultLimits()); err != nil {
+		tf.Close()
+		cleanup()
+		return fmt.Errorf("failed to extract tar: %v", err)
+	}
+	tf.Close()
 
 	// Atomically publish the finished image. os.Rename is atomic on the same
 	// filesystem (imgDir is the parent of tmpImgPath).

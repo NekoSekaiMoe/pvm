@@ -6,7 +6,9 @@ echo "========== Test 01: E2B API Simulation =========="
 # Build the CLI
 go build -o agentpvm cmd/agentpvm/main.go
 
-# Start the API server in the background
+# Start the API server in the background (a secret is REQUIRED — the server
+# refuses to start without one; keep it in sync with the Bearer header below)
+export API_SECRET="secret"
 ./agentpvm api -port 8081 &
 API_PID=$!
 

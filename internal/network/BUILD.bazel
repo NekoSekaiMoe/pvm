@@ -109,6 +109,7 @@ go_test(
     name = "network_test",
     srcs = [
         "bridge_internal_test.go",
+        "filter_registry_test.go",
         "network_test.go",
         "policy_test.go",
     ],

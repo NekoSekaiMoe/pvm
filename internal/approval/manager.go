@@ -80,6 +80,17 @@ func (m *Manager) Create(t Ticket) (string, error) {
 	}
 	if t.Deadline.IsZero() {
 		t.Deadline = t.CreatedAt.Add(5 * time.Minute) // default approval window
+	} else {
+		// An explicit deadline is caller-supplied input: keep it inside a
+		// sane window. An already-expired ticket could launder a decision
+		// (auto-expire logic fires immediately); an arbitrarily distant one
+		// would pin a pending gate open forever.
+		if t.Deadline.Before(t.CreatedAt) {
+			return "", fmt.Errorf("approval: deadline %s is before creation time", t.Deadline.Format(time.RFC3339))
+		}
+		if t.Deadline.After(t.CreatedAt.Add(time.Hour)) {
+			return "", fmt.Errorf("approval: deadline %s is more than 1h after creation", t.Deadline.Format(time.RFC3339))
+		}
 	}
 	t.State = StatePending
 
@@ -91,7 +102,10 @@ func (m *Manager) Create(t Ticket) (string, error) {
 		}
 	}
 
-	id := randID()
+	id, err := randID()
+	if err != nil {
+		return "", fmt.Errorf("approval: %w", err)
+	}
 	t.ID = id
 	m.tickets[id] = &t
 
@@ -225,14 +239,14 @@ func sameParams(a, b map[string]interface{}) bool {
 	return string(aj) == string(bj)
 }
 
-// randID is a 12-byte url-safe id.
-func randID() string {
+// randID is a timestamp-prefixed 8-byte url-safe id. It FAILS CLOSED: a
+// timestamp-only fallback id would be predictable (an attacker who can guess
+// the creation second could address the ticket), and a system whose CSPRNG
+// is unavailable has no business issuing approval credentials at all.
+func randID() (string, error) {
 	rs, err := randomString(8)
 	if err != nil {
-		// Fallback: timestamp-only id. randomString only fails when the
-		// CSPRNG is unavailable, which is exceptional; we still need a unique
-		// id so the ticket can be addressed.
-		rs = fmt.Sprintf("%x", time.Now().UnixNano())
+		return "", err
 	}
-	return time.Now().UTC().Format("20060102T150405Z") + "-" + rs
+	return time.Now().UTC().Format("20060102T150405Z") + "-" + rs, nil
 }

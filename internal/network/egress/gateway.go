@@ -100,6 +100,9 @@ type Gateway struct {
 	bytesOutMu sync.Mutex
 	server     *http.Server
 	listener   net.Listener
+	// transport is the shared upstream transport (SSRF-checked dialer,
+	// keep-alives ON). Created lazily so a bare &Gateway{} (unit tests) works.
+	transport *http.Transport
 
 	// ssrfBypass is a test-only escape hatch that disables the SSRF IP-floor
 	// on handleHTTP so unit tests can point at httptest's 127.0.0.1 backends.
@@ -302,6 +305,21 @@ func (g *Gateway) handleConnect(w http.ResponseWriter, r *http.Request, task str
 		http.Error(w, "egress: blocked", http.StatusForbidden)
 		return
 	}
+	// Flat-allowlist mode carries no per-rule port scoping, so an allowed
+	// domain would otherwise be usable as an arbitrary-port TCP relay
+	// (CONNECT pypi.org:22 ...). Constrain flat mode to the standard
+	// HTTP/TLS ports; extended Rules keep their explicit Port fields.
+	if len(pol.Rules) == 0 {
+		port := "443" // a port-less CONNECT line means the default TLS port
+		if _, p, err := net.SplitHostPort(r.Host); err == nil {
+			port = p
+		}
+		if port != "80" && port != "443" {
+			g.record(task, r, DecisionBlock, "CONNECT port "+port+" not allowed in flat allowlist mode (80/443 only)")
+			http.Error(w, "egress: port not allowed", http.StatusForbidden)
+			return
+		}
+	}
 	targetConn, err := net.DialTimeout("tcp", r.Host, 10*time.Second)
 	if err != nil {
 		g.record(task, r, DecisionBlock, "dial failed: "+err.Error())
@@ -331,8 +349,9 @@ func (g *Gateway) handleConnect(w http.ResponseWriter, r *http.Request, task str
 		return
 	}
 	g.record(task, r, DecisionAllow, "CONNECT "+v.host)
-	go pipe(clientConn, targetConn, task, g, pol)
-	go pipe(targetConn, clientConn, task, g, pol)
+	// Only the upload direction (client → upstream) is billed; see pipe.
+	go pipe(targetConn, clientConn, task, g, false) // upstream → client (download)
+	go pipe(clientConn, targetConn, task, g, true)  // client → upstream (egress)
 }
 
 // handleHTTP handles plain HTTP requests (body visible, method/size enforced).
@@ -430,44 +449,47 @@ func (g *Gateway) handleHTTP(w http.ResponseWriter, r *http.Request, task string
 	g.record(task, r, DecisionAllow, fmt.Sprintf("%s %s -> %d (%dB)", r.Method, v.host, resp.StatusCode, n))
 }
 
-// dialCheckedTransport returns an http.RoundTripper whose DialContext rejects
-// private/loopback/link-local destination IPs. When g.ssrfBypass is set (test
-// only), the DialContext is the standard one so loopback upstreams work.
-//
-// Every transport constructed here disables keep-alives: handleHTTP creates a
-// fresh transport PER request (so it can scope DialContext to that request's
-// SSRF check), and a transport that is discarded while holding idle connections
-// leaks them (and their goroutines) until GC. DisableKeepAlives=true makes each
-// round-trip open+close its own connection, so discarding the transport has no
-// dangling state.
+// dialCheckedTransport returns the gateway's shared upstream transport.
+// Its DialContext enforces the SSRF IP-floor (private/loopback/link-local
+// refused post-connect, which also covers DNS rebinding) and consults
+// ssrfBypass at DIAL time so the test-only bypass keeps working on the
+// shared transport. A single shared transport with keep-alives replaces the
+// previous per-request transport: connection reuse removes a full TCP (+TLS)
+// handshake from every forwarded request, and the connection-level SSRF
+// check is semantically identical (it runs on every established conn).
 func (g *Gateway) dialCheckedTransport() *http.Transport {
 	g.mu.RLock()
-	bypass := g.ssrfBypass
+	t := g.transport
 	g.mu.RUnlock()
-	if bypass {
-		return &http.Transport{
-			ResponseHeaderTimeout: 30 * time.Second,
-			DisableKeepAlives:     true,
-			IdleConnTimeout:       1 * time.Second,
-		}
+	if t != nil {
+		return t
 	}
-	return &http.Transport{
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.transport != nil { // lost the race; use the winner's
+		return g.transport
+	}
+	g.transport = &http.Transport{
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			g.mu.RLock()
+			bypass := g.ssrfBypass
+			g.mu.RUnlock()
 			d := net.Dialer{Timeout: 10 * time.Second}
 			conn, err := d.DialContext(ctx, network, addr)
 			if err != nil {
 				return nil, err
 			}
-			if isPrivate(conn.RemoteAddr()) {
+			if !bypass && isPrivate(conn.RemoteAddr()) {
 				conn.Close()
 				return nil, errPrivateIPBlocked
 			}
 			return conn, nil
 		},
 		ResponseHeaderTimeout: 30 * time.Second,
-		DisableKeepAlives:     true,
-		IdleConnTimeout:       1 * time.Second,
+		IdleConnTimeout:       90 * time.Second,
+		MaxIdleConnsPerHost:   8,
 	}
+	return g.transport
 }
 
 // errPrivateIPBlocked is returned by dialCheckedTransport when the dial lands
@@ -717,11 +739,17 @@ func methodAllowed(method string, allowed []string) bool {
 }
 
 // pipe shuttles bytes between two connections and accounts bytes.
-func pipe(dst, src net.Conn, task string, g *Gateway, pol *Policy) {
+// pipe relays bytes from src to dst. bill reports whether the copied bytes
+// count against the task's egress budget: only the client→upstream direction
+// is billable (that is the sandbox's own outbound traffic); the downstream
+// copy (upstream→client) is response data the sandbox received.
+func pipe(dst, src net.Conn, task string, g *Gateway, bill bool) {
 	defer dst.Close()
 	defer src.Close()
 	n, _ := io.Copy(dst, src)
-	g.addBytes(task, n)
+	if bill {
+		g.addBytes(task, n)
+	}
 }
 
 // addBytes accumulates per-task egress bytes for budget enforcement.
@@ -777,9 +805,12 @@ func (g *Gateway) policy(task string) *Policy {
 func (g *Gateway) record(task string, r *http.Request, d Decision, reason string) {
 	// Pick the task-specific ledger when one is registered, falling back to
 	// the gateway-wide ledger. This keeps multi-task traffic attributed to
-	// the right task instead of the controller's default.
-	l := g.ledger
+	// the right task instead of the controller's default. Both reads happen
+	// under the SAME RLock: AttachLedger/AttachTaskLedger write these fields
+	// under the write lock, so reading g.ledger before acquiring the lock was
+	// a data race.
 	g.mu.RLock()
+	l := g.ledger
 	if tl, ok := g.ledgers[task]; ok && tl != nil {
 		l = tl
 	}

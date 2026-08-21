@@ -41,7 +41,7 @@ func minimalSpec() *spec.TaskSpec {
 		Caller:    "alice",
 		Tenant:    "eng",
 		Runtime:   spec.RuntimeSpec{Name: "task-x", CPU: 1, Memory: "256M"},
-		Workspace: spec.WorkspaceSpec{BaseImage: "", Init: "/sbin/init"}, // no base => skip overlay
+		Workspace: spec.WorkspaceSpec{BaseImage: "/tmp/uml-test-base.img", Init: "/sbin/init"}, // ubd path mounts this verbatim
 		Kernel:    spec.KernelSpec{Path: "/usr/lib/uml/linux"},
 		Network:   spec.NetworkSpec{Enabled: false},
 		Lifecycle: spec.LifecycleSpec{OnAnomaly: "pause"},

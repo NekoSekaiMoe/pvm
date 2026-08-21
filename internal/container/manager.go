@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"regexp"
+	"strings"
 	"time"
 	"uml-container/internal/audit"
 	"uml-container/internal/cgroup"
@@ -73,16 +75,16 @@ func NewManager(launcher uml.Launcher) *Manager {
 // the given flat config, sets up cgroup limits, and records legacy status
 // (running/stopped/exited) in state.json. It does NOT engage the control planes.
 func (m *Manager) Start(ctx context.Context, cfg *config.ContainerConfig) error {
-	args := buildLegacyArgs(ctx, cfg)
+	args, err := buildLegacyArgs(ctx, cfg)
+	if err != nil {
+		return err
+	}
 
 	var logFile *os.File
 	if interactive, _ := ctx.Value(KeyInteractive).(bool); !interactive {
-		var err error
-		logFile, err = log.SetupConsoleLog(cfg.ID)
-		if err == nil {
-			defer logFile.Close()
-		} else {
-			fmt.Printf("Warning: could not setup log file: %v\n", err)
+		e := setupConsoleFile(cfg.ID, &logFile)
+		if e != nil {
+			return e
 		}
 	}
 
@@ -455,7 +457,13 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 	// kernel command line matches what we actually provisioned. egressAddr is
 	// the host:port of this task's dedicated egress listener (authoritative
 	// attribution source); the task id is NOT exposed to the guest.
-	args := buildTaskArgs(s, sockPath, resolvedRootfs, egressAddr, volumeArgs)
+	args, err := buildTaskArgs(s, sockPath, resolvedRootfs, egressAddr, volumeArgs)
+	if err != nil {
+		cleanupVolumes()
+		_ = st.Transition(state.StatusFailed, state.ActorController, "kernel args rejected: "+err.Error())
+		state.SaveState(taskID, st)
+		return err
+	}
 
 	defer func() {
 		if m.Autopause != nil {
@@ -464,7 +472,19 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 	}()
 
 	// Non-interactive (agent sandbox) => log to file under the task dir.
-	logFile, _ := log.SetupConsoleLog(taskID)
+	// Fail closed: if the console log cannot be created, route guest output
+	// to os.DevNull instead of letting the launcher fall back to the host's
+	// os.Stdin/os.Stdout (which would leak guest output into the daemon's
+	// terminal). Interactive mode (explicit KeyInteractive) is unchanged.
+	var logFile *os.File
+	if interactive, _ := ctx.Value(KeyInteractive).(bool); !interactive {
+		if e := setupConsoleFile(taskID, &logFile); e != nil {
+			cleanupVolumes()
+			_ = st.Transition(state.StatusFailed, state.ActorController, "console log setup failed: "+e.Error())
+			state.SaveState(taskID, st)
+			return e
+		}
+	}
 	if logFile != nil {
 		defer logFile.Close()
 	}
@@ -642,9 +662,87 @@ func (m *Manager) watchDeadline(ctx context.Context, taskID string, deadline tim
 	}
 }
 
+// setupConsoleFile creates the console log for containerID into *dst.
+// On success *dst is the open log file. On failure *dst is os.DevNull
+// (fail closed): the launcher must never fall back to host stdio for a
+// non-interactive sandbox just because its log file could not be created.
+func setupConsoleFile(containerID string, dst **os.File) error {
+	f, err := log.SetupConsoleLog(containerID)
+	if err == nil {
+		*dst = f
+		return nil
+	}
+	null, nerr := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if nerr != nil {
+		return fmt.Errorf("container: console log setup failed (%v) and %s unusable (%v)", err, os.DevNull, nerr)
+	}
+	log.Default().Warnf("console log unavailable for %s (%v); routing guest output to %s", containerID, err, os.DevNull)
+	*dst = null
+	return nil
+}
+
+// kernelFieldRe rejects characters that would break out of a single UML
+// command-line field: whitespace splits arguments and commas separate
+// options inside composite parameters (vec0=..., virtio_uml.device=...,
+// hostfs_volume=...). Field VALUES must not contain either; the composite
+// strings built by the arg functions themselves may use commas freely.
+var kernelFieldRe = regexp.MustCompile(`^[^\s,]+$`)
+
+// validateKernelField enforces the character-set contract on a value
+// interpolated into the UML kernel command line.
+func validateKernelField(name, val string) error {
+	if val == "" {
+		return fmt.Errorf("container: empty %q in kernel command line", name)
+	}
+	if !kernelFieldRe.MatchString(val) {
+		return fmt.Errorf("container: %s %q contains whitespace or comma", name, val)
+	}
+	return nil
+}
+
+// validateRootfs additionally requires an absolute path with no '..'
+// element (it is interpolated into ubd0=<path>).
+func validateRootfs(val string) error {
+	if err := validateKernelField("rootfs", val); err != nil {
+		return err
+	}
+	if !filepath.IsAbs(val) {
+		return fmt.Errorf("container: rootfs %q must be an absolute path", val)
+	}
+	// Reject '..' as a raw path element BEFORE cleaning: lexical dot-dot
+	// traversal (even when it stays inside the tree) has no business on a
+	// kernel command line.
+	for _, part := range strings.Split(val, string(filepath.Separator)) {
+		if part == ".." {
+			return fmt.Errorf("container: rootfs %q must not contain '..'", val)
+		}
+	}
+	return nil
+}
+
+// validateMemory accepts only canonical numeric forms the UML kernel
+// understands: plain bytes ("268435456") or a single k/m/g suffix
+// ("256M"). Anything else (arithmetic expressions, unknown units) is
+// rejected rather than passed through to the kernel cmdline.
+var memoryRe = regexp.MustCompile(`^[0-9]+[kKmMgG]?$`)
+
+func validateMemory(val string) error {
+	if !memoryRe.MatchString(val) {
+		return fmt.Errorf("container: memory %q is not a canonical size (want digits with optional k/m/g suffix)", val)
+	}
+	return nil
+}
+
 // buildLegacyArgs reproduces the original UML command-line for the umlctl path.
-// Extracted from the pre-refactor Start() to keep behavior byte-identical.
-func buildLegacyArgs(ctx context.Context, cfg *config.ContainerConfig) []string {
+// Extracted from the pre-refactor Start() to keep behavior byte-identical
+// (modulo validation of interpolated fields).
+func buildLegacyArgs(ctx context.Context, cfg *config.ContainerConfig) ([]string, error) {
+	if err := validateKernelField("init", cfg.Init); err != nil {
+		return nil, err
+	}
+	if err := validateMemory(cfg.Memory); err != nil {
+		return nil, err
+	}
 	args := []string{
 		fmt.Sprintf("init=%s", cfg.Init),
 		fmt.Sprintf("mem=%s", cfg.Memory),
@@ -654,9 +752,15 @@ func buildLegacyArgs(ctx context.Context, cfg *config.ContainerConfig) []string 
 		args = append(args, "con=null")
 	}
 	if cfg.UseVirtio && cfg.VhostUserSocket != "" {
+		if err := validateKernelField("vhost-user socket", cfg.VhostUserSocket); err != nil {
+			return nil, err
+		}
 		args = append(args, fmt.Sprintf("virtio_uml.device=%s:%d", cfg.VhostUserSocket, vhost.VirtioIDBlock))
 		args = append(args, "root=/dev/vda")
 	} else {
+		if err := validateRootfs(cfg.Rootfs); err != nil {
+			return nil, err
+		}
 		args = append(args, fmt.Sprintf("ubd0=%s", cfg.Rootfs))
 		args = append(args, "root=/dev/ubda")
 	}
@@ -664,14 +768,23 @@ func buildLegacyArgs(ctx context.Context, cfg *config.ContainerConfig) []string 
 	// Network device: vec0 (see buildTaskArgs — legacy eth0=tuntap is gone in
 	// Linux >= 6.16, only the vector transport remains).
 	if cfg.NetworkTap != "" {
+		if err := validateKernelField("tap device", cfg.NetworkTap); err != nil {
+			return nil, err
+		}
 		args = append(args, fmt.Sprintf("vec0:transport=tap,ifname=%s,depth=128,gro=1", cfg.NetworkTap))
 	}
 	vHost, hasVHost := ctx.Value(KeyVolumeHost).(string)
 	vGuest, hasVGuest := ctx.Value(KeyVolumeGuest).(string)
 	if hasVHost && hasVGuest {
+		if err := validateKernelField("volume host path", vHost); err != nil {
+			return nil, err
+		}
+		if err := validateKernelField("volume guest path", vGuest); err != nil {
+			return nil, err
+		}
 		args = append(args, fmt.Sprintf("hostfs_volume=%s:%s", vHost, vGuest))
 	}
-	return args
+	return args, nil
 }
 
 // buildTaskArgs builds the UML command-line from a TaskSpec. Mirrors the legacy
@@ -682,15 +795,27 @@ func buildLegacyArgs(ctx context.Context, cfg *config.ContainerConfig) []string 
 // guest so the guest dials it as its HTTP proxy. The task id is deliberately
 // NOT passed: the guest cannot be trusted with its own attribution id, and
 // the per-task listener binds the id by closure on the host side instead.
-func buildTaskArgs(s *spec.TaskSpec, vhostSock, resolvedRootfs, egressAddr string, volumeArgs []string) []string {
+func buildTaskArgs(s *spec.TaskSpec, vhostSock, resolvedRootfs, egressAddr string, volumeArgs []string) ([]string, error) {
+	if err := validateKernelField("init", s.Workspace.Init); err != nil {
+		return nil, err
+	}
+	if err := validateMemory(s.Runtime.Memory); err != nil {
+		return nil, err
+	}
 	args := []string{
 		fmt.Sprintf("init=%s", s.Workspace.Init),
 		fmt.Sprintf("mem=%s", s.Runtime.Memory),
 	}
 	if s.Kernel.UseVhostBlk && vhostSock != "" {
+		if err := validateKernelField("vhost-user socket", vhostSock); err != nil {
+			return nil, err
+		}
 		args = append(args, fmt.Sprintf("virtio_uml.device=%s:%d", vhostSock, vhost.VirtioIDBlock))
 		args = append(args, "root=/dev/vda")
 	} else {
+		if err := validateRootfs(resolvedRootfs); err != nil {
+			return nil, err
+		}
 		// ubd path: resolvedRootfs is the single source of truth that StartTask
 		// provisioned. StartTask sets it whenever BaseImage != "", so reaching
 		// here with it empty means BaseImage was empty too — there is nothing
@@ -712,6 +837,9 @@ func buildTaskArgs(s *spec.TaskSpec, vhostSock, resolvedRootfs, egressAddr strin
 	// Parameters per Documentation/virt/uml/user_mode_linux_howto_v2.rst:
 	//   transport=tap, ifname=<host tap>, depth=128 (queue depth), gro=1.
 	if s.Network.Enabled && s.Network.TAP != "" {
+		if err := validateKernelField("tap device", s.Network.TAP); err != nil {
+			return nil, err
+		}
 		args = append(args, fmt.Sprintf("vec0:transport=tap,ifname=%s,depth=128,gro=1", s.Network.TAP))
 	}
 	// Forward the task's DEDICATED egress listener address (host:port) into the
@@ -719,12 +847,28 @@ func buildTaskArgs(s *spec.TaskSpec, vhostSock, resolvedRootfs, egressAddr strin
 	// which listener the traffic arrives on (a host-side closure over taskID),
 	// not by any id the guest could forge. See StartTask for the lifecycle.
 	if egressAddr != "" {
+		if err := validateKernelField("egress proxy", egressAddr); err != nil {
+			return nil, err
+		}
 		args = append(args, fmt.Sprintf("egress_proxy=%s", egressAddr))
 	}
 	for _, v := range volumeArgs {
+		// v is a composite "<host>:<guest>" pair produced by the volume
+		// plane; each side must be comma/whitespace free (the ':' separator
+		// and the commas of the hostfs_volume= grammar itself are fine).
+		host, guest, found := strings.Cut(v, ":")
+		if !found {
+			return nil, fmt.Errorf("container: volume arg %q is not <host>:<guest>", v)
+		}
+		if err := validateKernelField("volume host path", host); err != nil {
+			return nil, err
+		}
+		if err := validateKernelField("volume guest path", guest); err != nil {
+			return nil, err
+		}
 		args = append(args, fmt.Sprintf("hostfs_volume=%s", v))
 	}
-	return args
+	return args, nil
 }
 
 // idRegexp is the task id format used by StartTask's defense-in-depth check.

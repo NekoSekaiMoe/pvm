@@ -37,6 +37,14 @@ func Serve(socketPath string, dev *BlkDev) (*Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("vu: listen %s: %w", socketPath, err)
 	}
+	// ListenUnix applies the process umask; a permissive umask would expose
+	// the control channel (memory-table fd passing) to other local users.
+	// Only the guest frontend may talk to it.
+	if err := os.Chmod(socketPath, 0600); err != nil {
+		ln.Close()
+		os.Remove(socketPath)
+		return nil, fmt.Errorf("vu: chmod %s: %w", socketPath, err)
+	}
 	s := &Server{dev: dev, ln: ln, path: socketPath}
 	s.wg.Add(1)
 	go s.acceptLoop()
@@ -365,6 +373,13 @@ func (s *session) maybeStartPump() {
 }
 
 // pump waits for kicks and drains the avail ring.
+//
+// Locking: s.mu is only held for the short pop/translateSG and push/notify
+// phases. The actual device IO (dev.process, which includes fsync on flush)
+// runs WITHOUT the lock, so control-channel messages (handle) and close()
+// are never blocked behind a long-running backend request. Guest memory
+// slices stay valid while the lock is released because session.close()
+// munmaps only after pumpWg.Wait() observes this goroutine finished.
 func (s *session) pump() {
 	for {
 		s.mu.Lock()
@@ -377,33 +392,79 @@ func (s *session) pump() {
 		if err := kick.wait(); err != nil {
 			return
 		}
-		s.mu.Lock()
 		for {
-			e, err := s.vq.pop(&s.mem)
-			if err != nil {
-				log.Printf("vu: pop: %v", err)
+			// Phase 1 (locked): pop a bounded batch of requests and resolve
+			// their descriptor chains into guest-memory SG slices.
+			batch := s.popBatch()
+			if len(batch) == 0 {
 				break
 			}
-			if e == nil {
-				break
+			// Phase 2 (unlocked): pure device IO — read/write/fsync.
+			type result struct {
+				e       *elem
+				usedLen uint32
 			}
-			if err := e.translateSG(&s.mem); err != nil {
-				log.Printf("vu: translate: %v", err)
-				break
+			results := make([]result, 0, len(batch))
+			for _, e := range batch {
+				usedLen, err := s.dev.process(e)
+				if err != nil {
+					log.Printf("vu: blk request: %v", err)
+					continue
+				}
+				results = append(results, result{e: e, usedLen: usedLen})
 			}
-			usedLen, err := s.dev.process(e)
-			if err != nil {
-				log.Printf("vu: blk request: %v", err)
-				continue
+			// Phase 3 (locked): publish completions and interrupt the guest.
+			s.mu.Lock()
+			if s.closed {
+				s.mu.Unlock()
+				return
 			}
-			if err := s.vq.push(e, usedLen); err != nil {
-				log.Printf("vu: push: %v", err)
+			for _, r := range results {
+				if err := s.vq.push(r.e, r.usedLen); err != nil {
+					log.Printf("vu: push: %v", err)
+					break
+				}
+			}
+			if err := s.vq.notify(); err != nil {
+				log.Printf("vu: notify: %v", err)
+			}
+			s.mu.Unlock()
+			// A full batch means more work may be pending; otherwise the
+			// queue is drained and we go back to waiting for a kick.
+			if len(batch) < pumpMaxBatch {
 				break
 			}
 		}
-		if err := s.vq.notify(); err != nil {
-			log.Printf("vu: notify: %v", err)
-		}
-		s.mu.Unlock()
 	}
+}
+
+// pumpMaxBatch bounds how many requests one locked pop phase extracts
+// before releasing s.mu for the (potentially slow) device IO.
+const pumpMaxBatch = 128
+
+// popBatch pops up to pumpMaxBatch elements under s.mu. It returns early
+// (empty batch) when the session is closed or the queue errors out.
+func (s *session) popBatch() []*elem {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return nil
+	}
+	batch := make([]*elem, 0, pumpMaxBatch)
+	for len(batch) < pumpMaxBatch {
+		e, err := s.vq.pop(&s.mem)
+		if err != nil {
+			log.Printf("vu: pop: %v", err)
+			break
+		}
+		if e == nil {
+			break
+		}
+		if err := e.translateSG(&s.mem); err != nil {
+			log.Printf("vu: translate: %v", err)
+			break
+		}
+		batch = append(batch, e)
+	}
+	return batch
 }

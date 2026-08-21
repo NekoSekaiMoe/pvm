@@ -468,7 +468,14 @@ func networkCmd(args []string) {
 	}
 	sub := args[0]
 	if sub == "whitelist" && len(args) >= 4 && args[1] == "add" {
-		ebpf.UpdateWhitelist(args[2], args[3])
+		// UpdateWhitelist returns an error (pinned map missing, bad IP,
+		// map update failure) — surfacing it beats silently succeeding.
+		if err := ebpf.UpdateWhitelist(args[2], args[3]); err != nil {
+			fmt.Printf("Whitelist Error: %v\n", err)
+			os.Exit(1)
+		} else {
+			fmt.Printf("Whitelist updated: %s -> %s\n", args[2], args[3])
+		}
 	} else if sub == "qos" && len(args) >= 3 {
 		if err := network.SetupQoS(args[1], args[2]); err != nil {
 			fmt.Printf("QoS Error: %v\n", err)
@@ -537,6 +544,13 @@ func gateCmd(args []string) {
 	// if the bundle doesn't carry one or the path is not writable.
 	var ledger *audit.Ledger
 	if b.TaskID != "" {
+		// Defense in depth: validate the task id before it reaches
+		// audit.Open (which validates too) so a crafted bundle cannot steer
+		// the ledger path.
+		if !taskIDRe.MatchString(b.TaskID) {
+			fmt.Fprintf(os.Stderr, "gate: invalid task id %q\n", b.TaskID)
+			os.Exit(1)
+		}
 		l, lerr := audit.Open(b.TaskID)
 		if lerr == nil {
 			ledger = l
@@ -667,3 +681,7 @@ var (
 // import; the inline regexp.MustCompile that used to live in runCmd now
 // reuses this single precompiled value.
 var idRegex = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
+
+// taskIDRe bounds the task id accepted by the gate subcommand before it
+// reaches audit.Open: 1..128 chars of [A-Za-z0-9_-].
+var taskIDRe = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,128}$`)

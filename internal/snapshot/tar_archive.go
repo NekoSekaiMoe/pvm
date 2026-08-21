@@ -1,17 +1,15 @@
 package snapshot
 
 import (
-	"archive/tar"
 	"compress/gzip"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
-	"strings"
 
 	"uml-container/internal/state"
+	"uml-container/internal/tarutil"
 )
 
 var validContainerID = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
@@ -102,94 +100,12 @@ func Import(srcTgz string, newContainerID string) error {
 	}
 	defer gr.Close()
 
-	tr := tar.NewReader(gr)
-	for {
-		header, err := tr.Next()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return fmt.Errorf("tar import failed: tar read: %v", err)
-		}
-
-		cleanPath := filepath.Clean(header.Name)
-		if strings.Contains(cleanPath, "..") || strings.HasPrefix(cleanPath, "/") {
-			return fmt.Errorf("tar import failed: invalid path %s", header.Name)
-		}
-
-		target := filepath.Join(dir, cleanPath)
-		if !strings.HasPrefix(target, filepath.Clean(dir)+string(filepath.Separator)) && target != filepath.Clean(dir) {
-			return fmt.Errorf("tar import failed: path escapes dir %s", header.Name)
-		}
-
-		// Check that no directory component in target's path is a symlink
-		curr := filepath.Dir(target)
-		for curr != filepath.Clean(dir) && strings.HasPrefix(curr, filepath.Clean(dir)) {
-			fi, err := os.Lstat(curr)
-			if err == nil && fi.Mode()&os.ModeSymlink != 0 {
-				return fmt.Errorf("tar import failed: path traverses symlink %s", header.Name)
-			}
-			curr = filepath.Dir(curr)
-		}
-
-		switch header.Typeflag {
-		case tar.TypeDir:
-			if err := os.MkdirAll(target, os.FileMode(header.Mode)); err != nil {
-				return fmt.Errorf("tar import failed: mkdir: %v", err)
-			}
-		case tar.TypeReg, tar.TypeRegA:
-			if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
-				return fmt.Errorf("tar import failed: mkdir: %v", err)
-			}
-			out, err := os.OpenFile(target, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, os.FileMode(header.Mode))
-			if err != nil {
-				return fmt.Errorf("tar import failed: create: %v", err)
-			}
-			if _, err := io.Copy(out, tr); err != nil {
-				out.Close()
-				return fmt.Errorf("tar import failed: copy: %v", err)
-			}
-			out.Close()
-		case tar.TypeSymlink:
-			if strings.HasPrefix(header.Linkname, "/") {
-				return fmt.Errorf("tar import failed: absolute symlink escapes dir %s -> %s", header.Name, header.Linkname)
-			}
-			linkTarget := filepath.Join(filepath.Dir(target), header.Linkname)
-			cleanLink := filepath.Clean(linkTarget)
-			if !strings.HasPrefix(cleanLink, filepath.Clean(dir)+string(filepath.Separator)) && cleanLink != filepath.Clean(dir) {
-				return fmt.Errorf("tar import failed: symlink target escapes dir %s -> %s", header.Name, header.Linkname)
-			}
-			if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
-				return fmt.Errorf("tar import failed: mkdir: %v", err)
-			}
-			if err := os.Remove(target); err != nil && !os.IsNotExist(err) {
-				return fmt.Errorf("tar import failed: remove existing symlink: %v", err)
-			}
-			if err := os.Symlink(header.Linkname, target); err != nil {
-				return fmt.Errorf("tar import failed: symlink: %v", err)
-			}
-		case tar.TypeLink:
-			// Hard link to a previously extracted entry. Resolve against the dest root.
-			linkSrc := filepath.Join(dir, filepath.Clean(header.Linkname))
-			if !strings.HasPrefix(linkSrc, filepath.Clean(dir)+string(filepath.Separator)) && linkSrc != filepath.Clean(dir) {
-				return fmt.Errorf("tar import failed: hardlink target escapes dir %s", header.Linkname)
-			}
-			if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
-				return fmt.Errorf("tar import failed: mkdir: %v", err)
-			}
-			if err := os.Remove(target); err != nil && !os.IsNotExist(err) {
-				return fmt.Errorf("tar import failed: remove existing hardlink: %v", err)
-			}
-			if err := os.Link(linkSrc, target); err != nil {
-				return fmt.Errorf("tar import failed: hardlink: %v", err)
-			}
-		case tar.TypeChar, tar.TypeBlock:
-			// Device nodes require root + CAP_MKNOD; surface as an explicit error instead
-			// of silently skipping, so a corrupted rootfs cannot go unnoticed.
-			return fmt.Errorf("tar import failed: unsupported entry type %d at %q (device node); aborting", header.Typeflag, header.Name)
-		default:
-			return fmt.Errorf("tar import failed: unsupported entry type %d at %q; aborting", header.Typeflag, header.Name)
-		}
+	// Extraction is delegated to the hardened tarutil extractor, which enforces
+	// exactly the rules this function used to implement inline (path-traversal,
+	// symlink-ancestor and device-node rejection) plus resource limits and
+	// setuid/setgid/sticky stripping shared with image.Pull.
+	if err := tarutil.Extract(gr, dir, tarutil.DefaultLimits()); err != nil {
+		return fmt.Errorf("tar import failed: %v", err)
 	}
 	importOk = true
 	return nil

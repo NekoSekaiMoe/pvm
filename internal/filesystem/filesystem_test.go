@@ -47,3 +47,27 @@ func TestCreateExt4Image_RequiresBinaries(t *testing.T) {
 	// dd/mkfs.ext4 missing is acceptable in constrained envs; anything else isn't.
 	t.Logf("CreateExt4Image returned error (likely missing dd/mkfs.ext4): %v", err)
 }
+
+func TestCreateExt4Image_RejectsRelativePath(t *testing.T) {
+	if err := CreateExt4Image("relative.img", 1); err == nil {
+		t.Fatal("relative image path must be rejected")
+	}
+}
+
+func TestCreateExt4Image_NotWorldReadable(t *testing.T) {
+	// The pre-created file must be 0600 even when the external tools are
+	// missing (the O_EXCL create happens before any subprocess). On success
+	// dd/mkfs must not have widened the mode either.
+	tmp := filepath.Join(t.TempDir(), "img.bin")
+	err := CreateExt4Image(tmp, 1)
+	if err != nil {
+		t.Skipf("dd/mkfs.ext4 unavailable: %v", err)
+	}
+	fi, statErr := os.Stat(tmp)
+	if statErr != nil {
+		t.Fatalf("stat: %v", statErr)
+	}
+	if fi.Mode().Perm() != 0600 {
+		t.Fatalf("image mode = %v, want 0600", fi.Mode().Perm())
+	}
+}

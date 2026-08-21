@@ -22,6 +22,9 @@ mkdir -p "$PVM_STATE_ROOT" "$PVM_AUDIT_ROOT" "$PVM_CGROUP_ROOT"
 
 PORT=18082
 export PVM_API="http://127.0.0.1:$PORT"
+# The server refuses to start without a secret; set it before launch (the
+# approval CLI section re-exports the same value for its own client calls).
+export API_SECRET="secret"
 API="$PVM_API/api"
 AUTH="Authorization: Bearer secret"
 

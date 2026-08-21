@@ -28,6 +28,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 )
 
 // qcow2Magic is the first 4 bytes of every qcow2 image ("QFI\xfb").
@@ -121,11 +122,10 @@ func createOverlayValidated(ctx context.Context, baseImage, overlayFile string, 
 	}
 	virtualSize := backing.Size()
 	backing.Close()
-	backingFormat := "raw"
-	if isQcow2(baseImage) {
-		backingFormat = "qcow2"
-	}
-	return createQcow2(overlayFile, virtualSize, baseImage, backingFormat, opt)
+	// Record the base image's directory as an allowed backing root so this
+	// overlay (and any descendant) can resolve its backing on later opens.
+	RegisterBackingRoot(filepath.Dir(absBase))
+	return createQcow2(overlayFile, virtualSize, baseImage, backing.Format(), opt)
 }
 
 // isQcow2 reports whether path begins with the qcow2 magic ("QFI\xfb"). A
@@ -169,6 +169,89 @@ func CommitOverlay(ctx context.Context, overlayFile, destImage string) error {
 		return err
 	}
 	return convertToRaw(ctx, overlayFile, destImage)
+}
+
+// backingRoots are the directory trees inside which a qcow2 header's backing
+// reference must resolve. Defaults cover every storage root PVM derives:
+// engine root (PVM_COW_ROOT or /var/lib/uml-container/cow), the image store
+// (/var/lib/uml-container/images) and the container state root (PVM_STATE_ROOT
+// or /var/lib/uml-container/containers). CreateOverlay additionally registers
+// the directory of every base image it is handed, so overlays backed by user-
+// supplied base paths keep resolving.
+var (
+	backingRootsMu     sync.Mutex
+	staticBackingRoots = func() []string {
+		cowRoot := os.Getenv("PVM_COW_ROOT")
+		if cowRoot == "" {
+			cowRoot = "/var/lib/uml-container/cow"
+		}
+		stateRoot := os.Getenv("PVM_STATE_ROOT")
+		if stateRoot == "" {
+			stateRoot = "/var/lib/uml-container/containers"
+		}
+		return []string{cowRoot, "/var/lib/uml-container/images", stateRoot}
+	}()
+	dynamicBackingRoots = map[string]bool{}
+)
+
+// RegisterBackingRoot whitelists dir as a permitted backing location for
+// qcow2 images opened later. CreateOverlay calls it with the resolved base
+// image's directory; tests can use it for temp dirs.
+func RegisterBackingRoot(dir string) {
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return
+	}
+	backingRootsMu.Lock()
+	dynamicBackingRoots[abs] = true
+	backingRootsMu.Unlock()
+}
+
+// validateBackingName syntactically validates the raw backing name stored in
+// a qcow2 header before anything resolves or opens it: no commas/NULs, no
+// leading '-' (option injection), no remote/protocol specifiers — the same
+// rules validatePath applies to caller-provided paths.
+func validateBackingName(name string) error {
+	if name == "" {
+		return errors.New("cow: empty backing name")
+	}
+	return validatePath(name)
+}
+
+// backingPathAllowed enforces containment of a RESOLVED backing path: it must
+// live under one of the managed roots, under the image's own directory tree,
+// or under a dynamically registered root. Relative names that climb out of
+// the image's directory with ".." therefore fail unless they land back in a
+// managed root, and absolute names pointing at arbitrary system files are
+// rejected outright.
+func backingPathAllowed(imagePath, resolved string) error {
+	absImageDir, err := filepath.Abs(filepath.Dir(imagePath))
+	if err != nil {
+		return fmt.Errorf("cow: resolve image dir of %s: %w", imagePath, err)
+	}
+	candidates := []string{absImageDir}
+	backingRootsMu.Lock()
+	candidates = append(candidates, staticBackingRoots...)
+	for r := range dynamicBackingRoots {
+		candidates = append(candidates, r)
+	}
+	backingRootsMu.Unlock()
+	for _, root := range candidates {
+		if withinSubtree(resolved, root) {
+			return nil
+		}
+	}
+	return fmt.Errorf("cow: backing file %s (of %s) is outside all managed storage roots", resolved, imagePath)
+}
+
+// withinSubtree reports whether p equals or lives below dir (both absolute,
+// lexically cleaned).
+func withinSubtree(p, dir string) bool {
+	rel, err := filepath.Rel(dir, p)
+	if err != nil {
+		return false
+	}
+	return rel == "." || (!strings.HasPrefix(rel, "..") && rel != "")
 }
 
 // validatePath rejects empty, comma-bearing, NUL-bearing and option/protocol

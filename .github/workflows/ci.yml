@@ -72,6 +72,16 @@ jobs:
 
     - name: Run unit tests
       run: go test -v ./...
+
+    - name: Run unit tests (privileged eBPF subset)
+      # TestWhitelistRegistry creates real eBPF maps: unprivileged runs skip
+      # it (EPERM, see filter_registry_test.go) so the leg above stays green
+      # on hosts with unprivileged BPF disabled. This leg runs it for real,
+      # scoped to one package+pattern — a blanket `sudo go test ./...` would
+      # flip every test's permission semantics and root-own the go caches
+      # for later non-root steps (HOME resets to /root, so caches stay
+      # isolated at the cost of one module re-download).
+      run: sudo env "PATH=$PATH" go test -v ./internal/network/ -run TestWhitelistRegistry
       
     - name: Build UML Kernel
       run: |

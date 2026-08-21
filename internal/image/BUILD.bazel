@@ -8,6 +8,7 @@ go_library(
     deps = [
         "//internal/filesystem",
         "//internal/state",
+        "//internal/tarutil",
         "@com_github_google_go_containerregistry//pkg/crane",
     ],
 )

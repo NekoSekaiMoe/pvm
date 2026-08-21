@@ -83,8 +83,14 @@ func prepareSocket(containerID string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(dir, 0700); err != nil {
 		return "", fmt.Errorf("failed to create dir: %v", err)
+	}
+	// MkdirAll leaves an existing dir's mode untouched; tighten it so the
+	// vhost-user socket never lives in a world-readable directory. The
+	// backend runs as root, so no compatibility concern.
+	if err := os.Chmod(dir, 0700); err != nil {
+		return "", fmt.Errorf("failed to tighten state dir %s: %v", dir, err)
 	}
 	return filepath.Join(dir, "vhost-blk.sock"), nil
 }

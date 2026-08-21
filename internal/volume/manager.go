@@ -3,6 +3,7 @@ package volume
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -305,17 +306,56 @@ func (m *Manager) HostPath(volumeID string) string {
 	return ""
 }
 
+// validateHostPath enforces that hostPath resolves INSIDE baseDir after
+// symlink resolution. A pure string-prefix check on the cleaned path is not
+// enough: a plugin may return "<base>/link -> /etc" and the string check
+// passes while the actual data lands outside the volume root.
 func (m *Manager) validateHostPath(hostPath string) error {
 	clean := filepath.Clean(hostPath)
 	base := filepath.Clean(m.baseDir)
-	// Must be inside baseDir: either equal or prefixed with baseDir+"/"
-	if clean == base {
+	resolvedBase, err := filepath.EvalSymlinks(base)
+	if err != nil {
+		return fmt.Errorf("volume: VolumeBaseDir %q not resolvable: %w", m.baseDir, err)
+	}
+	// Resolve symlinks of the nearest existing ancestor; trailing components
+	// don't exist yet (the plugin creates them) so EvalSymlinks would fail
+	// on the full path.
+	resolved := resolveExisting(clean)
+	if resolved == resolvedBase {
 		return nil
 	}
-	if !strings.HasPrefix(clean, base+string(filepath.Separator)) {
+	if !strings.HasPrefix(resolved, resolvedBase+string(filepath.Separator)) {
 		return fmt.Errorf("volume: HostPath %q must be inside VolumeBaseDir %q", hostPath, m.baseDir)
 	}
 	return nil
+}
+
+// resolveExisting returns p with all symlinks resolved for its longest
+// existing prefix; non-existing trailing components are appended verbatim
+// (they cannot carry symlinks yet).
+func resolveExisting(p string) string {
+	suffix := ""
+	cur := p
+	for {
+		if _, err := os.Lstat(cur); err == nil {
+			break
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			// Reached the filesystem root without finding anything that
+			// exists; nothing to resolve.
+			return p
+		}
+		suffix = filepath.Join(filepath.Base(cur), suffix)
+		cur = parent
+	}
+	resolved, err := filepath.EvalSymlinks(cur)
+	if err != nil {
+		// Raced deletion or unreadable ancestor: fall back to the lexical
+		// path — containment then relies on the string check as before.
+		return p
+	}
+	return filepath.Join(resolved, suffix)
 }
 
 // Close releases all registered plugins.

@@ -3,6 +3,7 @@ package image
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"uml-container/internal/state"
 )
@@ -23,14 +24,67 @@ func TestPull_AlreadyExistsShortCircuits(t *testing.T) {
 	defer os.RemoveAll(imgDir)
 
 	const ref = "alpine"
-	safe := "alpine.img"
-	target := filepath.Join(imgDir, safe)
+	target := filepath.Join(imgDir, imageName(ref))
 	if err := os.WriteFile(target, []byte("dummy"), 0644); err != nil {
 		t.Fatalf("seed image: %v", err)
 	}
 
 	if err := Pull(ref); err != nil {
 		t.Fatalf("Pull on existing image should be nil, got: %v", err)
+	}
+}
+
+func TestRegistryAllowlist(t *testing.T) {
+	tests := []struct {
+		env  string
+		ref  string
+		want bool
+	}{
+		{"", "alpine:3.19", true},                               // default registry docker.io
+		{"", "docker.io/library/alpine:3", true},                //
+		{"", "ghcr.io/org/img:v1", true},                        //
+		{"", "evil.example.com/img:latest", false},              // not on default list
+		{"", "127.0.0.1:5000/foo:bar", true},                    // local dev registries allowed by default
+		{"", "localhost:9000/foo:bar", true},                    //
+		{"*", "anything.example.com/x", true},                   // explicit wildcard
+		{"docker.io", "ghcr.io/a/b", false},                     // restrictive override
+		{"docker.io,localhost:*", "localhost:5000/a", true},     // wildcard port entry
+		{"docker.io,localhost:5000", "localhost:5001/a", false}, // exact port mismatch
+	}
+	for _, tc := range tests {
+		if tc.env == "" {
+			t.Setenv("PVM_REGISTRY_ALLOWLIST", "")
+			os.Unsetenv("PVM_REGISTRY_ALLOWLIST")
+		} else {
+			t.Setenv("PVM_REGISTRY_ALLOWLIST", tc.env)
+		}
+		if got := registryAllowed(tc.ref); got != tc.want {
+			t.Errorf("registryAllowed(%q) with env %q = %v, want %v", tc.ref, tc.env, got, tc.want)
+		}
+	}
+}
+
+func TestImageName_IsCollisionFreeSha256(t *testing.T) {
+	a := imageName("a/b:1")
+	b := imageName("a_b_1")
+	if a == b {
+		t.Fatalf("imageName collision: %q == %q", a, b)
+	}
+	// Old sanitizer collapsed both refs to the same name; sha256 naming must
+	// be stable per ref and hex-only.
+	if a != imageName("a/b:1") {
+		t.Fatal("imageName must be deterministic")
+	}
+	if len(a) != 64+4 || !strings.HasSuffix(a, ".img") || strings.ContainsAny(a[:64], "/_:") {
+		t.Fatalf("unexpected name format: %q", a)
+	}
+}
+
+func TestPull_RejectsNonAllowlistedRegistry(t *testing.T) {
+	t.Setenv("PVM_REGISTRY_ALLOWLIST", "docker.io")
+	err := Pull("evil.example.com/img:v1")
+	if err == nil || !strings.Contains(err.Error(), "allowlist") {
+		t.Fatalf("expected allowlist rejection, got: %v", err)
 	}
 }
 

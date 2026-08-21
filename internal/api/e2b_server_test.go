@@ -31,6 +31,9 @@ func freePort(t *testing.T) int {
 // port cannot be bound, the test is skipped rather than failed.
 func bootServer(t *testing.T) string {
 	t.Helper()
+	// The server refuses to start without a secret (no default credential);
+	// tests authenticate with this one.
+	t.Setenv("API_SECRET", "secret")
 	state.RootDir = t.TempDir()
 	port := freePort(t)
 

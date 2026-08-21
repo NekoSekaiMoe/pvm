@@ -1,0 +1,229 @@
+package tarutil
+
+import (
+	"archive/tar"
+	"bytes"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+// buildTar assembles an uncompressed tar from header/content specs.
+func buildTar(t *testing.T, entries []struct {
+	hdr  tar.Header
+	data []byte
+}) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	for _, e := range entries {
+		if err := tw.WriteHeader(&e.hdr); err != nil {
+			t.Fatalf("WriteHeader %s: %v", e.hdr.Name, err)
+		}
+		if len(e.data) > 0 {
+			if _, err := tw.Write(e.data); err != nil {
+				t.Fatalf("write data: %v", err)
+			}
+		}
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatalf("close tar: %v", err)
+	}
+	return buf.Bytes()
+}
+
+func TestExtract_HappyPath(t *testing.T) {
+	dir := t.TempDir()
+	data := buildTar(t, []struct {
+		hdr  tar.Header
+		data []byte
+	}{
+		{tar.Header{Name: "etc", Typeflag: tar.TypeDir, Mode: 0755}, nil},
+		{tar.Header{Name: "etc/conf", Typeflag: tar.TypeReg, Mode: 0644, Size: 5}, []byte("hello")},
+	})
+	if err := Extract(bytes.NewReader(data), dir, DefaultLimits()); err != nil {
+		t.Fatalf("Extract: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(dir, "etc", "conf"))
+	if err != nil || string(got) != "hello" {
+		t.Fatalf("extracted file wrong: %q err=%v", got, err)
+	}
+}
+
+func TestExtract_RejectsTraversalAndAbsolute(t *testing.T) {
+	for _, name := range []string{"../evil", "a/../../evil", "/etc/passwd", "./x/../../../evil"} {
+		dir := t.TempDir()
+		data := buildTar(t, []struct {
+			hdr  tar.Header
+			data []byte
+		}{
+			{tar.Header{Name: name, Typeflag: tar.TypeReg, Mode: 0644, Size: 1}, []byte("x")},
+		})
+		err := Extract(bytes.NewReader(data), dir, DefaultLimits())
+		if err == nil {
+			t.Fatalf("member %q: expected rejection", name)
+		}
+		if _, serr := os.Stat(filepath.Join(filepath.Dir(dir), "evil")); serr == nil {
+			t.Fatalf("member %q escaped destination", name)
+		}
+	}
+}
+
+func TestExtract_RejectsDeviceNode(t *testing.T) {
+	dir := t.TempDir()
+	data := buildTar(t, []struct {
+		hdr  tar.Header
+		data []byte
+	}{
+		{tar.Header{Name: "dev/null", Typeflag: tar.TypeChar, Mode: 0666}, nil},
+	})
+	err := Extract(bytes.NewReader(data), dir, DefaultLimits())
+	if err == nil || !strings.Contains(err.Error(), "unsupported entry type") {
+		t.Fatalf("expected unsupported-entry error, got: %v", err)
+	}
+}
+
+func TestExtract_SymlinkRules(t *testing.T) {
+	outside := t.TempDir()
+
+	t.Run("absolute_target_rejected", func(t *testing.T) {
+		dir := t.TempDir()
+		data := buildTar(t, []struct {
+			hdr  tar.Header
+			data []byte
+		}{
+			{tar.Header{Name: "pivot", Typeflag: tar.TypeSymlink, Linkname: outside, Mode: 0777}, nil},
+		})
+		if err := Extract(bytes.NewReader(data), dir, DefaultLimits()); err == nil {
+			t.Fatal("absolute symlink target must be rejected")
+		}
+	})
+
+	t.Run("escaping_relative_target_rejected", func(t *testing.T) {
+		dir := t.TempDir()
+		data := buildTar(t, []struct {
+			hdr  tar.Header
+			data []byte
+		}{
+			{tar.Header{Name: "sub/pivot", Typeflag: tar.TypeSymlink, Linkname: "../../outside", Mode: 0777}, nil},
+		})
+		if err := Extract(bytes.NewReader(data), dir, DefaultLimits()); err == nil {
+			t.Fatal("escaping relative symlink must be rejected")
+		}
+	})
+
+	t.Run("internal_symlink_ok", func(t *testing.T) {
+		dir := t.TempDir()
+		data := buildTar(t, []struct {
+			hdr  tar.Header
+			data []byte
+		}{
+			{tar.Header{Name: "real", Typeflag: tar.TypeReg, Mode: 0644, Size: 2}, []byte("ok")},
+			{tar.Header{Name: "link", Typeflag: tar.TypeSymlink, Linkname: "real", Mode: 0777}, nil},
+		})
+		if err := Extract(bytes.NewReader(data), dir, DefaultLimits()); err != nil {
+			t.Fatalf("internal symlink rejected: %v", err)
+		}
+	})
+}
+
+func TestExtract_PivotAttackRejected(t *testing.T) {
+	dir := t.TempDir()
+	data := buildTar(t, []struct {
+		hdr  tar.Header
+		data []byte
+	}{
+		{tar.Header{Name: "sub", Typeflag: tar.TypeDir, Mode: 0755}, nil},
+		// ".." itself stays inside dest (resolves to the dest root)...
+		{tar.Header{Name: "sub/pivot", Typeflag: tar.TypeSymlink, Linkname: "..", Mode: 0777}, nil},
+		// ...then a later member writes THROUGH the pivot below the root.
+		{tar.Header{Name: "sub/pivot/evil", Typeflag: tar.TypeReg, Mode: 0644, Size: 1}, []byte("p")},
+	})
+	err := Extract(bytes.NewReader(data), dir, DefaultLimits())
+	if err == nil || !strings.Contains(err.Error(), "traverses symlink") {
+		t.Fatalf("pivot attack must be rejected with traverses-symlink error, got: %v", err)
+	}
+}
+
+func TestExtract_LimitsEnforced(t *testing.T) {
+	t.Run("per_file_cap", func(t *testing.T) {
+		dir := t.TempDir()
+		big := make([]byte, 100)
+		data := buildTar(t, []struct {
+			hdr  tar.Header
+			data []byte
+		}{
+			{tar.Header{Name: "big", Typeflag: tar.TypeReg, Mode: 0644, Size: int64(len(big))}, big},
+		})
+		limits := Limits{MaxFileSize: 50, MaxTotalBytes: 1000, MaxEntries: 10}
+		if err := Extract(bytes.NewReader(data), dir, limits); err == nil {
+			t.Fatal("per-file limit must fire")
+		}
+	})
+
+	t.Run("total_cap", func(t *testing.T) {
+		dir := t.TempDir()
+		chunk := make([]byte, 60)
+		data := buildTar(t, []struct {
+			hdr  tar.Header
+			data []byte
+		}{
+			{tar.Header{Name: "a", Typeflag: tar.TypeReg, Mode: 0644, Size: int64(len(chunk))}, chunk},
+			{tar.Header{Name: "b", Typeflag: tar.TypeReg, Mode: 0644, Size: int64(len(chunk))}, chunk},
+		})
+		limits := Limits{MaxFileSize: 100, MaxTotalBytes: 100, MaxEntries: 10}
+		if err := Extract(bytes.NewReader(data), dir, limits); err == nil {
+			t.Fatal("total limit must fire")
+		}
+	})
+
+	t.Run("entry_cap", func(t *testing.T) {
+		dir := t.TempDir()
+		var specs []struct {
+			hdr  tar.Header
+			data []byte
+		}
+		for i := 0; i < 3; i++ {
+			specs = append(specs, struct {
+				hdr  tar.Header
+				data []byte
+			}{tar.Header{Name: string(rune('a' + i)), Typeflag: tar.TypeReg, Mode: 0644}, nil})
+		}
+		data := buildTar(t, specs)
+		limits := Limits{MaxFileSize: 100, MaxTotalBytes: 100, MaxEntries: 2}
+		if err := Extract(bytes.NewReader(data), dir, limits); err == nil {
+			t.Fatal("entry cap must fire")
+		}
+	})
+
+	t.Run("zero_limits_rejected", func(t *testing.T) {
+		dir := t.TempDir()
+		if err := Extract(bytes.NewReader(nil), dir, Limits{}); err == nil {
+			t.Fatal("zero Limits must be rejected")
+		}
+	})
+}
+
+func TestExtract_StripsSetuidSetgidSticky(t *testing.T) {
+	dir := t.TempDir()
+	data := buildTar(t, []struct {
+		hdr  tar.Header
+		data []byte
+	}{
+		{tar.Header{Name: "suid", Typeflag: tar.TypeReg, Mode: int64(os.ModeSetuid|os.ModeSetgid|os.ModeSticky) | 0755, Size: 1}, []byte("x")},
+	})
+	if err := Extract(bytes.NewReader(data), dir, DefaultLimits()); err != nil {
+		t.Fatalf("Extract: %v", err)
+	}
+	fi, err := os.Stat(filepath.Join(dir, "suid"))
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if fi.Mode()&(os.ModeSetuid|os.ModeSetgid|os.ModeSticky) != 0 {
+		t.Fatalf("special bits survived extraction: %v", fi.Mode())
+	}
+	if fi.Mode().Perm() != 0755 {
+		t.Fatalf("perm = %v, want 0755", fi.Mode().Perm())
+	}
+}

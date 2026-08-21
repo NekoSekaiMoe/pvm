@@ -20,6 +20,9 @@ mkdir -p "$PVM_STATE_ROOT" "$PVM_AUDIT_ROOT" "$PVM_CGROUP_ROOT"
 
 PORT=18081
 API="http://127.0.0.1:$PORT/api"
+# The server refuses to start without a secret (no default credential);
+# tests/13 covers the custom-secret path, this one uses the conventional one.
+export API_SECRET="secret"
 AUTH="Authorization: Bearer secret"
 
 echo "==> building agentpvm"

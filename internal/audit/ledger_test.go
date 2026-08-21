@@ -83,4 +83,3 @@ func TestLedger_CrossTaskIsolation(t *testing.T) {
 		t.Errorf("task scoping wrong")
 	}
 }
-

@@ -12,6 +12,7 @@ go_test(
     name = "log_test",
     srcs = [
         "logger_level_test.go",
+        "logger_perm_test.go",
         "logger_test.go",
     ],
     embed = [":log"],

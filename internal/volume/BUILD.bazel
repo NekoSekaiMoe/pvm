@@ -18,6 +18,7 @@ go_test(
     name = "volume_test",
     srcs = [
         "binary_test.go",
+        "hardening_test.go",
         "interleave_test.go",
         "volume_test.go",
     ],

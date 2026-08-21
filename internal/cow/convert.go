@@ -218,13 +218,24 @@ func ConvertToQcow2(ctx context.Context, srcPath, destPath string, opt OverlayOp
 			n = rem
 		}
 		// Round n UP to a cluster so the last partial cluster still writes as a
-		// full cluster (data beyond virtualSize is never read; padding with
-		// zeros preserves the tail cluster's in-range bytes).
+		// full cluster when the virtual size allows it (data beyond virtualSize
+		// is never read; padding with zeros preserves the tail cluster's
+		// in-range bytes).
 		if r := n % cs; r != 0 {
 			pad := cs - r
 			// Zero the padding region explicitly so stale buf bytes don't leak.
 			clear(buf[n : n+pad])
 			n += pad
+		}
+		// Never write past the DEST virtual size: WriteAt rejects guest
+		// offsets beyond hdr.size, so a non-cluster-aligned RAW source (e.g.
+		// 3*cs + 100 bytes) would otherwise fail on its final cluster. The
+		// tail cluster is written only up to the virtual-size boundary; the
+		// partial write takes the CoW path, which zero-fills the remainder
+		// (standalone dest has no backing).
+		end := off + n
+		if end > virtualSize {
+			end = virtualSize
 		}
 		chunk := buf[:n]
 		m, err := src.ReadAt(chunk, int64(off))
@@ -236,11 +247,16 @@ func ConvertToQcow2(ctx context.Context, srcPath, destPath string, opt OverlayOp
 			clear(chunk[m:])
 		}
 		// Write cluster-by-cluster, skipping all-zero clusters.
-		for c := uint64(0); c < n; c += cs {
-			if !allZero(chunk[c : c+cs]) {
-				if _, err := w.WriteAt(chunk[c:c+cs], int64(off+c)); err != nil {
+		for c := off; c < end; c += cs {
+			wlen := cs
+			if rem := end - c; rem < wlen {
+				wlen = rem
+			}
+			seg := chunk[c-off : c-off+wlen]
+			if !allZero(seg) {
+				if _, err := w.WriteAt(seg, int64(c)); err != nil {
 					closeAndCleanup()
-					return fmt.Errorf("cow: convert: write dest at %#x: %w", off+c, err)
+					return fmt.Errorf("cow: convert: write dest at %#x: %w", c, err)
 				}
 			}
 		}

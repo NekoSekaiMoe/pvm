@@ -51,6 +51,15 @@ func OpenWritable(path string) (WritableBackend, error) {
 		base.Close()
 		return nil, fmt.Errorf("cow: %s sniffed qcow2 but parsed raw", path)
 	}
+	// Capture the identity of the READ-ONLY fd before closing it. Reopening
+	// the path O_RDWR below races anyone replacing the file (rename/unlink);
+	// without this check a swapped-in different image would silently be
+	// served with the first file's parsed metadata.
+	firstStat, err := q.f.Stat()
+	if err != nil {
+		q.Close()
+		return nil, err
+	}
 	// Reopen RW (openGuestImage opened O_RDONLY).
 	q.f.Close()
 	f, err := os.OpenFile(path, os.O_RDWR, 0)
@@ -59,6 +68,14 @@ func OpenWritable(path string) (WritableBackend, error) {
 			q.backing.Close()
 		}
 		return nil, err
+	}
+	secondStat, err := f.Stat()
+	if err != nil || !os.SameFile(firstStat, secondStat) {
+		f.Close()
+		if q.backing != nil {
+			q.backing.Close()
+		}
+		return nil, fmt.Errorf("cow: %s was replaced between open and reopen (TOCTOU guard)", path)
 	}
 	q.f = f
 	st, err := f.Stat()
@@ -139,19 +156,16 @@ func (w *qcow2Writable) hostOffset(clusterIdx uint64) (uint64, error) {
 	l2Entries := w.clusterSize / 8
 	l1Idx := clusterIdx / l2Entries
 	l2Idx := clusterIdx % l2Entries
-	if l1Idx >= uint64(w.hdr.l1Size) {
+	l1e, err := w.l1Entry(l1Idx)
+	if err != nil {
 		return 0, fmt.Errorf("cow: guest cluster %d beyond L1", clusterIdx)
-	}
-	var l1e uint64
-	if err := w.readUint64At(&l1e, w.hdr.l1Offset+l1Idx*8); err != nil {
-		return 0, err
 	}
 	l2Off := l1e & l1eOffsetMask
 	if l2Off == 0 {
 		return 0, nil
 	}
-	var l2e uint64
-	if err := w.readUint64At(&l2e, l2Off+l2Idx*8); err != nil {
+	l2e, err := w.l2EntryAt(l2Off, l2Idx)
+	if err != nil {
 		return 0, err
 	}
 	if l2e&oflagCompressed != 0 {
@@ -220,10 +234,10 @@ func (w *qcow2Writable) setL2Entry(clusterIdx, l2e uint64) error {
 	l2Entries := w.clusterSize / 8
 	l1Idx := clusterIdx / l2Entries
 	l2Idx := clusterIdx % l2Entries
-	var l1e uint64
-	if err := w.readUint64At(&l1e, w.hdr.l1Offset+l1Idx*8); err != nil {
-		return err
+	if l1Idx >= uint64(len(w.l1)) {
+		return fmt.Errorf("cow: guest cluster %d beyond L1", clusterIdx)
 	}
+	l1e := w.l1[l1Idx]
 	l2Off := l1e & l1eOffsetMask
 	if l2Off == 0 {
 		var err error
@@ -240,12 +254,17 @@ func (w *qcow2Writable) setL2Entry(clusterIdx, l2e uint64) error {
 		if _, err := w.f.WriteAt(b[:], int64(w.hdr.l1Offset+l1Idx*8)); err != nil {
 			return err
 		}
+		// Keep the in-memory L1 copy in sync with the disk write above.
+		w.l1[l1Idx] = l2Off | oflagCopied
 	}
 	var b [8]byte
 	binary.BigEndian.PutUint64(b[:], l2e)
 	if _, err := w.f.WriteAt(b[:], int64(l2Off+l2Idx*8)); err != nil {
 		return err
 	}
+	// Write-through: mirror the new entry into the cached L2 table (if that
+	// table is cached) so reads never see a stale mapping.
+	w.updateL2Cache(l2Off, l2Idx, l2e)
 	return nil
 }
 
@@ -256,16 +275,25 @@ func (w *qcow2Writable) linkL2(clusterIdx, hostOff uint64) error {
 	return w.setL2Entry(clusterIdx, hostOff|oflagCopied)
 }
 
-// allocCluster appends a zeroed cluster at EOF and sets its refcount to 1.
-// Returns the host offset.
+// allocCluster appends a cluster's worth of space at EOF and sets its
+// refcount to 1. Returns the host offset.
+//
+// The cluster is NOT pre-zeroed on disk: the space becomes a sparse hole that
+// reads as zeros, which is exactly what the previous explicit zero-fill
+// produced, minus one full-cluster write per allocation (2x write amplification
+// removed for the common allocate-then-overwrite paths). Crash consistency is
+// unchanged: every caller writes the FULL cluster content BEFORE linking it —
+// allocDataCluster writes whole clusters (direct or CoW-materialized),
+// setL2Entry zero-fills fresh L2 tables — so an unlinked cluster is never
+// reachable through resolve() (its L2 entry is still unallocated), and once
+// linked its bytes are already in place. bumpRefcount's refcount blocks rely
+// on hole-reads-as-zeros for their untouched entries, identical to reading
+// back the old zero-filled blocks.
 func (w *qcow2Writable) allocCluster() (uint64, error) {
 	cs := w.clusterSize
 	off := w.fileSize
 	if off%cs != 0 {
 		return 0, fmt.Errorf("cow: host file size %#x not cluster-aligned", off)
-	}
-	if _, err := w.f.WriteAt(make([]byte, cs), int64(off)); err != nil {
-		return 0, err
 	}
 	w.fileSize += cs
 	if err := w.bumpRefcount(off >> w.clusterBits); err != nil {

@@ -9,6 +9,8 @@ package pool
 import (
 	"errors"
 	"fmt"
+	"math"
+	"strconv"
 	"sync"
 	"time"
 
@@ -20,9 +22,9 @@ import (
 type SandboxState string
 
 const (
-	SandboxReady     SandboxState = "ready"     // pre-created, unattached
-	SandboxClaimed   SandboxState = "claimed"   // attached to a task
-	SandboxWarming   SandboxState = "warming"   // being created
+	SandboxReady      SandboxState = "ready"   // pre-created, unattached
+	SandboxClaimed    SandboxState = "claimed" // attached to a task
+	SandboxWarming    SandboxState = "warming" // being created
 	SandboxDestroying SandboxState = "destroying"
 )
 
@@ -40,19 +42,19 @@ type Sandbox struct {
 	ID        string
 	Template  string
 	State     SandboxState
-	TaskID    string    // when Claimed
-	Tenant    string    // tenant that claimed it (for accurate Release accounting)
-	CPU       int       // cpu reserved at claim (for accurate Release accounting)
-	MemMB     int       // memory reserved at claim (for accurate Release accounting)
+	TaskID    string // when Claimed
+	Tenant    string // tenant that claimed it (for accurate Release accounting)
+	CPU       int    // cpu reserved at claim (for accurate Release accounting)
+	MemMB     int    // memory reserved at claim (for accurate Release accounting)
 	CreatedAt time.Time
 	ClaimedAt time.Time
 }
 
 // Quota is a tenant's resource ceiling (plan.md §12.3).
 type Quota struct {
-	MaxConcurrent int
-	MaxCPU        int
-	MaxMemoryMB   int
+	MaxConcurrent   int
+	MaxCPU          int
+	MaxMemoryMB     int
 	MaxTasksPerHour int
 }
 
@@ -79,9 +81,9 @@ type Manager struct {
 	capacity int
 	quotas   map[string]Quota
 	// live counters per tenant
-	running map[string]int     // tenant -> concurrent count
-	cpu     map[string]int     // tenant -> cpu sum
-	memMB   map[string]int     // tenant -> mem sum
+	running map[string]int         // tenant -> concurrent count
+	cpu     map[string]int         // tenant -> cpu sum
+	memMB   map[string]int         // tenant -> mem sum
 	hourly  map[string][]time.Time // tenant -> task start times (last hour)
 
 	// Factory creates a new warm sandbox. Controller wires this to the real
@@ -161,9 +163,50 @@ func (m *Manager) Warm(tmpl Template, n int) int {
 	return created
 }
 
+// decisionLog is one quota decision collected while holding m.mu. The ledger
+// append happens AFTER the lock is released (see flushDecisions): audit IO in
+// the claim critical section stalls every other tenant's Claim/Release.
+type decisionLog struct {
+	allow  bool
+	tenant string
+	note   string
+}
+
 // Claim hands a READY sandbox to a task, subject to tenant quota. Returns the
 // sandbox id or an error explaining the denial.
 func (m *Manager) Claim(tenant string, tmpl Template, taskID string) (string, error) {
+	var logs []decisionLog
+	id, err := m.claim(tenant, tmpl, taskID, &logs)
+	// Ledger appends run OUTSIDE m.mu (and outside the Factory call window).
+	m.flushDecisions(logs)
+	return id, err
+}
+
+// flushDecisions appends collected decisions to the audit ledger. Best-effort:
+// a failed append never fails the claim it describes.
+func (m *Manager) flushDecisions(logs []decisionLog) {
+	if m.ledger == nil {
+		return
+	}
+	for _, d := range logs {
+		dec := audit.DecisionDeny
+		if d.allow {
+			dec = audit.DecisionAllow
+		}
+		_ = m.ledger.Append(audit.Record{
+			Phase: audit.PhaseGoalAuth, Subject: d.tenant, Action: "pool:claim",
+			Decision: dec, Reason: d.note,
+		})
+	}
+}
+
+// recordDecision appends a decision to the caller's log buffer. Caller MUST
+// hold m.mu; no IO happens here.
+func recordDecision(out *[]decisionLog, tenant, why string, allow bool) {
+	*out = append(*out, decisionLog{allow: allow, tenant: tenant, note: why})
+}
+
+func (m *Manager) claim(tenant string, tmpl Template, taskID string, logs *[]decisionLog) (string, error) {
 	// ---- phase 1: quota check under lock ----
 	m.mu.Lock()
 	q, ok := m.quotas[tenant]
@@ -183,24 +226,30 @@ func (m *Manager) Claim(tenant string, tmpl Template, taskID string) (string, er
 	}
 	m.hourly[tenant] = recent
 
+	wantMB, err := parseMemMB(tmpl.Memory)
+	if err != nil {
+		recordDecision(logs, tenant, "bad template memory: "+err.Error(), false)
+		m.mu.Unlock()
+		return "", fmt.Errorf("pool: %w", err)
+	}
+
 	if len(recent) >= q.MaxTasksPerHour {
-		m.deny(tenant, "hourly task rate")
+		recordDecision(logs, tenant, "hourly task rate", false)
 		m.mu.Unlock()
 		return "", fmt.Errorf("%w: hourly task rate for tenant %s", ErrQuotaExceeded, tenant)
 	}
 	if m.running[tenant] >= q.MaxConcurrent {
-		m.deny(tenant, "concurrency")
+		recordDecision(logs, tenant, "concurrency", false)
 		m.mu.Unlock()
 		return "", fmt.Errorf("%w: concurrency for tenant %s", ErrQuotaExceeded, tenant)
 	}
 	if m.cpu[tenant]+tmpl.CPU > q.MaxCPU {
-		m.deny(tenant, "cpu")
+		recordDecision(logs, tenant, "cpu", false)
 		m.mu.Unlock()
 		return "", fmt.Errorf("%w: cpu for tenant %s", ErrQuotaExceeded, tenant)
 	}
-	wantMB := parseMemMB(tmpl.Memory)
 	if m.memMB[tenant]+wantMB > q.MaxMemoryMB {
-		m.deny(tenant, "memory")
+		recordDecision(logs, tenant, "memory", false)
 		m.mu.Unlock()
 		return "", fmt.Errorf("%w: memory for tenant %s", ErrQuotaExceeded, tenant)
 	}
@@ -222,8 +271,8 @@ func (m *Manager) Claim(tenant string, tmpl Template, taskID string) (string, er
 		sb.CPU = tmpl.CPU
 		sb.MemMB = wantMB
 		sb.ClaimedAt = now
-		m.accountClaim(tenant, tmpl, now)
-		m.allow(tenant, "claimed-warm")
+		m.accountClaim(tenant, tmpl.CPU, wantMB, now)
+		recordDecision(logs, tenant, "claimed-warm", true)
 		id := sb.ID
 		m.mu.Unlock()
 		return id, nil
@@ -236,7 +285,7 @@ func (m *Manager) Claim(tenant string, tmpl Template, taskID string) (string, er
 
 	if !canCreate {
 		m.mu.Lock()
-		m.deny(tenant, "no capacity")
+		recordDecision(logs, tenant, "no capacity", false)
 		m.mu.Unlock()
 		return "", ErrNoCapacity
 	}
@@ -245,14 +294,13 @@ func (m *Manager) Claim(tenant string, tmpl Template, taskID string) (string, er
 	id, err := m.Factory(tmpl)
 	if err != nil {
 		m.mu.Lock()
-		m.deny(tenant, "factory failed: "+err.Error())
+		recordDecision(logs, tenant, "factory failed: "+err.Error(), false)
 		m.mu.Unlock()
 		return "", fmt.Errorf("%w: factory: %v", ErrNoCapacity, err)
 	}
 
 	// ---- phase 3: re-check quota under lock and commit ----
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	// Capacity may have changed while the lock was released.
 	if len(m.pool) >= m.capacity {
 		m.mu.Unlock()
@@ -260,18 +308,38 @@ func (m *Manager) Claim(tenant string, tmpl Template, taskID string) (string, er
 			_ = m.Destroyer(id)
 		}
 		m.mu.Lock()
-		m.deny(tenant, "no capacity after race")
+		recordDecision(logs, tenant, "no capacity after race", false)
+		m.mu.Unlock()
 		return "", ErrNoCapacity
 	}
-	// Re-check concurrency/cpu/mem in case another claim sneaked in.
+	// Re-check hourly rate/concurrency/cpu/mem in case another claim sneaked
+	// in while the Factory ran. The hourly recheck mirrors phase 1: without it,
+	// N concurrent claims could blow past MaxTasksPerHour together.
+	if len(m.hourly[tenant]) >= q.MaxTasksPerHour {
+		m.mu.Unlock()
+		if m.Destroyer != nil {
+			_ = m.Destroyer(id) // don't leak the sandbox the factory just built
+		}
+		m.mu.Lock()
+		recordDecision(logs, tenant, "hourly task rate after factory", false)
+		m.mu.Unlock()
+		return "", fmt.Errorf("%w: hourly task rate for tenant %s changed during claim", ErrQuotaExceeded, tenant)
+	}
 	if m.running[tenant] >= q.MaxConcurrent || m.cpu[tenant]+tmpl.CPU > q.MaxCPU || m.memMB[tenant]+wantMB > q.MaxMemoryMB {
-		m.deny(tenant, "quota changed after factory")
+		m.mu.Unlock()
+		if m.Destroyer != nil {
+			_ = m.Destroyer(id) // don't leak the sandbox the factory just built
+		}
+		m.mu.Lock()
+		recordDecision(logs, tenant, "quota changed after factory", false)
+		m.mu.Unlock()
 		return "", fmt.Errorf("%w: quota for tenant %s changed during claim", ErrQuotaExceeded, tenant)
 	}
 	sb := &Sandbox{ID: id, Template: tmpl.Name, State: SandboxClaimed, TaskID: taskID, Tenant: tenant, CPU: tmpl.CPU, MemMB: wantMB, CreatedAt: now, ClaimedAt: now}
 	m.pool = append(m.pool, sb)
-	m.accountClaim(tenant, tmpl, now)
-	m.allow(tenant, "created-on-demand")
+	m.accountClaim(tenant, tmpl.CPU, wantMB, now)
+	recordDecision(logs, tenant, "created-on-demand", true)
+	m.mu.Unlock()
 	return id, nil
 }
 
@@ -286,7 +354,7 @@ func (m *Manager) Release(id string, recycle bool) error {
 		}
 		// Release quota counters for the tenant that actually claimed this
 		// sandbox. We trust the Tenant/CPU/MemMB recorded at Claim time rather
-				// than re-deriving tenant from TaskID (which is unreliable).
+		// than re-deriving tenant from TaskID (which is unreliable).
 		m.releaseQuotaLocked(s)
 
 		if recycle {
@@ -358,44 +426,46 @@ func (m *Manager) Stats() (ready, claimed, total int) {
 }
 
 // accountClaim updates the per-tenant counters after a successful claim.
-func (m *Manager) accountClaim(tenant string, tmpl Template, now time.Time) {
+// Caller MUST hold m.mu. memMB is pre-parsed by the caller so a bad template
+// memory string was already rejected at the quota-check stage.
+func (m *Manager) accountClaim(tenant string, cpu, memMB int, now time.Time) {
 	m.running[tenant]++
-	m.cpu[tenant] += tmpl.CPU
-	m.memMB[tenant] += parseMemMB(tmpl.Memory)
+	m.cpu[tenant] += cpu
+	m.memMB[tenant] += memMB
 	m.hourly[tenant] = append(m.hourly[tenant], now)
 }
 
-func (m *Manager) allow(tenant, how string) {
-	if m.ledger == nil {
-		return
+// parseMemMB parses "512M"/"2G" into MB. Strict: unlike the old Sscanf-based
+// version (where "1.5G" silently parsed as 1 MB), a malformed value or an
+// unsupported/missing unit is an ERROR, mirroring internal/config.ParseMemory.
+func parseMemMB(s string) (int, error) {
+	if s == "" {
+		return 0, errors.New("empty memory")
 	}
-	_ = m.ledger.Append(audit.Record{
-		Phase: audit.PhaseGoalAuth, Subject: tenant, Action: "pool:claim",
-		Decision: audit.DecisionAllow, Reason: how,
-	})
-}
-func (m *Manager) deny(tenant, why string) {
-	if m.ledger == nil {
-		return
+	i := 0
+	for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+		i++
 	}
-	_ = m.ledger.Append(audit.Record{
-		Phase: audit.PhaseGoalAuth, Subject: tenant, Action: "pool:claim",
-		Decision: audit.DecisionDeny, Reason: why,
-	})
-}
-
-// parseMemMB parses "512M"/"2G" into MB.
-func parseMemMB(s string) int {
-	var v int64
-	var unit string
-	fmt.Sscanf(s, "%d%s", &v, &unit)
-	switch unit {
-	case "G", "g", "GB", "gb":
-		return int(v * 1024)
-	case "", "M", "m", "MB", "mb":
-		return int(v)
+	if i == 0 {
+		return 0, fmt.Errorf("invalid memory %q", s)
+	}
+	v, err := strconv.ParseInt(s[:i], 10, 64)
+	if err != nil || v < 0 {
+		return 0, fmt.Errorf("invalid memory %q", s)
+	}
+	var mb int64
+	switch s[i:] {
 	case "K", "k", "KB", "kb":
-		return int(v / 1024)
+		mb = v / 1024
+	case "M", "m", "MB", "mb":
+		mb = v
+	case "G", "g", "GB", "gb":
+		if v > math.MaxInt64/1024 {
+			return 0, fmt.Errorf("memory value overflow: %q", s)
+		}
+		mb = v * 1024
+	default:
+		return 0, fmt.Errorf("unsupported or missing memory unit %q in %q", s[i:], s)
 	}
-	return int(v)
+	return int(mb), nil
 }

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"os/exec"
 	"path/filepath"
 	"strconv"
@@ -16,6 +17,28 @@ import (
 // caller's context carries no deadline, so a hung plugin cannot hold the
 // attach/detach path forever.
 const binaryPluginTimeout = 30 * time.Second
+
+// maxPluginStdout caps plugin stdout at 1 MiB: plugins are expected to emit
+// a single small JSON object, and an unbounded buffer lets a misbehaving (or
+// hostile) plugin exhaust host memory.
+const maxPluginStdout = 1 << 20
+
+// limitedBuffer collects up to max bytes of stdout; anything beyond sets
+// overflow instead of failing the write (an error here would surface as an
+// opaque exec.Wait error, hiding the real cause).
+type limitedBuffer struct {
+	buf      bytes.Buffer
+	max      int
+	overflow bool
+}
+
+func (l *limitedBuffer) Write(p []byte) (int, error) {
+	if l.buf.Len()+len(p) > l.max {
+		l.overflow = true
+		return len(p), nil // swallowed; reported by the overflow check in run()
+	}
+	return l.buf.Write(p)
+}
 
 // BinaryPlugin forks an external process per hook, mirroring
 // Cubelet/plugins/volume/binary.Driver from ref.
@@ -86,6 +109,7 @@ func (p *BinaryPlugin) Init(_ context.Context, cfg PluginConfig) error {
 		p.legacyArgv = false
 	case "argv-v1":
 		p.legacyArgv = true
+		log.Printf("[warn] volume binary %q: protocol=argv-v1 puts credentials in argv (world-readable via /proc/<pid>/cmdline); use protocol=stdin if the plugin supports it", p.binaryPath)
 	default:
 		return fmt.Errorf("volume binary: unknown protocol %q (want %q or %q)",
 			cfg.Extra["protocol"], "stdin", "argv-v1")
@@ -224,7 +248,8 @@ func (p *BinaryPlugin) run(ctx context.Context, args []string, in pluginInput) (
 			return nil, fmt.Errorf("volume binary %q: stdin pipe: %w", p.binaryPath, err)
 		}
 	}
-	var stdout bytes.Buffer
+	var stdout limitedBuffer
+	stdout.max = maxPluginStdout
 	cmd.Stdout = &stdout
 	cmd.Stderr = nil // captured via ExitError only when set
 	// Note: PrivateData/Metadata values are deliberately NOT included in any
@@ -251,5 +276,8 @@ func (p *BinaryPlugin) run(ctx context.Context, args []string, in pluginInput) (
 		}
 		return nil, fmt.Errorf("volume binary %q: %w", p.binaryPath, err)
 	}
-	return bytes.TrimSpace(stdout.Bytes()), nil
+	if stdout.overflow {
+		return nil, fmt.Errorf("volume binary %q: stdout exceeded %d bytes", p.binaryPath, maxPluginStdout)
+	}
+	return bytes.TrimSpace(stdout.buf.Bytes()), nil
 }

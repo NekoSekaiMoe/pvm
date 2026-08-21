@@ -16,6 +16,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strings"
 	"time"
 	"unicode"
 
@@ -270,6 +272,34 @@ type VolumeMount struct {
 // turns one mount into a garbage parameter. TaskSpec.Validate enforces this
 // rule, and container.StartTask re-checks it before attaching (a public
 // entry point must not assume its caller validated).
+// Character-set contracts for fields interpolated into the UML kernel
+// command line / host-side tooling argv. Kept side by side with the mount-path
+// rules so all kernel-adjacent validation lives in one place.
+var (
+	initPathRe = regexp.MustCompile(`^/[A-Za-z0-9._/-]+$`)
+	tapNameRe  = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,15}$`)
+)
+
+// validateImagePath guards a host-side image path (BaseImage/Overlay): it is
+// opened by the cow engine and interpolated into ubd0=…, so it must not
+// contain whitespace/':'/',' (kernel-arg and vec0 sub-parameter separators,
+// remote-source prefixes like json:/nbd:) and must not start with '-' — but
+// it MAY be relative: the shipped default TaskSpec uses base_image =
+// "rootfs.img" relative to the launch directory.
+func validateImagePath(field, val string) error {
+	if strings.ContainsAny(val, " \t\n\r,:") {
+		return fmt.Errorf("spec: %s must not contain whitespace, comma, or colon", field)
+	}
+	first := val
+	if idx := strings.IndexByte(val, '/'); idx >= 0 {
+		first = val[:idx]
+	}
+	if strings.HasPrefix(first, "-") {
+		return fmt.Errorf("spec: %s must not start with '-'", field)
+	}
+	return nil
+}
+
 func ValidateMountPath(path string) error {
 	if path == "" {
 		return fmt.Errorf("volume path is required")
@@ -369,6 +399,29 @@ func (s *TaskSpec) Validate() error {
 			errs = append(errs, fmt.Errorf("spec: runtime.memory: %w", err))
 		} else if memBytes < 0 {
 			errs = append(errs, fmt.Errorf("spec: runtime.memory must be >= 0"))
+		}
+	}
+	// Kernel-command-line interpolation safety: Init, TAP, BaseImage and
+	// Overlay land verbatim in the UML argv (init=%s, vec0:...,ifname=%s,
+	// ubd0=%s), and the kernel re-splits argv on whitespace with ',' splitting
+	// vec sub-parameters — so anything outside these inert sets is an
+	// injection primitive (see the container package's validateKernelField,
+	// which re-checks at build time as defense in depth).
+	if s.Workspace.Init != "" && !initPathRe.MatchString(s.Workspace.Init) {
+		errs = append(errs, fmt.Errorf("spec: workspace.init %q must match ^/[A-Za-z0-9._/-]+$", s.Workspace.Init))
+	}
+	if s.Network.TAP != "" && !tapNameRe.MatchString(s.Network.TAP) {
+		errs = append(errs, fmt.Errorf("spec: network.tap %q must match ^[a-zA-Z0-9_-]{1,15}$", s.Network.TAP))
+	}
+	for _, f := range []struct{ field, val string }{
+		{"workspace.base_image", s.Workspace.BaseImage},
+		{"workspace.overlay", s.Workspace.Overlay},
+	} {
+		if f.val == "" {
+			continue
+		}
+		if err := validateImagePath(f.field, f.val); err != nil {
+			errs = append(errs, err)
 		}
 	}
 	if s.Identity.TTL != "" {

@@ -71,6 +71,74 @@ func TestClaim_QuotaHourly(t *testing.T) {
 	}
 }
 
+// TestClaim_QuotaHourlyRecheckAfterFactory is the regression test for the
+// phase-3 race: the post-Factory recheck used to verify concurrency/cpu/mem
+// but NOT the hourly rate, so MaxConcurrent concurrent claims could together
+// exceed MaxTasksPerHour. Here MaxTasksPerHour=1 and the factory blocks until
+// a second claim sneaks in; the first claim must be rejected after the factory
+// returns instead of committing.
+func TestClaim_QuotaHourlyRecheckAfterFactory(t *testing.T) {
+	m := NewManager(10, nil)
+	m.SetQuota("t", Quota{MaxConcurrent: 10, MaxCPU: 99, MaxMemoryMB: 99999, MaxTasksPerHour: 1})
+	tmpl := Template{Name: "x", Memory: "128M", CPU: 1}
+
+	factoryEntered := make(chan struct{})
+	releaseFactory := make(chan struct{})
+	// Warm with a Factory that returns immediately: the placeholder path
+	// (nil Factory) would leave a READY sandbox that the FIRST claim below
+	// would claim instead of entering the blocking factory.
+	m.Factory = func(Template) (string, error) { return "warm-1", nil }
+	m.Warm(tmpl, 1) // warm first: Warm also invokes Factory
+	m.Factory = func(Template) (string, error) {
+		close(factoryEntered)
+		<-releaseFactory
+		return "ondemand-raced", nil
+	}
+	// tmpl2 deliberately uses a DIFFERENT template name: a claim for "x"
+	// would take the warm sandbox above and never enter the blocking factory.
+	tmpl2 := Template{Name: "y", Memory: "128M", CPU: 1}
+
+	// First claim passes phase 1 (hourly: 0/1) and enters the factory.
+	type claimResult struct {
+		id  string
+		err error
+	}
+	res := make(chan claimResult, 1)
+	go func() {
+		id, err := m.Claim("t", tmpl2, "task-2")
+		res <- claimResult{id, err}
+	}()
+	<-factoryEntered
+
+	// While the factory is stuck, a second claim consumes the hourly budget
+	// via the pre-warmed sandbox.
+	if _, err := m.Claim("t", tmpl, "task-1"); err != nil {
+		t.Fatalf("second claim should succeed within the hourly quota: %v", err)
+	}
+
+	// Release the factory: the first claim's phase-3 recheck must now see the
+	// exhausted hourly rate and reject.
+	close(releaseFactory)
+	r := <-res
+	if !errors.Is(r.err, ErrQuotaExceeded) {
+		t.Fatalf("first claim must be denied after hourly recheck, got id=%q err=%v", r.id, r.err)
+	}
+	if _, _, total := m.Stats(); total != 1 {
+		t.Errorf("raced on-demand sandbox leaked into the pool: total=%d", total)
+	}
+}
+
+// TestClaim_BadTemplateMemoryRejected pins strict memory parsing at the claim
+// boundary: an unparseable template memory must be a hard error, never a
+// silent 0/1MB accounting.
+func TestClaim_BadTemplateMemoryRejected(t *testing.T) {
+	m := NewManager(10, nil)
+	tmpl := Template{Name: "x", Memory: "1.5G", CPU: 1}
+	if _, err := m.Claim("t", tmpl, "task"); err == nil {
+		t.Fatal("claim with unparseable template memory must fail")
+	}
+}
+
 func TestRelease_Recycle(t *testing.T) {
 	m := NewManager(10, tmpLedger(t))
 	tmpl := Template{Name: "x", Memory: "128M", CPU: 1}
@@ -118,10 +186,23 @@ func TestClaim_OnDemandCreation(t *testing.T) {
 }
 
 func TestParseMemMB(t *testing.T) {
-	cases := map[string]int{"512M": 512, "2G": 2048, "1024K": 1, "1024": 1024}
-	for in, want := range cases {
-		if got := parseMemMB(in); got != want {
+	valid := map[string]int{"512M": 512, "2G": 2048, "1024K": 1, "1GB": 1024, "0M": 0}
+	for in, want := range valid {
+		got, err := parseMemMB(in)
+		if err != nil {
+			t.Errorf("parseMemMB(%q) unexpected error: %v", in, err)
+			continue
+		}
+		if got != want {
 			t.Errorf("parseMemMB(%q) = %d, want %d", in, got, want)
+		}
+	}
+	// Strict parsing: malformed values and unknown/missing units are errors,
+	// never silent fallbacks ("1.5G" used to parse as 1 MB).
+	invalid := []string{"", "1.5G", "512", "512X", "M", "abc", "-512M", "1 Ti"}
+	for _, in := range invalid {
+		if got, err := parseMemMB(in); err == nil {
+			t.Errorf("parseMemMB(%q) = %d, want error", in, got)
 		}
 	}
 }

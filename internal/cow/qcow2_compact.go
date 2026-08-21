@@ -271,6 +271,7 @@ func compactWalk(ctx context.Context, src *qcow2Image, dst *qcow2Writable, stats
 		// table in the unread suffix, or the binary.BigEndian read below
 		// would interpret stale entries as live clusters.
 		n, err := src.f.ReadAt(l2Table, int64(l2Off))
+
 		if err != nil && err != io.EOF {
 			return fmt.Errorf("read L2 table at %#x: %w", l2Off, err)
 		}
@@ -326,20 +327,35 @@ func compactWalk(ctx context.Context, src *qcow2Image, dst *qcow2Writable, stats
 				stats.ClustersDropped++
 				continue
 			}
-			// Allocated data cluster: read its guest-visible content through
-			// the chain, then decide data vs zero.
+			// Allocated data cluster: read its guest-visible content, then
+			// decide data vs zero. COPIED clusters (exclusively owned by this
+			// image) are read directly from the host file; the rest go through
+			// the chain.
 			n := cs
 			if rem := src.hdr.size - guestOff; rem < n {
 				n = rem
 			}
-			// ReadAt fills buf[:n] from the merged chain. n is already clamped
-			// to the virtual size and the chain internally zero-pads short
-			// BACKING reads (a legal overlay-over-shorter-backing layout), so
-			// a short read or error here means the overlay's own host file is
-			// truncated/corrupt: zero-filling would silently convert live data
-			// into ZERO flags in the rebuilt image. Fail instead, BEFORE any
-			// tmp-file replacement, so the original survives.
-			m, err := src.ReadAt(buf[:n], int64(guestOff))
+			// The read must fill buf[:n] exactly. n is already clamped to the
+			// virtual size and both sources fail loudly on truncation:
+			// zero-filling would silently convert live data into ZERO flags in
+			// the rebuilt image. Fail instead, BEFORE any tmp-file replacement,
+			// so the original survives.
+			var m int
+			if e&oflagCopied != 0 {
+				// COPIED + zero-flag-clear + uncompressed means the cluster is
+				// exclusively owned and its guest bytes ARE its host bytes:
+				// resolve() maps every offset of the cluster to `host` without
+				// consulting the backing (that holds for a trailing partial
+				// cluster too — only in-range bytes are ever read). Skip the
+				// per-cluster chain resolution entirely.
+				m, err = src.f.ReadAt(buf[:n], int64(host))
+			} else {
+				// Non-COPIED cluster: refcount may be > 1 (shared internal-
+				// snapshot cluster or foreign image). Read through the chain,
+				// which yields the true guest-visible bytes regardless of how
+				// the source stored them.
+				m, err = src.ReadAt(buf[:n], int64(guestOff))
+			}
 			if err != nil {
 				return fmt.Errorf("read source cluster %d: %w", clusterIdx, err)
 			}

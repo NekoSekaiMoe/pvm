@@ -21,14 +21,25 @@ func SetupConsoleLog(containerID string) (*os.File, error) {
 		return nil, err
 	}
 	logDir := filepath.Join(dir, "logs")
-	if err := os.MkdirAll(logDir, 0755); err != nil {
+	// 0700: console output can carry guest kernel messages and init output;
+	// keep it private to the (root) daemon.
+	if err := os.MkdirAll(logDir, 0700); err != nil {
 		return nil, fmt.Errorf("failed to create log dir: %v", err)
+	}
+	// MkdirAll leaves an existing dir's mode untouched — tighten it too.
+	if err := os.Chmod(logDir, 0700); err != nil {
+		return nil, fmt.Errorf("failed to tighten log dir %s: %v", logDir, err)
 	}
 
 	logFile := filepath.Join(logDir, "console.log")
-	file, err := os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	file, err := os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open console log: %v", err)
+	}
+	// Same for a pre-existing file created with looser permissions.
+	if err := file.Chmod(0600); err != nil {
+		file.Close()
+		return nil, fmt.Errorf("failed to tighten console log %s: %v", logFile, err)
 	}
 
 	return file, nil

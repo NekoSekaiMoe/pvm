@@ -14,7 +14,7 @@ func TestSnapshot_ExportImport(t *testing.T) {
 	if err := os.MkdirAll(baseDir, 0755); err != nil {
 		t.Skipf("Skipping test due to permission error on %s: %v", baseDir, err)
 	}
-	
+
 	containerID := "test-snap-1"
 	containerDir, err := state.ContainerDir(containerID)
 	if err != nil {
@@ -23,39 +23,39 @@ func TestSnapshot_ExportImport(t *testing.T) {
 	if err := os.MkdirAll(containerDir, 0755); err != nil {
 		t.Skipf("Skipping test due to permission error on %s: %v", containerDir, err)
 	}
-	
+
 	// Create dummy file
 	dummyFile := filepath.Join(containerDir, "config.json")
 	os.WriteFile(dummyFile, []byte(`{"test":true}`), 0644)
-	
+
 	tempDir := t.TempDir()
 	tgzPath := filepath.Join(tempDir, "test-export.tgz")
-	
+
 	err = Export(containerID, tgzPath)
 	if err != nil {
 		t.Fatalf("Export failed: %v", err)
 	}
-	
+
 	if _, err := os.Stat(tgzPath); err != nil {
 		t.Fatalf("Export did not create archive: %v", err)
 	}
-	
+
 	newID := "test-snap-2"
 	err = Import(tgzPath, newID)
 	if err != nil {
 		t.Fatalf("Import failed: %v", err)
 	}
-	
+
 	importedFile := filepath.Join(baseDir, newID, "config.json")
 	data, err := os.ReadFile(importedFile)
 	if err != nil {
 		t.Fatalf("Failed to read imported file: %v", err)
 	}
-	
+
 	if string(data) != `{"test":true}` {
 		t.Errorf("Imported content mismatch: %q", string(data))
 	}
-	
+
 	// Cleanup
 	os.RemoveAll(containerDir)
 	os.RemoveAll(filepath.Join(baseDir, newID))

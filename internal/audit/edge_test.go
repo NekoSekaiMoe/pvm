@@ -29,8 +29,8 @@ func TestLedger_ConcurrentAppends(t *testing.T) {
 			for i := 0; i < each; i++ {
 				_ = l.Append(Record{
 					Phase: PhaseExec, Subject: "agent",
-					Action: fmt.Sprintf("call-%d-%d", id, i),
-					Params: map[string]interface{}{"g": id, "i": i},
+					Action:   fmt.Sprintf("call-%d-%d", id, i),
+					Params:   map[string]interface{}{"g": id, "i": i},
 					Decision: DecisionAllow,
 				})
 			}
@@ -84,11 +84,39 @@ func TestLedger_TamperTruncation(t *testing.T) {
 
 	l2, _ := Open("trunc")
 	n, err := l2.Verify()
-	if err != nil {
-		t.Fatalf("truncated chain should still verify on its prefix: %v", err)
+	if err == nil {
+		t.Fatal("expected truncation detection error, got nil")
+	}
+	if !strings.Contains(err.Error(), "ledger truncated") {
+		t.Errorf("unexpected error: %v", err)
 	}
 	if n != 3 {
-		t.Errorf("expected 3 surviving records, got %d", n)
+		t.Errorf("expected 3 surviving records reported, got %d", n)
+	}
+}
+
+// TestLedger_TruncationWithoutHeadSkipped: a ledger that never had a head
+// watermark (legacy data) must still verify on its surviving prefix.
+func TestLedger_TruncationWithoutHeadSkipped(t *testing.T) {
+	LedgerRoot = t.TempDir()
+	l, _ := Open("legacy")
+	for i := 0; i < 3; i++ {
+		l.Append(Record{Phase: PhaseExec, Subject: "x", Action: "a", Decision: DecisionAllow})
+	}
+	path := filepath.Join(LedgerRoot, "legacy", "ledger.jsonl")
+	data, _ := os.ReadFile(path)
+	lines := strings.Split(strings.TrimRight(string(data), "\n"), "\n")
+	os.WriteFile(path, []byte(lines[0]+"\n"), 0644)
+	// simulate legacy data: no head file
+	os.Remove(filepath.Join(LedgerRoot, "legacy", "head"))
+
+	l2, _ := Open("legacy")
+	n, err := l2.Verify()
+	if err != nil {
+		t.Fatalf("legacy truncated chain should verify on its prefix: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("expected 1 surviving record, got %d", n)
 	}
 }
 
@@ -211,6 +239,96 @@ func TestLedger_HashDependsOnAllFields(t *testing.T) {
 		if hashRecord(v, v.PrevHash) == h0 {
 			t.Errorf("variant %d produced same hash as base (field ignored in canonical form)", i)
 		}
+	}
+}
+
+// TestLedger_IncrementalTailMatchesFullScan is the regression test for the
+// O(n²) append path: after many appends on a long-lived Ledger handle, the
+// incrementally-maintained tail (seq/lastHash) must equal what a fresh full
+// scan reports, and cross-process-style appends through a SECOND handle must
+// be picked up by the first handle's locked refresh.
+func TestLedger_IncrementalTailMatchesFullScan(t *testing.T) {
+	LedgerRoot = t.TempDir()
+	l, _ := Open("incr")
+	for i := 0; i < 200; i++ {
+		if err := l.Append(Record{Phase: PhaseExec, Subject: "x", Action: fmt.Sprint(i), Decision: DecisionAllow}); err != nil {
+			t.Fatalf("append %d: %v", i, err)
+		}
+	}
+	// A second handle simulates another process appending.
+	l2, _ := Open("incr")
+	if err := l2.Append(Record{Phase: PhaseExec, Subject: "peer", Action: "peer-write", Decision: DecisionAllow}); err != nil {
+		t.Fatalf("peer append: %v", err)
+	}
+	// The first handle must pick up the peer's record under its lock.
+	if err := l.Append(Record{Phase: PhaseExec, Subject: "x", Action: "after-peer", Decision: DecisionAllow}); err != nil {
+		t.Fatalf("append after peer: %v", err)
+	}
+
+	n, err := l.Verify()
+	if err != nil {
+		t.Fatalf("chain broken after mixed incremental/full refreshes: %v", err)
+	}
+	if n != 202 {
+		t.Errorf("verified %d records, want 202", n)
+	}
+	recs, err := l.ReadAll()
+	if err != nil {
+		t.Fatalf("readall: %v", err)
+	}
+	last := recs[len(recs)-1]
+	l.mu.Lock()
+	gotSeq, gotHash := l.seq, l.lastHash
+	l.mu.Unlock()
+	if gotSeq != last.Seq || gotHash != last.ThisHash {
+		t.Errorf("incremental tail (seq=%d) out of sync with disk (seq=%d)", gotSeq, last.Seq)
+	}
+}
+
+// TestLedger_FilePermissions pins the evidence-file modes: task dir 0700,
+// ledger and head 0600 — including files that already existed with looser
+// modes from older versions.
+func TestLedger_FilePermissions(t *testing.T) {
+	LedgerRoot = t.TempDir()
+	// Pre-create with loose modes like an older deployment would have.
+	dir := filepath.Join(LedgerRoot, "perm")
+	os.MkdirAll(dir, 0755)
+	os.WriteFile(filepath.Join(dir, "ledger.jsonl"), nil, 0644)
+	os.WriteFile(filepath.Join(dir, "head"), nil, 0644)
+
+	l, err := Open("perm")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := l.Append(Record{Phase: PhaseExec, Subject: "x", Action: "a", Decision: DecisionAllow}); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	for _, tc := range []struct {
+		path string
+		want os.FileMode
+	}{{dir, 0700}, {filepath.Join(dir, "ledger.jsonl"), 0600}, {filepath.Join(dir, "head"), 0600}} {
+		fi, err := os.Stat(tc.path)
+		if err != nil {
+			t.Fatalf("stat %s: %v", tc.path, err)
+		}
+		if got := fi.Mode().Perm(); got != tc.want {
+			t.Errorf("%s mode = %o, want %o", tc.path, got, tc.want)
+		}
+	}
+}
+
+// TestOpen_InvalidTaskIDs pins the defense-in-depth id validation: ids that
+// would escape LedgerRoot or smuggle odd characters are rejected.
+func TestOpen_InvalidTaskIDs(t *testing.T) {
+	LedgerRoot = t.TempDir()
+	for _, id := range []string{"", "../escape", "a/b", "a.b", "has space", strings.Repeat("a", 129)} {
+		if _, err := Open(id); err == nil {
+			t.Errorf("Open(%q) accepted an invalid task id", id)
+		}
+	}
+	// Boundary: exactly 128 chars is fine.
+	if _, err := Open(strings.Repeat("a", 128)); err != nil {
+		t.Errorf("Open(128 chars) rejected: %v", err)
 	}
 }
 

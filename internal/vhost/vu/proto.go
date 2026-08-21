@@ -154,11 +154,31 @@ func (m *msg) vringAddr() vringAddr {
 
 // conn wraps the control socket with fd-passing read/write of whole
 // vhost-user messages.
+//
+// Buffer reuse: recv is called only from the session's control-loop
+// goroutine and send/reply only from the same goroutine, so the header, OOB,
+// payload and send buffers below are single-goroutine state and safe to
+// reuse across messages. A returned msg's payload aliases the reusable
+// buffer and is only valid until the next recv — which matches the control
+// loop, which fully consumes each message (including replies) before
+// reading the next one. Handlers must not retain m.payload.
 type conn struct {
 	c *net.UnixConn
+
+	hdrBuf  [12]byte
+	oobBuf  []byte // SCM_RIGHTS control message buffer (up to 8 fds)
+	payload []byte // reusable receive payload buffer
+	sendBuf []byte // reusable send buffer (header + payload)
 }
 
-func newConn(c *net.UnixConn) *conn { return &conn{c: c} }
+func newConn(c *net.UnixConn) *conn {
+	return &conn{
+		c:       c,
+		oobBuf:  make([]byte, unix.CmsgSpace(4*8)),
+		payload: make([]byte, 0, 8192),
+		sendBuf: make([]byte, 12, 12+8192),
+	}
+}
 
 // recv reads one message. Payload is capped defensively: the largest
 // legitimate payload is the memory table (nregions*32 + 8 with the baseline
@@ -167,8 +187,7 @@ func (c *conn) recv() (m *msg, err error) {
 	// The socket is SOCK_STREAM, so one read may coalesce multiple messages:
 	// read exactly the 12-byte header first (fds arrive attached to the first
 	// bytes of a sendmsg batch), then exactly `size` payload bytes.
-	hdr := make([]byte, 0, 12)
-	oob := make([]byte, unix.CmsgSpace(4*8)) // up to 8 fds
+	hdr := c.hdrBuf[:0]
 	var fds []int
 	// Collected fds are owned by the returned message; on error they have no
 	// owner and must be closed here.
@@ -180,17 +199,22 @@ func (c *conn) recv() (m *msg, err error) {
 		}
 	}()
 	for len(hdr) < 12 {
-		chunk := make([]byte, 12-len(hdr))
-		n, oobn, _, _, err := c.c.ReadMsgUnix(chunk, oob)
+		n, oobn, flags, _, err := c.c.ReadMsgUnix(hdr[len(hdr):12], c.oobBuf)
 		if err != nil {
 			return nil, err
 		}
 		if n == 0 {
 			return nil, io.EOF
 		}
-		hdr = append(hdr, chunk[:n]...)
+		hdr = hdr[:len(hdr)+n]
+		// MSG_CTRUNC means the kernel dropped part of the control data (more
+		// fds than the buffer holds): the message would be silently
+		// corrupted, so treat the connection as broken instead.
+		if flags&unix.MSG_CTRUNC != 0 {
+			return nil, errors.New("vu: truncated control message (too many passed fds)")
+		}
 		if oobn > 0 {
-			cmsgs, err := unix.ParseSocketControlMessage(oob[:oobn])
+			cmsgs, err := unix.ParseSocketControlMessage(c.oobBuf[:oobn])
 			if err == nil {
 				for _, cmsg := range cmsgs {
 					if got, err := unix.ParseUnixRights(&cmsg); err == nil {
@@ -200,9 +224,15 @@ func (c *conn) recv() (m *msg, err error) {
 			}
 		}
 	}
+	flags := binary.LittleEndian.Uint32(hdr[4:])
+	// vhost-user protocol version is the low 2 bits and must be 1; anything
+	// else is a peer speaking a different protocol generation.
+	if flags&flagVersion != 1 {
+		return nil, fmt.Errorf("vu: unsupported protocol version %d (want 1)", flags&flagVersion)
+	}
 	m = &msg{
 		request: binary.LittleEndian.Uint32(hdr[0:]),
-		flags:   binary.LittleEndian.Uint32(hdr[4:]),
+		flags:   flags,
 		fds:     fds,
 	}
 	size := binary.LittleEndian.Uint32(hdr[8:])
@@ -210,7 +240,10 @@ func (c *conn) recv() (m *msg, err error) {
 		return nil, fmt.Errorf("vu: implausible payload size %d", size)
 	}
 	if size > 0 {
-		m.payload = make([]byte, size)
+		if int(cap(c.payload)) < int(size) {
+			c.payload = make([]byte, size)
+		}
+		m.payload = c.payload[:size]
 		if _, err := io.ReadFull(c.c, m.payload); err != nil {
 			return nil, err
 		}
@@ -232,11 +265,15 @@ func (c *conn) ack(m *msg) error {
 }
 
 func (c *conn) send(request, flags uint32, payload []byte, fds ...int) error {
-	hdr := make([]byte, 12)
-	binary.LittleEndian.PutUint32(hdr[0:], request)
-	binary.LittleEndian.PutUint32(hdr[4:], (flags&^flagVersion)|1) // version 1
-	binary.LittleEndian.PutUint32(hdr[8:], uint32(len(payload)))
-	buf := append(hdr, payload...)
+	need := 12 + len(payload)
+	if cap(c.sendBuf) < need {
+		c.sendBuf = make([]byte, need)
+	}
+	buf := c.sendBuf[:need]
+	binary.LittleEndian.PutUint32(buf[0:], request)
+	binary.LittleEndian.PutUint32(buf[4:], (flags&^flagVersion)|1) // version 1
+	binary.LittleEndian.PutUint32(buf[8:], uint32(len(payload)))
+	copy(buf[12:], payload)
 	var oob []byte
 	if len(fds) > 0 {
 		oob = unix.UnixRights(fds...)

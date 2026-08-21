@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"sync"
 )
 
 // virtio-blk request types / status codes / config (linux/virtio_blk.h).
@@ -85,7 +86,44 @@ func (d *BlkDev) config(offset, size uint32) ([]byte, error) {
 	return out, nil
 }
 
-// outhdr mirrors struct virtio_blk_outhdr { u32 type; u32 ioprio; u64 sector }.
+// Bounce buffers are needed because backends take contiguous []byte while
+// requests arrive as scatter-gather lists. They used to be allocated per
+// request; pool them in power-of-two size buckets (512B..64KiB, matching the
+// advertised size_max=65536) instead. Sizes beyond the largest bucket fall
+// back to a plain make.
+const (
+	bufPoolMinSize = 512
+	bufPoolBuckets = 8 // 512 << 7 == 64KiB
+)
+
+var bufPools [bufPoolBuckets]sync.Pool
+
+func bufBucket(size int) int {
+	b := 0
+	for c := bufPoolMinSize; c < size && b < bufPoolBuckets-1; c <<= 1 {
+		b++
+	}
+	return b
+}
+
+// getBuf returns a buffer with at least n bytes (n rounded up to the bucket
+// size). The caller must return it via putBuf when done.
+func getBuf(n int) []byte {
+	b := bufBucket(n)
+	if v := bufPools[b].Get(); v != nil {
+		return v.([]byte)[:n]
+	}
+	return make([]byte, n, bufPoolMinSize<<b)
+}
+
+func putBuf(buf []byte) {
+	b := bufBucket(cap(buf))
+	if b < 0 || b >= bufPoolBuckets || cap(buf) != bufPoolMinSize<<b {
+		return // not a pooled bucket size
+	}
+	bufPools[b].Put(buf[:cap(buf)])
+}
+
 type outhdr struct {
 	typ    uint32
 	ioprio uint32
@@ -138,7 +176,14 @@ func (d *BlkDev) process(e *elem) (usedLen uint32, err error) {
 			usedLen = 1
 			break
 		}
-		buf := make([]byte, n)
+		// Bounce buffer from the pool for the common sizes; oversized
+		// (guest-coalesced) reads just allocate.
+		var buf []byte
+		if n <= bufPoolMinSize<<(bufPoolBuckets-1) {
+			buf = getBuf(n)
+		} else {
+			buf = make([]byte, n)
+		}
 		m, rerr := d.be.ReadAt(buf, int64(h.sector)*512)
 		if rerr != nil && rerr != io.EOF {
 			status = blkSIOErr
@@ -147,17 +192,27 @@ func (d *BlkDev) process(e *elem) (usedLen uint32, err error) {
 			sgCopy(dataIn, buf[:m])
 		}
 		usedLen = uint32(m) + 1
+		putBuf(buf)
 	case blkTOut:
-		if d.ro || !d.inRange(h.sector, sgLen(dataOut)) {
+		n := sgLen(dataOut)
+		if d.ro || !d.inRange(h.sector, n) {
 			status = blkSIOErr
 			usedLen = 1
 			break
 		}
-		buf := sgGather(dataOut)
+		// Gather into a pooled bounce buffer instead of allocating per write.
+		var buf []byte
+		if n <= bufPoolMinSize<<(bufPoolBuckets-1) {
+			buf = getBuf(n)
+		} else {
+			buf = make([]byte, n)
+		}
+		sgGatherInto(dataOut, buf)
 		if _, err := d.be.WriteAt(buf, int64(h.sector)*512); err != nil {
 			status = blkSIOErr
 		}
 		usedLen = 1
+		putBuf(buf)
 	case blkTFlush:
 		if err := d.be.Sync(); err != nil {
 			status = blkSIOErr
@@ -197,6 +252,15 @@ func sgGather(sg [][]byte) []byte {
 		out = append(out, b...)
 	}
 	return out
+}
+
+// sgGatherInto copies the concatenated scatter-gather list into dst, which
+// must be at least sgLen(sg) bytes.
+func sgGatherInto(sg [][]byte, dst []byte) {
+	off := 0
+	for _, b := range sg {
+		off += copy(dst[off:], b)
+	}
 }
 
 // sgCopy copies data into the front of the scatter-gather list. It must NOT
