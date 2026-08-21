@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 	"uml-container/internal/approval"
 	"uml-container/internal/artifact"
 	"uml-container/internal/audit"
@@ -46,6 +47,12 @@ type ExecResponse struct {
 // StartE2BServer starts a REST API compatible with E2B SDK and serves the WebUI
 func StartE2BServer(port int) error {
 	e := echo.New()
+
+	// Shared lifecycle manager: injected into container.Managers created by
+	// this server (so StartTask arms autopause timers) and reused by the
+	// pause/resume and activity endpoints below instead of separate instances.
+	cgMgr := cgroup.NewManager()
+	autoMgr := lifecycle.New(cgMgr)
 
 	e.Use(middleware.Logger())
 	e.Use(middleware.Recover())
@@ -102,6 +109,7 @@ func StartE2BServer(port int) error {
 		}
 
 		mgr := container.NewManager(nil)
+		mgr.Autopause = autoMgr
 		mem := req.Mem
 		if mem == "" {
 			mem = "512M"
@@ -237,6 +245,9 @@ func StartE2BServer(port int) error {
 		if taskID == "" {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": "task id required (?task= or X-Task-Id)"})
 		}
+		// API activity counts for lifecycle policy: bump the idle timer of a
+		// Running task, or auto-resume a Suspended one when its config allows.
+		lifecycleActivity(taskID, autoMgr)
 		gw := gateways.get(taskID)
 		if gw == nil {
 			return c.JSON(http.StatusForbidden, map[string]string{"error": "no policy gateway registered for task"})
@@ -305,6 +316,7 @@ func StartE2BServer(port int) error {
 		mu := taskLock(id)
 		mu.Lock()
 		defer mu.Unlock()
+		lifecycleActivity(id, autoMgr)
 		st, err := state.LoadState(id)
 		if err != nil {
 			return c.JSON(http.StatusNotFound, map[string]string{"error": "task not found"})
@@ -496,6 +508,19 @@ func StartE2BServer(port int) error {
 
 	// --- Volumes (Cube parity: POST/GET/DELETE /volumes) ---
 	volStore := volume.NewStore("")
+	// Volume API responses intentionally exclude Token and PrivateData: those
+	// are credentials for mount plugins (internal paths read them from the
+	// store), never for API clients.
+	type volumeResponse struct {
+		VolumeID  string    `json:"volume_id"`
+		Name      string    `json:"name"`
+		Driver    string    `json:"driver"`
+		RefCount  int       `json:"refcount"`
+		CreatedAt time.Time `json:"created_at"`
+	}
+	toVolumeResponse := func(r volume.VolumeRecord) volumeResponse {
+		return volumeResponse{VolumeID: r.VolumeID, Name: r.Name, Driver: r.Driver, RefCount: r.RefCount, CreatedAt: r.CreatedAt}
+	}
 	api.POST("/volumes", func(c echo.Context) error {
 		var req struct {
 			Name        string `json:"name"`
@@ -524,7 +549,7 @@ func StartE2BServer(port int) error {
 		if err != nil {
 			return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		}
-		return c.JSON(http.StatusCreated, got)
+		return c.JSON(http.StatusCreated, toVolumeResponse(*got))
 	})
 	api.GET("/volumes", func(c echo.Context) error {
 		list, err := volStore.List()
@@ -534,7 +559,11 @@ func StartE2BServer(port int) error {
 		if list == nil {
 			list = []volume.VolumeRecord{}
 		}
-		return c.JSON(http.StatusOK, list)
+		out := make([]volumeResponse, 0, len(list))
+		for _, r := range list {
+			out = append(out, toVolumeResponse(r))
+		}
+		return c.JSON(http.StatusOK, out)
 	})
 	api.GET("/volumes/:id", func(c echo.Context) error {
 		id := c.Param("id")
@@ -549,7 +578,7 @@ func StartE2BServer(port int) error {
 				return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
 			}
 		}
-		return c.JSON(http.StatusOK, rec)
+		return c.JSON(http.StatusOK, toVolumeResponse(*rec))
 	})
 	api.DELETE("/volumes/:id", func(c echo.Context) error {
 		id := c.Param("id")
@@ -669,8 +698,6 @@ func StartE2BServer(port int) error {
 	})
 
 	// --- AutoPause (Cube parity: POST /tasks/:id/pause|resume) ---
-	cgMgr := cgroup.NewManager()
-	autoMgr := lifecycle.New(cgMgr)
 	api.POST("/tasks/:id/pause", func(c echo.Context) error {
 		id := c.Param("id")
 		if !idRegex.MatchString(id) {
@@ -689,14 +716,24 @@ func StartE2BServer(port int) error {
 		if st.Status != state.StatusRunning {
 			return c.JSON(http.StatusConflict, map[string]string{"error": fmt.Sprintf("task not running (status=%s)", st.Status)})
 		}
-		if err := cgMgr.Freeze(id); err != nil && !os.IsNotExist(err) {
+		if err := cgMgr.Freeze(id); err != nil {
+			// A missing cgroup means the runtime is gone (the task exited); do
+			// not persist SUSPENDED for a task that cannot actually be frozen.
+			if os.IsNotExist(err) {
+				return c.JSON(http.StatusConflict, map[string]string{"error": "task runtime missing (cgroup not found); task may have exited"})
+			}
 			return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		}
 		autoMgr.Disarm(id)
 		if err := st.Transition(state.StatusSuspended, state.ActorHuman, "manual pause"); err != nil {
+			// Roll back the freeze so runtime and persisted state stay in sync
+			// (disk still says Running).
+			_ = cgMgr.Thaw(id)
 			return c.JSON(http.StatusConflict, map[string]string{"error": err.Error()})
 		}
 		if err := state.SaveState(id, st); err != nil {
+			// Same rollback: the transition was not persisted.
+			_ = cgMgr.Thaw(id)
 			return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		}
 		return c.NoContent(http.StatusNoContent)
@@ -711,8 +748,14 @@ func StartE2BServer(port int) error {
 		mu := taskLock(id)
 		mu.Lock()
 		defer mu.Unlock()
-		if _, err := state.LoadState(id); err != nil {
+		st, err := state.LoadState(id)
+		if err != nil {
 			return c.JSON(http.StatusNotFound, map[string]string{"error": "task not found"})
+		}
+		// Explicit resume honors the task's auto_resume configuration: when
+		// disabled, the task must stay Suspended until the config changes.
+		if !st.AutoResume {
+			return c.JSON(http.StatusConflict, map[string]string{"error": "auto_resume is disabled for this task"})
 		}
 		if err := autoMgr.Resume(id); err != nil {
 			if errors.Is(err, state.ErrInvalidTransition) || errors.Is(err, state.ErrTerminal) {
@@ -720,7 +763,7 @@ func StartE2BServer(port int) error {
 			}
 			return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		}
-		st, err := state.LoadState(id)
+		st, err = state.LoadState(id)
 		if err != nil {
 			return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		}
@@ -737,6 +780,29 @@ func StartE2BServer(port int) error {
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
 	fmt.Printf("E2B-compatible API & WebUI Server listening on %s\n", addr)
 	return e.Start(addr)
+}
+
+// lifecycleActivity applies the task's lifecycle policy on API activity:
+// a Suspended task with AutoResume=true is resumed, and a Running task's
+// idle timer is bumped (Reset) when an idle_timeout is configured. Best
+// effort: failures never fail the calling endpoint.
+func lifecycleActivity(taskID string, autoMgr *lifecycle.Manager) {
+	st, err := state.LoadState(taskID)
+	if err != nil {
+		return
+	}
+	switch st.Status {
+	case state.StatusSuspended:
+		if st.AutoResume {
+			_ = autoMgr.Resume(taskID)
+		}
+	case state.StatusRunning:
+		if st.IdleTimeout != "" {
+			if d, derr := time.ParseDuration(st.IdleTimeout); derr == nil && d > 0 {
+				autoMgr.Reset(taskID, d)
+			}
+		}
+	}
 }
 
 // procBelongsToContainer reports whether the process with the given pid still

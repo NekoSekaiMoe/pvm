@@ -84,6 +84,9 @@ func (s *Store) Create(rec VolumeRecord) error {
 	if !volumeIDRe.MatchString(rec.Name) {
 		return fmt.Errorf("%w: invalid name %q", ErrInvalid, rec.Name)
 	}
+	if rec.RefCount < 0 {
+		return fmt.Errorf("%w: negative refcount %d", ErrInvalid, rec.RefCount)
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	dir, err := s.volumeDir(rec.VolumeID)
@@ -99,7 +102,23 @@ func (s *Store) Create(rec VolumeRecord) error {
 	if rec.CreatedAt.IsZero() {
 		rec.CreatedAt = time.Now().UTC()
 	}
-	return writeMeta(dir, rec)
+	writeErr := writeMeta(dir, rec)
+	if writeErr != nil {
+		if !errors.Is(writeErr, fsjson.ErrDurability) {
+			return writeErr
+		}
+		// The rename was committed; only the durability confirmation failed.
+		// Re-read the on-disk record: if it matches, the Create succeeded.
+		data, rerr := os.ReadFile(filepath.Join(dir, "meta.json"))
+		if rerr != nil {
+			return writeErr
+		}
+		var got VolumeRecord
+		if json.Unmarshal(data, &got) != nil || got.VolumeID != rec.VolumeID {
+			return writeErr
+		}
+	}
+	return nil
 }
 
 // Get returns the record for id or an error if not found.

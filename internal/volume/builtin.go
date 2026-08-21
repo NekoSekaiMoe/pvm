@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // BuiltinPlugin is a host-directory plugin compiled into the binary.
@@ -36,10 +37,18 @@ func (p *BuiltinPlugin) Attach(_ context.Context, req *AttachRequest) (*AttachRe
 		return nil, fmt.Errorf("volume builtin: VolumeBaseDir required")
 	}
 	hostPath := filepath.Join(req.VolumeBaseDir, fmt.Sprintf("%s-%s", req.Driver, req.VolumeID))
-	if req.RefCount == 0 {
-		if err := os.MkdirAll(hostPath, 0755); err != nil {
-			return nil, fmt.Errorf("volume builtin: mkdir %s: %w", hostPath, err)
-		}
+	// Defense in depth: Join cleans the path, so a hostile id/driver could
+	// still escape the base directory. Never create anything outside it.
+	clean := filepath.Clean(hostPath)
+	base := filepath.Clean(req.VolumeBaseDir)
+	if clean != base && !strings.HasPrefix(clean, base+string(filepath.Separator)) {
+		return nil, fmt.Errorf("volume builtin: host path %q escapes VolumeBaseDir %q", hostPath, req.VolumeBaseDir)
+	}
+	// Idempotent mkdir on every attach: concurrent first-time attaches both
+	// need the directory, and NodeRefFirstAttach (not RefCount==0) carries
+	// first-attach semantics.
+	if err := os.MkdirAll(hostPath, 0755); err != nil {
+		return nil, fmt.Errorf("volume builtin: mkdir %s: %w", hostPath, err)
 	}
 	return &AttachResult{
 		VolumeID: req.VolumeID,

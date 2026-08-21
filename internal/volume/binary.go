@@ -6,7 +6,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"os/exec"
+	"path/filepath"
+	"strconv"
+	"time"
 )
+
+// binaryPluginTimeout bounds a single plugin process execution when the
+// caller's context carries no deadline, so a hung plugin cannot hold the
+// attach/detach path forever.
+const binaryPluginTimeout = 30 * time.Second
 
 // BinaryPlugin forks an external process per hook, speaking the
 // newline-delimited JSON wire protocol over stdin/stdout — mirroring
@@ -33,6 +41,9 @@ func (p *BinaryPlugin) Init(_ context.Context, cfg PluginConfig) error {
 	if p.binaryPath == "" {
 		return fmt.Errorf("volume binary: binary_path required for driver %q", cfg.Name)
 	}
+	if !filepath.IsAbs(p.binaryPath) {
+		return fmt.Errorf("volume binary: binary_path must be absolute, got %q", p.binaryPath)
+	}
 	return nil
 }
 
@@ -42,7 +53,9 @@ func (p *BinaryPlugin) Attach(ctx context.Context, req *AttachRequest) (*AttachR
 		"--sandbox-id", req.SandboxID,
 		"--namespace", req.Namespace,
 		"--volume-id", req.VolumeID,
+		"--driver", req.Driver,
 		"--ref-count", fmt.Sprintf("%d", req.RefCount),
+		"--node-ref-first-attach", strconv.FormatBool(req.NodeRefFirstAttach),
 		"--volume-base-dir", req.VolumeBaseDir,
 	}
 	if req.PrivateData != "" {
@@ -77,7 +90,9 @@ func (p *BinaryPlugin) Detach(ctx context.Context, req *DetachRequest) error {
 		"--sandbox-id", req.SandboxID,
 		"--namespace", req.Namespace,
 		"--volume-id", req.VolumeID,
+		"--driver", req.Driver,
 		"--ref-count", fmt.Sprintf("%d", req.RefCount),
+		"--node-ref-last-detach", strconv.FormatBool(req.NodeRefLastDetach),
 		"--metadata", string(metaJSON),
 	}
 	out, err := p.run(ctx, args)
@@ -103,6 +118,12 @@ func (p *BinaryPlugin) Detach(ctx context.Context, req *DetachRequest) error {
 func (p *BinaryPlugin) Close() error { return nil }
 
 func (p *BinaryPlugin) run(ctx context.Context, args []string) ([]byte, error) {
+	// Bound execution even when the caller supplied context.Background().
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, binaryPluginTimeout)
+		defer cancel()
+	}
 	cmd := exec.CommandContext(ctx, p.binaryPath, args...)
 	out, err := cmd.Output()
 	if err != nil {

@@ -8,10 +8,17 @@ package fsjson
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 )
+
+// ErrDurability reports that the rename was committed (the new content IS
+// the on-disk state) but the follow-up directory fsync could not be
+// confirmed. Unlike ordinary write errors, callers receiving an error that
+// wraps ErrDurability should re-read the target before concluding failure.
+var ErrDurability = errors.New("fsjson: rename committed but durability confirmation failed")
 
 // Write atomically persists v as pretty-printed JSON at path. The temporary
 // file is synced and closed before the rename; on any failure the temporary
@@ -46,16 +53,18 @@ func Write(path string, v any) error {
 	// fsync the parent directory so the rename itself (a directory entry
 	// update) survives a crash; syncing only the file would leave the new
 	// name uncommitted on some filesystems (e.g. ext4 with delayed allocation).
+	// Failures here are distinct: the write is committed, only the durability
+	// confirmation is missing.
 	d, err := os.Open(dir)
 	if err != nil {
-		return fmt.Errorf("fsjson: open dir %s: %w", dir, err)
+		return fmt.Errorf("%w: open %s: %w", ErrDurability, dir, err)
 	}
 	if err := d.Sync(); err != nil {
 		d.Close()
-		return fmt.Errorf("fsjson: sync dir %s: %w", dir, err)
+		return fmt.Errorf("%w: sync %s: %w", ErrDurability, dir, err)
 	}
 	if err := d.Close(); err != nil {
-		return fmt.Errorf("fsjson: close dir %s: %w", dir, err)
+		return fmt.Errorf("%w: close %s: %w", ErrDurability, dir, err)
 	}
 	return nil
 }

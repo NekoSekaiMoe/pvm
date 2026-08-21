@@ -23,9 +23,11 @@ func isNotExist(err error) bool {
 
 // Manager owns per-task idle timers.
 type Manager struct {
-	mu     sync.Mutex
-	timers map[string]*time.Timer
-	cg     *cgroup.Manager
+	mu      sync.Mutex
+	timers  map[string]*time.Timer
+	gens    map[string]uint64 // taskID -> generation of the live schedule
+	nextGen uint64
+	cg      *cgroup.Manager
 }
 
 // New creates a Manager. cg may be nil to use the default cgroup root.
@@ -35,6 +37,7 @@ func New(cg *cgroup.Manager) *Manager {
 	}
 	return &Manager{
 		timers: make(map[string]*time.Timer),
+		gens:   make(map[string]uint64),
 		cg:     cg,
 	}
 }
@@ -42,6 +45,10 @@ func New(cg *cgroup.Manager) *Manager {
 // Arm starts (or resets) the idle countdown for taskID. When d elapses
 // without a Reset/Disarm, the task is frozen and moved to Suspended.
 // d <= 0 disables autopause for this task.
+//
+// Every Arm stamps a new generation; the scheduled callback verifies its
+// generation before pausing, so a callback from a replaced (Reset) or
+// cancelled (Disarm) schedule can never pause a task afterwards.
 func (m *Manager) Arm(taskID string, d time.Duration) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -49,10 +56,16 @@ func (m *Manager) Arm(taskID string, d time.Duration) {
 		old.Stop()
 		delete(m.timers, taskID)
 	}
+	// Dropping the generation entry invalidates any callback that already
+	// fired and is racing towards pause().
+	delete(m.gens, taskID)
 	if d <= 0 {
 		return
 	}
-	m.timers[taskID] = time.AfterFunc(d, func() { m.pause(taskID) })
+	m.nextGen++
+	gen := m.nextGen
+	m.gens[taskID] = gen
+	m.timers[taskID] = time.AfterFunc(d, func() { m.pause(taskID, gen) })
 }
 
 // Reset bumps the idle deadline for taskID (call on every API activity).
@@ -68,6 +81,9 @@ func (m *Manager) Disarm(taskID string) {
 		t.Stop()
 		delete(m.timers, taskID)
 	}
+	// Removing the generation entry also stops an already-fired callback
+	// that has not reached pause() yet.
+	delete(m.gens, taskID)
 }
 
 // Resume thaws a Suspended task and drives Suspended -> Resuming -> Running.
@@ -98,7 +114,21 @@ func (m *Manager) Resume(taskID string) error {
 	return state.SaveState(taskID, st)
 }
 
-func (m *Manager) pause(taskID string) {
+func (m *Manager) pause(taskID string, gen uint64) {
+	m.mu.Lock()
+	if cur, ok := m.gens[taskID]; !ok || cur != gen {
+		// Superseded by a newer Arm/Reset or a Disarm; do nothing.
+		m.mu.Unlock()
+		return
+	}
+	// Claim the schedule before doing the (slow) pause work below, so a
+	// concurrent Arm cannot double-fire and a later Disarm finds no stale
+	// entry. The map entries are removed; the generation check above has
+	// already authorized this callback.
+	delete(m.timers, taskID)
+	delete(m.gens, taskID)
+	m.mu.Unlock()
+
 	st, err := state.LoadState(taskID)
 	if err != nil {
 		return
@@ -106,12 +136,13 @@ func (m *Manager) pause(taskID string) {
 	if st.Status != state.StatusRunning {
 		return
 	}
-	// Best-effort freeze; if cgroup not present (e.g. test), still transition.
-	_ = m.cg.Freeze(taskID)
+	// Best-effort freeze: if the cgroup is not present (e.g. tests, or the
+	// task exited between Load and Freeze) still transition. A genuine
+	// freeze failure (EACCES, EIO, ...) must NOT persist Suspended for a
+	// task that is still running — skip the transition instead.
+	if err := m.cg.Freeze(taskID); err != nil && !isNotExist(err) {
+		return
+	}
 	_ = st.Transition(state.StatusSuspended, state.ActorSystem, "idle timeout")
 	_ = state.SaveState(taskID, st)
-
-	m.mu.Lock()
-	delete(m.timers, taskID)
-	m.mu.Unlock()
 }

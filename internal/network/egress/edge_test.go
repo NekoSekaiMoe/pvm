@@ -73,12 +73,12 @@ func TestDomainMatch_WildcardBoundary(t *testing.T) {
 		want       bool
 	}{
 		{"api.github.com", "*.github.com", true},
-		{"github.com", "*.github.com", false},   // wildcard needs a subdomain
+		{"github.com", "*.github.com", false},    // wildcard needs a subdomain
 		{"apigithub.com", "*.github.com", false}, // suffix must be dot-prefixed
 		{"evil.com", "*.github.com", false},
 		{"a.b.github.com", "*.github.com", true}, // multi-level sub
 		{"github.com", "github.com", true},
-		{"GITHUB.COM", "github.com", true}, // case-insensitive at decide layer
+		{"GITHUB.COM", "github.com", true},                 // case-insensitive at decide layer
 		{"api.github.com.evil.com", "*.github.com", false}, // suffix hijack
 	}
 	for _, c := range cases {
@@ -196,10 +196,20 @@ func TestBlockOverAllow(t *testing.T) {
 		AllowDomains: []string{"a.com"},
 		BlockDomains: []string{"a.com"},
 	}
-	d := (&Gateway{}).decideDomain("a.com", pol)
+	v := viewFromHTTP(mustReq(t, "GET", "http://a.com/"))
+	d := (&Gateway{}).decideDomain(v, pol)
 	if d != DecisionBlock {
 		t.Error("block must take precedence over allow")
 	}
+}
+
+func mustReq(t *testing.T, method, rawurl string) *http.Request {
+	t.Helper()
+	req, err := http.NewRequest(method, rawurl, nil)
+	if err != nil {
+		t.Fatalf("bad test request %q: %v", rawurl, err)
+	}
+	return req
 }
 
 // --- task attribution required ---

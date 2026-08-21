@@ -19,51 +19,57 @@ func TestBuiltinAttach_Detach_RefCount(t *testing.T) {
 		t.Fatalf("register: %v", err)
 	}
 
-	// first attach -> mkdir
-	r1, err := m.Attach(ctx, &AttachRequest{SandboxID: "sb-1", VolumeID: "vol-1", Driver: "demo"})
-	if err != nil {
-		t.Fatalf("attach 1: %v", err)
-	}
-	if r1.HostPath == "" {
-		t.Fatalf("empty HostPath")
-	}
-	if _, err := os.Stat(r1.HostPath); err != nil {
-		t.Fatalf("hostPath not created: %v", err)
-	}
-	if got := m.RefCount("vol-1"); got != 1 {
-		t.Fatalf("refCount after 1st attach = %d, want 1", got)
-	}
+	var r1 *AttachResult
+	t.Run("first attach creates host path", func(t *testing.T) {
+		r, err := m.Attach(ctx, &AttachRequest{SandboxID: "sb-1", VolumeID: "vol-1", Driver: "demo"})
+		if err != nil {
+			t.Fatalf("attach 1: %v", err)
+		}
+		r1 = r
+		if r.HostPath == "" {
+			t.Fatalf("empty HostPath")
+		}
+		if _, err := os.Stat(r.HostPath); err != nil {
+			t.Fatalf("hostPath not created: %v", err)
+		}
+		if got := m.RefCount("vol-1"); got != 1 {
+			t.Fatalf("refCount after 1st attach = %d, want 1", got)
+		}
+	})
 
-	// second sandbox reuses same hostPath (refCount 1→2)
-	r2, err := m.Attach(ctx, &AttachRequest{SandboxID: "sb-2", VolumeID: "vol-1", Driver: "demo"})
-	if err != nil {
-		t.Fatalf("attach 2: %v", err)
-	}
-	if r2.HostPath != r1.HostPath {
-		t.Fatalf("HostPath mismatch: %q vs %q", r2.HostPath, r1.HostPath)
-	}
-	if got := m.RefCount("vol-1"); got != 2 {
-		t.Fatalf("refCount after 2nd attach = %d, want 2", got)
-	}
+	t.Run("second sandbox reuses host path", func(t *testing.T) {
+		r2, err := m.Attach(ctx, &AttachRequest{SandboxID: "sb-2", VolumeID: "vol-1", Driver: "demo"})
+		if err != nil {
+			t.Fatalf("attach 2: %v", err)
+		}
+		if r2.HostPath != r1.HostPath {
+			t.Fatalf("HostPath mismatch: %q vs %q", r2.HostPath, r1.HostPath)
+		}
+		if got := m.RefCount("vol-1"); got != 2 {
+			t.Fatalf("refCount after 2nd attach = %d, want 2", got)
+		}
+	})
 
-	// first detach -> post 1, not last
-	if err := m.Detach(ctx, &DetachRequest{SandboxID: "sb-1", VolumeID: "vol-1", Driver: "demo"}); err != nil {
-		t.Fatalf("detach 1: %v", err)
-	}
-	if got := m.RefCount("vol-1"); got != 1 {
-		t.Fatalf("refCount after 1st detach = %d, want 1", got)
-	}
-	if _, err := os.Stat(r1.HostPath); err != nil {
-		t.Fatalf("hostPath should still exist after non-last detach: %v", err)
-	}
+	t.Run("non-last detach keeps host path", func(t *testing.T) {
+		if err := m.Detach(ctx, &DetachRequest{SandboxID: "sb-1", VolumeID: "vol-1", Driver: "demo"}); err != nil {
+			t.Fatalf("detach 1: %v", err)
+		}
+		if got := m.RefCount("vol-1"); got != 1 {
+			t.Fatalf("refCount after 1st detach = %d, want 1", got)
+		}
+		if _, err := os.Stat(r1.HostPath); err != nil {
+			t.Fatalf("hostPath should still exist after non-last detach: %v", err)
+		}
+	})
 
-	// last detach -> post 0
-	if err := m.Detach(ctx, &DetachRequest{SandboxID: "sb-2", VolumeID: "vol-1", Driver: "demo"}); err != nil {
-		t.Fatalf("detach 2: %v", err)
-	}
-	if got := m.RefCount("vol-1"); got != 0 {
-		t.Fatalf("refCount after last detach = %d, want 0", got)
-	}
+	t.Run("last detach drops bookkeeping", func(t *testing.T) {
+		if err := m.Detach(ctx, &DetachRequest{SandboxID: "sb-2", VolumeID: "vol-1", Driver: "demo"}); err != nil {
+			t.Fatalf("detach 2: %v", err)
+		}
+		if got := m.RefCount("vol-1"); got != 0 {
+			t.Fatalf("refCount after last detach = %d, want 0", got)
+		}
+	})
 }
 
 func TestManager_HostPathContainment(t *testing.T) {
@@ -158,6 +164,15 @@ func TestStore_Lifecycle(t *testing.T) {
 	t.Run("create and get", func(t *testing.T) {
 		if err := s.Create(VolumeRecord{VolumeID: "vol-a", Driver: "builtin"}); err != nil {
 			t.Fatalf("create: %v", err)
+		}
+		// negative refcount must be rejected before persisting
+		if err := s.Create(VolumeRecord{VolumeID: "vol-neg", Driver: "builtin", RefCount: -1}); err == nil {
+			t.Fatalf("expected error for negative refcount")
+		} else if !errors.Is(err, ErrInvalid) {
+			t.Fatalf("negative refcount error = %v, want ErrInvalid", err)
+		}
+		if _, err := s.Get("vol-neg"); err == nil {
+			t.Fatalf("negative-refcount record must not be persisted")
 		}
 		got, err := s.Get("vol-a")
 		if err != nil {
