@@ -1,6 +1,7 @@
 package cow
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -9,7 +10,9 @@ import (
 
 // TestEngine_NameValidation_BlocksTraversal verifies that volume/snapshot
 // names which would escape the engine root (via "../", absolute paths, or
-// separators/dots) are rejected before any path is constructed.
+// separators/dots) are rejected by the name validator itself — the error must
+// be an invalid-name error, not an incidental IO/not-found failure that would
+// also occur if validation were missing.
 func TestEngine_NameValidation_BlocksTraversal(t *testing.T) {
 	e := NewEngine(t.TempDir())
 	bad := []string{
@@ -24,31 +27,36 @@ func TestEngine_NameValidation_BlocksTraversal(t *testing.T) {
 		strings.Repeat("x", 129),
 	}
 	for _, name := range bad {
-		if _, err := e.CreateVolume(name, 1<<20); err == nil {
-			t.Fatalf("CreateVolume accepted traversal name %q", name)
-		}
-		if err := e.DeleteVolume(name); err == nil {
-			t.Fatalf("DeleteVolume accepted traversal name %q", name)
-		}
-		if _, err := e.GetVolumeInfo(name); err == nil {
-			t.Fatalf("GetVolumeInfo accepted traversal name %q", name)
-		}
-		if _, err := e.CreateSnapshot(name, "snap"); err == nil {
-			t.Fatalf("CreateSnapshot accepted traversal source %q", name)
-		}
-		if _, err := e.CreateSnapshot("src", name); err == nil {
-			t.Fatalf("CreateSnapshot accepted traversal snapshot name %q", name)
-		}
-		if err := e.DeleteSnapshot(name); err == nil {
-			t.Fatalf("DeleteSnapshot accepted traversal name %q", name)
-		}
-		// ListSnapshots("") is a valid "list all" filter, so only non-empty
-		// names must be rejected there.
-		if name != "" {
-			if _, err := e.ListSnapshots(name); err == nil {
-				t.Fatalf("ListSnapshots accepted traversal filter %q", name)
+		t.Run(fmt.Sprintf("name_%q", name), func(t *testing.T) {
+			// Each op must fail specifically with an invalid-name error so a
+			// missing validator (which would surface as not-found/IO errors)
+			// cannot satisfy the assertion.
+			if _, err := e.CreateVolume(name, 1<<20); err == nil || !strings.Contains(err.Error(), "invalid") {
+				t.Fatalf("CreateVolume err = %v, want invalid-name error", err)
 			}
-		}
+			if err := e.DeleteVolume(name); err == nil || !strings.Contains(err.Error(), "invalid") {
+				t.Fatalf("DeleteVolume err = %v, want invalid-name error", err)
+			}
+			if _, err := e.GetVolumeInfo(name); err == nil || !strings.Contains(err.Error(), "invalid") {
+				t.Fatalf("GetVolumeInfo err = %v, want invalid-name error", err)
+			}
+			if _, err := e.CreateSnapshot(name, "snap"); err == nil || !strings.Contains(err.Error(), "invalid") {
+				t.Fatalf("CreateSnapshot(source) err = %v, want invalid-name error", err)
+			}
+			if _, err := e.CreateSnapshot("src", name); err == nil || !strings.Contains(err.Error(), "invalid") {
+				t.Fatalf("CreateSnapshot(snapshot) err = %v, want invalid-name error", err)
+			}
+			if err := e.DeleteSnapshot(name); err == nil || !strings.Contains(err.Error(), "invalid") {
+				t.Fatalf("DeleteSnapshot err = %v, want invalid-name error", err)
+			}
+			// ListSnapshots("") is a valid "list all" filter, so only non-empty
+			// names must be rejected there.
+			if name != "" {
+				if _, err := e.ListSnapshots(name); err == nil || !strings.Contains(err.Error(), "invalid") {
+					t.Fatalf("ListSnapshots err = %v, want invalid-name error", err)
+				}
+			}
+		})
 	}
 	// Nothing may have been created inside or outside the engine root.
 	entries, err := os.ReadDir(e.root)

@@ -9,6 +9,7 @@ package template
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -24,6 +25,16 @@ import (
 
 var idRe = regexp.MustCompile(`^(tpl|snap)-[a-f0-9]{24}$`)
 var aliasRe = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$`)
+
+// Sentinel errors so callers (e.g. the REST layer) can classify failures
+// with errors.Is instead of matching error strings:
+//   - ErrInvalid / ErrConflict / ErrNotFound map to 400 / 409 / 404;
+//     anything else is an underlying storage fault (500).
+var (
+	ErrInvalid  = errors.New("template: invalid input")
+	ErrConflict = errors.New("template: conflict")
+	ErrNotFound = errors.New("template: not found")
+)
 
 // Record mirrors CubeMaster templatecenter.TemplateInfo at the storage layer.
 type Record struct {
@@ -107,7 +118,7 @@ func GenerateSnapshotID() string { return generateSnapshotID() }
 
 func (s *Store) dir(id string) (string, error) {
 	if !idRe.MatchString(id) {
-		return "", fmt.Errorf("template: invalid id %q", id)
+		return "", fmt.Errorf("%w: invalid id %q", ErrInvalid, id)
 	}
 	return filepath.Join(s.root, id), nil
 }
@@ -117,7 +128,7 @@ func validateAlias(alias string) error {
 		return nil
 	}
 	if !aliasRe.MatchString(alias) {
-		return fmt.Errorf("template: invalid alias %q (must match %s)", alias, aliasRe.String())
+		return fmt.Errorf("%w: invalid alias %q (must match %s)", ErrInvalid, alias, aliasRe.String())
 	}
 	return nil
 }
@@ -131,7 +142,7 @@ func (s *Store) Create(rec Record) error {
 		rec.TemplateID = generateTemplateID()
 	}
 	if !idRe.MatchString(rec.TemplateID) {
-		return fmt.Errorf("template: invalid id %q", rec.TemplateID)
+		return fmt.Errorf("%w: invalid id %q", ErrInvalid, rec.TemplateID)
 	}
 	if err := validateAlias(rec.Alias); err != nil {
 		return err
@@ -140,12 +151,12 @@ func (s *Store) Create(rec Record) error {
 		// uniqueness among all templates (mirrors alias_key unique index)
 		existing, _ := s.getByAliasLocked(rec.Alias)
 		if existing != nil {
-			return fmt.Errorf("template: alias %q already claimed by %s", rec.Alias, existing.TemplateID)
+			return fmt.Errorf("%w: alias %q already claimed by %s", ErrConflict, rec.Alias, existing.TemplateID)
 		}
 	}
 	dir, _ := s.dir(rec.TemplateID)
 	if _, err := os.Stat(filepath.Join(dir, "meta.json")); err == nil {
-		return fmt.Errorf("template: %q already exists", rec.TemplateID)
+		return fmt.Errorf("%w: %q already exists", ErrConflict, rec.TemplateID)
 	}
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return err
@@ -186,7 +197,7 @@ func (s *Store) getLocked(id string) (*Record, error) {
 	}
 	data, err := os.ReadFile(filepath.Join(dir, "meta.json"))
 	if err != nil {
-		return nil, fmt.Errorf("template: not found %q", id)
+		return nil, fmt.Errorf("%w: %q", ErrNotFound, id)
 	}
 	var rec Record
 	if err := json.Unmarshal(data, &rec); err != nil {
@@ -204,17 +215,17 @@ func (s *Store) GetByAlias(alias string) (*Record, error) {
 
 func (s *Store) getByAliasLocked(alias string) (*Record, error) {
 	if alias == "" {
-		return nil, fmt.Errorf("template: empty alias")
+		return nil, fmt.Errorf("%w: empty alias", ErrInvalid)
 	}
 	id, ok := s.aliases[alias]
 	if !ok {
-		return nil, fmt.Errorf("template: alias %q not found", alias)
+		return nil, fmt.Errorf("%w: alias %q", ErrNotFound, alias)
 	}
 	rec, err := s.getLocked(id)
 	if err != nil {
 		// Record vanished on disk (deleted externally); drop the stale entry.
 		delete(s.aliases, alias)
-		return nil, fmt.Errorf("template: alias %q not found", alias)
+		return nil, fmt.Errorf("%w: alias %q", ErrNotFound, alias)
 	}
 	return rec, nil
 }
@@ -251,19 +262,19 @@ func (s *Store) SetAlias(templateID, alias string) error {
 	}
 	data, err := os.ReadFile(filepath.Join(dir, "meta.json"))
 	if err != nil {
-		return fmt.Errorf("template: not found %q", templateID)
+		return fmt.Errorf("%w: %q", ErrNotFound, templateID)
 	}
 	var rec Record
 	if err := json.Unmarshal(data, &rec); err != nil {
 		return err
 	}
 	if alias != "" && rec.Status != "READY" {
-		return fmt.Errorf("template: %q not ready (status=%s)", templateID, rec.Status)
+		return fmt.Errorf("%w: %q not ready (status=%s)", ErrConflict, templateID, rec.Status)
 	}
 	if alias != "" {
 		existing, _ := s.getByAliasLocked(alias)
 		if existing != nil && existing.TemplateID != templateID {
-			return fmt.Errorf("template: alias %q already claimed by %s", alias, existing.TemplateID)
+			return fmt.Errorf("%w: alias %q already claimed by %s", ErrConflict, alias, existing.TemplateID)
 		}
 	}
 	oldAlias := rec.Alias
@@ -320,7 +331,7 @@ func (s *Store) Delete(id string) error {
 	}
 	data, err := os.ReadFile(filepath.Join(dir, "meta.json"))
 	if err != nil {
-		return fmt.Errorf("template: not found %q", id)
+		return fmt.Errorf("%w: %q", ErrNotFound, id)
 	}
 	var rec Record
 	if err := json.Unmarshal(data, &rec); err != nil {

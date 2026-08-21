@@ -2,6 +2,7 @@ package volume
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -14,6 +15,18 @@ import (
 )
 
 var volumeIDRe = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,128}$`)
+
+// Sentinel errors so callers (e.g. the REST layer) can classify failures
+// with errors.Is instead of matching error strings:
+//   - ErrInvalid / ErrExists / ErrNotFound / ErrStillMounted map to
+//     400 / 409 / 404 / 409 respectively; anything else is an underlying
+//     storage fault (500).
+var (
+	ErrInvalid      = errors.New("volume: invalid input")
+	ErrExists       = errors.New("volume: already exists")
+	ErrNotFound     = errors.New("volume: not found")
+	ErrStillMounted = errors.New("volume: still mounted")
+)
 
 // VolumeRecord is the persisted metadata for one volume, mirroring
 // CubeMaster/pkg/base/db/models/volume.go:VolumeRecord.
@@ -55,7 +68,7 @@ func NewStore(root string) *Store {
 // volumeDir validates id and returns the record directory under s.root.
 func (s *Store) volumeDir(id string) (string, error) {
 	if !volumeIDRe.MatchString(id) {
-		return "", fmt.Errorf("volume: invalid id %q (must match %s)", id, volumeIDRe.String())
+		return "", fmt.Errorf("%w: invalid id %q (must match %s)", ErrInvalid, id, volumeIDRe.String())
 	}
 	return filepath.Join(s.root, id), nil
 }
@@ -63,13 +76,13 @@ func (s *Store) volumeDir(id string) (string, error) {
 // Create inserts a new record. Returns an error if the id already exists.
 func (s *Store) Create(rec VolumeRecord) error {
 	if !volumeIDRe.MatchString(rec.VolumeID) {
-		return fmt.Errorf("volume: invalid id %q", rec.VolumeID)
+		return fmt.Errorf("%w: invalid id %q", ErrInvalid, rec.VolumeID)
 	}
 	if rec.Name == "" {
 		rec.Name = rec.VolumeID
 	}
 	if !volumeIDRe.MatchString(rec.Name) {
-		return fmt.Errorf("volume: invalid name %q", rec.Name)
+		return fmt.Errorf("%w: invalid name %q", ErrInvalid, rec.Name)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -78,7 +91,7 @@ func (s *Store) Create(rec VolumeRecord) error {
 		return err
 	}
 	if _, err := os.Stat(filepath.Join(dir, "meta.json")); err == nil {
-		return fmt.Errorf("volume: %q already exists", rec.VolumeID)
+		return fmt.Errorf("%w: %q", ErrExists, rec.VolumeID)
 	}
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return err
@@ -99,7 +112,7 @@ func (s *Store) Get(id string) (*VolumeRecord, error) {
 	}
 	data, err := os.ReadFile(filepath.Join(dir, "meta.json"))
 	if err != nil {
-		return nil, fmt.Errorf("volume: not found %q", id)
+		return nil, fmt.Errorf("%w: %q", ErrNotFound, id)
 	}
 	var rec VolumeRecord
 	if err := json.Unmarshal(data, &rec); err != nil {
@@ -149,14 +162,14 @@ func (s *Store) Delete(id string) error {
 	}
 	data, err := os.ReadFile(filepath.Join(dir, "meta.json"))
 	if err != nil {
-		return fmt.Errorf("volume: not found %q", id)
+		return fmt.Errorf("%w: %q", ErrNotFound, id)
 	}
 	var rec VolumeRecord
 	if err := json.Unmarshal(data, &rec); err != nil {
 		return err
 	}
 	if rec.RefCount != 0 {
-		return fmt.Errorf("volume: %q still mounted (refcount=%d)", id, rec.RefCount)
+		return fmt.Errorf("%w: %q (refcount=%d)", ErrStillMounted, id, rec.RefCount)
 	}
 	return os.RemoveAll(dir)
 }
@@ -171,7 +184,7 @@ func (s *Store) IncRef(id string) error {
 	}
 	data, err := os.ReadFile(filepath.Join(dir, "meta.json"))
 	if err != nil {
-		return fmt.Errorf("volume: not found %q", id)
+		return fmt.Errorf("%w: %q", ErrNotFound, id)
 	}
 	var rec VolumeRecord
 	if err := json.Unmarshal(data, &rec); err != nil {
@@ -191,7 +204,7 @@ func (s *Store) DecRef(id string) error {
 	}
 	data, err := os.ReadFile(filepath.Join(dir, "meta.json"))
 	if err != nil {
-		return fmt.Errorf("volume: not found %q", id)
+		return fmt.Errorf("%w: %q", ErrNotFound, id)
 	}
 	var rec VolumeRecord
 	if err := json.Unmarshal(data, &rec); err != nil {

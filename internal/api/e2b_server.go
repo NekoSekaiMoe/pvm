@@ -511,9 +511,19 @@ func StartE2BServer(port int) error {
 		}
 		rec := volume.VolumeRecord{VolumeID: req.Name, Name: req.Name, Driver: req.Driver, Token: req.Token, PrivateData: req.PrivateData}
 		if err := volStore.Create(rec); err != nil {
-			return c.JSON(http.StatusConflict, map[string]string{"error": err.Error()})
+			switch {
+			case errors.Is(err, volume.ErrInvalid):
+				return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+			case errors.Is(err, volume.ErrExists):
+				return c.JSON(http.StatusConflict, map[string]string{"error": err.Error()})
+			default:
+				return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			}
 		}
-		got, _ := volStore.Get(req.Name)
+		got, err := volStore.Get(req.Name)
+		if err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		}
 		return c.JSON(http.StatusCreated, got)
 	})
 	api.GET("/volumes", func(c echo.Context) error {
@@ -530,17 +540,30 @@ func StartE2BServer(port int) error {
 		id := c.Param("id")
 		rec, err := volStore.Get(id)
 		if err != nil {
-			return c.JSON(http.StatusNotFound, map[string]string{"error": err.Error()})
+			switch {
+			case errors.Is(err, volume.ErrInvalid):
+				return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+			case errors.Is(err, volume.ErrNotFound):
+				return c.JSON(http.StatusNotFound, map[string]string{"error": err.Error()})
+			default:
+				return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			}
 		}
 		return c.JSON(http.StatusOK, rec)
 	})
 	api.DELETE("/volumes/:id", func(c echo.Context) error {
 		id := c.Param("id")
 		if err := volStore.Delete(id); err != nil {
-			if strings.Contains(err.Error(), "still mounted") {
+			switch {
+			case errors.Is(err, volume.ErrInvalid):
+				return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+			case errors.Is(err, volume.ErrStillMounted):
 				return c.JSON(http.StatusConflict, map[string]string{"error": err.Error()})
+			case errors.Is(err, volume.ErrNotFound):
+				return c.JSON(http.StatusNotFound, map[string]string{"error": err.Error()})
+			default:
+				return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
 			}
-			return c.JSON(http.StatusNotFound, map[string]string{"error": err.Error()})
 		}
 		return c.NoContent(http.StatusNoContent)
 	})
@@ -560,9 +583,19 @@ func StartE2BServer(port int) error {
 		}
 		rec := template.Record{TemplateID: template.GenerateTemplateID(), Alias: req.Alias, ImageRef: req.ImageRef, Status: "READY", Kind: "template"}
 		if err := tmplStore.Create(rec); err != nil {
-			return c.JSON(http.StatusConflict, map[string]string{"error": err.Error()})
+			switch {
+			case errors.Is(err, template.ErrInvalid):
+				return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+			case errors.Is(err, template.ErrConflict):
+				return c.JSON(http.StatusConflict, map[string]string{"error": err.Error()})
+			default:
+				return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			}
 		}
-		got, _ := tmplStore.Get(rec.TemplateID)
+		got, err := tmplStore.Get(rec.TemplateID)
+		if err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		}
 		return c.JSON(http.StatusCreated, got)
 	})
 	api.GET("/templates", func(c echo.Context) error {
@@ -583,7 +616,14 @@ func StartE2BServer(port int) error {
 			if aliasRec, aerr := tmplStore.GetByAlias(id); aerr == nil {
 				return c.JSON(http.StatusOK, aliasRec)
 			}
-			return c.JSON(http.StatusNotFound, map[string]string{"error": err.Error()})
+			switch {
+			case errors.Is(err, template.ErrInvalid):
+				return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+			case errors.Is(err, template.ErrNotFound):
+				return c.JSON(http.StatusNotFound, map[string]string{"error": err.Error()})
+			default:
+				return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			}
 		}
 		return c.JSON(http.StatusOK, rec)
 	})
@@ -596,26 +636,52 @@ func StartE2BServer(port int) error {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
 		}
 		if err := tmplStore.SetAlias(id, req.Alias); err != nil {
-			return c.JSON(http.StatusConflict, map[string]string{"error": err.Error()})
+			switch {
+			case errors.Is(err, template.ErrInvalid):
+				return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+			case errors.Is(err, template.ErrNotFound):
+				return c.JSON(http.StatusNotFound, map[string]string{"error": err.Error()})
+			case errors.Is(err, template.ErrConflict):
+				return c.JSON(http.StatusConflict, map[string]string{"error": err.Error()})
+			default:
+				return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			}
 		}
-		rec, _ := tmplStore.Get(id)
+		rec, err := tmplStore.Get(id)
+		if err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		}
 		return c.JSON(http.StatusOK, rec)
 	})
 	api.DELETE("/templates/:id", func(c echo.Context) error {
 		id := c.Param("id")
 		if err := tmplStore.Delete(id); err != nil {
-			return c.JSON(http.StatusNotFound, map[string]string{"error": err.Error()})
+			switch {
+			case errors.Is(err, template.ErrInvalid):
+				return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+			case errors.Is(err, template.ErrNotFound):
+				return c.JSON(http.StatusNotFound, map[string]string{"error": err.Error()})
+			default:
+				return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			}
 		}
 		return c.NoContent(http.StatusNoContent)
 	})
 
 	// --- AutoPause (Cube parity: POST /tasks/:id/pause|resume) ---
-	autoMgr := lifecycle.New(cgroup.NewManager())
+	cgMgr := cgroup.NewManager()
+	autoMgr := lifecycle.New(cgMgr)
 	api.POST("/tasks/:id/pause", func(c echo.Context) error {
 		id := c.Param("id")
 		if !idRegex.MatchString(id) {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid task id"})
 		}
+		// Hold the per-task mutex across Load -> Freeze -> Transition -> Save
+		// so concurrent transitions on the SAME task serialize (cf. /transition)
+		// and a racing resume cannot clobber the persisted SUSPENDED state.
+		mu := taskLock(id)
+		mu.Lock()
+		defer mu.Unlock()
 		st, err := state.LoadState(id)
 		if err != nil {
 			return c.JSON(http.StatusNotFound, map[string]string{"error": "task not found"})
@@ -623,15 +689,16 @@ func StartE2BServer(port int) error {
 		if st.Status != state.StatusRunning {
 			return c.JSON(http.StatusConflict, map[string]string{"error": fmt.Sprintf("task not running (status=%s)", st.Status)})
 		}
-		cg := cgroup.NewManager()
-		if err := cg.Freeze(id); err != nil && !os.IsNotExist(err) {
+		if err := cgMgr.Freeze(id); err != nil && !os.IsNotExist(err) {
 			return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		}
 		autoMgr.Disarm(id)
 		if err := st.Transition(state.StatusSuspended, state.ActorHuman, "manual pause"); err != nil {
 			return c.JSON(http.StatusConflict, map[string]string{"error": err.Error()})
 		}
-		_ = state.SaveState(id, st)
+		if err := state.SaveState(id, st); err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		}
 		return c.NoContent(http.StatusNoContent)
 	})
 	api.POST("/tasks/:id/resume", func(c echo.Context) error {
@@ -639,10 +706,24 @@ func StartE2BServer(port int) error {
 		if !idRegex.MatchString(id) {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid task id"})
 		}
-		if err := autoMgr.Resume(id); err != nil {
-			return c.JSON(http.StatusConflict, map[string]string{"error": err.Error()})
+		// Same per-task lock as pause: Load -> Thaw -> Transition -> Save must
+		// serialize against concurrent pause/transition requests.
+		mu := taskLock(id)
+		mu.Lock()
+		defer mu.Unlock()
+		if _, err := state.LoadState(id); err != nil {
+			return c.JSON(http.StatusNotFound, map[string]string{"error": "task not found"})
 		}
-		st, _ := state.LoadState(id)
+		if err := autoMgr.Resume(id); err != nil {
+			if errors.Is(err, state.ErrInvalidTransition) || errors.Is(err, state.ErrTerminal) {
+				return c.JSON(http.StatusConflict, map[string]string{"error": err.Error()})
+			}
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		}
+		st, err := state.LoadState(id)
+		if err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		}
 		return c.JSON(http.StatusOK, st)
 	})
 
