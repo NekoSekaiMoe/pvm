@@ -121,6 +121,42 @@ func TestEngine_VolumeSnapshotLifecycle(t *testing.T) {
 		t.Fatalf("list snapshots(all): err=%v len=%d", err, len(all))
 	}
 
+	// Chained snapshots: vol -> snapA -> snapB. Filtering by the root
+	// volume must return BOTH snapshots.
+	snapA, err := e.CreateSnapshot("data", "chain-a")
+	if err != nil {
+		t.Fatalf("create chain-a: %v", err)
+	}
+	_ = snapA
+	snapB, err := e.CreateSnapshot("chain-a", "chain-b")
+	if err != nil {
+		t.Fatalf("create chain-b (snap of snap): %v", err)
+	}
+	_ = snapB
+	chain, err := e.ListSnapshots("data")
+	if err != nil {
+		t.Fatalf("list snapshots(data) after chaining: %v", err)
+	}
+	got := map[string]string{}
+	for _, s := range chain {
+		got[s.Name] = s.OriginVolume
+	}
+	if got["chain-a"] != "data" {
+		t.Fatalf("chain-a origin = %q, want data", got["chain-a"])
+	}
+	if got["chain-b"] != "data" {
+		t.Fatalf("chain-b origin = %q, want data (root of chain)", got["chain-b"])
+	}
+	if len(chain) != 3 { // s1 from earlier + chain-a + chain-b
+		t.Fatalf("filtering by root volume returned %d snapshots, want 3: %+v", len(chain), chain)
+	}
+	if err := e.DeleteSnapshot("chain-b"); err != nil {
+		t.Fatalf("delete chain-b: %v", err)
+	}
+	if err := e.DeleteSnapshot("chain-a"); err != nil {
+		t.Fatalf("delete chain-a: %v", err)
+	}
+
 	if err := e.DeleteSnapshot("s1"); err != nil {
 		t.Fatalf("delete snapshot: %v", err)
 	}

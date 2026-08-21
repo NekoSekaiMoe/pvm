@@ -28,6 +28,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"path"
 	"strconv"
 	"strings"
 	"sync"
@@ -491,13 +492,16 @@ type requestView struct {
 	port   string // effective port as a string
 }
 
-// viewFromHTTP builds the view for a plain HTTP proxy request.
+// viewFromHTTP builds the view for a plain HTTP proxy request. The path is
+// normalized with path.Clean so the policy view and the forwarded request
+// agree ("//a/../b" and "/b" match the same rules); an empty path means root.
 func viewFromHTTP(r *http.Request) requestView {
 	scheme := r.URL.Scheme
 	if scheme == "" {
 		scheme = "http"
 	}
-	port := r.URL.Port()
+	host, urlPort := splitHostPort(r.Host)
+	port := urlPort
 	if port == "" {
 		if strings.EqualFold(scheme, "https") {
 			port = "443"
@@ -505,10 +509,14 @@ func viewFromHTTP(r *http.Request) requestView {
 			port = "80"
 		}
 	}
+	p := r.URL.Path
+	if p == "" {
+		p = "/"
+	}
 	return requestView{
 		method: r.Method,
-		host:   strings.ToLower(stripPort(r.Host)),
-		path:   r.URL.Path,
+		host:   strings.ToLower(host),
+		path:   path.Clean(p),
 		scheme: strings.ToLower(scheme),
 		port:   port,
 	}
@@ -517,16 +525,13 @@ func viewFromHTTP(r *http.Request) requestView {
 // viewFromConnect builds the (partial) view for a CONNECT tunnel: the target
 // host and port are visible, the path is encrypted.
 func viewFromConnect(r *http.Request) requestView {
-	port := ""
-	if i := strings.LastIndex(r.Host, ":"); i >= 0 {
-		port = r.Host[i+1:]
-	}
+	host, port := splitHostPort(r.Host)
 	if port == "" {
 		port = "443"
 	}
 	return requestView{
 		method: http.MethodConnect,
-		host:   strings.ToLower(stripPort(r.Host)),
+		host:   strings.ToLower(host),
 		scheme: "https",
 		port:   port,
 	}
@@ -568,20 +573,30 @@ func ruleMatches(r EgressRule, v requestView) bool {
 }
 
 // pathMatches supports exact paths and "/prefix/*" globs (per EgressRule.Path).
-func pathMatches(rule, path string) bool {
-	if rule == path {
+// A glob also matches the bare prefix directory ("/v1/*" matches "/v1").
+func pathMatches(rule, p string) bool {
+	if rule == p {
 		return true
 	}
 	if strings.HasSuffix(rule, "/*") {
-		return strings.HasPrefix(path, strings.TrimSuffix(rule, "*"))
+		prefix := strings.TrimSuffix(rule, "*") // "/v1/"
+		bare := strings.TrimSuffix(prefix, "/") // "/v1"
+		return strings.HasPrefix(p, prefix) || p == bare
 	}
 	return false
 }
 
-// decideDomain applies the Rules with first-match-wins semantics: only a rule
-// that fully matches (host/SNI plus method, path, scheme, port) may decide.
-// When Policy.Rules is empty the flat block-over-allow lists are the fallback.
+// decideDomain evaluates the flat BlockDomains denylist FIRST — an
+// explicitly blocked domain must never be rescued by a rule — then applies
+// the Rules with first-match-wins semantics: only a rule that fully matches
+// (host/SNI plus method, path, scheme, port) may decide. When Policy.Rules is
+// empty the flat allow list is the fallback.
 func (g *Gateway) decideDomain(v requestView, pol *Policy) Decision {
+	for _, b := range pol.BlockDomains {
+		if domainMatches(v.host, strings.ToLower(b)) {
+			return DecisionBlock
+		}
+	}
 	if len(pol.Rules) > 0 {
 		for _, r := range pol.Rules {
 			if !ruleMatches(r, v) {
@@ -593,11 +608,6 @@ func (g *Gateway) decideDomain(v requestView, pol *Policy) Decision {
 			return DecisionAllow
 		}
 		return DecisionBlock // no rule fully matched -> deny
-	}
-	for _, b := range pol.BlockDomains {
-		if domainMatches(v.host, strings.ToLower(b)) {
-			return DecisionBlock
-		}
 	}
 	for _, a := range pol.AllowDomains {
 		if domainMatches(v.host, strings.ToLower(a)) {
@@ -756,11 +766,25 @@ func isPrivate(addr net.Addr) bool {
 	return false
 }
 
-func stripPort(hostport string) string {
-	if i := strings.LastIndex(hostport, ":"); i >= 0 {
-		return hostport[:i]
+// splitHostPort extracts host and port from an authority string, handling
+// bracketed IPv6 literals ("[::1]:8443") and bare hosts. When no port is
+// present the host is returned whole and port is "".
+func splitHostPort(hostport string) (host, port string) {
+	if h, p, err := net.SplitHostPort(hostport); err == nil {
+		return h, p
 	}
-	return hostport
+	// No parseable port. A bracketed IPv6 literal ([::1]) keeps its brackets
+	// through URL parsing; strip them so the host compares equal to rules.
+	if strings.HasPrefix(hostport, "[") && strings.HasSuffix(hostport, "]") {
+		return hostport[1 : len(hostport)-1], ""
+	}
+	return hostport, ""
+}
+
+// stripPort strips the port from an authority for logging (DIP-lite).
+func stripPort(hostport string) string {
+	h, _ := splitHostPort(hostport)
+	return h
 }
 
 var _ = bufio.NewReader // keep import for future streaming body scan

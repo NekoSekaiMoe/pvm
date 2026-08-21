@@ -236,20 +236,41 @@ func (e *Qcow2Engine) ListSnapshots(volumeName string) ([]Snapshot, error) {
 		}
 		name := ent.Name()[5 : len(ent.Name())-6]
 		path := filepath.Join(e.root, ent.Name())
-		// Open once: size AND backing name must come from the same file state.
+		// Open once: size AND backing chain must come from the same file state.
 		img, err := openGuestImage(path)
 		if err != nil {
 			continue
 		}
 		size := img.Size()
-		origin := volumeName // best-effort; qcow2 header carries backing name
-		if qi, ok := img.(*qcow2Image); ok && qi.backingName != "" {
-			origin = filepath.Base(qi.backingName)
-			if ext := filepath.Ext(origin); ext == ".qcow2" {
-				origin = origin[:len(origin)-len(ext)]
-				if len(origin) > 5 && origin[:5] == "snap-" {
-					origin = origin[5:]
+		// Walk the qcow2 backing chain to the root origin: for snapshot-of-
+		// snapshot chains (vol -> snapA -> snapB) the direct backing file is
+		// another snapshot, so keep following until the backing name stops
+		// resolving to a snapshot (best-effort; unresolvable links stop the walk).
+		origin := volumeName
+		if qi, ok := img.(*qcow2Image); ok {
+			backing := qi.backingName
+			for hop := 0; hop < 64 && backing != ""; hop++ {
+				base := filepath.Base(backing)
+				if ext := filepath.Ext(base); ext == ".qcow2" {
+					base = base[:len(base)-len(ext)]
 				}
+				if len(base) > 5 && base[:5] == "snap-" {
+					// backing is another snapshot; follow ITS backing file.
+					next, oerr := openGuestImage(filepath.Join(e.root, filepath.Base(backing)))
+					if oerr != nil {
+						break
+					}
+					nq, ok2 := next.(*qcow2Image)
+					if !ok2 || nq.backingName == "" {
+						next.Close()
+						break
+					}
+					backing = nq.backingName
+					next.Close()
+					continue
+				}
+				origin = base // first non-snapshot backing is the root volume
+				break
 			}
 		}
 		img.Close()

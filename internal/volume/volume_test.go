@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -19,57 +20,47 @@ func TestBuiltinAttach_Detach_RefCount(t *testing.T) {
 		t.Fatalf("register: %v", err)
 	}
 
-	var r1 *AttachResult
-	t.Run("first attach creates host path", func(t *testing.T) {
-		r, err := m.Attach(ctx, &AttachRequest{SandboxID: "sb-1", VolumeID: "vol-1", Driver: "demo"})
+	var first *AttachResult
+	attach := func(sb string) *AttachResult {
+		r, err := m.Attach(ctx, &AttachRequest{SandboxID: sb, VolumeID: "vol-1", Driver: "demo"})
 		if err != nil {
-			t.Fatalf("attach 1: %v", err)
+			t.Fatalf("attach %s: %v", sb, err)
 		}
-		r1 = r
-		if r.HostPath == "" {
-			t.Fatalf("empty HostPath")
+		return r
+	}
+	detach := func(sb string) {
+		if err := m.Detach(ctx, &DetachRequest{SandboxID: sb, VolumeID: "vol-1", Driver: "demo"}); err != nil {
+			t.Fatalf("detach %s: %v", sb, err)
 		}
-		if _, err := os.Stat(r.HostPath); err != nil {
-			t.Fatalf("hostPath not created: %v", err)
-		}
-		if got := m.RefCount("vol-1"); got != 1 {
-			t.Fatalf("refCount after 1st attach = %d, want 1", got)
-		}
-	})
+	}
 
-	t.Run("second sandbox reuses host path", func(t *testing.T) {
-		r2, err := m.Attach(ctx, &AttachRequest{SandboxID: "sb-2", VolumeID: "vol-1", Driver: "demo"})
-		if err != nil {
-			t.Fatalf("attach 2: %v", err)
-		}
-		if r2.HostPath != r1.HostPath {
-			t.Fatalf("HostPath mismatch: %q vs %q", r2.HostPath, r1.HostPath)
-		}
-		if got := m.RefCount("vol-1"); got != 2 {
-			t.Fatalf("refCount after 2nd attach = %d, want 2", got)
-		}
-	})
-
-	t.Run("non-last detach keeps host path", func(t *testing.T) {
-		if err := m.Detach(ctx, &DetachRequest{SandboxID: "sb-1", VolumeID: "vol-1", Driver: "demo"}); err != nil {
-			t.Fatalf("detach 1: %v", err)
-		}
-		if got := m.RefCount("vol-1"); got != 1 {
-			t.Fatalf("refCount after 1st detach = %d, want 1", got)
-		}
-		if _, err := os.Stat(r1.HostPath); err != nil {
-			t.Fatalf("hostPath should still exist after non-last detach: %v", err)
-		}
-	})
-
-	t.Run("last detach drops bookkeeping", func(t *testing.T) {
-		if err := m.Detach(ctx, &DetachRequest{SandboxID: "sb-2", VolumeID: "vol-1", Driver: "demo"}); err != nil {
-			t.Fatalf("detach 2: %v", err)
-		}
-		if got := m.RefCount("vol-1"); got != 0 {
-			t.Fatalf("refCount after last detach = %d, want 0", got)
-		}
-	})
+	steps := []struct {
+		name       string
+		op         func()
+		wantRefCnt int64
+		hostExists bool // whether the first attach's host path must exist after the op
+	}{
+		{"first attach creates host path", func() { first = attach("sb-1") }, 1, true},
+		{"second sandbox reuses host path", func() {
+			if got := attach("sb-2"); got.HostPath != first.HostPath {
+				t.Fatalf("HostPath mismatch: %q vs %q", got.HostPath, first.HostPath)
+			}
+		}, 2, true},
+		{"non-last detach keeps host path", func() { detach("sb-1") }, 1, true},
+		{"last detach drops bookkeeping", func() { detach("sb-2") }, 0, true},
+	}
+	for _, st := range steps {
+		t.Run(st.name, func(t *testing.T) {
+			st.op()
+			if got := m.RefCount("vol-1"); got != st.wantRefCnt {
+				t.Fatalf("refCount = %d, want %d", got, st.wantRefCnt)
+			}
+			_, err := os.Stat(first.HostPath)
+			if st.hostExists && err != nil {
+				t.Fatalf("hostPath %q: %v", first.HostPath, err)
+			}
+		})
+	}
 }
 
 func TestManager_HostPathContainment(t *testing.T) {
@@ -292,6 +283,50 @@ func TestStore_InvalidID(t *testing.T) {
 	}
 	if len(list) != 0 {
 		t.Fatalf("invalid ids created records: %+v", list)
+	}
+}
+
+// TestManager_ConcurrentAttachDetach drives concurrent Attach and Detach for
+// the same volume: the per-volume lifecycle serialization must keep the
+// refcount exact (no lost decrements, no duplicate teardown of the last
+// detach) and the final count must return to 0.
+func TestManager_ConcurrentAttachDetach(t *testing.T) {
+	base := t.TempDir()
+	m := NewManager(base)
+	ctx := context.Background()
+	if err := m.Register(ctx, PluginConfig{Name: "demo", Type: PluginTypeBuiltin}, NewBuiltin("demo")); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	const n = 16
+	// n attaches
+	for i := 0; i < n; i++ {
+		if _, err := m.Attach(ctx, &AttachRequest{SandboxID: fmt.Sprintf("sb-%d", i), VolumeID: "vol-race", Driver: "demo"}); err != nil {
+			t.Fatalf("attach %d: %v", i, err)
+		}
+	}
+	// concurrent detaches: all must succeed and drive the count exactly to 0
+	var wg sync.WaitGroup
+	errs := make(chan error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			if err := m.Detach(ctx, &DetachRequest{SandboxID: fmt.Sprintf("sb-%d", i), VolumeID: "vol-race", Driver: "demo"}); err != nil {
+				errs <- err
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatalf("concurrent detach: %v", err)
+	}
+	if got := m.RefCount("vol-race"); got != 0 {
+		t.Fatalf("refcount after concurrent detaches = %d, want 0", got)
+	}
+	if m.HostPath("vol-race") != "" {
+		t.Fatalf("attached state must be cleared at count 0")
 	}
 }
 

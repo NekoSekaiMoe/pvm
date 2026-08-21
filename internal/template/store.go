@@ -162,6 +162,18 @@ func (s *Store) Create(rec Record) error {
 	if err := validateAlias(rec.Alias); err != nil {
 		return err
 	}
+	// Validate explicit Status/Kind values; anything outside the known sets
+	// must not be persisted.
+	switch rec.Status {
+	case "", "READY", "PENDING", "FAILED":
+	default:
+		return fmt.Errorf("%w: status %q (must be READY, PENDING or FAILED)", ErrInvalid, rec.Status)
+	}
+	switch rec.Kind {
+	case "", "template", "snapshot":
+	default:
+		return fmt.Errorf("%w: kind %q (must be template or snapshot)", ErrInvalid, rec.Kind)
+	}
 	if rec.Alias != "" {
 		// Aliases may only be claimed by READY templates (mirrors the
 		// SetAlias requireReady rule).

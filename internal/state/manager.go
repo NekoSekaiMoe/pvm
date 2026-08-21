@@ -235,20 +235,22 @@ func (s *ContainerState) snapshotLocked() *ContainerState {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	cp := &ContainerState{
-		ID:         s.ID,
-		Name:       s.Name,
-		Tenant:     s.Tenant,
-		Caller:     s.Caller,
-		Status:     s.Status,
-		PID:        s.PID,
-		StartedAt:  s.StartedAt,
-		EndedAt:    s.EndedAt,
-		SpecFP:     s.SpecFP,
-		Retries:    s.Retries,
-		Deadline:   s.Deadline,
-		NetworkTap: s.NetworkTap,
-		Bridge:     s.Bridge,
-		GatewayIP:  s.GatewayIP,
+		ID:          s.ID,
+		Name:        s.Name,
+		Tenant:      s.Tenant,
+		Caller:      s.Caller,
+		Status:      s.Status,
+		PID:         s.PID,
+		StartedAt:   s.StartedAt,
+		EndedAt:     s.EndedAt,
+		SpecFP:      s.SpecFP,
+		IdleTimeout: s.IdleTimeout,
+		AutoResume:  s.AutoResume,
+		Retries:     s.Retries,
+		Deadline:    s.Deadline,
+		NetworkTap:  s.NetworkTap,
+		Bridge:      s.Bridge,
+		GatewayIP:   s.GatewayIP,
 	}
 	if len(s.Transitions) > 0 {
 		cp.Transitions = append([]Transition(nil), s.Transitions...)

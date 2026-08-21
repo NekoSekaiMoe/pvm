@@ -93,6 +93,20 @@ func TestAutopause_FiresAndResume(t *testing.T) {
 	}
 }
 
+// waitForStatus polls until the task reaches the wanted status or the
+// deadline passes; it returns whether the status was reached.
+func waitForStatus(t *testing.T, id string, want state.Status, within time.Duration) bool {
+	t.Helper()
+	deadline := time.Now().Add(within)
+	for time.Now().Before(deadline) {
+		if st, err := state.LoadState(id); err == nil && st.Status == want {
+			return true
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	return false
+}
+
 func TestAutopause_ResetBumpsDeadline(t *testing.T) {
 	dir := t.TempDir()
 	origRoot := state.RootDir
@@ -107,18 +121,30 @@ func TestAutopause_ResetBumpsDeadline(t *testing.T) {
 
 	m := New(nil)
 	m.Arm(id, 80*time.Millisecond)
-	time.Sleep(30 * time.Millisecond)
-	m.Reset(id, 80*time.Millisecond)  // bump
-	time.Sleep(40 * time.Millisecond) // would have fired at 80ms from first arm
-
-	loaded, _ := state.LoadState(id)
-	if loaded.Status == state.StatusSuspended {
+	// Wait until we are safely INSIDE the first window (and past any startup
+	// jitter) before bumping; polling the deadline condition instead of a
+	// fixed sleep keeps this deterministic on slow runners.
+	time.Sleep(20 * time.Millisecond)
+	m.Reset(id, 200*time.Millisecond) // bump: new deadline is now+200ms
+	// The ORIGINAL deadline (arm+80ms) must pass without a pause. Waiting
+	// 100ms from here crosses arm+80ms with margin while staying well inside
+	// the reset deadline.
+	time.Sleep(100 * time.Millisecond)
+	if mustStatus(t, id) == state.StatusSuspended {
 		t.Fatalf("autopause fired despite reset")
 	}
-	// Now let it fire
-	time.Sleep(60 * time.Millisecond)
-	loaded2, _ := state.LoadState(id)
-	if loaded2.Status != state.StatusSuspended {
-		t.Fatalf("expected suspended after bumped deadline, got %q", loaded2.Status)
+	// Now wait for the reset deadline to fire; polling instead of a fixed
+	// sleep so a slow runner still observes it.
+	if !waitForStatus(t, id, state.StatusSuspended, 2*time.Second) {
+		t.Fatalf("expected suspended after bumped deadline, got %q", mustStatus(t, id))
 	}
+}
+
+func mustStatus(t *testing.T, id string) state.Status {
+	t.Helper()
+	st, err := state.LoadState(id)
+	if err != nil {
+		t.Fatalf("load %s: %v", id, err)
+	}
+	return st.Status
 }

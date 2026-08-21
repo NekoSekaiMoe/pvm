@@ -114,6 +114,10 @@ func (m *Manager) Resume(taskID string) error {
 	return state.SaveState(taskID, st)
 }
 
+// pauseRetryDelay is how long autopause waits before retrying after a
+// genuine (non-ENOENT) freeze failure.
+const pauseRetryDelay = 30 * time.Second
+
 func (m *Manager) pause(taskID string, gen uint64) {
 	m.mu.Lock()
 	if cur, ok := m.gens[taskID]; !ok || cur != gen {
@@ -139,8 +143,11 @@ func (m *Manager) pause(taskID string, gen uint64) {
 	// Best-effort freeze: if the cgroup is not present (e.g. tests, or the
 	// task exited between Load and Freeze) still transition. A genuine
 	// freeze failure (EACCES, EIO, ...) must NOT persist Suspended for a
-	// task that is still running — skip the transition instead.
+	// task that is still running; re-schedule the idle timer and skip the
+	// transition so autopause retries later instead of going permanently
+	// silent.
 	if err := m.cg.Freeze(taskID); err != nil && !isNotExist(err) {
+		m.Arm(taskID, pauseRetryDelay)
 		return
 	}
 	_ = st.Transition(state.StatusSuspended, state.ActorSystem, "idle timeout")

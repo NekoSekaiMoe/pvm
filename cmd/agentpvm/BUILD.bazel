@@ -26,6 +26,7 @@ go_library(
         "//internal/spec",
         "//internal/state",
         "//internal/vhost",
+        "//internal/volume",
     ],
 )
 

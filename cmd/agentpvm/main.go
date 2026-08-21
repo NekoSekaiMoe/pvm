@@ -44,6 +44,7 @@ import (
 	"uml-container/internal/spec"
 	"uml-container/internal/state"
 	"uml-container/internal/vhost"
+	"uml-container/internal/volume"
 )
 
 // defaultConfigPath is consulted when -config is not given.
@@ -222,10 +223,36 @@ func runCmd(args []string) {
 	// attributed to it, not to the controller's default ledger task.
 	eg.AttachTaskLedger(taskID, ledger)
 
+	// Volume plugins: wire the volume Manager so specs with volumes can
+	// attach. The builtin host-directory driver is always registered; extra
+	// binary drivers can be added via PVM_VOLUME_PLUGINS (comma-separated
+	// "name=/abs/path" entries).
+	volMgr := volume.NewManager("")
+	ctxVol := context.Background()
+	if err := volMgr.Register(ctxVol, volume.PluginConfig{Name: "builtin", Type: volume.PluginTypeBuiltin}, volume.NewBuiltin("builtin")); err != nil {
+		fmt.Fprintf(os.Stderr, "volume builtin register: %v\n", err)
+		os.Exit(1)
+	}
+	for _, ent := range strings.Split(os.Getenv("PVM_VOLUME_PLUGINS"), ",") {
+		if ent == "" {
+			continue
+		}
+		parts := strings.SplitN(ent, "=", 2)
+		if len(parts) != 2 {
+			fmt.Fprintf(os.Stderr, "PVM_VOLUME_PLUGINS entry %q must be name=/abs/path\n", ent)
+			os.Exit(1)
+		}
+		if err := volMgr.Register(ctxVol, volume.PluginConfig{Name: parts[0], Type: volume.PluginTypeBinary, BinaryPath: parts[1]}, volume.NewBinary(parts[0], parts[1])); err != nil {
+			fmt.Fprintf(os.Stderr, "volume plugin %s register: %v\n", parts[0], err)
+			os.Exit(1)
+		}
+	}
+
 	mgr := container.NewManager(nil)
 	mgr.Broker = broker
 	mgr.Egress = eg
 	mgr.IncidentHandler = &incidentAdapter{ctl: incidentCtl}
+	mgr.Volumes = volMgr
 	// Shared lifecycle manager so StartTask can arm autopause timers from the
 	// spec's lifecycle.idle_timeout.
 	mgr.Autopause = lifecycle.New(cgroup.NewManager())
