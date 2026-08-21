@@ -1,6 +1,8 @@
 package lifecycle
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -163,4 +165,78 @@ func mustStatus(t *testing.T, id string) state.Status {
 		t.Fatalf("load %s: %v", id, err)
 	}
 	return st.Status
+}
+
+// TestAutopause_EpochChangeAfterFreezeCannotCommit is the regression test
+// for the commit window: a pause whose generation was still current when it
+// started, but whose schedule was replaced (Reset) or cancelled (Disarm)
+// while the freeze was running, must not commit Suspended. It drives
+// commitPause directly with the captured epoch, so no real racing is
+// involved.
+func TestAutopause_EpochChangeAfterFreezeCannotCommit(t *testing.T) {
+	dir := t.TempDir()
+	origRoot := state.RootDir
+	state.RootDir = dir
+	t.Cleanup(func() { state.RootDir = origRoot })
+	t.Setenv("PVM_CGROUP_ROOT", t.TempDir())
+
+	id := "epoch-commit"
+	st := &state.ContainerState{ID: id, Name: id, Status: state.StatusRunning}
+	if err := state.SaveState(id, st); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	m := New(nil)
+	m.Arm(id, time.Hour) // epoch 1, generation 1
+	m.Disarm(id)         // epoch bumped to 2 while the pause was in flight
+
+	// The in-flight pause still holds epoch 1: committing on it must be
+	// rejected, and no retry may be armed for the disarmed task.
+	m.commitPause(id, 1, st)
+
+	loaded, err := state.LoadState(id)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if loaded.Status != state.StatusRunning {
+		t.Fatalf("stale-epoch pause committed: status=%q", loaded.Status)
+	}
+	m.mu.Lock()
+	_, rearmed := m.timers[id]
+	m.mu.Unlock()
+	if rearmed {
+		t.Fatalf("retry armed for a disarmed task")
+	}
+}
+
+// TestAutopause_SaveFailureThawsAndRearms verifies the unwind path: when
+// the FSM transition succeeds but persisting Suspended fails, the task must
+// not be left frozen with no timer armed (a state that never self-heals) —
+// a retry is scheduled instead.
+func TestAutopause_SaveFailureThawsAndRearms(t *testing.T) {
+	root := t.TempDir()
+	origRoot := state.RootDir
+	state.RootDir = root
+	t.Cleanup(func() { state.RootDir = origRoot })
+	t.Setenv("PVM_CGROUP_ROOT", t.TempDir())
+
+	// Pre-create <root>/<id> as a regular file so SaveState's MkdirAll
+	// fails deterministically (LoadState is not on this path).
+	id := "save-fail"
+	if err := os.WriteFile(filepath.Join(root, id), []byte("x"), 0644); err != nil {
+		t.Fatalf("block state dir: %v", err)
+	}
+
+	m := New(nil)
+	m.Arm(id, time.Hour) // epoch 1
+	st := &state.ContainerState{ID: id, Name: id, Status: state.StatusRunning}
+	m.commitPause(id, 1, st)
+
+	m.mu.Lock()
+	_, rearmed := m.timers[id]
+	m.mu.Unlock()
+	if !rearmed {
+		t.Fatalf("no retry armed after SaveState failure")
+	}
+	m.Disarm(id) // stop the retry timer before the test ends
 }

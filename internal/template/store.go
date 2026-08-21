@@ -322,7 +322,16 @@ func (s *Store) SetAlias(templateID, alias string) error {
 	oldAlias := rec.Alias
 	rec.Alias = alias
 	if err := writeMeta(dir, rec); err != nil {
-		return err
+		if !errors.Is(err, fsjson.ErrDurability) {
+			return err
+		}
+		// The rename committed; only the durability confirmation failed.
+		// Re-read the record: if the new alias landed, SetAlias succeeded —
+		// returning the error would make callers retry an applied change.
+		got, rerr := readMeta(dir)
+		if rerr != nil || got.TemplateID != templateID || got.Alias != alias {
+			return err
+		}
 	}
 	if oldAlias != "" && s.aliases[oldAlias] == templateID {
 		delete(s.aliases, oldAlias)
@@ -388,6 +397,11 @@ func (s *Store) Delete(id string) error {
 	return nil
 }
 
+// writeJSON is the atomic persistence primitive; a variable so tests can
+// inject fsjson.ErrDurability (write committed, durability confirmation
+// failed) and exercise the reconciliation paths in Create and SetAlias.
+var writeJSON = fsjson.Write
+
 func writeMeta(dir string, rec Record) error {
-	return fsjson.Write(filepath.Join(dir, "meta.json"), rec)
+	return writeJSON(filepath.Join(dir, "meta.json"), rec)
 }

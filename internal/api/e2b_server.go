@@ -990,9 +990,6 @@ var (
 	planesMu        sync.RWMutex
 )
 
-// NewLifecycleManager exposes the lifecycle manager for external wiring (tests).
-func NewLifecycleManager() *lifecycle.Manager { return lifecycle.New(cgroup.NewManager()) }
-
 // RegisterApprovalManager lets the controller inject its own approval manager
 // (e.g. one wired to a real audit ledger) to replace the default.
 func RegisterApprovalManager(m *approval.Manager) {

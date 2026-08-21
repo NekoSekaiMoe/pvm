@@ -210,7 +210,7 @@ func (s *Store) IncRef(id string) error {
 		return err
 	}
 	rec.RefCount++
-	return writeMeta(dir, rec)
+	return s.commitRefCount(dir, rec)
 }
 
 // DecRef decrements the persisted refcount (called on 1→0 detach).
@@ -232,9 +232,37 @@ func (s *Store) DecRef(id string) error {
 	if rec.RefCount > 0 {
 		rec.RefCount--
 	}
-	return writeMeta(dir, rec)
+	return s.commitRefCount(dir, rec)
 }
 
+// commitRefCount persists a RefCount change and reconciles the fsjson
+// durability condition: when the rename committed but the durability
+// confirmation failed, re-read the record and treat the change as applied
+// only if the on-disk refcount matches the intended value. Returning the
+// error instead would make callers retry an already-applied increment or
+// decrement and double-count.
+func (s *Store) commitRefCount(dir string, rec VolumeRecord) error {
+	if err := writeMeta(dir, rec); err != nil {
+		if !errors.Is(err, fsjson.ErrDurability) {
+			return err
+		}
+		data, rerr := os.ReadFile(filepath.Join(dir, "meta.json"))
+		if rerr != nil {
+			return err
+		}
+		var got VolumeRecord
+		if json.Unmarshal(data, &got) != nil || got.VolumeID != rec.VolumeID || got.RefCount != rec.RefCount {
+			return err
+		}
+	}
+	return nil
+}
+
+// writeJSON is the atomic persistence primitive; a variable so tests can
+// inject fsjson.ErrDurability (write committed, durability confirmation
+// failed) and exercise the reconciliation paths in Create and IncRef/DecRef.
+var writeJSON = fsjson.Write
+
 func writeMeta(dir string, rec VolumeRecord) error {
-	return fsjson.Write(filepath.Join(dir, "meta.json"), rec)
+	return writeJSON(filepath.Join(dir, "meta.json"), rec)
 }

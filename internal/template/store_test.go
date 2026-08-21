@@ -1,7 +1,10 @@
 package template
 
 import (
+	"fmt"
 	"testing"
+
+	"uml-container/internal/fsjson"
 )
 
 // TestStore drives the Store scenarios as a table of named cases executed
@@ -184,5 +187,72 @@ func TestStore_CreateRejectsInvalidStatusKind(t *testing.T) {
 				t.Fatalf("invalid record was persisted: %+v", list)
 			}
 		})
+	}
+}
+
+// injectDurability swaps the persistence seam: commit=true persists the new
+// record and then reports fsjson.ErrDurability (rename committed, durability
+// confirmation failed); commit=false reports it without persisting.
+func injectDurability(commit bool) func() {
+	orig := writeJSON
+	if commit {
+		writeJSON = func(path string, v any) error {
+			if err := fsjson.Write(path, v); err != nil {
+				return err
+			}
+			return fmt.Errorf("%w: sync (injected)", fsjson.ErrDurability)
+		}
+	} else {
+		writeJSON = func(path string, v any) error {
+			return fmt.Errorf("%w: sync (injected, not committed)", fsjson.ErrDurability)
+		}
+	}
+	return func() { writeJSON = orig }
+}
+
+// TestStore_SetAliasDurabilityReconciled covers the fsjson.ErrDurability
+// path in SetAlias: when the rename committed but the directory-sync
+// confirmation failed, SetAlias must re-read the record, treat the change
+// as applied when the new alias landed, and update the in-memory alias
+// index — surfacing the error instead would make callers retry an
+// already-applied change.
+func TestStore_SetAliasDurabilityReconciled(t *testing.T) {
+	s := NewStore(t.TempDir())
+	id := GenerateTemplateID()
+	if err := s.Create(Record{TemplateID: id, Alias: "old-alias", ImageRef: "ubuntu:22.04", Status: "READY"}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	// Rename committed, durability unconfirmed: reconcile to success.
+	restore := injectDurability(true)
+	if err := s.SetAlias(id, "new-alias"); err != nil {
+		t.Fatalf("SetAlias must reconcile ErrDurability: %v", err)
+	}
+	restore()
+
+	dir, err := s.dir(id)
+	if err != nil {
+		t.Fatalf("dir: %v", err)
+	}
+	got, err := readMeta(dir)
+	if err != nil || got.Alias != "new-alias" {
+		t.Fatalf("on-disk alias = (%v, %v), want new-alias", got, err)
+	}
+	if resolved, err := s.ResolveIdentifier("new-alias"); err != nil || resolved != id {
+		t.Fatalf("alias index not updated: (%q, %v)", resolved, err)
+	}
+	if _, err := s.GetByAlias("old-alias"); err == nil {
+		t.Fatalf("old alias still resolvable after move")
+	}
+
+	// Durability error without the change on disk: the error must surface
+	// so the caller knows nothing was applied.
+	restore = injectDurability(false)
+	if err := s.SetAlias(id, "other-alias"); err == nil {
+		t.Fatalf("SetAlias must fail when the re-read does not match")
+	}
+	restore()
+	if _, err := s.GetByAlias("other-alias"); err == nil {
+		t.Fatalf("alias index updated despite failed commit")
 	}
 }
