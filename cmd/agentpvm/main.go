@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -249,12 +250,19 @@ func runCmd(args []string) {
 			fmt.Fprintf(os.Stderr, "PVM_VOLUME_PLUGINS entry %q: plugin binary path is empty\n", ent)
 			os.Exit(1)
 		}
+		// The documented contract is name=/abs/path: a relative path would
+		// resolve against whatever the agent's working directory happens to
+		// be at launch time, so refuse it outright.
+		if !filepath.IsAbs(path) {
+			fmt.Fprintf(os.Stderr, "PVM_VOLUME_PLUGINS entry %q: plugin binary path %q must be absolute\n", ent, path)
+			os.Exit(1)
+		}
 		// Fail fast on invalid driver names: without this check a bad name
 		// only surfaces at the first Attach, long after startup "succeeded".
-		// Same rule the volume package enforces at Attach/Detach time
-		// (volumeIDRe); mirrored here because that regexp is unexported.
-		if !volumeIDRegex.MatchString(name) {
-			fmt.Fprintf(os.Stderr, "PVM_VOLUME_PLUGINS entry %q: invalid driver name %q (must match %s)\n", ent, name, volumeIDRegex.String())
+		// volume.ValidateID is the single rule the volume package itself
+		// enforces at Register/Attach/Detach time.
+		if !volume.ValidateID(name) {
+			fmt.Fprintf(os.Stderr, "PVM_VOLUME_PLUGINS entry %q: invalid driver name %q\n", ent, name)
 			os.Exit(1)
 		}
 		if err := volMgr.Register(ctxVol, volume.PluginConfig{Name: name, Type: volume.PluginTypeBinary, BinaryPath: path}, volume.NewBinary(name, path)); err != nil {
@@ -642,10 +650,3 @@ var (
 // import; the inline regexp.MustCompile that used to live in runCmd now
 // reuses this single precompiled value.
 var idRegex = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
-
-// volumeIDRegex is the driver/volume name rule internal/volume enforces at
-// Attach/Detach time (volumeIDRe). Mirrored here so PVM_VOLUME_PLUGINS driver
-// names can be validated BEFORE volume.Manager.Register — an invalid name is
-// a startup config error, not a deferred Attach failure. Keep in sync with
-// internal/volume/store.go (it is unexported there, hence the mirror).
-var volumeIDRegex = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,128}$`)

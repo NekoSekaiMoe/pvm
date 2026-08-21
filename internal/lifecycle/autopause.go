@@ -21,6 +21,11 @@ func isNotExist(err error) bool {
 	return errors.Is(err, os.ErrNotExist) || (err != nil && os.IsNotExist(err))
 }
 
+// saveState is the persistence seam used by Resume/commitPause. Tests swap
+// it to inject write failures and to observe the persist ordering (same
+// pattern as volume's writeJSON).
+var saveState = state.SaveState
+
 // Manager owns per-task idle timers.
 type Manager struct {
 	mu      sync.Mutex
@@ -116,13 +121,31 @@ func (m *Manager) Resume(taskID string) error {
 	if err := st.Transition(state.StatusResuming, state.ActorController, "auto-resume"); err != nil {
 		return err
 	}
-	if err := state.SaveState(taskID, st); err != nil {
+	if err := saveState(taskID, st); err != nil {
+		// Resuming was NOT persisted: on disk the task is still Suspended,
+		// but its cgroup was already thawed. Compensate by re-freezing so
+		// the frozen runtime matches the persisted Suspended state — then
+		// Resume can simply be retried. A missing cgroup (task exited,
+		// tests) is fine; other freeze errors have no remedy at this layer.
+		m.refreezeBestEffort(taskID)
 		return err
 	}
 	if err := st.Transition(state.StatusRunning, state.ActorController, "resumed"); err != nil {
 		return err
 	}
-	if err := state.SaveState(taskID, st); err != nil {
+	if err := saveState(taskID, st); err != nil {
+		// Running was NOT persisted: on disk the task is stuck in Resuming,
+		// which Resume can never re-enter (its entry check requires
+		// Suspended) — without compensation the task is permanently
+		// unresumable. Roll the in-memory state back to Suspended via the
+		// FSM's Running->Suspended edge, persist THAT, and re-freeze, so the
+		// persisted Suspended + frozen runtime pair stays consistent and
+		// retryable. If the compensation save fails too there is nothing
+		// further to do here; surface the original error.
+		if rerr := st.Transition(state.StatusSuspended, state.ActorSystem, "resume rollback: persist failed"); rerr == nil {
+			_ = saveState(taskID, st)
+		}
+		m.refreezeBestEffort(taskID)
 		return err
 	}
 	// The task is Running again: restart its idle countdown so a resumed
@@ -186,10 +209,18 @@ func (m *Manager) pause(taskID string, gen uint64) {
 //   - A Reset/Disarm that landed while the freeze was running bumped the
 //     cancel epoch; the task must stay running. Thaw (the freeze above may
 //     have succeeded) and let the new schedule govern.
+//
 //   - A transition or persistence failure must not leave the task frozen
 //     while on disk it is still Running with no timer armed — that state
 //     never self-heals. Thaw and schedule a retry via rearmRetry (which
 //     skips the retry if the epoch moved on).
+//
+//   - A Reset/Disarm that lands WHILE Suspended is being persisted bumps the
+//     epoch after the entry check above already passed. A stale Suspended
+//     on disk makes the new schedule's pause() skip the task forever (pause
+//     only suspends Running tasks), so the commit re-checks the epoch after
+//     the save and rolls the persisted state back to Running (via Resuming,
+//     the only FSM path Suspended -> Running) before thawing.
 func (m *Manager) commitPause(taskID string, epoch uint64, st *state.ContainerState) {
 	if !m.epochCurrent(taskID, epoch) {
 		m.thawBestEffort(taskID)
@@ -199,8 +230,22 @@ func (m *Manager) commitPause(taskID string, epoch uint64, st *state.ContainerSt
 		m.abortPause(taskID, epoch)
 		return
 	}
-	if err := state.SaveState(taskID, st); err != nil {
+	if err := saveState(taskID, st); err != nil {
 		m.abortPause(taskID, epoch)
+		return
+	}
+	// Second epoch check AFTER the (slow) persist: if the schedule was
+	// replaced mid-commit, undo the just-persisted Suspended so the new
+	// schedule governs. Best effort: if the rollback save fails the task
+	// stays Suspended-but-thawed, recoverable by Resume.
+	if !m.epochCurrent(taskID, epoch) {
+		const reason = "autopause rollback: schedule replaced during commit"
+		if st.Transition(state.StatusResuming, state.ActorSystem, reason) == nil {
+			if st.Transition(state.StatusRunning, state.ActorSystem, reason) == nil {
+				_ = saveState(taskID, st)
+			}
+		}
+		m.thawBestEffort(taskID)
 	}
 }
 
@@ -226,6 +271,13 @@ func (m *Manager) abortPause(taskID string, epoch uint64) {
 // retry path or an explicit resume is the recovery route.
 func (m *Manager) thawBestEffort(taskID string) {
 	_ = m.cg.Thaw(taskID)
+}
+
+// refreezeBestEffort is the compensating inverse of Resume's Thaw: after a
+// failed persist, restore a frozen runtime so it matches the Suspended
+// state still on disk (same best-effort posture as thawBestEffort).
+func (m *Manager) refreezeBestEffort(taskID string) {
+	_ = m.cg.Freeze(taskID)
 }
 
 // rearmRetry schedules a pause retry for a failed freeze, but only if the

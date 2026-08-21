@@ -291,6 +291,9 @@ func (g *Gateway) handle(w http.ResponseWriter, r *http.Request) {
 // handleConnect implements the HTTPS CONNECT tunnel. We see the target host
 // (from the CONNECT line) but not the encrypted body, so only domain-level
 // policy is enforceable here. The eBPF floor still applies IP-block at TC.
+// Known limitation: the tunnel relays opaque TLS bytes, so EgressInject
+// credentials can never be attached to tunneled requests — an Inject rule
+// matches the tunnel only at the host level (see ApplyInject).
 func (g *Gateway) handleConnect(w http.ResponseWriter, r *http.Request, task string, pol *Policy) {
 	v := viewFromConnect(r)
 	d := g.decideDomain(v, pol)
@@ -307,7 +310,9 @@ func (g *Gateway) handleConnect(w http.ResponseWriter, r *http.Request, task str
 	}
 	// SSRF floor check: refuse to tunnel to private IPs even if the proxy
 	// allowed the domain (defense against DNS rebinding to internal IPs).
-	if isPrivate(targetConn.RemoteAddr()) {
+	// Tests tunnelling to loopback targets bypass via the same test-only
+	// flag as handleHTTP (EnableSSRFBypassForTest).
+	if g.ssrFloorEnabled() && isPrivate(targetConn.RemoteAddr()) {
 		targetConn.Close()
 		g.record(task, r, DecisionBlock, "target resolved to private IP (SSRF floor)")
 		http.Error(w, "egress: private IP blocked", http.StatusForbidden)
@@ -532,12 +537,22 @@ func viewFromHTTP(r *http.Request) requestView {
 // normalizePath canonicalizes a request path for BOTH the policy view
 // (viewFromHTTP) and the forwarded request (handleHTTP), so the gateway can
 // never allow one path and forward another ("//a/../b" and "/b" are one
-// resource). An empty path means root ("/").
+// resource). Dot segments and duplicate slashes are removed, but the
+// ORIGINAL trailing slash is preserved: "/v1/" and "/v1" are distinct
+// resources (RFC 3986 §6.2.3), and collapsing them would change what the
+// upstream receives. An empty path means root ("/").
 func normalizePath(p string) string {
 	if p == "" {
 		return "/"
 	}
-	return path.Clean(p)
+	clean := path.Clean(p)
+	// path.Clean drops a trailing slash; re-attach it when the caller sent
+	// one — unless Clean collapsed the path all the way to the root, which
+	// keeps its single slash (never "//").
+	if clean != "/" && strings.HasSuffix(p, "/") {
+		clean += "/"
+	}
+	return clean
 }
 
 // viewFromConnect builds the (partial) view for a CONNECT tunnel: the target
@@ -643,6 +658,12 @@ func (g *Gateway) decideDomain(v requestView, pol *Policy) Decision {
 // returned Allow; it mutates outReq.Header in place. A rule that matches but
 // carries no Inject stops the walk: a later, broader rule must never leak
 // its credentials into this request.
+//
+// Limitation (by construction): CONNECT tunnels never receive injections.
+// handleConnect relays opaque TLS bytes with no readable header, so an
+// Inject rule may authorize a CONNECT tunnel (via its host) but can NEVER
+// deliver its secret through it — credentials for tunneled HTTPS must be
+// provisioned inside the guest, not at the proxy.
 func (g *Gateway) ApplyInject(outReq *http.Request, v requestView, pol *Policy) {
 	if len(pol.Rules) == 0 {
 		return
@@ -737,6 +758,14 @@ func (g *Gateway) PolicyForTask(task string) *Policy {
 // it, the request is denied (can't attribute the traffic).
 func taskFromRequest(r *http.Request) string {
 	return r.Header.Get("X-Task-Id")
+}
+
+// ssrFloorEnabled reports whether the SSRF IP-floor is active (false only
+// when the test-only bypass flag is set — see EnableSSRFBypassForTest).
+func (g *Gateway) ssrFloorEnabled() bool {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	return !g.ssrfBypass
 }
 
 func (g *Gateway) policy(task string) *Policy {

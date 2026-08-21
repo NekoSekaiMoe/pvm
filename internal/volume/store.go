@@ -16,6 +16,15 @@ import (
 
 var volumeIDRe = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,128}$`)
 
+// ValidateID reports whether id is a valid volume/driver identifier. It is
+// the exported form of the rule the store, Manager.Register, Attach and
+// Detach all enforce, so callers that validate names BEFORE registration
+// (e.g. agentpvm's PVM_VOLUME_PLUGINS parsing) share one rule instead of
+// mirroring the unexported regexp.
+func ValidateID(id string) bool {
+	return volumeIDRe.MatchString(id)
+}
+
 // Sentinel errors so callers (e.g. the REST layer) can classify failures
 // with errors.Is instead of matching error strings:
 //   - ErrInvalid / ErrExists / ErrNotFound / ErrStillMounted map to

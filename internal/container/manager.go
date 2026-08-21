@@ -289,6 +289,22 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 			attachedVolumes = append(attachedVolumes, vm)
 			// hostfs_volume is only valid on the host; guest sees it as a virtiofs/hostfs mount
 			// For UML we wire via extra kernel args (hostfs_volume=host:guest)
+			// The plugin-returned host path is spliced in verbatim below, so it
+			// must pass the SAME separator rules as the guest path above
+			// (spec.ValidateMountPath): whitespace splits the kernel command
+			// line and ':'/',' are field separators. Inline rollback: the loop
+			// below detaches this volume (appended above) plus everything
+			// attached so far, mirroring the attach-failure path
+			// (cleanupVolumes is defined only after the loop, so it cannot be
+			// reused here).
+			if err := spec.ValidateMountPath(res.HostPath); err != nil {
+				for _, av := range attachedVolumes {
+					_ = m.Volumes.Detach(context.Background(), &volume.DetachRequest{SandboxID: taskID, VolumeID: av.Name, Driver: av.Driver})
+				}
+				_ = st.Transition(state.StatusFailed, state.ActorController, "invalid volume host path: "+err.Error())
+				state.SaveState(taskID, st)
+				return fmt.Errorf("container: volume attach %q: %w", vm.Name, err)
+			}
 			mode := "rw"
 			if vm.ReadOnly {
 				mode = "ro"

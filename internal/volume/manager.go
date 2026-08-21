@@ -94,6 +94,11 @@ func (m *Manager) Register(ctx context.Context, cfg PluginConfig, p VolumePlugin
 	if cfg.Name == "" {
 		return fmt.Errorf("volume: plugin name required")
 	}
+	// Same id rule as Attach/Detach, enforced at registration so an invalid
+	// driver name is rejected up front rather than at first use.
+	if !ValidateID(cfg.Name) {
+		return fmt.Errorf("volume: invalid driver name %q (must match %s)", cfg.Name, volumeIDRe.String())
+	}
 	if p == nil {
 		return fmt.Errorf("volume: nil plugin for driver %q", cfg.Name)
 	}
@@ -140,10 +145,10 @@ func (m *Manager) Attach(ctx context.Context, req *AttachRequest) (*AttachResult
 	if req == nil {
 		return nil, fmt.Errorf("volume: nil AttachRequest")
 	}
-	if !volumeIDRe.MatchString(req.VolumeID) {
+	if !ValidateID(req.VolumeID) {
 		return nil, fmt.Errorf("volume: invalid volume id %q (must match %s)", req.VolumeID, volumeIDRe.String())
 	}
-	if !volumeIDRe.MatchString(req.Driver) {
+	if !ValidateID(req.Driver) {
 		return nil, fmt.Errorf("volume: invalid driver %q (must match %s)", req.Driver, volumeIDRe.String())
 	}
 	m.mu.Lock()
@@ -221,10 +226,10 @@ func (m *Manager) Detach(ctx context.Context, req *DetachRequest) error {
 	if req == nil {
 		return fmt.Errorf("volume: nil DetachRequest")
 	}
-	if !volumeIDRe.MatchString(req.VolumeID) {
+	if !ValidateID(req.VolumeID) {
 		return fmt.Errorf("volume: invalid volume id %q (must match %s)", req.VolumeID, volumeIDRe.String())
 	}
-	if !volumeIDRe.MatchString(req.Driver) {
+	if !ValidateID(req.Driver) {
 		return fmt.Errorf("volume: invalid driver %q (must match %s)", req.Driver, volumeIDRe.String())
 	}
 	m.mu.Lock()
@@ -274,6 +279,10 @@ func (m *Manager) Detach(ctx context.Context, req *DetachRequest) error {
 	if post == 0 {
 		delete(m.attached, req.VolumeID)
 		delete(m.extraMeta, req.VolumeID)
+		// Match Attach's rollback: a fully-detached volume leaves no zero
+		// entry behind in refCounts. RefCount keeps returning 0 for missing
+		// keys, so this is hygiene, not a behavior change.
+		delete(m.refCounts, req.VolumeID)
 	}
 	m.mu.Unlock()
 	return nil
