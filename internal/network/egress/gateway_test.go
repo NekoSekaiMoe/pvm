@@ -1,7 +1,10 @@
 package egress
 
 import (
+	"bufio"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -207,5 +210,80 @@ func TestBytesAccounting(t *testing.T) {
 	resp.Body.Close()
 	if g.BytesUsed("t1") == 0 {
 		t.Error("expected non-zero bytes accounted")
+	}
+}
+
+// TestConnectTunnelOpaque_NoInject pins the documented limitation of
+// EgressInject on CONNECT: a rule with Inject may authorize an HTTPS tunnel
+// (host-level match), but the tunnel relays opaque TLS bytes, so the target
+// must receive EXACTLY what the client wrote — no credential header can be
+// (or ever was) attached. This exercises the real handle dispatch
+// (handle -> handleConnect -> pipe), not a direct ApplyInject call.
+func TestConnectTunnelOpaque_NoInject(t *testing.T) {
+	// A raw TCP target that records the first bytes it receives.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	target := ln.Addr().String()
+
+	payload := []byte("OPAQUE-TUNNEL-PAYLOAD\r\n")
+	got := make(chan []byte, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			got <- nil
+			return
+		}
+		buf := make([]byte, len(payload))
+		_, _ = io.ReadFull(conn, buf)
+		got <- buf
+		conn.Close()
+	}()
+
+	// A rule that would inject on any plain-HTTPS request it matches.
+	allow := true
+	pol := &Policy{Rules: []EgressRule{{
+		Host:   "127.0.0.1", // matches the CONNECT target (host:port)
+		Allow:  &allow,
+		Inject: &EgressInject{Header: "Authorization", Secret: "top-secret-token"},
+	}}}
+	g := startGateway(t, pol)
+
+	// Drive the CONNECT through the gateway's real HTTP dispatch.
+	conn, err := net.DialTimeout("tcp", g.Addr(), 5*time.Second)
+	if err != nil {
+		t.Fatalf("dial gateway: %v", err)
+	}
+	defer conn.Close()
+	fmt.Fprintf(conn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\nX-Task-Id: t1\r\n\r\n", target, target)
+
+	br := bufio.NewReader(conn)
+	status, err := br.ReadString('\n')
+	if err != nil || !strings.Contains(status, "200") {
+		rest, _ := io.ReadAll(br)
+		t.Fatalf("CONNECT status = %q body = %q (err %v), want 200", status, rest, err)
+	}
+	for { // drain the response headers
+		line, err := br.ReadString('\n')
+		if err != nil {
+			t.Fatalf("read response headers: %v", err)
+		}
+		if line == "\r\n" || line == "\n" {
+			break
+		}
+	}
+
+	if _, err := conn.Write(payload); err != nil {
+		t.Fatalf("write tunnel payload: %v", err)
+	}
+	select {
+	case b := <-got:
+		if string(b) != string(payload) {
+			t.Fatalf("tunnel payload mutated: target got %q, want %q (no injection is possible through an opaque tunnel)", b, payload)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("target received nothing through the tunnel")
 	}
 }

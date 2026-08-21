@@ -72,6 +72,21 @@ func TestBuildNetPolicyPlan(t *testing.T) {
 			wantErr: true,
 		},
 		{
+			// Regression: 0.0.0.0/0 COVERS every always-denied range without
+			// being contained by any of them — containment-only checking used
+			// to let it through.
+			name:    "allow 0.0.0.0/0 covering all denied ranges rejected",
+			allow:   []string{"0.0.0.0/0"},
+			wantErr: true,
+		},
+		{
+			// Regression: 8.0.0.0/5 (8.0.0.0–15.255.255.255) straddles
+			// 10.0.0.0/8 — overlaps it without being contained by it.
+			name:    "allow 8.0.0.0/5 straddling 10.0.0.0/8 rejected",
+			allow:   []string{"8.0.0.0/5"},
+			wantErr: true,
+		},
+		{
 			name:      "deny narrower than always-denied still merged",
 			allow:     []string{"8.8.8.0/24"},
 			deny:      []string{"10.5.0.0/16"},
@@ -121,6 +136,9 @@ func TestIsAlwaysDenied(t *testing.T) {
 		{name: "public cidr", cidr: "8.8.8.0/24", want: false},
 		{name: "public bare ip", cidr: "1.2.3.4", want: false},
 		{name: "adjacent public range not contained", cidr: "11.0.0.0/8", want: false},
+		{name: "everything-range covers all denied ranges", cidr: "0.0.0.0/0", want: true},
+		{name: "straddling range overlaps 10/8 without containment", cidr: "8.0.0.0/5", want: true},
+		{name: "straddling range overlaps 192.168/16 edge", cidr: "192.160.0.0/12", want: true},
 		{name: "invalid entry", cidr: "not-a-cidr", want: false},
 		{name: "empty entry", cidr: "", want: false},
 		{name: "whitespace trimmed before match", cidr: "  10.0.0.0/8  ", want: true},

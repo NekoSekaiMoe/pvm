@@ -188,6 +188,12 @@ func TestPathNormalizationAndViewConsistency(t *testing.T) {
 		{"http://a.com/", "/"},
 		{"http://a.com//v1/../v2/x", "/v2/x"},
 		{"http://a.com/v1/../v1/y", "/v1/y"},
+		// The original trailing slash is preserved (RFC 3986 §6.2.3) while
+		// dot segments and duplicate slashes still normalize away.
+		{"http://a.com/v1/", "/v1/"},
+		{"http://a.com//v1///x/", "/v1/x/"},
+		{"http://a.com/v1/../v2/", "/v2/"},
+		{"http://a.com/v1/..", "/"}, // collapses to root, never "//"
 	}
 	for _, tt := range tests {
 		t.Run(tt.rawurl, func(t *testing.T) {
@@ -200,6 +206,9 @@ func TestPathNormalizationAndViewConsistency(t *testing.T) {
 	allow := true
 	if !pathMatches("/v1/*", "/v1") {
 		t.Fatalf("glob must match bare prefix")
+	}
+	if !pathMatches("/v1/*", "/v1/") {
+		t.Fatalf("glob must match trailing-slash prefix (\"/v1/\" shares the \"/v1/\" glob prefix)")
 	}
 	if !pathMatches("/v1/*", "/v1/x") || pathMatches("/v1/*", "/v2") {
 		t.Fatalf("glob semantics broken")

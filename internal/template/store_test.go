@@ -192,8 +192,11 @@ func TestStore_CreateRejectsInvalidStatusKind(t *testing.T) {
 
 // injectDurability swaps the persistence seam: commit=true persists the new
 // record and then reports fsjson.ErrDurability (rename committed, durability
-// confirmation failed); commit=false reports it without persisting.
-func injectDurability(commit bool) func() {
+// confirmation failed); commit=false reports it without persisting. The
+// original seam is restored automatically via t.Cleanup (same pattern as
+// internal/volume/store_durability_test.go).
+func injectDurability(t *testing.T, commit bool) {
+	t.Helper()
 	orig := writeJSON
 	if commit {
 		writeJSON = func(path string, v any) error {
@@ -207,7 +210,7 @@ func injectDurability(commit bool) func() {
 			return fmt.Errorf("%w: sync (injected, not committed)", fsjson.ErrDurability)
 		}
 	}
-	return func() { writeJSON = orig }
+	t.Cleanup(func() { writeJSON = orig })
 }
 
 // TestStore_SetAliasDurabilityReconciled covers the fsjson.ErrDurability
@@ -224,11 +227,10 @@ func TestStore_SetAliasDurabilityReconciled(t *testing.T) {
 	}
 
 	// Rename committed, durability unconfirmed: reconcile to success.
-	restore := injectDurability(true)
+	injectDurability(t, true)
 	if err := s.SetAlias(id, "new-alias"); err != nil {
 		t.Fatalf("SetAlias must reconcile ErrDurability: %v", err)
 	}
-	restore()
 
 	dir, err := s.dir(id)
 	if err != nil {
@@ -247,11 +249,10 @@ func TestStore_SetAliasDurabilityReconciled(t *testing.T) {
 
 	// Durability error without the change on disk: the error must surface
 	// so the caller knows nothing was applied.
-	restore = injectDurability(false)
+	injectDurability(t, false)
 	if err := s.SetAlias(id, "other-alias"); err == nil {
 		t.Fatalf("SetAlias must fail when the re-read does not match")
 	}
-	restore()
 	if _, err := s.GetByAlias("other-alias"); err == nil {
 		t.Fatalf("alias index updated despite failed commit")
 	}

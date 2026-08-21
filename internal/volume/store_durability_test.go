@@ -9,8 +9,11 @@ import (
 
 // injectDurability swaps the persistence seam: commit=true persists the new
 // record and then reports fsjson.ErrDurability (rename committed, durability
-// confirmation failed); commit=false reports it without persisting.
-func injectDurability(commit bool) func() {
+// confirmation failed); commit=false reports it without persisting. The
+// original seam is restored automatically via t.Cleanup, so a t.Fatalf
+// between swap and manual restore cannot leak the stub into later tests.
+func injectDurability(t *testing.T, commit bool) {
+	t.Helper()
 	orig := writeJSON
 	if commit {
 		writeJSON = func(path string, v any) error {
@@ -24,7 +27,7 @@ func injectDurability(commit bool) func() {
 			return fmt.Errorf("%w: sync (injected, not committed)", fsjson.ErrDurability)
 		}
 	}
-	return func() { writeJSON = orig }
+	t.Cleanup(func() { writeJSON = orig })
 }
 
 // TestStore_RefCountDurabilityReconciled covers the fsjson.ErrDurability
@@ -41,11 +44,10 @@ func TestStore_RefCountDurabilityReconciled(t *testing.T) {
 
 	// IncRef: rename committed, durability unconfirmed -> success, exactly
 	// one applied increment.
-	restore := injectDurability(true)
+	injectDurability(t, true)
 	if err := s.IncRef("vol-dur"); err != nil {
 		t.Fatalf("IncRef must reconcile ErrDurability: %v", err)
 	}
-	restore()
 	rec, err := s.Get("vol-dur")
 	if err != nil {
 		t.Fatalf("get: %v", err)
@@ -55,11 +57,10 @@ func TestStore_RefCountDurabilityReconciled(t *testing.T) {
 	}
 
 	// DecRef: rename committed, durability unconfirmed -> success.
-	restore = injectDurability(true)
+	injectDurability(t, true)
 	if err := s.DecRef("vol-dur"); err != nil {
 		t.Fatalf("DecRef must reconcile ErrDurability: %v", err)
 	}
-	restore()
 	rec, _ = s.Get("vol-dur")
 	if rec.RefCount != 1 {
 		t.Fatalf("RefCount = %d, want 1", rec.RefCount)
@@ -67,11 +68,10 @@ func TestStore_RefCountDurabilityReconciled(t *testing.T) {
 
 	// Durability error without the change on disk: the error must surface
 	// and RefCount must be untouched.
-	restore = injectDurability(false)
+	injectDurability(t, false)
 	if err := s.IncRef("vol-dur"); err == nil {
 		t.Fatalf("IncRef must fail when the re-read does not match")
 	}
-	restore()
 	rec, _ = s.Get("vol-dur")
 	if rec.RefCount != 1 {
 		t.Fatalf("RefCount = %d, want 1 after failed IncRef", rec.RefCount)

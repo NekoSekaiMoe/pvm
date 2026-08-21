@@ -1,6 +1,7 @@
 package lifecycle
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -118,8 +119,10 @@ func TestAutopause_ResumeRearmsIdleTimer(t *testing.T) {
 	if err := m.Resume(id); err != nil {
 		t.Fatalf("resume: %v", err)
 	}
-	if loaded, _ := state.LoadState(id); loaded.Status != state.StatusRunning {
-		t.Fatalf("status after resume = %q, want running", mustStatus(t, id))
+	if loaded, err := state.LoadState(id); err != nil {
+		t.Fatalf("load after resume: %v", err)
+	} else if loaded.Status != state.StatusRunning {
+		t.Fatalf("status after resume = %q, want running", loaded.Status)
 	}
 	// The re-armed idle timer must fire again: same polling rationale as
 	// TestAutopause_FiresAndResume (timers never fire early, so waiting for
@@ -311,4 +314,115 @@ func TestAutopause_SaveFailureThawsAndRearms(t *testing.T) {
 		t.Fatalf("no retry armed after SaveState failure")
 	}
 	m.Disarm(id) // stop the retry timer before the test ends
+}
+
+// TestAutopause_EpochChangeAfterPersistRolledBack is the regression test
+// for the post-persist commit window: a pause whose Suspended state was
+// successfully written, but whose schedule was replaced (Reset) BEFORE the
+// commit finished, must roll the persisted state back to Running (via the
+// FSM's Suspended -> Resuming -> Running path). A stale Suspended left on
+// disk would make the replacement schedule's pause() skip the task forever,
+// since pause only suspends Running tasks.
+func TestAutopause_EpochChangeAfterPersistRolledBack(t *testing.T) {
+	dir := t.TempDir()
+	origRoot := state.RootDir
+	state.RootDir = dir
+	t.Cleanup(func() { state.RootDir = origRoot })
+	t.Setenv("PVM_CGROUP_ROOT", t.TempDir())
+
+	id := "epoch-after-persist"
+	st := &state.ContainerState{ID: id, Name: id, Status: state.StatusRunning}
+	if err := state.SaveState(id, st); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	m := New(nil)
+	m.Arm(id, time.Hour) // epoch 1
+
+	// The seam persists normally, but a Reset (fresh idle window) lands
+	// right after the Suspended write: the cancel epoch bumps to 2 while
+	// commitPause is still in its commit critical section.
+	orig := saveState
+	saveState = func(taskID string, st *state.ContainerState) error {
+		if err := orig(taskID, st); err != nil {
+			return err
+		}
+		if st.Status == state.StatusSuspended {
+			m.Reset(taskID, time.Hour)
+		}
+		return nil
+	}
+	t.Cleanup(func() { saveState = orig })
+
+	m.commitPause(id, 1, st)
+
+	loaded, err := state.LoadState(id)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if loaded.Status != state.StatusRunning {
+		t.Fatalf("stale pause left status=%q, want running (rolled back)", loaded.Status)
+	}
+	// The rollback must be auditable, not a silent status overwrite.
+	if n := len(loaded.Transitions); n < 3 {
+		t.Fatalf("rollback audit trail missing: %d transitions, want >= 3 (%v)", n, loaded.Transitions)
+	}
+	m.Disarm(id) // stop the Reset-armed timer before the test ends
+}
+
+// TestAutopause_ResumeCompensatesSaveFailure pins Resume's compensating
+// recovery: when the SECOND SaveState (Running) fails after the cgroup was
+// already thawed, Resume must roll the persisted state back to Suspended
+// (via the FSM's Running -> Suspended edge) instead of leaving it stuck in
+// Resuming — a state Resume can never re-enter (its entry check requires
+// Suspended), so without compensation one transient write failure would
+// make the task permanently unresumable. The HTTP handlers delegate to
+// Manager.Resume precisely so this recovery lives in exactly one place.
+func TestAutopause_ResumeCompensatesSaveFailure(t *testing.T) {
+	dir := t.TempDir()
+	origRoot := state.RootDir
+	state.RootDir = dir
+	t.Cleanup(func() { state.RootDir = origRoot })
+	t.Setenv("PVM_CGROUP_ROOT", t.TempDir())
+
+	id := "resume-savefail"
+	st := &state.ContainerState{ID: id, Name: id, Status: state.StatusSuspended, IdleTimeout: "1h"}
+	if err := state.SaveState(id, st); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	// Fail ONLY the Running persist (call 2); the compensating Suspended
+	// persist (call 3) goes through.
+	orig := saveState
+	calls := 0
+	saveState = func(taskID string, st *state.ContainerState) error {
+		calls++
+		if calls == 2 {
+			return fmt.Errorf("injected save failure")
+		}
+		return orig(taskID, st)
+	}
+	t.Cleanup(func() { saveState = orig })
+
+	m := New(nil)
+	if err := m.Resume(id); err == nil {
+		t.Fatalf("resume must surface the save failure")
+	}
+	loaded, err := state.LoadState(id)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if loaded.Status != state.StatusSuspended {
+		t.Fatalf("status after failed resume = %q, want suspended (compensated)", loaded.Status)
+	}
+
+	// The compensation kept the task resumable: a retry must succeed.
+	saveState = orig
+	if err := m.Resume(id); err != nil {
+		t.Fatalf("retry after compensation: %v", err)
+	}
+	if s := mustStatus(t, id); s != state.StatusRunning {
+		t.Fatalf("status after retry = %q, want running", s)
+	}
+	m.Disarm(id) // stop the re-armed idle timer before the test ends
 }

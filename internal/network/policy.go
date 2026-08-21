@@ -45,7 +45,7 @@ func BuildNetPolicyPlan(allowOut, denyOut []string) (allow []string, deny []stri
 			}
 		}
 		if IsAlwaysDenied(trimmed) {
-			return nil, nil, fmt.Errorf("network: allow CIDR/IP %q falls inside an always-denied range", cidr)
+			return nil, nil, fmt.Errorf("network: allow CIDR/IP %q overlaps an always-denied range", cidr)
 		}
 		allowSet[trimmed] = struct{}{}
 	}
@@ -85,12 +85,15 @@ func BuildNetPolicyPlan(allowOut, denyOut []string) (allow []string, deny []stri
 	return allow, deny, nil
 }
 
-// IsAlwaysDenied reports whether cidr falls inside one of the
-// always-denied ranges. cidr may be a CIDR or a bare IP (interpreted as a
-// host route, /32 for IPv4 or /128 for IPv6). Containment is a range
-// check via net.IPNet.Contains rather than a string comparison, so
-// narrower subnets of an always-denied range (e.g. 10.1.2.0/24 inside
-// 10.0.0.0/8) are also reported as denied.
+// IsAlwaysDenied reports whether cidr overlaps one of the always-denied
+// ranges — either by falling inside one or by (partially) covering one.
+// Containment alone is not enough: a broad allow such as 0.0.0.0/0 contains
+// every denied range without being contained by any, and 8.0.0.0/5 merely
+// straddles 10.0.0.0/8; both must count as denied overlap. cidr may be a
+// CIDR or a bare IP (interpreted as a host route, /32 for IPv4 or /128 for
+// IPv6); the overlap is a range check via net.IPNet.Contains rather than a
+// string comparison, so narrower subnets of an always-denied range (e.g.
+// 10.1.2.0/24 inside 10.0.0.0/8) are also reported as denied.
 func IsAlwaysDenied(cidr string) bool {
 	entry, ok := parseNetEntry(strings.TrimSpace(cidr))
 	if !ok {
@@ -101,11 +104,20 @@ func IsAlwaysDenied(cidr string) bool {
 		if err != nil {
 			continue // Unreachable: alwaysDeniedCIDRs are valid constants.
 		}
-		if denied.Contains(entry.IP) {
+		if cidrsOverlap(entry, denied) {
 			return true
 		}
 	}
 	return false
+}
+
+// cidrsOverlap reports whether two CIDR blocks intersect. Proper CIDR
+// blocks are laminar — nested or disjoint — so it suffices to test each
+// block's network address against the other; a partial-only overlap
+// between two aligned power-of-two ranges cannot exist. Mismatched
+// address families never overlap (Contains is false cross-family).
+func cidrsOverlap(a, b *net.IPNet) bool {
+	return a.Contains(b.IP) || b.Contains(a.IP)
 }
 
 // parseNetEntry parses s as a CIDR, falling back to a bare IP interpreted
