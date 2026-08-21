@@ -122,6 +122,16 @@ func Import(srcTgz string, newContainerID string) error {
 			return fmt.Errorf("tar import failed: path escapes dir %s", header.Name)
 		}
 
+		// Check that no directory component in target's path is a symlink
+		curr := filepath.Dir(target)
+		for curr != filepath.Clean(dir) && strings.HasPrefix(curr, filepath.Clean(dir)) {
+			fi, err := os.Lstat(curr)
+			if err == nil && fi.Mode()&os.ModeSymlink != 0 {
+				return fmt.Errorf("tar import failed: path traverses symlink %s", header.Name)
+			}
+			curr = filepath.Dir(curr)
+		}
+
 		switch header.Typeflag {
 		case tar.TypeDir:
 			if err := os.MkdirAll(target, os.FileMode(header.Mode)); err != nil {
@@ -141,7 +151,14 @@ func Import(srcTgz string, newContainerID string) error {
 			}
 			out.Close()
 		case tar.TypeSymlink:
-			//(header.Linkname is the link target; not path-escaped because it's interpreted by the guest kernel)
+			if strings.HasPrefix(header.Linkname, "/") {
+				return fmt.Errorf("tar import failed: absolute symlink escapes dir %s -> %s", header.Name, header.Linkname)
+			}
+			linkTarget := filepath.Join(filepath.Dir(target), header.Linkname)
+			cleanLink := filepath.Clean(linkTarget)
+			if !strings.HasPrefix(cleanLink, filepath.Clean(dir)+string(filepath.Separator)) && cleanLink != filepath.Clean(dir) {
+				return fmt.Errorf("tar import failed: symlink target escapes dir %s -> %s", header.Name, header.Linkname)
+			}
 			if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
 				return fmt.Errorf("tar import failed: mkdir: %v", err)
 			}

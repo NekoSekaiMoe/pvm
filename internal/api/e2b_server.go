@@ -74,7 +74,11 @@ func StartE2BServer(port int) error {
 		if expected == "" {
 			expected = "secret"
 		}
-		return key == expected, nil
+		if key == expected {
+			c.Set("actor", "api-user")
+			return true, nil
+		}
+		return false, nil
 	}))
 
 	// Per-task policy gateways registered by the controller / agentpvm run.
@@ -257,14 +261,14 @@ func StartE2BServer(port int) error {
 		// st is nil here: /exec does not need the state itself, so the helper
 		// loads it once internally.
 		lifecycleActivity(taskID, autoMgr, nil)
-		gw := gateways.get(taskID)
-		if gw == nil {
-			return c.JSON(http.StatusForbidden, map[string]string{"error": "no policy gateway registered for task"})
-		}
 		// Parse "name arg=val arg2=val2 ..." into a ToolRequest.
 		treq, err := parseExecCommand(req.Command)
 		if err != nil {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+		}
+		gw := gateways.get(taskID)
+		if gw == nil {
+			return c.JSON(http.StatusForbidden, map[string]string{"error": "no policy gateway registered for task"})
 		}
 		resp, err := gw.Execute(treq)
 		if err != nil {
@@ -434,7 +438,7 @@ func StartE2BServer(port int) error {
 		return c.JSON(http.StatusOK, map[string]string{"id": id})
 	})
 
-	// POST /api/approvals/:id/decide — approve/reject. Body: {approved: bool, by: "..."}.
+	// POST /api/approvals/:id/decide — approve/reject. Body: {approved: bool}.
 	api.POST("/approvals/:id/decide", func(c echo.Context) error {
 		id := c.Param("id")
 		var req struct {
@@ -444,8 +448,12 @@ func StartE2BServer(port int) error {
 		if err := c.Bind(&req); err != nil {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
 		}
+		actor, _ := c.Get("actor").(string)
+		if actor == "" {
+			actor = "operator"
+		}
 		m := currentApprovals()
-		if err := m.Decide(id, req.Approved, req.By); err != nil {
+		if err := m.Decide(id, req.Approved, actor); err != nil {
 			return c.JSON(http.StatusConflict, map[string]string{"error": err.Error()})
 		}
 		t, _ := m.Get(id)
@@ -462,6 +470,23 @@ func StartE2BServer(port int) error {
 			return c.JSON(http.StatusNotFound, map[string]string{"error": "no gateway for task"})
 		}
 		return c.JSON(http.StatusOK, gw.Rules())
+	})
+
+	// POST /api/policy/:task — register or update compiled tool rules for a task.
+	api.POST("/policy/:task", func(c echo.Context) error {
+		task := c.Param("task")
+		if !idRegex.MatchString(task) {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid task id"})
+		}
+		var req struct {
+			Rules []policy.Rule `json:"rules"`
+		}
+		if err := c.Bind(&req); err != nil {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+		}
+		gw := policy.NewGateway(req.Rules, nil)
+		RegisterPolicyGateway(task, gw)
+		return c.JSON(http.StatusOK, map[string]interface{}{"status": "registered", "rules": gw.Rules()})
 	})
 
 	// --- Pool / Quota (plan.md §12) ---
@@ -498,6 +523,12 @@ func StartE2BServer(port int) error {
 		}
 		if err := c.Bind(&req); err != nil {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+		}
+		if req.Tenant == "" || !idRegex.MatchString(req.Tenant) {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid tenant id"})
+		}
+		if req.Quota.MaxConcurrent < 0 || req.Quota.MaxCPU < 0 || req.Quota.MaxMemoryMB < 0 || req.Quota.MaxTasksPerHour < 0 {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "quota limits cannot be negative"})
 		}
 		currentPool().SetQuota(req.Tenant, req.Quota)
 		return c.JSON(http.StatusOK, map[string]string{"status": "ok"})
@@ -664,12 +695,19 @@ func StartE2BServer(port int) error {
 	})
 	api.GET("/templates/:id", func(c echo.Context) error {
 		id := c.Param("id")
-		// Try direct id first, then alias resolution
-		rec, err := tmplStore.Get(id)
+		resolved, err := tmplStore.ResolveIdentifier(id)
 		if err != nil {
-			if aliasRec, aerr := tmplStore.GetByAlias(id); aerr == nil {
-				return c.JSON(http.StatusOK, aliasRec)
+			switch {
+			case errors.Is(err, template.ErrInvalid):
+				return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+			case errors.Is(err, template.ErrNotFound):
+				return c.JSON(http.StatusNotFound, map[string]string{"error": err.Error()})
+			default:
+				return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
 			}
+		}
+		rec, err := tmplStore.Get(resolved)
+		if err != nil {
 			switch {
 			case errors.Is(err, template.ErrInvalid):
 				return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
@@ -971,6 +1009,50 @@ func RegisterPolicyGateway(taskID string, g *policy.Gateway) { globalRegistries.
 // across test runs (the registry is a package-level singleton).
 func UnregisterPolicyGateway(taskID string) { globalRegistries.unregister(taskID) }
 
+func splitCommandArgs(cmd string) ([]string, error) {
+	var args []string
+	var current strings.Builder
+	inSingleQuote := false
+	inDoubleQuote := false
+	escaped := false
+
+	for i := 0; i < len(cmd); i++ {
+		b := cmd[i]
+		if escaped {
+			current.WriteByte(b)
+			escaped = false
+			continue
+		}
+		if b == '\\' && !inSingleQuote {
+			escaped = true
+			continue
+		}
+		if b == '\'' && !inDoubleQuote {
+			inSingleQuote = !inSingleQuote
+			continue
+		}
+		if b == '"' && !inSingleQuote {
+			inDoubleQuote = !inDoubleQuote
+			continue
+		}
+		if (b == ' ' || b == '\t' || b == '\n') && !inSingleQuote && !inDoubleQuote {
+			if current.Len() > 0 {
+				args = append(args, current.String())
+				current.Reset()
+			}
+			continue
+		}
+		current.WriteByte(b)
+	}
+	if inSingleQuote || inDoubleQuote {
+		return nil, fmt.Errorf("unclosed quote in command")
+	}
+	if current.Len() > 0 {
+		args = append(args, current.String())
+	}
+	return args, nil
+}
+
 // parseExecCommand turns a flat command string "name k=v k2=v2" into a
 // structured ToolRequest for the policy gateway. Simplest viable contract;
 // structured JSON bodies can be added later without breaking this.
@@ -981,7 +1063,13 @@ func parseExecCommand(cmd string) (policy.ToolRequest, error) {
 	if cmd == "" {
 		return policy.ToolRequest{}, fmt.Errorf("empty command")
 	}
-	parts := strings.Fields(cmd)
+	parts, err := splitCommandArgs(cmd)
+	if err != nil {
+		return policy.ToolRequest{}, err
+	}
+	if len(parts) == 0 {
+		return policy.ToolRequest{}, fmt.Errorf("empty command")
+	}
 	req := policy.ToolRequest{Name: parts[0], Args: map[string]interface{}{}}
 	positional := 0
 	for _, p := range parts[1:] {

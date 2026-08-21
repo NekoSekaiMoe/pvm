@@ -1,18 +1,61 @@
 <template>
   <div>
     <h1>Containers Dashboard</h1>
+    <p class="muted">Manage standalone UML container instances and snapshots.</p>
+
+    <!-- Quick Stats -->
+    <div class="stat-grid">
+      <div class="stat-tile">
+        <div class="stat-value">{{ runningCount }}</div>
+        <div class="stat-label">Running Instances</div>
+      </div>
+      <div class="stat-tile">
+        <div class="stat-value">{{ stoppedCount }}</div>
+        <div class="stat-label">Stopped / Exited</div>
+      </div>
+      <div class="stat-tile">
+        <div class="stat-value">{{ containers.length }}</div>
+        <div class="stat-label">Total Registered</div>
+      </div>
+    </div>
     
+    <!-- Launch Form -->
     <div class="glass-card">
       <h3>Launch New Container</h3>
-      <div class="input-group">
-        <input v-model="newContainer.name" placeholder="Container Name (e.g. web1)" />
-        <input v-model="newContainer.rootfs" placeholder="Rootfs Image (default: alpine)" />
+      <div class="form-row">
+        <div>
+          <label class="section-title">Container Name</label>
+          <input v-model="newContainer.name" placeholder="e.g. web-node-1" />
+        </div>
+        <div>
+          <label class="section-title">Rootfs Image</label>
+          <input v-model="newContainer.rootfs" placeholder="rootfs.img or alpine" />
+        </div>
+      </div>
+      <div class="form-row">
+        <div>
+          <label class="section-title">Memory Allocation</label>
+          <input v-model="newContainer.mem" placeholder="512M or 1G" />
+        </div>
+        <div>
+          <label class="section-title">CPU Millicpu (0 = unlimited)</label>
+          <input v-model.number="newContainer.cpu" type="number" placeholder="1000" />
+        </div>
+      </div>
+      
+      <div style="display:flex;gap:1rem;margin-top:1rem;">
         <button class="btn btn-primary" @click="startContainer">Launch Container</button>
-        <button class="btn btn-primary" @click="restoreContainer">Restore from Snapshot</button>
+        <button class="btn btn-primary" @click="restoreContainer" style="background:var(--success);">Restore from Snapshot</button>
       </div>
     </div>
 
+    <!-- Containers List -->
     <div class="glass-card">
+      <div class="toolbar">
+        <input v-model="searchQuery" placeholder="Search containers..." class="search-input" />
+        <span class="muted" style="font-size:0.875rem;">Total: {{ filteredContainers.length }}</span>
+      </div>
+
       <div class="table-container">
         <table>
           <thead>
@@ -24,20 +67,43 @@
             </tr>
           </thead>
           <tbody>
-            <tr v-for="c in containers" :key="c.id">
-              <td>{{ c.id }}</td>
+            <tr v-for="c in filteredContainers" :key="c.id">
+              <td class="mono"><strong>{{ c.id }}</strong></td>
               <td>
                 <span class="badge" :class="c.status.toLowerCase()">{{ c.status }}</span>
               </td>
-              <td>{{ c.pid }}</td>
+              <td>{{ c.pid || '—' }}</td>
               <td>
-                <NuxtLink :to="`/logs/${c.id}`" class="btn btn-primary" style="margin-right: 0.5rem; text-decoration: none; font-size: 0.875rem;">Logs</NuxtLink>
-                <button class="btn btn-primary" @click="snapshotContainer(c.id)" :disabled="snapshotInFlight(c.id)" style="margin-right: 0.5rem; background: var(--success);">{{ snapshotInFlight(c.id) ? 'Snapshotting…' : 'Snapshot' }}</button>
-                <button class="btn btn-danger" @click="deleteContainer(c.id)">Delete</button>
+                <NuxtLink :to="`/logs/${c.id}`" class="btn btn-primary" style="margin-right:0.4rem;text-decoration:none;font-size:0.8rem;">Logs</NuxtLink>
+                <button 
+                  v-if="c.status.toLowerCase() === 'running'" 
+                  class="btn btn-danger" 
+                  style="margin-right:0.4rem;font-size:0.8rem;" 
+                  @click="pauseContainer(c.id)"
+                >
+                  Pause
+                </button>
+                <button 
+                  v-if="c.status.toLowerCase() === 'suspended'" 
+                  class="btn btn-primary" 
+                  style="margin-right:0.4rem;font-size:0.8rem;background:var(--success);" 
+                  @click="resumeContainer(c.id)"
+                >
+                  Resume
+                </button>
+                <button 
+                  class="btn btn-primary" 
+                  @click="snapshotContainer(c.id)" 
+                  :disabled="snapshotInFlight(c.id)" 
+                  style="margin-right:0.4rem;background:var(--success);font-size:0.8rem;"
+                >
+                  {{ snapshotInFlight(c.id) ? 'Saving...' : 'Snapshot' }}
+                </button>
+                <button class="btn btn-danger" style="font-size:0.8rem;" @click="deleteContainer(c.id)">Delete</button>
               </td>
             </tr>
-            <tr v-if="containers.length === 0">
-              <td colspan="4" style="text-align: center; color: var(--text-muted); padding: 2rem;">No containers found.</td>
+            <tr v-if="filteredContainers.length === 0">
+              <td colspan="4" class="muted" style="text-align:center;padding:2rem;">No containers found.</td>
             </tr>
           </tbody>
         </table>
@@ -47,19 +113,30 @@
 </template>
 
 <script setup>
-import { ref, onMounted, onUnmounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted } from 'vue'
+import { apiFetch } from '~/composables/useApi'
 
 const containers = ref([])
-const newContainer = ref({ name: '', rootfs: 'alpine', mem: '512M' })
+const searchQuery = ref('')
+const newContainer = ref({ name: '', rootfs: 'alpine', mem: '512M', cpu: 0 })
 const snapshottingIds = ref(new Set())
 let timer
 
 const snapshotInFlight = (id) => snapshottingIds.value.has(id)
 
+const runningCount = computed(() => containers.value.filter(c => c.status.toLowerCase() === 'running').length)
+const stoppedCount = computed(() => containers.value.filter(c => c.status.toLowerCase() !== 'running').length)
+
+const filteredContainers = computed(() => {
+  if (!searchQuery.value) return containers.value
+  const q = searchQuery.value.toLowerCase()
+  return containers.value.filter(c => c.id && c.id.toLowerCase().includes(q))
+})
+
 const fetchContainers = async () => {
   try {
-    const res = await fetch('/api/containers')
-    if (res.ok) containers.value = await res.json()
+    const list = await apiFetch('/api/containers')
+    containers.value = list || []
   } catch (e) {
     console.error(e)
   }
@@ -68,21 +145,32 @@ const fetchContainers = async () => {
 const startContainer = async () => {
   if (!newContainer.value.name) return
   try {
-    const res = await fetch('/api/containers/start', {
+    await apiFetch('/api/containers/start', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(newContainer.value)
+      body: newContainer.value
     })
-    if (res.ok) {
-      newContainer.value.name = ''
-      setTimeout(fetchContainers, 500)
-    } else {
-      const err = await res.json()
-      alert(`Error starting container: ${err.error || res.statusText}`)
-    }
+    newContainer.value.name = ''
+    setTimeout(fetchContainers, 500)
   } catch (e) {
-    console.error(e)
-    alert(`Network error starting container: ${e.message}`)
+    alert(`Error starting container: ${e.message}`)
+  }
+}
+
+const pauseContainer = async (id) => {
+  try {
+    await apiFetch(`/api/tasks/${encodeURIComponent(id)}/pause`, { method: 'POST' })
+    fetchContainers()
+  } catch (e) {
+    alert(`Pause error: ${e.message}`)
+  }
+}
+
+const resumeContainer = async (id) => {
+  try {
+    await apiFetch(`/api/tasks/${encodeURIComponent(id)}/resume`, { method: 'POST' })
+    fetchContainers()
+  } catch (e) {
+    alert(`Resume error: ${e.message}`)
   }
 }
 
@@ -92,58 +180,36 @@ const restoreContainer = async () => {
     alert("Please enter the original container name to restore from")
     return
   }
-  if (!/^[a-zA-Z0-9_-]+$/.test(name)) {
-    alert("Invalid container name: only letters, numbers, '_' and '-' are allowed")
-    return
-  }
   try {
-    const res = await fetch(`/api/containers/${encodeURIComponent(name)}/restore`, { method: 'POST' })
-    if (res.ok) {
-      newContainer.value.name = ''
-      alert("Container restored successfully!")
-      setTimeout(fetchContainers, 500)
-    } else {
-      const err = await res.json()
-      alert(`Error restoring container: ${err.error || res.statusText}`)
-    }
+    await apiFetch(`/api/containers/${encodeURIComponent(name)}/restore`, { method: 'POST' })
+    newContainer.value.name = ''
+    alert("Container restored successfully!")
+    setTimeout(fetchContainers, 500)
   } catch (e) {
-    console.error(e)
-    alert(`Network error restoring container: ${e.message}`)
+    alert(`Error restoring container: ${e.message}`)
   }
 }
 
 const deleteContainer = async (id) => {
-  if(!confirm(`Delete container ${id}?`)) return
+  if (!confirm(`Delete container ${id}?`)) return
   try {
-    const res = await fetch(`/api/containers/${id}`, { method: 'DELETE' })
-    if (res.ok) {
-      fetchContainers()
-    } else {
-      const err = await res.json()
-      alert(`Error deleting container: ${err.error || res.statusText}`)
-    }
+    await apiFetch(`/api/containers/${encodeURIComponent(id)}`, { method: 'DELETE' })
+    fetchContainers()
   } catch (e) {
-    console.error(e)
-    alert(`Network error deleting container: ${e.message}`)
+    alert(`Error deleting container: ${e.message}`)
   }
 }
 
 const snapshotContainer = async (id) => {
   if (snapshotInFlight(id)) return
-  if(!confirm(`Snapshot container ${id}?`)) return
+  if (!confirm(`Snapshot container ${id}?`)) return
   snapshottingIds.value.add(id)
   snapshottingIds.value = new Set(snapshottingIds.value)
   try {
-    const res = await fetch(`/api/containers/${id}/snapshot`, { method: 'POST' })
-    if (res.ok) {
-      alert(`Snapshot for ${id} created successfully!`)
-    } else {
-      const err = await res.json()
-      alert(`Error creating snapshot: ${err.error || res.statusText}`)
-    }
+    await apiFetch(`/api/containers/${encodeURIComponent(id)}/snapshot`, { method: 'POST' })
+    alert(`Snapshot for ${id} created successfully!`)
   } catch (e) {
-    console.error(e)
-    alert(`Network error: ${e.message}`)
+    alert(`Error creating snapshot: ${e.message}`)
   } finally {
     snapshottingIds.value.delete(id)
     snapshottingIds.value = new Set(snapshottingIds.value)

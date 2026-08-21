@@ -1,32 +1,45 @@
-# Tests (`tests/`)
+# Integration & End-to-End Tests (`tests/`)
 
-This directory contains integration and end-to-end (E2E) tests for the PVM system.
+This directory contains shell-based integration and end-to-end (E2E) suites validating PVM's CLI commands, REST API endpoints, security defenses, and control plane integrations.
 
-While unit tests in Go are typically placed alongside the code they test (e.g., `manager_test.go` in `internal/container/`), this directory is reserved for tests that require a full system setup, network configurations, or complex container lifecycles.
+---
 
-## Suites
+## Test Suites Matrix
 
-| Script | Requires UML kernel? | What it covers |
-|---|---|---|
-| `01_test_e2b_api.sh` | no | E2B-compatible API: auth, `/api/exec` gating (400/403 instead of legacy 501), container CRUD |
-| `02_test_network_qos.sh` | yes | TAP + tc tbf bandwidth shaping |
-| `03_test_cgroup_freeze.sh` | yes | cgroup v2 freeze/thaw suspends CPU |
-| `04_test_qcow2_mount.sh` | yes | qcow2 overlay + vhost-user-blk mount |
-| `05_test_controlplane_api.sh` | **no** | Black-box REST test of the new control planes: TaskSpec load, FSM transitions, audit verify, approvals, pool warm/stats, artifact gate, `/exec` gating |
-| `06_test_cli_smoke.sh` | **no** | CLI wiring: `agentpvm run -config`, default config path, FSM recording on launch failure, audit spec evidence, cow path-injection guard, pool subcommands, `umlctl -config` |
-| `07_test_gate_snapshot_cli.sh` | **no** | `agentpvm gate`: PASS/FAIL verdicts + exit codes, secret scan in diff and in declared files, missing/malformed bundle, audit allow/deny rows; `agentpvm snapshot`: export/import round trip, invalid-id and existing-id rejection |
-| `08_test_approval_pool_cli.sh` | **no** | `agentpvm approval`/`pool` subcommands against a live API: mandatory `API_SECRET`, empty/pending/decided ticket listing, pool stats reflecting REST-driven warm, documented `pool warm` CLI gap |
-| `09_test_cgroup_limits.sh` | **yes** (+ root) | Guest-side cgroup v2 limits inside a real UML boot: `memory`/`pids` controllers present in `/proc/cgroups` (proves `CONFIG_MEMCG`/`CONFIG_CGROUP_PIDS`), `pids.max=8` caps a 32-fork burst at `pids.current<=8`, `memory.max=32M` OOM-kills a 256M tmpfs writer (exit 137) |
+| Suite | Requires Kernel / Root? | What It Validates |
+|:---|:---:|:---|
+| `01_test_e2b_api.sh` | No | E2B REST API: authentication, `/api/exec` gating, container start/logs/delete |
+| `02_test_network_qos.sh` | Yes | TAP network interface and `tc tbf` bandwidth rate limiting |
+| `03_test_cgroup_freeze.sh` | Yes | cgroup v2 freeze/thaw suspending and resuming guest processes |
+| `04_test_qcow2_mount.sh` | Yes | qcow2 overlay creation and vhost-user-blk virtio mount |
+| `05_test_controlplane_api.sh` | No | Full control plane: TaskSpec load, FSM transitions, audit verify, approvals, pool warm |
+| `06_test_cli_smoke.sh` | No | CLI wiring: `agentpvm run -config`, default config fallback, FSM launch recording |
+| `07_test_gate_snapshot_cli.sh`| No | `agentpvm gate` PASS/FAIL secret scan; `agentpvm snapshot` export/import |
+| `08_test_approval_pool_cli.sh`| No | CLI subcommands for approvals and warm pool stats against live API |
+| `09_test_cgroup_limits.sh` | Yes (+ Root) | Guest-side in-UML memory.max and pids.max OOM-kill limits |
+| `10_test_volume_api_cli.sh` | No | Volume REST CRUD, token masking, ID regex validation, plugin CLI parsing |
+| `11_test_template_api.sh` | No | Template Center REST API, PENDING->READY transitions, alias binding, conflict rejection |
+| `12_test_lifecycle_autopause.sh` | No | Task Pause/Resume, cgroup.freeze synchronization, auto-resume on API activity |
+| `13_test_e2b_api_security.sh` | No | Bearer token auth enforcement, custom API_SECRET, public WebUI route, input sanitization |
+| `14_test_policy_gateway.sh` | No | Tool Gateway `/api/exec` syntax parsing, missing task gating, 403 unregistered policy |
+| `15_test_audit_ledger.sh` | No | Cryptographic hash chain verification, tampering detection, truncation defense |
+| `16_test_pool_quota.sh` | No | Warm pool pre-allocation (1..100 boundary checks), tenant quota management |
+| `17_test_umlctl_cli.sh` | No | `umlctl start/logs/ps/network` CLI argument parsing and validation |
+| `18_test_agentpvm_cli.sh` | No | `agentpvm` subcommands, usage banners, and missing flag handling |
+| `19_test_cow_advanced.sh` | No | Pure-Go qcow2 path injection defense, in-place compaction, raw <-> qcow2 byte round-trip |
+| `20_test_snapshot_security.sh`| No | Snapshot tarball directory structure integrity and destination overwrite protection |
+| `21_test_state_fsm_durability.sh`| No | Complete lifecycle FSM path (pending->completed), illegal edge rejection, quarantine |
+| `22_test_docker_image_pull.sh`| No | Docker image pull error handling and safeName sanitization |
 
-Suites `05`–`08` are **CI-safe** (no kernel, no root needed beyond `go build`). They require `curl`, `jq` and a POSIX `base64` on `PATH` (all preinstalled on GitHub `ubuntu-latest` runners; on macOS install jq via `brew install jq`). Run all of them serially:
+---
+
+## Running the Suites
 
 ```bash
-for s in tests/*.sh; do ./"$s"; done
+# Run all unprivileged CI-safe suites (fails fast on first error)
+set -e
+for s in tests/{05,06,07,08,10,11,12,13,14,15,16,17,18,19,20,21,22}_*.sh; do
+    echo "Running $s..."
+    ./"$s"
+done
 ```
-
-The Go test suite (adversarial + cross-plane included) is at:
-
-- `internal/integrationtest/` — cross-plane flows (spec→task→audit, incident→revoke, pool→quota, policy→approval, artifact gate)
-- `internal/securitytest/` — adversarial attacks (ledger tamper, token forge, SSRF, secret leak, quota bypass, param-binding bypass)
-- `internal/spec/spec_matrix_test.go`, `internal/state/fsm_matrix_test.go`, `internal/audit/edge_test.go`, `internal/network/egress/edge_test.go`, `internal/policy/edge_test.go` — per-plane unit deepening
-- `internal/config/parse_memory_test.go`, `internal/cgroup/manager_edge_test.go`, `internal/network/bridge_internal_test.go`, `cmd/agentpvm/main_test.go` — pure-helper units (memory parsing, cgroup input validation + env precedence, bridge error classification, CLI config resolution / safe defaults)

@@ -9,20 +9,17 @@ import (
 )
 
 func TestSnapshot_ExportImport(t *testing.T) {
-	// Setup test environment
-	baseDir := "/var/lib/uml-container/containers"
-	// Ensure base dir exists for test, or we can mock the paths if they were configurable.
-	// Since paths are hardcoded to /var/lib in the implementation, we might face permission issues
-	// if not running as root. We will mock the paths in the functions if we want it fully unit-testable,
-	// but for now, we will create a lightweight test that checks if tar is invoked or we'll skip 
-	// if we don't have permissions.
-	
+	// Setup test environment using configured state.RootDir
+	baseDir := state.RootDir
 	if err := os.MkdirAll(baseDir, 0755); err != nil {
-		t.Skipf("Skipping test due to permission error on %s (run as root): %v", baseDir, err)
+		t.Skipf("Skipping test due to permission error on %s: %v", baseDir, err)
 	}
 	
 	containerID := "test-snap-1"
-	containerDir := filepath.Join(baseDir, containerID)
+	containerDir, err := state.ContainerDir(containerID)
+	if err != nil {
+		t.Fatalf("state.ContainerDir: %v", err)
+	}
 	if err := os.MkdirAll(containerDir, 0755); err != nil {
 		t.Skipf("Skipping test due to permission error on %s: %v", containerDir, err)
 	}
@@ -34,7 +31,7 @@ func TestSnapshot_ExportImport(t *testing.T) {
 	tempDir := t.TempDir()
 	tgzPath := filepath.Join(tempDir, "test-export.tgz")
 	
-	err := Export(containerID, tgzPath)
+	err = Export(containerID, tgzPath)
 	if err != nil {
 		t.Fatalf("Export failed: %v", err)
 	}

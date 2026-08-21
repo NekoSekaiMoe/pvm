@@ -82,6 +82,7 @@ func main() {
 		poolCmd(os.Args[2:])
 	default:
 		fmt.Println("Unknown command:", cmd)
+		os.Exit(1)
 	}
 }
 
@@ -437,28 +438,33 @@ func trimExt(p string) string {
 func snapshotCmd(args []string) {
 	if len(args) < 3 {
 		fmt.Println("Usage: agentpvm snapshot [export|import] <id> <file.tgz>")
-		return
+		os.Exit(1)
 	}
 	sub, id, file := args[0], args[1], args[2]
 	if sub == "export" {
 		if err := snapshot.Export(id, file); err != nil {
 			fmt.Printf("Export failed: %v\n", err)
+			os.Exit(1)
 		} else {
 			fmt.Println("Snapshot exported successfully to", file)
 		}
 	} else if sub == "import" {
 		if err := snapshot.Import(file, id); err != nil {
 			fmt.Printf("Import failed: %v\n", err)
+			os.Exit(1)
 		} else {
 			fmt.Println("Snapshot imported successfully as", id)
 		}
+	} else {
+		fmt.Println("Usage: agentpvm snapshot [export|import] <id> <file.tgz>")
+		os.Exit(1)
 	}
 }
 
 func networkCmd(args []string) {
 	if len(args) < 2 {
 		fmt.Println("Usage: agentpvm network [whitelist|qos]")
-		return
+		os.Exit(1)
 	}
 	sub := args[0]
 	if sub == "whitelist" && len(args) >= 4 && args[1] == "add" {
@@ -466,16 +472,20 @@ func networkCmd(args []string) {
 	} else if sub == "qos" && len(args) >= 3 {
 		if err := network.SetupQoS(args[1], args[2]); err != nil {
 			fmt.Printf("QoS Error: %v\n", err)
+			os.Exit(1)
 		} else {
 			fmt.Printf("QoS limit set to %s on %s\n", args[2], args[1])
 		}
+	} else {
+		fmt.Println("Usage: agentpvm network [whitelist|qos]")
+		os.Exit(1)
 	}
 }
 
 func cgroupCmd(args []string) {
 	if len(args) < 2 {
 		fmt.Println("Usage: agentpvm cgroup [freeze|thaw] <id>")
-		return
+		os.Exit(1)
 	}
 	sub, id := args[0], args[1]
 	cg := cgroup.NewManager()
@@ -483,15 +493,20 @@ func cgroupCmd(args []string) {
 	case "freeze":
 		if err := cg.Freeze(id); err != nil {
 			fmt.Printf("Freeze failed: %v\n", err)
+			os.Exit(1)
 		} else {
 			fmt.Println("Container frozen successfully (0 CPU usage)")
 		}
 	case "thaw":
 		if err := cg.Thaw(id); err != nil {
 			fmt.Printf("Thaw failed: %v\n", err)
+			os.Exit(1)
 		} else {
 			fmt.Println("Container thawed successfully (CPU restored)")
 		}
+	default:
+		fmt.Println("Usage: agentpvm cgroup [freeze|thaw] <id>")
+		os.Exit(1)
 	}
 }
 
@@ -561,7 +576,7 @@ func resolveAPISecret() (string, error) {
 func approvalCmd(args []string) {
 	if len(args) == 0 {
 		fmt.Println("Usage: agentpvm approval [list]   (operates against $PVM_API / $API_SECRET)")
-		return
+		os.Exit(1)
 	}
 	base := os.Getenv("PVM_API")
 	if base == "" {
@@ -579,7 +594,7 @@ func approvalCmd(args []string) {
 		resp, err := cliHTTPClient.Do(req)
 		if err != nil {
 			fmt.Printf("approval list: %v (is the API running at %s?)\n", err, base)
-			return
+			os.Exit(1)
 		}
 		defer resp.Body.Close()
 		var tickets []approval.Ticket
@@ -593,6 +608,7 @@ func approvalCmd(args []string) {
 		}
 	default:
 		fmt.Println("unknown subcommand:", args[0])
+		os.Exit(1)
 	}
 }
 
@@ -601,7 +617,7 @@ func approvalCmd(args []string) {
 func poolCmd(args []string) {
 	if len(args) == 0 {
 		fmt.Println("Usage: agentpvm pool [stats|warm <template> <n>]   (operates against $PVM_API / $API_SECRET)")
-		return
+		os.Exit(1)
 	}
 	base := os.Getenv("PVM_API")
 	if base == "" {
@@ -619,7 +635,7 @@ func poolCmd(args []string) {
 		resp, err := cliHTTPClient.Do(req)
 		if err != nil {
 			fmt.Printf("pool stats: %v (is the API running at %s?)\n", err, base)
-			return
+			os.Exit(1)
 		}
 		defer resp.Body.Close()
 		var st struct {
@@ -631,6 +647,7 @@ func poolCmd(args []string) {
 		fmt.Printf("ready=%d claimed=%d total=%d\n", st.Ready, st.Claimed, st.Total)
 	default:
 		fmt.Println("unknown subcommand:", args[0], "(warm is not yet implemented over HTTP)")
+		os.Exit(1)
 	}
 }
 
