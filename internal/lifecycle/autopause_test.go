@@ -74,14 +74,15 @@ func TestAutopause_FiresAndResume(t *testing.T) {
 
 	m := New(nil)
 	m.Arm(id, 30*time.Millisecond)
-	time.Sleep(80 * time.Millisecond)
 
-	loaded, err := state.LoadState(id)
-	if err != nil {
-		t.Fatalf("load after pause: %v", err)
-	}
-	if loaded.Status != state.StatusSuspended {
-		t.Fatalf("status after autopause = %q, want suspended", loaded.Status)
+	// Poll instead of sleeping a fixed 80ms: on a loaded CI runner (bazel
+	// test //... runs every test binary in parallel) the pause callback can
+	// be descheduled for tens of milliseconds after the timer fires, so a
+	// fixed sleep sees a stale "running". Timers never fire early, so
+	// waiting for the transition cannot false-pass; it can only fail if the
+	// callback never runs at all.
+	if !waitForStatus(t, id, state.StatusSuspended, 2*time.Second) {
+		t.Fatalf("status after autopause = %q, want suspended", mustStatus(t, id))
 	}
 
 	if err := m.Resume(id); err != nil {
@@ -120,22 +121,37 @@ func TestAutopause_ResetBumpsDeadline(t *testing.T) {
 	_ = state.SaveState(id, st)
 
 	m := New(nil)
-	m.Arm(id, 80*time.Millisecond)
-	// Wait until we are safely INSIDE the first window (and past any startup
-	// jitter) before bumping; polling the deadline condition instead of a
-	// fixed sleep keeps this deterministic on slow runners.
-	time.Sleep(20 * time.Millisecond)
-	m.Reset(id, 200*time.Millisecond) // bump: new deadline is now+200ms
-	// The ORIGINAL deadline (arm+80ms) must pass without a pause. Waiting
-	// 100ms from here crosses arm+80ms with margin while staying well inside
-	// the reset deadline.
-	time.Sleep(100 * time.Millisecond)
-	if mustStatus(t, id) == state.StatusSuspended {
-		t.Fatalf("autopause fired despite reset")
+	// The original schedule (200ms) is superseded immediately (Reset is a
+	// full re-Arm, so no delay is needed to be "inside" the window — the
+	// original deadline just has to be far enough out that no realistic
+	// scheduler stall between the two adjacent statements lets it fire).
+	// The reset deadline must land well AFTER the observation window below.
+	const (
+		origDeadline  = 200 * time.Millisecond
+		resetDeadline = 1 * time.Second
+		window        = 500 * time.Millisecond // > origDeadline, < resetDeadline
+	)
+	m.Arm(id, origDeadline)
+	m.Reset(id, resetDeadline)
+
+	// Observation window: cross the ORIGINAL deadline and assert the task
+	// never gets suspended by it. Polling bounded by wall clock is sound
+	// because timers never fire early: under correct behavior every
+	// in-window observation sees "running"; a scheduler stall only skips
+	// polls (the loop guard drops out-of-window checks), never fabricates a
+	// suspension. Only a superseded-but-still-live schedule fails here.
+	windowEnd := time.Now().Add(window)
+	for time.Now().Before(windowEnd) {
+		if s := mustStatus(t, id); s == state.StatusSuspended {
+			t.Fatalf("autopause fired despite reset (deadline was bumped to %v)", resetDeadline)
+		}
+		time.Sleep(2 * time.Millisecond)
 	}
+
 	// Now wait for the reset deadline to fire; polling instead of a fixed
-	// sleep so a slow runner still observes it.
-	if !waitForStatus(t, id, state.StatusSuspended, 2*time.Second) {
+	// sleep so a slow runner still observes it. This also fails if Reset
+	// dropped the schedule entirely (no suspension would ever arrive).
+	if !waitForStatus(t, id, state.StatusSuspended, 4*time.Second) {
 		t.Fatalf("expected suspended after bumped deadline, got %q", mustStatus(t, id))
 	}
 }
