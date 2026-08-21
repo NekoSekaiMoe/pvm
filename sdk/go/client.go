@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strings"
 )
 
 type Config struct {
@@ -44,6 +45,9 @@ func NewClient(cfg Config) *Client {
 	if cfg.APIURL == "" {
 		cfg.APIURL = "http://127.0.0.1:3000"
 	}
+	// Normalize: a trailing slash would produce double slashes in every
+	// joined path (e.g. "http://h:1//api/volumes").
+	cfg.APIURL = strings.TrimRight(cfg.APIURL, "/")
 	return &Client{cfg: cfg, http: &http.Client{}}
 }
 
@@ -68,13 +72,15 @@ type CreateVolumeOptions struct {
 	Driver string `json:"driver,omitempty"`
 }
 
+// VolumeInfo is the API-facing volume shape. Token and PrivateData are
+// deliberately absent: they are mount-plugin credentials and the API never
+// returns them.
 type VolumeInfo struct {
-	VolumeID    string `json:"volume_id"`
-	Name        string `json:"name"`
-	Driver      string `json:"driver"`
-	Token       string `json:"token"`
-	RefCount    int    `json:"refcount"`
-	CreatedAt   string `json:"created_at"`
+	VolumeID  string `json:"volume_id"`
+	Name      string `json:"name"`
+	Driver    string `json:"driver"`
+	RefCount  int    `json:"refcount"`
+	CreatedAt string `json:"created_at"`
 }
 
 func (c *Client) CreateVolume(ctx context.Context, opts CreateVolumeOptions) (*VolumeInfo, error) {
@@ -139,6 +145,19 @@ func (c *Client) GetTemplate(ctx context.Context, id string) (*TemplateInfo, err
 		return nil, err
 	}
 	return &out, nil
+}
+
+func (c *Client) SetTemplateAlias(ctx context.Context, id, alias string) (*TemplateInfo, error) {
+	payload := map[string]string{"alias": alias}
+	var out TemplateInfo
+	if err := c.doJSON(ctx, http.MethodPost, "/api/templates/"+url.PathEscape(id)+"/alias", payload, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+func (c *Client) DeleteTemplate(ctx context.Context, id string) error {
+	return c.doJSON(ctx, http.MethodDelete, "/api/templates/"+url.PathEscape(id), nil, nil)
 }
 
 // --- Tasks (existing) ---

@@ -175,15 +175,15 @@ type NetworkSpec struct {
 
 // EgressRule is one L7 egress rule, mirroring CubeSandbox's Rule/Match/Action.
 type EgressRule struct {
-	Name   string            `toml:"name" json:"name"`
-	Host   string            `toml:"host" json:"host"`     // exact or "*.suffix"
-	SNI    string            `toml:"sni" json:"sni"`       // TLS SNI, same wildcard as Host
-	Method []string          `toml:"method" json:"method"` // OR within list
-	Path   string            `toml:"path" json:"path"`     // exact or "/prefix/*"
-	Scheme string            `toml:"scheme" json:"scheme"` // "http" | "https"
-	Port   int               `toml:"port" json:"port"`     // 1..65535, 0 = default 80/443
-	Allow  *bool             `toml:"allow" json:"allow"`   // nil = allow=true
-	Inject *EgressInject     `toml:"inject" json:"inject"`
+	Name   string        `toml:"name" json:"name"`
+	Host   string        `toml:"host" json:"host"`     // exact or "*.suffix"
+	SNI    string        `toml:"sni" json:"sni"`       // TLS SNI, same wildcard as Host
+	Method []string      `toml:"method" json:"method"` // OR within list
+	Path   string        `toml:"path" json:"path"`     // exact or "/prefix/*"
+	Scheme string        `toml:"scheme" json:"scheme"` // "http" | "https"
+	Port   int           `toml:"port" json:"port"`     // 1..65535, 0 = default 80/443
+	Allow  *bool         `toml:"allow" json:"allow"`   // nil = allow=true
+	Inject *EgressInject `toml:"inject" json:"inject"`
 }
 
 // EgressInject mirrors Cube's Inject{header, format, secret} for credential injection.
@@ -246,11 +246,12 @@ type ArtifactsSpec struct {
 
 // VolumeMount declares one persistent volume attachment. Mirrors
 // sdk/go:VolumeMount{Name, Path, ReadOnly} and the TOML form:
-//   [[volumes]]
-//   name = "my-data"
-//   path = "/workspace"
-//   driver = "hostdir"   # optional, defaults to first registered plugin
-//   read_only = true
+//
+//	[[volumes]]
+//	name = "my-data"
+//	path = "/workspace"
+//	driver = "hostdir"   # optional, defaults to first registered plugin
+//	read_only = true
 type VolumeMount struct {
 	Name     string `toml:"name" json:"name"`
 	Path     string `toml:"path" json:"path"`
@@ -406,8 +407,11 @@ func (s *TaskSpec) Validate() error {
 		}
 	}
 	if s.Lifecycle.IdleTimeout != "" {
-		if _, err := time.ParseDuration(s.Lifecycle.IdleTimeout); err != nil {
+		d, err := time.ParseDuration(s.Lifecycle.IdleTimeout)
+		if err != nil {
 			errs = append(errs, fmt.Errorf("spec: lifecycle.idle_timeout: %w", err))
+		} else if d <= 0 {
+			errs = append(errs, fmt.Errorf("spec: lifecycle.idle_timeout must be positive, got %q", s.Lifecycle.IdleTimeout))
 		}
 	}
 	return errors.Join(errs...)

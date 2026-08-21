@@ -182,6 +182,10 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 	st.Tenant = s.Tenant
 	st.Caller = s.Caller
 	st.SpecFP = s.Fingerprint()
+	// Persist the lifecycle config snapshot so API endpoints (/exec,
+	// /tasks/:id/*) can honor auto_resume/idle policy without the spec file.
+	st.IdleTimeout = s.Lifecycle.IdleTimeout
+	st.AutoResume = s.Lifecycle.AutoResume
 	st.Status = state.StatusPending
 	state.SaveState(taskID, st)
 
@@ -230,6 +234,14 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 
 	// Volume attachments: for each spec.Volumes entry, attach via volume.Manager
 	// and collect hostfs_volume args. RefCounts are tracked inside Manager.
+	// A spec that references volumes without a configured volume Manager must
+	// fail BEFORE any runtime resource is launched — silently dropping the
+	// mounts would run the task with different storage than contracted.
+	if m.Volumes == nil && len(s.Volumes) > 0 {
+		_ = st.Transition(state.StatusFailed, state.ActorController, "volumes requested but no volume manager configured")
+		state.SaveState(taskID, st)
+		return fmt.Errorf("container: task %s requests %d volumes but no volume manager is configured", taskID, len(s.Volumes))
+	}
 	var volumeArgs []string
 	var attachedVolumes []spec.VolumeMount
 	if m.Volumes != nil && len(s.Volumes) > 0 {
@@ -342,33 +354,41 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 	// the guest as the proxy address it must dial; the task id never crosses
 	// the trust boundary.
 	if m.Egress != nil && s.Network.Enabled {
-			pol := &egress.Policy{
-				AllowDomains:   s.Network.EgressAllowDomains,
-				BlockDomains:   s.Network.EgressBlockDomains,
-				MaxRequestBody: s.Network.MaxRequestBodyBytes,
+		pol := &egress.Policy{
+			AllowDomains:   s.Network.EgressAllowDomains,
+			BlockDomains:   s.Network.EgressBlockDomains,
+			MaxRequestBody: s.Network.MaxRequestBodyBytes,
+		}
+		for _, r := range s.Network.EgressRules {
+			host := r.Host
+			if host == "" {
+				host = r.SNI
 			}
-			for _, r := range s.Network.EgressRules {
-				host := r.Host
-				if host == "" {
-					host = r.SNI
-				}
-				if host == "" {
-					continue
-				}
-				if r.Allow != nil && !*r.Allow {
-					pol.BlockDomains = append(pol.BlockDomains, host)
-				} else {
-					pol.AllowDomains = append(pol.AllowDomains, host)
-				}
-				// Also wire the full L7 rule so the gateway can enforce method/path/scheme and inject credentials.
-				var inj *egress.EgressInject
-				if r.Inject != nil {
-					inj = &egress.EgressInject{Header: r.Inject.Header, Format: r.Inject.Format, Secret: r.Inject.Secret}
-				}
-				pol.Rules = append(pol.Rules, egress.EgressRule{
-					Name: r.Name, Host: r.Host, SNI: r.SNI, Method: r.Method, Path: r.Path, Scheme: r.Scheme, Port: r.Port, Allow: r.Allow, Inject: inj,
-				})
+			if host == "" {
+				continue
 			}
+			if r.Allow != nil && !*r.Allow {
+				pol.BlockDomains = append(pol.BlockDomains, host)
+			} else {
+				pol.AllowDomains = append(pol.AllowDomains, host)
+			}
+			// Also wire the full L7 rule so the gateway can enforce method/path/scheme and inject credentials.
+			var inj *egress.EgressInject
+			if r.Inject != nil {
+				inj = &egress.EgressInject{Header: r.Inject.Header, Format: r.Inject.Format, Secret: r.Inject.Secret}
+			}
+			pol.Rules = append(pol.Rules, egress.EgressRule{
+				Name:   r.Name,
+				Host:   r.Host,
+				SNI:    r.SNI,
+				Method: r.Method,
+				Path:   r.Path,
+				Scheme: r.Scheme,
+				Port:   r.Port,
+				Allow:  r.Allow,
+				Inject: inj,
+			})
+		}
 		m.Egress.SetPolicy(taskID, pol)
 		if lp, err := m.Egress.ListenForTask(ctx, taskID); err == nil {
 			defer lp.Close()
@@ -477,6 +497,14 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 		// so fail closed (we already transitioned to Running; flip to Failed).
 		_ = st.Transition(state.StatusFailed, state.ActorController, "audit task:start append failed: "+err.Error())
 		state.SaveState(taskID, st)
+		// The process is already launched; a sandbox must never keep running
+		// without its task:start authorization evidence. Terminate it, wait
+		// for exit, and release the attached volumes before failing.
+		if p != nil && p.Cmd != nil && p.Cmd.Process != nil {
+			_ = p.Cmd.Process.Kill()
+			_ = m.Launcher.Wait(p)
+		}
+		cleanupVolumes()
 		return fmt.Errorf("container: audit task:start for %s: %w", taskID, err)
 	}
 

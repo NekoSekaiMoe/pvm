@@ -236,30 +236,28 @@ func (e *Qcow2Engine) ListSnapshots(volumeName string) ([]Snapshot, error) {
 		}
 		name := ent.Name()[5 : len(ent.Name())-6]
 		path := filepath.Join(e.root, ent.Name())
+		// Open once: size AND backing name must come from the same file state.
 		img, err := openGuestImage(path)
 		if err != nil {
 			continue
 		}
 		size := img.Size()
+		origin := volumeName // best-effort; qcow2 header carries backing name
+		if qi, ok := img.(*qcow2Image); ok && qi.backingName != "" {
+			origin = filepath.Base(qi.backingName)
+			if ext := filepath.Ext(origin); ext == ".qcow2" {
+				origin = origin[:len(origin)-len(ext)]
+				if len(origin) > 5 && origin[:5] == "snap-" {
+					origin = origin[5:]
+				}
+			}
+		}
 		img.Close()
 		// Best-effort created-at: the file may vanish between open and stat
 		// (concurrent DeleteSnapshot); use a zero timestamp instead of panicking.
 		var created string
 		if st, err := os.Stat(path); err == nil {
 			created = st.ModTime().UTC().Format("2006-01-02T15:04:05Z")
-		}
-		origin := volumeName // best-effort; qcow2 header carries backing name
-		if q, err := openGuestImage(path); err == nil {
-			if qi, ok := q.(*qcow2Image); ok && qi.backingName != "" {
-				origin = filepath.Base(qi.backingName)
-				if ext := filepath.Ext(origin); ext == ".qcow2" {
-					origin = origin[:len(origin)-len(ext)]
-					if len(origin) > 5 && origin[:5] == "snap-" {
-						origin = origin[5:]
-					}
-				}
-			}
-			q.Close()
 		}
 		if volumeName != "" && origin != volumeName {
 			continue

@@ -144,23 +144,8 @@ func (s *Store) Create(rec Record) error {
 	if !idRe.MatchString(rec.TemplateID) {
 		return fmt.Errorf("%w: invalid id %q", ErrInvalid, rec.TemplateID)
 	}
-	if err := validateAlias(rec.Alias); err != nil {
-		return err
-	}
-	if rec.Alias != "" {
-		// uniqueness among all templates (mirrors alias_key unique index)
-		existing, _ := s.getByAliasLocked(rec.Alias)
-		if existing != nil {
-			return fmt.Errorf("%w: alias %q already claimed by %s", ErrConflict, rec.Alias, existing.TemplateID)
-		}
-	}
-	dir, _ := s.dir(rec.TemplateID)
-	if _, err := os.Stat(filepath.Join(dir, "meta.json")); err == nil {
-		return fmt.Errorf("%w: %q already exists", ErrConflict, rec.TemplateID)
-	}
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return err
-	}
+	// Apply defaults BEFORE alias validation so the READY gate below sees the
+	// effective status, not the raw zero value.
 	if rec.CreatedAt.IsZero() {
 		rec.CreatedAt = time.Now().UTC()
 	}
@@ -174,13 +159,58 @@ func (s *Store) Create(rec Record) error {
 			rec.Kind = "template"
 		}
 	}
-	if err := writeMeta(dir, rec); err != nil {
+	if err := validateAlias(rec.Alias); err != nil {
 		return err
+	}
+	if rec.Alias != "" {
+		// Aliases may only be claimed by READY templates (mirrors the
+		// SetAlias requireReady rule).
+		if rec.Status != "READY" {
+			return fmt.Errorf("%w: alias %q on non-READY template (status=%s)", ErrInvalid, rec.Alias, rec.Status)
+		}
+		// uniqueness among all templates (mirrors alias_key unique index)
+		existing, _ := s.getByAliasLocked(rec.Alias)
+		if existing != nil {
+			return fmt.Errorf("%w: alias %q already claimed by %s", ErrConflict, rec.Alias, existing.TemplateID)
+		}
+	}
+	dir, _ := s.dir(rec.TemplateID)
+	if _, err := os.Stat(filepath.Join(dir, "meta.json")); err == nil {
+		return fmt.Errorf("%w: %q already exists", ErrConflict, rec.TemplateID)
+	}
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return err
+	}
+	writeErr := writeMeta(dir, rec)
+	if writeErr != nil {
+		if !errors.Is(writeErr, fsjson.ErrDurability) {
+			return writeErr
+		}
+		// The rename was committed; only the durability confirmation failed.
+		// Re-read the on-disk record: if it matches, the Create succeeded.
+		got, rerr := readMeta(dir)
+		if rerr != nil || got.TemplateID != rec.TemplateID {
+			return writeErr
+		}
 	}
 	if rec.Alias != "" {
 		s.aliases[rec.Alias] = rec.TemplateID
 	}
 	return nil
+}
+
+// readMeta loads the persisted Record from dir (used to reconcile the
+// fsjson durability condition in Create).
+func readMeta(dir string) (*Record, error) {
+	data, err := os.ReadFile(filepath.Join(dir, "meta.json"))
+	if err != nil {
+		return nil, err
+	}
+	var rec Record
+	if err := json.Unmarshal(data, &rec); err != nil {
+		return nil, err
+	}
+	return &rec, nil
 }
 
 // Get returns the record for id.

@@ -28,6 +28,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -38,11 +39,11 @@ import (
 
 // Policy is the per-task egress rule set.
 type Policy struct {
-	AllowDomains     []string // exact match or "*.suffix" wildcard
-	BlockDomains     []string // takes precedence over allow
-	MaxRequestBody    int64   // bytes; 0 = unlimited
-	MaxResponseBody   int64   // bytes; 0 = unlimited
-	AllowedMethods   []string // default GET/HEAD/POST/PUT/DELETE/PATCH
+	AllowDomains    []string // exact match or "*.suffix" wildcard
+	BlockDomains    []string // takes precedence over allow
+	MaxRequestBody  int64    // bytes; 0 = unlimited
+	MaxResponseBody int64    // bytes; 0 = unlimited
+	AllowedMethods  []string // default GET/HEAD/POST/PUT/DELETE/PATCH
 	// ReviewHook is called for requests flagged as REVIEW (large POST, etc.).
 	// If nil, REVIEW is treated as BLOCK.
 	ReviewHook func(req *http.Request, bodySize int64) (allow bool, reason string)
@@ -288,8 +289,8 @@ func (g *Gateway) handle(w http.ResponseWriter, r *http.Request) {
 // (from the CONNECT line) but not the encrypted body, so only domain-level
 // policy is enforceable here. The eBPF floor still applies IP-block at TC.
 func (g *Gateway) handleConnect(w http.ResponseWriter, r *http.Request, task string, pol *Policy) {
-	host := anonymousPort(r.Host)
-	d := g.decideDomain(host, pol)
+	v := viewFromConnect(r)
+	d := g.decideDomain(v, pol)
 	if d == DecisionBlock {
 		g.record(task, r, d, "domain blocked")
 		http.Error(w, "egress: blocked", http.StatusForbidden)
@@ -321,7 +322,7 @@ func (g *Gateway) handleConnect(w http.ResponseWriter, r *http.Request, task str
 		targetConn.Close()
 		return
 	}
-	g.record(task, r, DecisionAllow, "CONNECT "+host)
+	g.record(task, r, DecisionAllow, "CONNECT "+v.host)
 	go pipe(clientConn, targetConn, task, g, pol)
 	go pipe(targetConn, clientConn, task, g, pol)
 }
@@ -331,8 +332,8 @@ func (g *Gateway) handleConnect(w http.ResponseWriter, r *http.Request, task str
 // DialContext) so a domain that resolves to an internal IP is refused here
 // too — not only on CONNECT.
 func (g *Gateway) handleHTTP(w http.ResponseWriter, r *http.Request, task string, pol *Policy) {
-	host := anonymousPort(r.Host)
-	d := g.decideDomain(host, pol)
+	v := viewFromHTTP(r)
+	d := g.decideDomain(v, pol)
 	if d == DecisionBlock {
 		g.record(task, r, d, "domain blocked")
 		http.Error(w, "egress: blocked", http.StatusForbidden)
@@ -365,8 +366,9 @@ func (g *Gateway) handleHTTP(w http.ResponseWriter, r *http.Request, task string
 	// internal routing/audit identifier and must not leak to third parties;
 	// hop-by-hop headers per RFC 7230 §6.1 are connection-scoped.
 	outReq.Header = stripInternalHeaders(r.Header.Clone())
-	// Credential injection: if an allow rule carries Inject, add the header.
-	g.ApplyInject(outReq, host, pol)
+	// Credential injection: if the first fully matching allow rule carries
+	// Inject, add the header.
+	g.ApplyInject(outReq, v, pol)
 	// SSRF floor: dial through a custom transport whose DialContext rejects
 	// any IP that resolves to a private/loopback/link-local range. This mirrors
 	// the isPrivate() check on handleConnect's established connection. Tests
@@ -409,7 +411,7 @@ func (g *Gateway) handleHTTP(w http.ResponseWriter, r *http.Request, task string
 	w.WriteHeader(resp.StatusCode)
 	n, _ := io.Copy(w, src)
 	g.addBytes(task, n)
-	g.record(task, r, DecisionAllow, fmt.Sprintf("%s %s -> %d (%dB)", r.Method, host, resp.StatusCode, n))
+	g.record(task, r, DecisionAllow, fmt.Sprintf("%s %s -> %d (%dB)", r.Method, v.host, resp.StatusCode, n))
 }
 
 // dialCheckedTransport returns an http.RoundTripper whose DialContext rejects
@@ -478,70 +480,154 @@ func stripInternalHeaders(hdr http.Header) http.Header {
 	return out
 }
 
-// decideDomain applies block-over-allow with wildcard suffix matching.
-// When Policy.Rules is non-empty it is evaluated first (first-match-wins,
-// mirroring CubeEgress lua/access_phase.lua); flat lists are the fallback.
-func (g *Gateway) decideDomain(host string, pol *Policy) Decision {
-	host = strings.ToLower(stripPort(host))
-	if len(pol.Rules) > 0 {
-		for _, r := range pol.Rules {
-			h := r.Host
-			if h == "" {
-				h = r.SNI
-			}
-			if h == "" {
-				continue
-			}
-			if domainMatches(host, strings.ToLower(h)) {
-				if r.Allow != nil && !*r.Allow {
-					return DecisionBlock
-				}
-				return DecisionAllow
+// requestView is the policy-relevant view of an outbound request, shared by
+// decideDomain and ApplyInject so both walk the Rules with the same
+// first-match-wins semantics.
+type requestView struct {
+	method string
+	host   string // lowercase, port-stripped
+	path   string // "" when not visible (CONNECT tunnels)
+	scheme string // "http" | "https"
+	port   string // effective port as a string
+}
+
+// viewFromHTTP builds the view for a plain HTTP proxy request.
+func viewFromHTTP(r *http.Request) requestView {
+	scheme := r.URL.Scheme
+	if scheme == "" {
+		scheme = "http"
+	}
+	port := r.URL.Port()
+	if port == "" {
+		if strings.EqualFold(scheme, "https") {
+			port = "443"
+		} else {
+			port = "80"
+		}
+	}
+	return requestView{
+		method: r.Method,
+		host:   strings.ToLower(stripPort(r.Host)),
+		path:   r.URL.Path,
+		scheme: strings.ToLower(scheme),
+		port:   port,
+	}
+}
+
+// viewFromConnect builds the (partial) view for a CONNECT tunnel: the target
+// host and port are visible, the path is encrypted.
+func viewFromConnect(r *http.Request) requestView {
+	port := ""
+	if i := strings.LastIndex(r.Host, ":"); i >= 0 {
+		port = r.Host[i+1:]
+	}
+	if port == "" {
+		port = "443"
+	}
+	return requestView{
+		method: http.MethodConnect,
+		host:   strings.ToLower(stripPort(r.Host)),
+		scheme: "https",
+		port:   port,
+	}
+}
+
+// ruleMatches reports whether every constraint present on the rule matches
+// the request view. A rule with neither Host nor SNI never matches; unset
+// constraints (Method/Path/Scheme/Port) are wildcards.
+func ruleMatches(r EgressRule, v requestView) bool {
+	h := r.Host
+	if h == "" {
+		h = r.SNI
+	}
+	if h == "" || !domainMatches(v.host, strings.ToLower(h)) {
+		return false
+	}
+	if len(r.Method) > 0 {
+		ok := false
+		for _, m := range r.Method {
+			if strings.EqualFold(m, v.method) {
+				ok = true
+				break
 			}
 		}
-		return DecisionBlock // no rule matched -> deny
+		if !ok {
+			return false
+		}
+	}
+	if r.Path != "" && !pathMatches(r.Path, v.path) {
+		return false
+	}
+	if r.Scheme != "" && !strings.EqualFold(r.Scheme, v.scheme) {
+		return false
+	}
+	if r.Port != 0 && strconv.Itoa(r.Port) != v.port {
+		return false
+	}
+	return true
+}
+
+// pathMatches supports exact paths and "/prefix/*" globs (per EgressRule.Path).
+func pathMatches(rule, path string) bool {
+	if rule == path {
+		return true
+	}
+	if strings.HasSuffix(rule, "/*") {
+		return strings.HasPrefix(path, strings.TrimSuffix(rule, "*"))
+	}
+	return false
+}
+
+// decideDomain applies the Rules with first-match-wins semantics: only a rule
+// that fully matches (host/SNI plus method, path, scheme, port) may decide.
+// When Policy.Rules is empty the flat block-over-allow lists are the fallback.
+func (g *Gateway) decideDomain(v requestView, pol *Policy) Decision {
+	if len(pol.Rules) > 0 {
+		for _, r := range pol.Rules {
+			if !ruleMatches(r, v) {
+				continue
+			}
+			if r.Allow != nil && !*r.Allow {
+				return DecisionBlock
+			}
+			return DecisionAllow
+		}
+		return DecisionBlock // no rule fully matched -> deny
 	}
 	for _, b := range pol.BlockDomains {
-		if domainMatches(host, strings.ToLower(b)) {
+		if domainMatches(v.host, strings.ToLower(b)) {
 			return DecisionBlock
 		}
 	}
 	for _, a := range pol.AllowDomains {
-		if domainMatches(host, strings.ToLower(a)) {
+		if domainMatches(v.host, strings.ToLower(a)) {
 			return DecisionAllow
 		}
 	}
 	return DecisionBlock // default deny
 }
 
-// ApplyInject adds credential headers from matching allow rules. Call after
-// decideDomain returned Allow; it mutates outReq.Header in place.
-func (g *Gateway) ApplyInject(outReq *http.Request, host string, pol *Policy) {
+// ApplyInject adds credential headers from the FIRST fully matching rule.
+// Call after decideDomain returned Allow; it mutates outReq.Header in place.
+// A rule that matches but carries no Inject stops the walk: a later, broader
+// rule must never leak its credentials into this request.
+func (g *Gateway) ApplyInject(outReq *http.Request, v requestView, pol *Policy) {
 	if len(pol.Rules) == 0 {
 		return
 	}
-	host = strings.ToLower(stripPort(host))
 	for _, r := range pol.Rules {
-		h := r.Host
-		if h == "" {
-			h = r.SNI
-		}
-		if h == "" || !domainMatches(host, strings.ToLower(h)) {
+		if !ruleMatches(r, v) {
 			continue
 		}
-		if r.Inject == nil || r.Inject.Header == "" || r.Inject.Secret == "" {
-			continue
+		if r.Inject != nil && r.Inject.Header != "" && r.Inject.Secret != "" && (r.Allow == nil || *r.Allow) {
+			format := r.Inject.Format
+			if format == "" {
+				format = "${SECRET}"
+			}
+			val := strings.ReplaceAll(format, "${SECRET}", r.Inject.Secret)
+			outReq.Header.Set(r.Inject.Header, val)
 		}
-		if r.Allow != nil && !*r.Allow {
-			continue
-		}
-		format := r.Inject.Format
-		if format == "" {
-			format = "${SECRET}"
-		}
-		val := strings.ReplaceAll(format, "${SECRET}", r.Inject.Secret)
-		outReq.Header.Set(r.Inject.Header, val)
-		return // first matching rule wins, like CubeEgress
+		return // first fully matching rule wins, like CubeEgress
 	}
 }
 
@@ -675,11 +761,6 @@ func stripPort(hostport string) string {
 		return hostport[:i]
 	}
 	return hostport
-}
-
-// anonymousPort strips the port from a host for logging (privacy/DLP-lite).
-func anonymousPort(host string) string {
-	return stripPort(host)
 }
 
 var _ = bufio.NewReader // keep import for future streaming body scan

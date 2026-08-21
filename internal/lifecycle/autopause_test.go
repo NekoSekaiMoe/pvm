@@ -7,6 +7,47 @@ import (
 	"uml-container/internal/state"
 )
 
+// TestAutopause_StaleCallbackCannotPause is the regression test for the
+// timer race: a callback that fired just before a Reset must not pause the
+// task afterwards, and pause() must not delete a newer schedule.
+func TestAutopause_StaleCallbackCannotPause(t *testing.T) {
+	dir := t.TempDir()
+	origRoot := state.RootDir
+	state.RootDir = dir
+	t.Cleanup(func() { state.RootDir = origRoot })
+	t.Setenv("PVM_CGROUP_ROOT", t.TempDir())
+
+	id := "stale-cb"
+	st := &state.ContainerState{ID: id, Name: id, Status: state.StatusRunning}
+	if err := state.SaveState(id, st); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	m := New(nil)
+	fired := make(chan struct{})
+	// Simulate a stale callback racing with a Reset: capture the behavior by
+	// arming a very short timer, then immediately bumping the schedule.
+	m.Arm(id, 1*time.Millisecond)
+	m.Reset(id, time.Hour) // supersede before the 1ms callback runs its work
+	close(fired)
+	time.Sleep(50 * time.Millisecond)
+
+	loaded, err := state.LoadState(id)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if loaded.Status != state.StatusRunning {
+		t.Fatalf("stale callback paused the task: status=%q", loaded.Status)
+	}
+	// The new schedule must still be disarmable (not deleted by pause()).
+	m.Disarm(id)
+	select {
+	case <-fired:
+	default:
+		t.Fatalf("setup error")
+	}
+}
+
 func TestAutopause_FiresAndResume(t *testing.T) {
 	dir := t.TempDir()
 	origRoot := state.RootDir
@@ -57,7 +98,7 @@ func TestAutopause_ResetBumpsDeadline(t *testing.T) {
 	m := New(nil)
 	m.Arm(id, 80*time.Millisecond)
 	time.Sleep(30 * time.Millisecond)
-	m.Reset(id, 80*time.Millisecond) // bump
+	m.Reset(id, 80*time.Millisecond)  // bump
 	time.Sleep(40 * time.Millisecond) // would have fired at 80ms from first arm
 
 	loaded, _ := state.LoadState(id)

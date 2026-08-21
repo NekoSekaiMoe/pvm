@@ -3,22 +3,46 @@ package network
 import "testing"
 
 func TestBuildNetPolicyPlan(t *testing.T) {
-	allow, deny, err := BuildNetPolicyPlan([]string{"1.2.3.0/24"}, []string{"10.0.0.0/8"})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	tests := []struct {
+		name      string
+		allow     []string
+		deny      []string
+		wantAllow int
+		wantDeny  int // minimum expected
+		wantErr   bool
+	}{
+		{
+			name:      "allow and deny ranges",
+			allow:     []string{"1.2.3.0/24"},
+			deny:      []string{"10.0.0.0/8"},
+			wantAllow: 1,
+			// deny includes user deny + alwaysDenied (5)
+			wantDeny: 5,
+		},
+		{
+			name:    "invalid cidr",
+			allow:   []string{"not-a-cidr"},
+			wantErr: true,
+		},
 	}
-	if len(allow) != 1 {
-		t.Fatalf("allow len %d, want 1", len(allow))
-	}
-	// deny should include user deny + alwaysDenied (5)
-	if len(deny) < 5 {
-		t.Fatalf("deny len %d, want >=5", len(deny))
-	}
-}
-
-func TestBuildNetPolicyPlan_InvalidCIDR(t *testing.T) {
-	_, _, err := BuildNetPolicyPlan([]string{"not-a-cidr"}, nil)
-	if err == nil {
-		t.Fatalf("expected error for invalid CIDR")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			allow, deny, err := BuildNetPolicyPlan(tt.allow, tt.deny)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("expected error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if len(allow) != tt.wantAllow {
+				t.Fatalf("allow len %d, want %d", len(allow), tt.wantAllow)
+			}
+			if len(deny) < tt.wantDeny {
+				t.Fatalf("deny len %d, want >=%d", len(deny), tt.wantDeny)
+			}
+		})
 	}
 }

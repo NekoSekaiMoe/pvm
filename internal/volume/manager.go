@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 )
@@ -79,21 +80,25 @@ func (m *Manager) Registered() []string {
 	for k := range m.plugins {
 		out = append(out, k)
 	}
+	sort.Strings(out)
 	return out
 }
 
 // Attach provisions (or reuses) the host path for volumeID on behalf of
-// sandboxID. The Manager fills RefCount/VolumeBaseDir/NodeRefFirstAttach
-// before delegating to the plugin, then validates HostPath containment.
+// sandboxID. The Manager validates the ids, reserves the refcount and fills
+// RefCount/VolumeBaseDir/NodeRefFirstAttach under one lock (so concurrent
+// Attaches for the same volume cannot both observe the pre-attach count),
+// delegates to the plugin, and rolls the reservation back if the plugin or
+// the HostPath containment check fails.
 func (m *Manager) Attach(ctx context.Context, req *AttachRequest) (*AttachResult, error) {
 	if req == nil {
 		return nil, fmt.Errorf("volume: nil AttachRequest")
 	}
-	if req.VolumeID == "" {
-		return nil, fmt.Errorf("volume: volumeID required")
+	if !volumeIDRe.MatchString(req.VolumeID) {
+		return nil, fmt.Errorf("volume: invalid volume id %q (must match %s)", req.VolumeID, volumeIDRe.String())
 	}
-	if req.Driver == "" {
-		return nil, fmt.Errorf("volume: driver required")
+	if !volumeIDRe.MatchString(req.Driver) {
+		return nil, fmt.Errorf("volume: invalid driver %q (must match %s)", req.Driver, volumeIDRe.String())
 	}
 	m.mu.Lock()
 	plugin, ok := m.plugins[req.Driver]
@@ -101,28 +106,44 @@ func (m *Manager) Attach(ctx context.Context, req *AttachRequest) (*AttachResult
 		m.mu.Unlock()
 		return nil, fmt.Errorf("volume: no plugin registered for driver %q", req.Driver)
 	}
-	// Fill Manager-owned fields.
+	// Reserve the count and compute first-attach under the same lock.
 	req.RefCount = m.refCounts[req.VolumeID]
-	req.VolumeBaseDir = m.baseDir
+	m.refCounts[req.VolumeID]++
 	req.NodeRefFirstAttach = req.RefCount == 0
+	req.VolumeBaseDir = m.baseDir
 	m.mu.Unlock()
+
+	// Roll back the reservation on any failure below.
+	rollback := func() {
+		m.mu.Lock()
+		if m.refCounts[req.VolumeID] > 0 {
+			m.refCounts[req.VolumeID]--
+		}
+		if m.refCounts[req.VolumeID] <= 0 {
+			delete(m.refCounts, req.VolumeID)
+		}
+		m.mu.Unlock()
+	}
 
 	res, err := plugin.Attach(ctx, req)
 	if err != nil {
+		rollback()
 		return nil, err
 	}
 	if res == nil {
+		rollback()
 		return nil, fmt.Errorf("volume: plugin %q returned nil AttachResult", req.Driver)
 	}
 	if res.HostPath == "" {
+		rollback()
 		return nil, fmt.Errorf("volume: plugin %q returned empty HostPath", req.Driver)
 	}
 	if err := m.validateHostPath(res.HostPath); err != nil {
+		rollback()
 		return nil, err
 	}
 
 	m.mu.Lock()
-	m.refCounts[req.VolumeID]++
 	m.attached[req.VolumeID] = res
 	// copy metadata for Detach replay
 	if res.Metadata != nil {
@@ -137,17 +158,19 @@ func (m *Manager) Attach(ctx context.Context, req *AttachRequest) (*AttachResult
 	return res, nil
 }
 
-// Detach tears down the attachment. The Manager decrements the ref count
-// first to compute the post-detach count handed to the plugin.
+// Detach tears down the attachment. The Manager computes the post-detach
+// count and replays metadata, delegates to the plugin, and only commits the
+// refcount/attached/extraMeta changes after the plugin succeeds — a plugin
+// error leaves the previous state intact.
 func (m *Manager) Detach(ctx context.Context, req *DetachRequest) error {
 	if req == nil {
 		return fmt.Errorf("volume: nil DetachRequest")
 	}
-	if req.VolumeID == "" {
-		return fmt.Errorf("volume: volumeID required")
+	if !volumeIDRe.MatchString(req.VolumeID) {
+		return fmt.Errorf("volume: invalid volume id %q (must match %s)", req.VolumeID, volumeIDRe.String())
 	}
-	if req.Driver == "" {
-		return fmt.Errorf("volume: driver required")
+	if !volumeIDRe.MatchString(req.Driver) {
+		return fmt.Errorf("volume: invalid driver %q (must match %s)", req.Driver, volumeIDRe.String())
 	}
 	m.mu.Lock()
 	plugin, ok := m.plugins[req.Driver]
@@ -160,23 +183,30 @@ func (m *Manager) Detach(ctx context.Context, req *DetachRequest) error {
 		m.mu.Unlock()
 		return fmt.Errorf("volume: detach without matching attach for %q", req.VolumeID)
 	}
-	m.refCounts[req.VolumeID] = cur - 1
 	post := cur - 1
 	req.RefCount = post
 	req.NodeRefLastDetach = post == 0
-	// Replay the metadata from the last Attach so the plugin can locate resources.
+	// Replay the metadata from the last Attach so the plugin can locate
+	// resources. State is NOT mutated yet.
 	if req.Metadata == nil {
 		if meta, ok := m.extraMeta[req.VolumeID]; ok {
 			req.Metadata = meta
 		}
 	}
+	m.mu.Unlock()
+
+	if err := plugin.Detach(ctx, req); err != nil {
+		return err // state untouched
+	}
+
+	m.mu.Lock()
+	m.refCounts[req.VolumeID] = post
 	if post == 0 {
 		delete(m.attached, req.VolumeID)
 		delete(m.extraMeta, req.VolumeID)
 	}
 	m.mu.Unlock()
-
-	return plugin.Detach(ctx, req)
+	return nil
 }
 
 // RefCount returns the current node-local ref count for volumeID.

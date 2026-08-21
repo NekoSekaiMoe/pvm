@@ -35,6 +35,7 @@ import (
 	"uml-container/internal/ebpf"
 	"uml-container/internal/identity"
 	"uml-container/internal/incident"
+	"uml-container/internal/lifecycle"
 	"uml-container/internal/log"
 	"uml-container/internal/network"
 	"uml-container/internal/network/egress"
@@ -225,6 +226,9 @@ func runCmd(args []string) {
 	mgr.Broker = broker
 	mgr.Egress = eg
 	mgr.IncidentHandler = &incidentAdapter{ctl: incidentCtl}
+	// Shared lifecycle manager so StartTask can arm autopause timers from the
+	// spec's lifecycle.idle_timeout.
+	mgr.Autopause = lifecycle.New(cgroup.NewManager())
 	// Register the task's policy gateway with the API's /exec dispatcher.
 	// Without this, /api/exec always returns 403 even though /api/policy/:task
 	// shows the rules (the two used to read from different registries).

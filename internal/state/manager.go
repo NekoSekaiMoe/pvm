@@ -48,19 +48,19 @@ func ContainerDir(id string) (string, error) {
 type Status string
 
 const (
-	StatusPending      Status = "pending"       // accepted, not yet provisioned
-	StatusProvisioning Status = "provisioning"  // creating runtime + policy
-	StatusReady        Status = "ready"         // health-checked, not yet running agent loop
-	StatusRunning      Status = "running"       // agent ReAct loop active
-	StatusSuspended    Status = "suspended"     // checkpointed / frozen
-	StatusResuming     Status = "resuming"      // restoring identity + runtime
-	StatusReview       Status = "review"        // awaiting verify/approve
-	StatusCompleted    Status = "completed"     // artifact sealed
-	StatusFailed       Status = "failed"        // retry / inspect
-	StatusQuarantined  Status = "quarantined"   // network revoked, anomaly isolated
-	StatusDestroy      Status = "destroy"       // revoke + cleanup done
-	StatusStopped      Status = "stopped"       // generic terminal (legacy compat)
-	StatusExited       Status = "exited"        // process exited (legacy compat)
+	StatusPending      Status = "pending"      // accepted, not yet provisioned
+	StatusProvisioning Status = "provisioning" // creating runtime + policy
+	StatusReady        Status = "ready"        // health-checked, not yet running agent loop
+	StatusRunning      Status = "running"      // agent ReAct loop active
+	StatusSuspended    Status = "suspended"    // checkpointed / frozen
+	StatusResuming     Status = "resuming"     // restoring identity + runtime
+	StatusReview       Status = "review"       // awaiting verify/approve
+	StatusCompleted    Status = "completed"    // artifact sealed
+	StatusFailed       Status = "failed"       // retry / inspect
+	StatusQuarantined  Status = "quarantined"  // network revoked, anomaly isolated
+	StatusDestroy      Status = "destroy"      // revoke + cleanup done
+	StatusStopped      Status = "stopped"      // generic terminal (legacy compat)
+	StatusExited       Status = "exited"       // process exited (legacy compat)
 )
 
 // Terminal reports whether no further transitions are possible.
@@ -87,25 +87,30 @@ const (
 // Transition is one recorded state change. The full slice is the audit trail
 // required by plan.md §14.2 (phase 03 EXECUTION).
 type Transition struct {
-	From      Status    `json:"from"`
-	To        Status    `json:"to"`
-	Actor     Actor     `json:"actor"`
-	Reason    string    `json:"reason"`
-	At        time.Time `json:"at"`
+	From   Status    `json:"from"`
+	To     Status    `json:"to"`
+	Actor  Actor     `json:"actor"`
+	Reason string    `json:"reason"`
+	At     time.Time `json:"at"`
 }
 
 // ContainerState is the persisted task state. The new fields drive the FSM;
 // the legacy ID/Status/PID/StartedAt are kept for API compatibility.
 type ContainerState struct {
-	ID         string   `json:"id"`
-	Name       string   `json:"name"`
-	Tenant     string   `json:"tenant,omitempty"`
-	Caller     string   `json:"caller,omitempty"`
-	Status     Status   `json:"status"`
-	PID        int      `json:"pid"`
-	StartedAt  time.Time `json:"started_at"`
-	EndedAt    time.Time `json:"ended_at,omitempty"`
-	SpecFP     string   `json:"spec_fingerprint,omitempty"`
+	ID        string    `json:"id"`
+	Name      string    `json:"name"`
+	Tenant    string    `json:"tenant,omitempty"`
+	Caller    string    `json:"caller,omitempty"`
+	Status    Status    `json:"status"`
+	PID       int       `json:"pid"`
+	StartedAt time.Time `json:"started_at"`
+	EndedAt   time.Time `json:"ended_at,omitempty"`
+	SpecFP    string    `json:"spec_fingerprint,omitempty"`
+
+	// Lifecycle config snapshot (from TaskSpec.Lifecycle) so API endpoints
+	// can honor idle/resume policy without re-reading the spec file.
+	IdleTimeout string `json:"idle_timeout,omitempty"`
+	AutoResume  bool   `json:"auto_resume,omitempty"`
 
 	// lifecycle bookkeeping
 	Transitions []Transition `json:"transitions,omitempty"`
@@ -230,20 +235,20 @@ func (s *ContainerState) snapshotLocked() *ContainerState {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	cp := &ContainerState{
-		ID:          s.ID,
-		Name:        s.Name,
-		Tenant:      s.Tenant,
-		Caller:      s.Caller,
-		Status:      s.Status,
-		PID:         s.PID,
-		StartedAt:   s.StartedAt,
-		EndedAt:     s.EndedAt,
-		SpecFP:      s.SpecFP,
-		Retries:     s.Retries,
-		Deadline:    s.Deadline,
-		NetworkTap:  s.NetworkTap,
-		Bridge:      s.Bridge,
-		GatewayIP:   s.GatewayIP,
+		ID:         s.ID,
+		Name:       s.Name,
+		Tenant:     s.Tenant,
+		Caller:     s.Caller,
+		Status:     s.Status,
+		PID:        s.PID,
+		StartedAt:  s.StartedAt,
+		EndedAt:    s.EndedAt,
+		SpecFP:     s.SpecFP,
+		Retries:    s.Retries,
+		Deadline:   s.Deadline,
+		NetworkTap: s.NetworkTap,
+		Bridge:     s.Bridge,
+		GatewayIP:  s.GatewayIP,
 	}
 	if len(s.Transitions) > 0 {
 		cp.Transitions = append([]Transition(nil), s.Transitions...)
