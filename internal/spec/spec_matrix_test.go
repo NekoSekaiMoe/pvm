@@ -11,21 +11,21 @@ import (
 func baseValid() *TaskSpec {
 	s := &TaskSpec{
 		Version: 1, Caller: "alice",
-		Runtime:  RuntimeSpec{CPU: 500, Memory: "512M"},
-		Kernel:   KernelSpec{Path: "./bin/linux"},
-		Network:  NetworkSpec{Enabled: true, GatewayIP: "10.0.0.1/24"},
-		Identity: Identity{TTL: "15m"},
-		Budget:   BudgetSpec{MaxWallTime: "30m"},
+		Runtime:   RuntimeSpec{CPU: 500, Memory: "512M"},
+		Kernel:    KernelSpec{Path: "./bin/linux"},
+		Network:   NetworkSpec{Enabled: true, GatewayIP: "10.0.0.1/24"},
+		Identity:  Identity{TTL: "15m"},
+		Budget:    BudgetSpec{MaxWallTime: "30m"},
 		Lifecycle: LifecycleSpec{OnAnomaly: "pause", TTL: "1h"},
-		Approval: ApprovalSpec{Timeout: "5m"},
+		Approval:  ApprovalSpec{Timeout: "5m"},
 	}
 	return s
 }
 
 func TestValidateMatrix(t *testing.T) {
 	cases := []struct {
-		name      string
-		mutate    func(*TaskSpec)
+		name       string
+		mutate     func(*TaskSpec)
 		wantSubstr string
 	}{
 		{"missing caller", func(s *TaskSpec) { s.Caller = "" }, "caller is required"},
@@ -42,6 +42,15 @@ func TestValidateMatrix(t *testing.T) {
 		{"bad on_anomaly", func(s *TaskSpec) { s.Lifecycle.OnAnomaly = "pray" }, "on_anomaly"},
 		{"bad approval timeout", func(s *TaskSpec) { s.Approval.Timeout = "soon" }, "approval.timeout"},
 		{"version mismatch", func(s *TaskSpec) { s.Version = 999 }, "version mismatch"},
+		{"volume path relative", func(s *TaskSpec) {
+			s.Volumes = []VolumeMount{{Name: "v", Path: "data"}}
+		}, "must be absolute"},
+		{"volume path duplicate via trailing slash", func(s *TaskSpec) {
+			s.Volumes = []VolumeMount{{Name: "a", Path: "/data"}, {Name: "b", Path: "/data/"}}
+		}, "duplicates an earlier mount"},
+		{"volume path duplicate via dotdot", func(s *TaskSpec) {
+			s.Volumes = []VolumeMount{{Name: "a", Path: "/a/../data"}, {Name: "b", Path: "/data"}}
+		}, "duplicates an earlier mount"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -126,7 +135,10 @@ max_retries = 3
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	checks := []struct{ name string; got, want interface{} }{
+	checks := []struct {
+		name      string
+		got, want interface{}
+	}{
 		{"tenant", s.Tenant, "eng"},
 		{"virtio", s.Kernel.Virtio, true},
 		{"vhost_blk", s.Kernel.UseVhostBlk, true},

@@ -170,7 +170,9 @@ type NetworkSpec struct {
 	// QoSRate is a tc tbf rate, e.g. "10mbit". Empty = no shaping.
 	QoSRate string `toml:"qos_rate"`
 	// EgressRules is the extended L7 rule set (Cube parity: docs/guide/security-proxy.md).
-	// When non-empty, it takes precedence over the flat allow/block domain lists.
+	// When non-empty, rule decisions take precedence over the flat allow/block
+	// domain allowlist; the deny list is always evaluated first at the gateway
+	// and can never be overridden by a rule.
 	EgressRules []EgressRule `toml:"egress_rules"`
 }
 
@@ -404,12 +406,19 @@ func (s *TaskSpec) Validate() error {
 		}
 		if vm.Path == "" {
 			errs = append(errs, fmt.Errorf("spec: volumes[%d].path is required", i))
-		} else if !filepath.IsAbs(vm.Path) {
-			errs = append(errs, fmt.Errorf("spec: volumes[%d].path %q must be absolute", i, vm.Path))
-		} else if seenPaths[vm.Path] {
-			errs = append(errs, fmt.Errorf("spec: volumes[%d].path %q duplicates an earlier mount", i, vm.Path))
 		} else {
-			seenPaths[vm.Path] = true
+			// Normalize before validation so equivalent spellings of the same
+			// mount point (trailing slashes, interior "..") are caught as
+			// duplicates and share one absolute-path check. The error messages
+			// keep the original spelling.
+			clean := filepath.Clean(vm.Path)
+			if !filepath.IsAbs(clean) {
+				errs = append(errs, fmt.Errorf("spec: volumes[%d].path %q must be absolute", i, vm.Path))
+			} else if seenPaths[clean] {
+				errs = append(errs, fmt.Errorf("spec: volumes[%d].path %q duplicates an earlier mount", i, vm.Path))
+			} else {
+				seenPaths[clean] = true
+			}
 		}
 	}
 	if s.Lifecycle.IdleTimeout != "" {

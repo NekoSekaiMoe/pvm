@@ -8,7 +8,7 @@ func TestBuildNetPolicyPlan(t *testing.T) {
 		allow     []string
 		deny      []string
 		wantAllow int
-		wantDeny  int // minimum expected (always-denied CIDRs are additive)
+		wantDeny  int // exact: deduped user deny ∪ the 5 always-denied CIDRs
 		wantErr   bool
 	}{
 		{
@@ -36,8 +36,9 @@ func TestBuildNetPolicyPlan(t *testing.T) {
 			allow:     []string{"1.2.3.0/24", " 1.2.3.0/24 ", "1.2.3.0/24"},
 			deny:      []string{"10.0.0.0/8", "10.0.0.0/8"},
 			wantAllow: 1,
-			// 10.0.0.0/8 is also an always-denied CIDR, so the deduped set is
-			// exactly the 5 always-denied entries.
+			// 10.0.0.0/8 is itself an always-denied CIDR, so the deduped set
+			// must be EXACTLY the 5 always-denied entries — a dedup failure
+			// that double-counts would produce 6.
 			wantDeny: 5,
 		},
 		{
@@ -66,8 +67,8 @@ func TestBuildNetPolicyPlan(t *testing.T) {
 			if len(allow) != tt.wantAllow {
 				t.Fatalf("allow len %d, want %d (%v)", len(allow), tt.wantAllow, allow)
 			}
-			if len(deny) < tt.wantDeny {
-				t.Fatalf("deny len %d, want >=%d (%v)", len(deny), tt.wantDeny, deny)
+			if len(deny) != tt.wantDeny {
+				t.Fatalf("deny len %d, want exactly %d (%v)", len(deny), tt.wantDeny, deny)
 			}
 		})
 	}

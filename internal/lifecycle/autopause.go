@@ -26,6 +26,7 @@ type Manager struct {
 	mu      sync.Mutex
 	timers  map[string]*time.Timer
 	gens    map[string]uint64 // taskID -> generation of the live schedule
+	epochs  map[string]uint64 // taskID -> cancel epoch; bumped by every Arm/Disarm
 	nextGen uint64
 	cg      *cgroup.Manager
 }
@@ -38,6 +39,7 @@ func New(cg *cgroup.Manager) *Manager {
 	return &Manager{
 		timers: make(map[string]*time.Timer),
 		gens:   make(map[string]uint64),
+		epochs: make(map[string]uint64),
 		cg:     cg,
 	}
 }
@@ -52,6 +54,14 @@ func New(cg *cgroup.Manager) *Manager {
 func (m *Manager) Arm(taskID string, d time.Duration) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.armLocked(taskID, d)
+}
+
+// armLocked is Arm assuming m.mu is held. Every schedule change bumps the
+// task's cancel epoch so an in-flight pause (see pause) can detect that its
+// schedule was replaced and must not re-arm a retry on top of it.
+func (m *Manager) armLocked(taskID string, d time.Duration) {
+	m.epochs[taskID]++
 	if old, ok := m.timers[taskID]; ok {
 		old.Stop()
 		delete(m.timers, taskID)
@@ -77,6 +87,7 @@ func (m *Manager) Reset(taskID string, d time.Duration) {
 func (m *Manager) Disarm(taskID string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.epochs[taskID]++ // invalidate an in-flight pause's retry (see pause)
 	if t, ok := m.timers[taskID]; ok {
 		t.Stop()
 		delete(m.timers, taskID)
@@ -125,6 +136,10 @@ func (m *Manager) pause(taskID string, gen uint64) {
 		m.mu.Unlock()
 		return
 	}
+	// Snapshot the cancel epoch together with claiming the schedule: any
+	// Arm/Disarm that lands while the (slow) pause work below runs bumps it,
+	// which rearmRetry checks before re-scheduling.
+	epoch := m.epochs[taskID]
 	// Claim the schedule before doing the (slow) pause work below, so a
 	// concurrent Arm cannot double-fire and a later Disarm finds no stale
 	// entry. The map entries are removed; the generation check above has
@@ -147,9 +162,27 @@ func (m *Manager) pause(taskID string, gen uint64) {
 	// transition so autopause retries later instead of going permanently
 	// silent.
 	if err := m.cg.Freeze(taskID); err != nil && !isNotExist(err) {
-		m.Arm(taskID, pauseRetryDelay)
+		m.rearmRetry(taskID, epoch)
 		return
 	}
 	_ = st.Transition(state.StatusSuspended, state.ActorSystem, "idle timeout")
 	_ = state.SaveState(taskID, st)
+}
+
+// rearmRetry schedules a pause retry for a failed freeze, but only if the
+// task's cancel epoch still equals the one captured when the pause started.
+// Without this, a Reset (fresh idle window) or Disarm that lands while the
+// pause was failing to freeze would be silently clobbered by the retry
+// Arm — or resurrect an explicitly disarmed task. The epoch check and the
+// re-Arm happen under one lock hold, so no Reset/Disarm can slip between
+// them.
+func (m *Manager) rearmRetry(taskID string, epoch uint64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.epochs[taskID] != epoch {
+		// Arm/Disarm intervened after this pause started: its schedule
+		// (or its absence, after Disarm) governs — do not touch it.
+		return
+	}
+	m.armLocked(taskID, pauseRetryDelay)
 }

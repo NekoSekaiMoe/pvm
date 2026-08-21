@@ -13,6 +13,7 @@ go_test(
     srcs = [
         "edge_test.go",
         "gateway_test.go",
+        "rule_matcher_test.go",
     ],
     embed = [":egress"],
     deps = ["//internal/audit"],

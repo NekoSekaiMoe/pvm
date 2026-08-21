@@ -49,7 +49,9 @@ type Policy struct {
 	// If nil, REVIEW is treated as BLOCK.
 	ReviewHook func(req *http.Request, bodySize int64) (allow bool, reason string)
 	// Rules is the extended L7 set (Cube parity: security-proxy.md). When
-	// non-empty it is evaluated before the flat AllowDomains/BlockDomains.
+	// non-empty, rule decisions take precedence over the flat AllowDomains
+	// allowlist. BlockDomains is always evaluated first and can never be
+	// overridden by a rule; when Rules is empty the flat lists decide.
 	Rules []EgressRule
 }
 
