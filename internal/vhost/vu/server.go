@@ -27,6 +27,13 @@ type Server struct {
 	wg     sync.WaitGroup
 }
 
+// umaskMu serializes the umask save/set/restore window around ListenUnix in
+// Serve. umask(2) manipulates a PROCESS-GLOBAL value with no per-call
+// isolation, so two concurrent Serve calls could otherwise interleave — one
+// restoring while the other is still mid-listen — leaving the wrong umask
+// installed (or a socket created under the other caller's umask).
+var umaskMu sync.Mutex
+
 // Serve binds socketPath and starts accepting. The socket file appears
 // immediately (unlike a subprocess daemon there is no startup race).
 func Serve(socketPath string, dev *BlkDev) (*Server, error) {
@@ -36,12 +43,14 @@ func Serve(socketPath string, dev *BlkDev) (*Server, error) {
 	// net.ListenUnix creates the socket with mode 0777 &^ process umask:
 	// a permissive umask would expose the control channel (memory-table fd
 	// passing) to other local users during the window before the Chmod
-	// below — permanently, if the Chmod failed. A private umask around the
-	// create closes that window; the Chmod still pins the enforced 0600
-	// mode, and only the guest frontend may talk to the socket.
+	// old value (or expose the socket created under the wrong one). The lock
+	// spans set -> ListenUnix -> restore on EVERY path, so restoration also
+	// happens when socket creation fails.
+	umaskMu.Lock()
 	oldUmask := unix.Umask(0o077)
 	ln, err := net.ListenUnix("unix", &net.UnixAddr{Name: socketPath, Net: "unix"})
 	unix.Umask(oldUmask)
+	umaskMu.Unlock()
 	if err != nil {
 		return nil, fmt.Errorf("vu: listen %s: %w", socketPath, err)
 	}

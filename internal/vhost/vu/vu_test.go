@@ -3,9 +3,11 @@ package vu
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"golang.org/x/sys/unix"
@@ -382,5 +384,55 @@ func TestServerHandshake(t *testing.T) {
 	capSectors := binary.LittleEndian.Uint64(m.payload[12:])
 	if capSectors != (1<<20)/512 {
 		t.Errorf("capacity = %d sectors, want %d", capSectors, (1<<20)/512)
+	}
+}
+
+// TestServeConcurrentUmaskSafe exercises concurrent Serve calls: the umask
+// save/set/restore around ListenUnix manipulates a PROCESS-GLOBAL value, so
+// interleaved calls used to be able to restore the wrong umask. umaskMu
+// serializes the window; concurrent Serves must all succeed and still end up
+// with 0600 sockets (run with -race to also cover the surrounding state).
+func TestServeConcurrentUmaskSafe(t *testing.T) {
+	const n = 8
+	dirs := make([]string, n)
+	for i := range dirs {
+		dirs[i] = t.TempDir()
+	}
+	var wg sync.WaitGroup
+	errs := make(chan error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			sock := filepath.Join(dirs[i], fmt.Sprintf("vu-%d.sock", i))
+			be := &memBackend{data: make([]byte, 512)}
+			dev, err := NewBlkDev(be, false)
+			if err != nil {
+				errs <- err
+				return
+			}
+			srv, err := Serve(sock, dev)
+			if err != nil {
+				errs <- fmt.Errorf("serve %d: %w", i, err)
+				return
+			}
+			fi, err := os.Stat(sock)
+			if err != nil {
+				srv.Close()
+				errs <- err
+				return
+			}
+			if fi.Mode().Perm() != 0600 {
+				srv.Close()
+				errs <- fmt.Errorf("socket %s mode %o, want 600", sock, fi.Mode().Perm())
+				return
+			}
+			srv.Close()
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
 	}
 }

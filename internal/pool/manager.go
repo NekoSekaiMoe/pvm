@@ -86,6 +86,16 @@ type Manager struct {
 	cpu     map[string]int         // tenant -> cpu sum
 	memMB   map[string]int         // tenant -> mem sum
 	hourly  map[string][]time.Time // tenant -> task start times (last hour)
+	// pendingCleanups records sandboxes whose teardown after a rejected
+	// claim/warm FAILED and must be retried (see destroyAsync). The old code
+	// discarded those Destroyer errors and silently leaked the sandbox.
+	// Guarded by m.mu.
+	pendingCleanups map[string]string // sandbox ID -> cleanup reason
+
+	// now supplies the current time for hourly-window pruning and sandbox
+	// timestamps. A func field (defaulting to time.Now via NewManager) so
+	// tests can pin the clock across an hourly boundary.
+	now func() time.Time
 
 	// Factory creates a new warm sandbox. Controller wires this to the real
 	// UML+vhost+overlay provisioning path.
@@ -99,14 +109,16 @@ type Manager struct {
 // NewManager constructs a pool with a max capacity and quota table.
 func NewManager(capacity int, ledger *audit.Ledger) *Manager {
 	return &Manager{
-		pool:     make([]*Sandbox, 0, capacity),
-		capacity: capacity,
-		quotas:   make(map[string]Quota),
-		running:  make(map[string]int),
-		cpu:      make(map[string]int),
-		memMB:    make(map[string]int),
-		hourly:   make(map[string][]time.Time),
-		ledger:   ledger,
+		pool:            make([]*Sandbox, 0, capacity),
+		capacity:        capacity,
+		quotas:          make(map[string]Quota),
+		running:         make(map[string]int),
+		cpu:             make(map[string]int),
+		memMB:           make(map[string]int),
+		hourly:          make(map[string][]time.Time),
+		pendingCleanups: make(map[string]string),
+		now:             time.Now,
+		ledger:          ledger,
 	}
 }
 
@@ -140,23 +152,23 @@ func (m *Manager) Warm(tmpl Template, n int) int {
 				continue
 			}
 		} else {
-			id = fmt.Sprintf("warm-%s-%d", tmpl.Name, time.Now().UnixNano())
+			id = fmt.Sprintf("warm-%s-%d", tmpl.Name, m.now().UnixNano())
 		}
 
 		m.mu.Lock()
 		// Re-check capacity: another goroutine may have filled the pool.
 		if len(m.pool) >= m.capacity {
 			m.mu.Unlock()
-			if m.Destroyer != nil {
-				_ = m.Destroyer(id) // don't leak a sandbox we can't keep
-			}
+			// Don't leak a sandbox we can't keep; a failed teardown is
+			// queued for the retry sweep instead of being discarded.
+			m.destroyAsync(id, "warm capacity recheck")
 			break
 		}
 		m.pool = append(m.pool, &Sandbox{
 			ID:        id,
 			Template:  tmpl.Name,
 			State:     SandboxReady,
-			CreatedAt: time.Now(),
+			CreatedAt: m.now(),
 		})
 		m.mu.Unlock()
 		created++
@@ -222,16 +234,10 @@ func (m *Manager) claim(tenant string, tmpl Template, taskID string, logs *[]dec
 		m.quotas[tenant] = q
 	}
 
-	// prune hourly window
-	now := time.Now()
-	cutoff := now.Add(-time.Hour)
-	var recent []time.Time
-	for _, t := range m.hourly[tenant] {
-		if t.After(cutoff) {
-			recent = append(recent, t)
-		}
-	}
-	m.hourly[tenant] = recent
+	// prune hourly window (phase 3 re-prunes with a fresh reading after
+	// the Factory call — see pruneHourlyLocked)
+	now := m.now()
+	m.pruneHourlyLocked(tenant, now)
 
 	wantMB, err := parseMemMB(tmpl.Memory)
 	if err != nil {
@@ -240,7 +246,7 @@ func (m *Manager) claim(tenant string, tmpl Template, taskID string, logs *[]dec
 		return "", fmt.Errorf("pool: %w", err)
 	}
 
-	if len(recent) >= q.MaxTasksPerHour {
+	if len(m.hourly[tenant]) >= q.MaxTasksPerHour {
 		recordDecision(logs, tenant, "hourly task rate", false)
 		m.mu.Unlock()
 		return "", fmt.Errorf("%w: hourly task rate for tenant %s", ErrQuotaExceeded, tenant)
@@ -255,7 +261,7 @@ func (m *Manager) claim(tenant string, tmpl Template, taskID string, logs *[]dec
 		m.mu.Unlock()
 		return "", fmt.Errorf("%w: cpu for tenant %s", ErrQuotaExceeded, tenant)
 	}
-	if m.memMB[tenant]+wantMB > q.MaxMemoryMB {
+	if memExceeded(q.MaxMemoryMB, m.memMB[tenant], wantMB) {
 		recordDecision(logs, tenant, "memory", false)
 		m.mu.Unlock()
 		return "", fmt.Errorf("%w: memory for tenant %s", ErrQuotaExceeded, tenant)
@@ -316,28 +322,29 @@ func (m *Manager) claim(tenant string, tmpl Template, taskID string, logs *[]dec
 	// Capacity may have changed while the lock was released.
 	if len(m.pool) >= m.capacity {
 		m.mu.Unlock()
-		if m.Destroyer != nil {
-			_ = m.Destroyer(id)
-		}
+		m.destroyAsync(id, "capacity race after factory")
 		recordDecision(logs, tenant, "no capacity after race", false)
 		return "", ErrNoCapacity
 	}
+	// Re-prune the hourly window with a FRESH clock reading before the
+	// recheck, mirroring phase 1: the Factory may have taken long enough
+	// to cross an hourly boundary, and counting already-expired timestamps
+	// here would wrongly reject the claim.
+	now = m.now()
+	m.pruneHourlyLocked(tenant, now)
 	// Re-check hourly rate/concurrency/cpu/mem in case another claim sneaked
 	// in while the Factory ran. The hourly recheck mirrors phase 1: without it,
 	// N concurrent claims could blow past MaxTasksPerHour together.
 	if len(m.hourly[tenant]) >= q.MaxTasksPerHour {
 		m.mu.Unlock()
-		if m.Destroyer != nil {
-			_ = m.Destroyer(id) // don't leak the sandbox the factory just built
-		}
+		m.destroyAsync(id, "hourly quota recheck after factory")
 		recordDecision(logs, tenant, "hourly task rate after factory", false)
 		return "", fmt.Errorf("%w: hourly task rate for tenant %s changed during claim", ErrQuotaExceeded, tenant)
 	}
-	if m.running[tenant] >= q.MaxConcurrent || m.cpu[tenant]+tmpl.CPU > q.MaxCPU || m.memMB[tenant]+wantMB > q.MaxMemoryMB {
+	if m.running[tenant] >= q.MaxConcurrent || m.cpu[tenant]+tmpl.CPU > q.MaxCPU ||
+		memExceeded(q.MaxMemoryMB, m.memMB[tenant], wantMB) {
 		m.mu.Unlock()
-		if m.Destroyer != nil {
-			_ = m.Destroyer(id) // don't leak the sandbox the factory just built
-		}
+		m.destroyAsync(id, "quota recheck after factory")
 		recordDecision(logs, tenant, "quota changed after factory", false)
 		return "", fmt.Errorf("%w: quota for tenant %s changed during claim", ErrQuotaExceeded, tenant)
 	}
@@ -347,6 +354,90 @@ func (m *Manager) claim(tenant string, tmpl Template, taskID string, logs *[]dec
 	recordDecision(logs, tenant, "created-on-demand", true)
 	m.mu.Unlock()
 	return id, nil
+}
+
+// destroyAsync tears down a sandbox built for a claim/warm that was
+// subsequently rejected. A Destroyer failure is NOT discarded: the id and
+// reason are recorded in pendingCleanups for RetryCleanups, so a flaky
+// teardown surfaces in logs and gets retried instead of leaking the sandbox
+// with no trace. Callers must NOT hold m.mu (Destroyer is external); the
+// rejection returned to the caller is unaffected either way.
+func (m *Manager) destroyAsync(id, reason string) {
+	if m.Destroyer == nil {
+		return
+	}
+	if err := m.Destroyer(id); err != nil {
+		m.mu.Lock()
+		m.queueCleanupLocked(id, reason)
+		m.mu.Unlock()
+		log.Printf("pool: destroy sandbox %s failed (%s): %v; queued for retry", id, reason, err)
+	}
+}
+
+// queueCleanupLocked records a sandbox whose teardown failed. Caller MUST
+// hold m.mu.
+func (m *Manager) queueCleanupLocked(id, reason string) {
+	if m.pendingCleanups == nil {
+		m.pendingCleanups = make(map[string]string)
+	}
+	m.pendingCleanups[id] = reason
+}
+
+// RetryCleanups re-attempts destruction of every sandbox queued by a failed
+// post-rejection teardown. Best-effort and race-free: successful retries are
+// removed from the queue; persistent failures stay queued for the next
+// sweep (wire a periodic ticker to this for a reaper). The Destroyer runs
+// WITHOUT m.mu held.
+func (m *Manager) RetryCleanups() {
+	m.mu.Lock()
+	ids := make([]string, 0, len(m.pendingCleanups))
+	for id := range m.pendingCleanups {
+		ids = append(ids, id)
+	}
+	m.mu.Unlock()
+	if m.Destroyer == nil {
+		return
+	}
+	for _, id := range ids {
+		if err := m.Destroyer(id); err != nil {
+			continue // stays queued for the next sweep
+		}
+		m.mu.Lock()
+		delete(m.pendingCleanups, id)
+		m.mu.Unlock()
+	}
+}
+
+// PendingCleanups reports how many sandbox teardowns are awaiting retry.
+func (m *Manager) PendingCleanups() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.pendingCleanups)
+}
+
+// pruneHourlyLocked drops task-start timestamps older than one hour from
+// the tenant's window. BOTH quota-check stages run this against their own
+// clock reading: an expired entry left in place counts against
+// MaxTasksPerHour forever. Caller MUST hold m.mu.
+func (m *Manager) pruneHourlyLocked(tenant string, now time.Time) {
+	cutoff := now.Add(-time.Hour)
+	var recent []time.Time
+	for _, t := range m.hourly[tenant] {
+		if t.After(cutoff) {
+			recent = append(recent, t)
+		}
+	}
+	m.hourly[tenant] = recent
+}
+
+// memExceeded is the overflow-safe memory quota boundary check, used by
+// BOTH check stages (phase 1 and the post-Factory recheck). The naive
+// used+want > limit addition wraps int when usage sits near math.MaxInt —
+// a legal value per parseMemMB — turning an over-quota claim into a false
+// ALLOW. The subtraction cannot wrap: both operands are non-negative, so
+// limit-used stays within [-math.MaxInt, math.MaxInt].
+func memExceeded(limit, used, want int) bool {
+	return want > limit-used
 }
 
 // Release returns a sandbox to the pool (after task completion) or destroys it.

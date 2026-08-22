@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"uml-container/internal/audit"
 )
@@ -346,5 +347,242 @@ func TestRelease_DestroyErrorPropagates(t *testing.T) {
 	m.Warm(tmpl, 1)
 	if _, err := m.Claim("tenant", tmpl, "task-2"); err != nil {
 		t.Errorf("claim after destroy failure was denied (quota leaked despite error propagation): %v", err)
+	}
+}
+
+// TestClaim_MemoryQuotaOverflowSafe is the regression test for the int
+// overflow in the stage-1 memory quota check: the legacy
+// m.memMB[tenant]+wantMB > limit addition wraps when usage sits near
+// math.MaxInt (a legal value per parseMemMB), turning an over-quota claim
+// into a false ALLOW. The subtraction boundary check must reject it, and a
+// rejection must NOT update the tenant's recorded memory usage.
+func TestClaim_MemoryQuotaOverflowSafe(t *testing.T) {
+	m := NewManager(10, nil)
+	// Huge-but-valid limit: MaxMemoryMB at the platform int maximum.
+	m.SetQuota("t", Quota{MaxConcurrent: 10, MaxCPU: 99, MaxMemoryMB: math.MaxInt, MaxTasksPerHour: 99})
+
+	// First claim: usage 0 + (MaxInt-1024) <= MaxInt → allowed.
+	big := strconv.FormatInt(int64(math.MaxInt)-1024, 10) + "M"
+	tmplBig := Template{Name: "x", Memory: big, CPU: 1}
+	m.Warm(tmplBig, 1)
+	if _, err := m.Claim("t", tmplBig, "task-1"); err != nil {
+		t.Fatalf("huge-but-valid claim: %v", err)
+	}
+	if got := m.memMB["t"]; got != math.MaxInt-1024 {
+		t.Fatalf("recorded usage = %d, want %d", got, math.MaxInt-1024)
+	}
+
+	// Second claim: (MaxInt-1024)+2048 wraps int in the addition form — the
+	// exact false-allow the subtraction check must close. Only 1024 MB of
+	// headroom remain, so a 2G claim must be rejected.
+	tmpl2G := Template{Name: "y", Memory: "2G", CPU: 1}
+	m.Warm(tmpl2G, 1)
+	if _, err := m.Claim("t", tmpl2G, "task-2"); !errors.Is(err, ErrQuotaExceeded) {
+		t.Fatalf("overflowing claim must be rejected, got err=%v", err)
+	}
+	// The rejection must NOT have updated the recorded usage.
+	if got := m.memMB["t"]; got != math.MaxInt-1024 {
+		t.Fatalf("rejected claim updated recorded usage: %d, want %d", got, math.MaxInt-1024)
+	}
+	// A claim that FITS the remaining headroom (exactly 1024 MB) still
+	// succeeds — the check is a boundary, not a blanket denial — and lands
+	// usage exactly on the limit without wrapping.
+	tmplFits := Template{Name: "z", Memory: "1024M", CPU: 1}
+	m.Warm(tmplFits, 1)
+	if _, err := m.Claim("t", tmplFits, "task-3"); err != nil {
+		t.Fatalf("claim within remaining headroom: %v", err)
+	}
+	if got := m.memMB["t"]; got != math.MaxInt {
+		t.Fatalf("recorded usage = %d, want exactly %d", got, math.MaxInt)
+	}
+}
+
+// TestClaim_MemoryQuotaOverflowSafeAfterFactory is the stage-3 sibling of
+// TestClaim_MemoryQuotaOverflowSafe: the post-Factory quota recheck had the
+// same wrapping addition, so a claim that passed stage 1 could commit an
+// over-limit sandbox after a concurrent claim filled the headroom near
+// math.MaxInt.
+func TestClaim_MemoryQuotaOverflowSafeAfterFactory(t *testing.T) {
+	m := NewManager(10, nil)
+	m.SetQuota("t", Quota{MaxConcurrent: 10, MaxCPU: 99, MaxMemoryMB: math.MaxInt, MaxTasksPerHour: 99})
+
+	// tmpl2G has no warm sandbox; its claim goes through the Factory.
+	tmpl2G := Template{Name: "ondemand", Memory: "2G", CPU: 1}
+	factoryEntered := make(chan struct{})
+	releaseFactory := make(chan struct{})
+	m.Factory = func(Template) (string, error) {
+		close(factoryEntered)
+		<-releaseFactory
+		return "ondemand-raced", nil
+	}
+	res := make(chan error, 1)
+	go func() {
+		_, err := m.Claim("t", tmpl2G, "task-2g")
+		res <- err
+	}()
+	<-factoryEntered
+
+	// While the factory is blocked, a warm claim pushes usage to
+	// MaxInt-1024 — allowed at stage 1 (0 + MaxInt-1024 <= MaxInt).
+	big := strconv.FormatInt(int64(math.MaxInt)-1024, 10) + "M"
+	tmplBig := Template{Name: "x", Memory: big, CPU: 1}
+	m.Factory = func(Template) (string, error) { return "warm-x", nil }
+	m.Warm(tmplBig, 1)
+	if _, err := m.Claim("t", tmplBig, "task-big"); err != nil {
+		t.Fatalf("warm claim near MaxInt: %v", err)
+	}
+
+	// Release the factory: the stage-3 recheck must see only 1024 MB of
+	// headroom and reject the 2G claim. The legacy addition wrapped
+	// (MaxInt-1024)+2048 negative and ALLOWED it.
+	close(releaseFactory)
+	if err := <-res; !errors.Is(err, ErrQuotaExceeded) {
+		t.Fatalf("stage-3 recheck must reject the wrapping claim, got err=%v", err)
+	}
+	// The rejected claim must not have updated the recorded usage, and the
+	// on-demand sandbox must not have leaked into the pool.
+	if got := m.memMB["t"]; got != math.MaxInt-1024 {
+		t.Fatalf("rejected claim updated recorded usage: %d, want %d", got, math.MaxInt-1024)
+	}
+	if _, _, total := m.Stats(); total != 1 {
+		t.Errorf("raced on-demand sandbox leaked into the pool: total=%d", total)
+	}
+}
+
+// TestClaim_HourlyQuotaPrunesExpiredAfterFactory is the regression test for
+// the missing phase-3 prune: the post-Factory hourly recheck used to count
+// entries older than an hour (phase 1 prunes them; phase 3 didn't), so a
+// claim whose Factory crossed an hourly boundary was incorrectly rejected.
+// The clock is pinned via the manager's now hook.
+func TestClaim_HourlyQuotaPrunesExpiredAfterFactory(t *testing.T) {
+	m := NewManager(10, nil)
+	m.SetQuota("t", Quota{MaxConcurrent: 99, MaxCPU: 99, MaxMemoryMB: 99999, MaxTasksPerHour: 1})
+
+	cur := time.Now()
+	m.now = func() time.Time { return cur }
+
+	tmpl := Template{Name: "x", Memory: "128M", CPU: 1}
+	// Pre-warm with an instant factory, then install the blocking one (the
+	// warm claim below must not enter it).
+	m.Factory = func(Template) (string, error) { return "warm-1", nil }
+	m.Warm(tmpl, 1)
+	tmpl2 := Template{Name: "y", Memory: "128M", CPU: 1}
+	factoryEntered := make(chan struct{})
+	releaseFactory := make(chan struct{})
+	m.Factory = func(Template) (string, error) {
+		close(factoryEntered)
+		<-releaseFactory
+		// The provision took over an hour: phase 3 runs with the clock past
+		// the hourly boundary of the entry added meanwhile.
+		cur = cur.Add(time.Hour + time.Minute)
+		return "ondemand-crossed", nil
+	}
+
+	type claimResult struct {
+		id  string
+		err error
+	}
+	res := make(chan claimResult, 1)
+	go func() {
+		id, err := m.Claim("t", tmpl2, "task-cross")
+		res <- claimResult{id, err}
+	}()
+	<-factoryEntered
+
+	// While the factory is blocked, a second claim spends the hourly budget.
+	if _, err := m.Claim("t", tmpl, "task-warm"); err != nil {
+		t.Fatalf("warm claim within hourly quota: %v", err)
+	}
+	// hourly = [cur] with MaxTasksPerHour = 1.
+
+	close(releaseFactory)
+	r := <-res
+	// The warm claim's timestamp is now over an hour old: phase 3 must
+	// prune it before the recheck instead of rejecting the claim.
+	if r.err != nil {
+		t.Fatalf("claim crossing an hourly boundary must not be rejected: %v", r.err)
+	}
+	// The expired entry was removed; only the fresh claim remains.
+	m.mu.Lock()
+	window := m.hourly["t"]
+	m.mu.Unlock()
+	if len(window) != 1 || !window[0].Equal(cur) {
+		t.Errorf("hourly window = %v, want exactly the fresh entry %v (expired entry pruned)", window, cur)
+	}
+}
+
+// TestClaim_FailedCleanupQueuedAndRetried: when a post-Factory recheck
+// rejects a claim, the freshly built sandbox must be torn down — and if that
+// teardown FAILS, the id and reason must be recorded and retried instead of
+// being silently discarded (the old `_ = m.Destroyer(id)` leak), while the
+// caller still gets the original rejection.
+func TestClaim_FailedCleanupQueuedAndRetried(t *testing.T) {
+	m := NewManager(10, nil)
+	m.SetQuota("t", Quota{MaxConcurrent: 10, MaxCPU: 99, MaxMemoryMB: 99999, MaxTasksPerHour: 1})
+
+	tmpl := Template{Name: "x", Memory: "128M", CPU: 1}
+	m.Factory = func(Template) (string, error) { return "warm-1", nil }
+	m.Warm(tmpl, 1)
+	tmpl2 := Template{Name: "y", Memory: "128M", CPU: 1}
+	factoryEntered := make(chan struct{})
+	releaseFactory := make(chan struct{})
+	m.Factory = func(Template) (string, error) {
+		close(factoryEntered)
+		<-releaseFactory
+		return "ondemand-raced", nil
+	}
+	// The destroyer fails on every attempt during the rejection path.
+	m.Destroyer = func(string) error { return errors.New("destroy down") }
+
+	res := make(chan error, 1)
+	go func() {
+		_, err := m.Claim("t", tmpl2, "task-raced")
+		res <- err
+	}()
+	<-factoryEntered
+	// Spend the hourly budget while the factory is blocked, so the blocked
+	// claim is rejected by the phase-3 recheck after the factory returns.
+	if _, err := m.Claim("t", tmpl, "task-warm"); err != nil {
+		t.Fatalf("warm claim within hourly quota: %v", err)
+	}
+	close(releaseFactory)
+
+	// The rejection is preserved for the caller.
+	if err := <-res; !errors.Is(err, ErrQuotaExceeded) {
+		t.Fatalf("claim must still be rejected, got err=%v", err)
+	}
+	// The failed teardown was recorded (id + reason), not discarded.
+	if got := m.PendingCleanups(); got != 1 {
+		t.Fatalf("pending cleanups = %d, want 1", got)
+	}
+	m.mu.Lock()
+	reason, queued := m.pendingCleanups["ondemand-raced"]
+	m.mu.Unlock()
+	if !queued {
+		t.Fatal("failed teardown of the raced sandbox was not recorded")
+	}
+	if !strings.Contains(reason, "hourly") {
+		t.Errorf("cleanup reason = %q, want it to mention the hourly recheck", reason)
+	}
+
+	// A failed retry keeps it queued for the next sweep...
+	m.RetryCleanups()
+	if got := m.PendingCleanups(); got != 1 {
+		t.Fatalf("persistent failure must stay queued, got %d", got)
+	}
+	// ...a successful retry clears it.
+	destroyed := make(chan string, 1)
+	m.Destroyer = func(id string) error { destroyed <- id; return nil }
+	m.RetryCleanups()
+	if got := m.PendingCleanups(); got != 0 {
+		t.Fatalf("successful retry must clear the queue, got %d", got)
+	}
+	select {
+	case id := <-destroyed:
+		if id != "ondemand-raced" {
+			t.Errorf("retry destroyed %q, want ondemand-raced", id)
+		}
+	default:
+		t.Error("retry sweep did not attempt destruction")
 	}
 }
