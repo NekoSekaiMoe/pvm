@@ -20,7 +20,9 @@ go_test(
         "binary_test.go",
         "hardening_test.go",
         "interleave_test.go",
+        "store_durability_test.go",
         "volume_test.go",
     ],
     embed = [":volume"],
+    deps = ["//internal/fsjson"],
 )

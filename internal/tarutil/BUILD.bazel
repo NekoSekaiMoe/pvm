@@ -5,6 +5,7 @@ go_library(
     srcs = ["tarutil.go"],
     importpath = "uml-container/internal/tarutil",
     visibility = ["//:__subpackages__"],
+    deps = ["@org_golang_x_sys//unix"],
 )
 
 go_test(

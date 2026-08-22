@@ -12,6 +12,7 @@ go_library(
         "//internal/cgroup",
         "//internal/config",
         "//internal/container",
+        "//internal/cow",
         "//internal/image",
         "//internal/lifecycle",
         "//internal/policy",
@@ -33,6 +34,7 @@ go_test(
         "controlplanes_test.go",
         "e2b_server_test.go",
         "secret_required_test.go",
+        "snapshot_clone_rollback_test.go",
     ],
     embed = [":api"],
     deps = [
@@ -40,6 +42,7 @@ go_test(
         "//internal/audit",
         "//internal/policy",
         "//internal/pool",
+        "//internal/snapshot",
         "//internal/state",
     ],
 )

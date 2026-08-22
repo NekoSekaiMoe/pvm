@@ -28,9 +28,11 @@ func newTestMap(t *testing.T) *ebpf.Map {
 	// allocate map memory under pressure), not a defect under test.
 	if err != nil {
 		if errors.Is(err, os.ErrPermission) || errors.Is(err, unix.EPERM) ||
-			errors.Is(err, syscall.ENOMEM) ||
-			strings.Contains(err.Error(), "operation not permitted") {
-			t.Skipf("eBPF map creation unavailable on this host (root/MEMLOCK/memory required): %v", err)
+			errors.Is(err, unix.ENOSYS) || errors.Is(err, syscall.ENOSYS) ||
+			errors.Is(err, syscall.ENOMEM) || errors.Is(err, ebpf.ErrNotSupported) ||
+			strings.Contains(err.Error(), "operation not permitted") ||
+			strings.Contains(err.Error(), "function not implemented") {
+			t.Skipf("eBPF map creation unavailable on this host (root/MEMLOCK/memory/kernel BPF support required): %v", err)
 		}
 		t.Fatalf("NewMapWithOptions: %v", err)
 	}

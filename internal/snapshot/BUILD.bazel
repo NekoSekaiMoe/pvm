@@ -2,10 +2,16 @@ load("@rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
     name = "snapshot",
-    srcs = ["tar_archive.go"],
+    srcs = [
+        "clone.go",
+        "event.go",
+        "rollback.go",
+        "tar_archive.go",
+    ],
     importpath = "uml-container/internal/snapshot",
     visibility = ["//:__subpackages__"],
     deps = [
+        "//internal/cow",
         "//internal/state",
         "//internal/tarutil",
     ],
@@ -14,6 +20,8 @@ go_library(
 go_test(
     name = "snapshot_test",
     srcs = [
+        "clone_rollback_test.go",
+        "event_snapshot_test.go",
         "tar_archive_links_test.go",
         "tar_archive_test.go",
     ],

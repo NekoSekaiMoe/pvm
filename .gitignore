@@ -22,3 +22,4 @@ node_modules/
 /package.json
 package-lock.json
 webui/package-lock.json
+internal/network/bpf_bpf*
