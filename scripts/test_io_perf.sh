@@ -99,9 +99,13 @@ sudo umount mnt
 # root — including repo-cwd paths. sudo because this script runs as the CI
 # user while the image store is root-owned.
 IMG_DIR=/var/lib/uml-container/images
-sudo mkdir -p "${IMG_DIR}"
-BASE_QCOW2="${IMG_DIR}/perf_rootfs.qcow2"
-sudo rm -f "${BASE_QCOW2}"
+# Per-run unique directory: never touch a shared fixed base file — a
+# concurrent (or re-run after crash) suite must not have its base deleted
+# from under it. The EXIT trap removes only this run's directory.
+RUN_DIR="${IMG_DIR}/io-perf-$(date +%s)-$$-$RANDOM"
+sudo mkdir -p "${RUN_DIR}"
+trap 'sudo rm -rf "${RUN_DIR}"' EXIT
+BASE_QCOW2="${RUN_DIR}/perf_rootfs.qcow2"
 if sudo ./agentpvm cow -to-qcow2 "${IMG_NAME}" -overlay "${BASE_QCOW2}" 2>/dev/null; then
     echo "Built qcow2 base via pure-Go converter."
 elif command -v qemu-img >/dev/null 2>&1; then
