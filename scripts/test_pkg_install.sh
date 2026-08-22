@@ -106,7 +106,9 @@ sudo umount mnt_pkg
 # vec0 is transport-independent — it works identically over the vhost
 # (virtio_uml / vhost-user-blk) block backend, which tests/04_test_qcow2_mount.sh
 # proves end-to-end (guest boots from /dev/vda and reaches the gateway).
-BASE_IMG="${IMG_NAME}"   # raw ext4 image, mounted directly via ubd0
+# validateRootfs (fb4ed76a) requires an absolute path on the kernel cmdline,
+# so resolve the image against this script's cwd before handing it to umlctl.
+BASE_IMG="$(pwd)/${IMG_NAME}"   # raw ext4 image, mounted directly via ubd0
 
 # Setup Host Networking. Do NOT swallow these errors silently: a missing
 # bridge or a tap that never got mastered leaves the guest with no route,

@@ -22,7 +22,13 @@ go build -o "$TMP/umlctl"   ./cmd/umlctl
 
 # --- 1. agentpvm run loads a config and reports the fingerprint ---
 echo "--- agentpvm run loads config (no kernel => fails at launch, but planes wire up)"
-cat > "$TMP/spec.toml" <<'EOF'
+# A REAL base image inside a registered image root: the daemon-side rootfs
+# validation resolves symlinks, requires a regular file and enforces trusted-
+# root containment, so a placeholder path would now fail BEFORE launch.
+export PVM_IMAGE_ROOT="$TMP/images"
+mkdir -p "$PVM_IMAGE_ROOT"
+dd if=/dev/zero of="$PVM_IMAGE_ROOT/rootfs.img" bs=1M count=1 status=none
+cat > "$TMP/spec.toml" <<EOF
 version = 1
 caller = "smoke"
 tenant = "qa"
@@ -31,7 +37,7 @@ name = "smoke-task"
 memory = "256M"
 [workspace]
 init = "/init.sh"
-base_image = "/nonexistent/rootfs.img"
+base_image = "$PVM_IMAGE_ROOT/rootfs.img"
 [kernel]
 path = "/nonexistent/linux"
 EOF

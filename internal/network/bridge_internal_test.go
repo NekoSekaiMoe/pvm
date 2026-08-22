@@ -1,6 +1,7 @@
 package network
 
 import (
+	"strconv"
 	"errors"
 	"strings"
 	"testing"
@@ -229,9 +230,11 @@ func TestDeleteBridge_EmptyGatewayIPStillTeardowns(t *testing.T) {
 // tc arguments.
 func TestSetupQoS_RejectsNonRateArg(t *testing.T) {
 	for _, bad := range []string{"10 mbit", "10mbit burst 32kbit", "", "abc", "10Gbps", "10mbit,32kbit"} {
-		err := SetupQoS("tap0", bad)
-		if err == nil || !strings.Contains(err.Error(), "invalid QoS rate") {
-			t.Errorf("SetupQoS(rate %q) = %v, want invalid-rate error", bad, err)
-		}
+		t.Run("rate "+strconv.Quote(bad), func(t *testing.T) {
+			err := SetupQoS("tap0", bad)
+			if err == nil || !strings.Contains(err.Error(), "invalid QoS rate") {
+				t.Errorf("SetupQoS(rate %q) = %v, want invalid-rate error", bad, err)
+			}
+		})
 	}
 }

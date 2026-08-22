@@ -59,7 +59,12 @@ func TestFlow_SpecToTaskToAudit(t *testing.T) {
 	setupIsolatedRoots(t)
 	// The ubd path mounts BaseImage directly, so a minimal on-disk base is
 	// required: buildTaskArgs now rejects an empty rootfs (nothing to mount).
-	base := filepath.Join(t.TempDir(), "base.img")
+	// The base's directory must also be a trusted image root —
+	// validateRootfsContained rejects daemon-side rootfs paths outside
+	// PVM_IMAGE_ROOT / the default storage roots.
+	baseDir := t.TempDir()
+	t.Setenv("PVM_IMAGE_ROOT", baseDir)
+	base := filepath.Join(baseDir, "base.img")
 	if err := os.WriteFile(base, make([]byte, 4096), 0600); err != nil {
 		t.Fatal(err)
 	}

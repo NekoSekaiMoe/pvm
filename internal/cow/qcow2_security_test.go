@@ -134,8 +134,8 @@ func TestOpen_RejectsSystemFileBacking(t *testing.T) {
 	img := filepath.Join(dir, "overlay.qcow2")
 	craftHeader(t, img, clusterSize, "/etc/hostname", "")
 	_, err := openGuestImage(img)
-	if err == nil {
-		t.Fatal("absolute /etc backing must be rejected")
+	if err == nil || !strings.Contains(err.Error(), "managed storage roots") {
+		t.Fatalf("expected backing-root rejection, got: %v", err)
 	}
 }
 
@@ -155,8 +155,8 @@ func TestOpen_RejectsRelativeBackingTraversal(t *testing.T) {
 	}
 	craftHeader(t, img, clusterSize, "../escape.img", "")
 	_, err := openGuestImage(img)
-	if err == nil {
-		t.Fatal("..-traversing backing name must be rejected")
+	if err == nil || !strings.Contains(err.Error(), "managed storage roots") {
+		t.Fatalf("expected backing-root rejection, got: %v", err)
 	}
 }
 
@@ -168,8 +168,7 @@ func TestOpen_AcceptsSiblingRelativeBacking(t *testing.T) {
 	img := filepath.Join(dir, "overlay.qcow2")
 	craftHeader(t, img, clusterSize, "base.raw", "raw")
 	got := make([]byte, clusterSize)
-	n, err := readFull(t, img, got)
-	if err != nil {
+	if _, err := readFull(t, img, got); err != nil {
 		t.Fatalf("open/read: %v", err)
 	}
 	for i := range got {
@@ -177,7 +176,6 @@ func TestOpen_AcceptsSiblingRelativeBacking(t *testing.T) {
 			t.Fatalf("byte %d differs through backing chain", i)
 		}
 	}
-	_ = n
 }
 
 func readFull(t *testing.T, path string, buf []byte) (int, error) {

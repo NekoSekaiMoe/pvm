@@ -2,6 +2,8 @@ package container
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -44,24 +46,38 @@ func TestValidateKernelField(t *testing.T) {
 }
 
 // TestValidateRootfs pins the extra rootfs constraints: absolute path, no
-// '..' element, plus the base character-set rules.
+// '..' element, plus the base character-set rules, resolvability and the
+// regular-file requirement.
 func TestValidateRootfs(t *testing.T) {
+	dir := t.TempDir()
+	writeImg := func(rel string) string {
+		p := filepath.Join(dir, rel)
+		if err := os.MkdirAll(filepath.Dir(p), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte("img"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
 	cases := []struct {
 		name string
 		val  string
 		ok   bool
 	}{
-		{"absolute", "/var/lib/uml/rootfs.img", true},
+		{"absolute", writeImg("rootfs.img"), true},
 		{"relative", "rootfs.img", false},
 		{"dotdot traversal", "/var/lib/../etc/passwd", false},
 		{"dotdot leading", "../var/lib/img", false},
-		{"dotdot hidden name ok", "/var/lib/x..y/img", true}, // ".." only as full element is rejected
+		{"dotdot hidden name ok", writeImg("x..y/img"), true}, // ".." only as full element is rejected
 		{"space", "/var/li b/img", false},
 		{"empty", "", false},
+		{"nonexistent", filepath.Join(dir, "missing.img"), false}, // must resolve to a real file
+		{"directory not file", dir, false},                         // regular files only
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			err := validateRootfs(c.val)
+			_, err := validateRootfs(c.val)
 			if c.ok && err != nil {
 				t.Fatalf("validateRootfs(%q) = %v, want nil", c.val, err)
 			}
@@ -120,10 +136,18 @@ func TestBuildLegacyArgs_RejectsInjection(t *testing.T) {
 }
 
 // TestBuildLegacyArgs_AcceptsLegitFixture keeps the honest path working:
-// /init.sh, tap0, absolute rootfs, canonical memory.
+// /init.sh, tap0, absolute rootfs (a real file), canonical memory.
 func TestBuildLegacyArgs_AcceptsLegitFixture(t *testing.T) {
+	rootfs := filepath.Join(t.TempDir(), "rootfs.img")
+	if err := os.WriteFile(rootfs, []byte("img"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := filepath.EvalSymlinks(rootfs)
+	if err != nil {
+		t.Fatal(err)
+	}
 	cfg := config.ContainerConfig{
-		ID: "c1", Kernel: "/kernel", Rootfs: "/var/lib/uml/rootfs.img",
+		ID: "c1", Kernel: "/kernel", Rootfs: rootfs,
 		Memory: "512M", Init: "/init.sh", NetworkTap: "tap0",
 	}
 	args, err := buildLegacyArgs(context.Background(), &cfg)
@@ -131,7 +155,9 @@ func TestBuildLegacyArgs_AcceptsLegitFixture(t *testing.T) {
 		t.Fatalf("buildLegacyArgs: %v", err)
 	}
 	joined := strings.Join(args, "\n")
-	for _, want := range []string{"init=/init.sh", "mem=512M", "ubd0=/var/lib/uml/rootfs.img", "ifname=tap0"} {
+	// ubd0= must carry the RESOLVED path: the kernel boots exactly what was
+	// validated, closing the symlink-swap window.
+	for _, want := range []string{"init=/init.sh", "mem=512M", "ubd0=" + resolved, "ifname=tap0"} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("args missing %q:\n%s", want, joined)
 		}

@@ -31,6 +31,10 @@ echo "==> building agentpvm"
 go build -o "$TMP/agentpvm" ./cmd/agentpvm
 
 echo "==> starting server on :$PORT (no PVM_SPEC_ROOT)"
+# The first boot asserts the path-loading-disabled branch; a PVM_SPEC_ROOT
+# inherited from the caller's environment would flip that branch and fail
+# the test for environment reasons, not code reasons.
+unset PVM_SPEC_ROOT
 
 req() { # method path [json-body]
     local m=$1 p=$2 b=${3:-}

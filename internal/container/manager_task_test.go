@@ -35,22 +35,38 @@ func newTestManager(t *testing.T) (*Manager, *trackingLauncher) {
 	return &Manager{Launcher: tl}, tl
 }
 
-func minimalSpec() *spec.TaskSpec {
+func minimalSpec(baseImage string) *spec.TaskSpec {
 	return &spec.TaskSpec{
 		Version:   1,
 		Caller:    "alice",
 		Tenant:    "eng",
 		Runtime:   spec.RuntimeSpec{Name: "task-x", CPU: 1, Memory: "256M"},
-		Workspace: spec.WorkspaceSpec{BaseImage: "/tmp/uml-test-base.img", Init: "/sbin/init"}, // ubd path mounts this verbatim
+		Workspace: spec.WorkspaceSpec{BaseImage: baseImage, Init: "/sbin/init"}, // ubd path mounts this verbatim
 		Kernel:    spec.KernelSpec{Path: "/usr/lib/uml/linux"},
 		Network:   spec.NetworkSpec{Enabled: false},
 		Lifecycle: spec.LifecycleSpec{OnAnomaly: "pause"},
 	}
 }
 
+// testBaseImage materializes a real raw image inside a directory registered
+// as the test's trusted image root (PVM_IMAGE_ROOT). validateRootfs/
+// validateRootfsContained reject nonexistent or out-of-root images, so every
+// StartTask test must mount an actual file — not a hardcoded /tmp path that
+// may or may not exist on the host.
+func testBaseImage(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	t.Setenv("PVM_IMAGE_ROOT", dir)
+	p := filepath.Join(dir, "base.img")
+	if err := os.WriteFile(p, make([]byte, 4096), 0o600); err != nil {
+		t.Fatalf("write base image: %v", err)
+	}
+	return p
+}
+
 func TestStartTask_DrivesFSM(t *testing.T) {
 	m, tl := newTestManager(t)
-	s := minimalSpec()
+	s := minimalSpec(testBaseImage(t))
 
 	if err := m.StartTask(context.Background(), "task-x", s); err != nil {
 		t.Fatalf("starttask: %v", err)
@@ -67,8 +83,7 @@ func TestStartTask_DrivesFSM(t *testing.T) {
 		t.Errorf("status = %s, want review", st.Status)
 	}
 	// FSM must have recorded the full path Pending->Provisioning->Ready->Running->Review
-	wantSeq := []state.Status{state.StatusProvisioning, state.StatusReady, state.StatusRunning, state.StatusReview}
-	if len(st.Transitions) < len(wantSeq) {
+	if len(st.Transitions) < len(wantSequence) {
 		t.Fatalf("only %d transitions recorded: %+v", len(st.Transitions), st.Transitions)
 	}
 	for i, want := range wantSequence {
@@ -91,7 +106,7 @@ var wantSequence = []state.Status{
 
 func TestStartTask_RecordsAuditAndFingerprint(t *testing.T) {
 	m, _ := newTestManager(t)
-	s := minimalSpec()
+	s := minimalSpec(testBaseImage(t))
 
 	_ = m.StartTask(context.Background(), "task-y", s)
 
@@ -130,18 +145,27 @@ func TestStartTask_RawBaseUbdDirectMount(t *testing.T) {
 	if err := os.WriteFile(base, make([]byte, 1<<20), 0644); err != nil {
 		t.Fatalf("write base: %v", err)
 	}
+	// The temp dir must be a trusted image root, and the assertion below
+	// must use the symlink-resolved path: validateRootfsContained boots the
+	// resolved file, which can differ from the lexical temp path.
+	t.Setenv("PVM_IMAGE_ROOT", dir)
+	resolvedBase, rerr := filepath.EvalSymlinks(base)
+	if rerr != nil {
+		t.Fatalf("resolve base: %v", rerr)
+	}
 
-	s := minimalSpec()
+	s := minimalSpec(base)
 	s.Workspace.BaseImage = base
 	s.Kernel.UseVhostBlk = false // ubd path: raw base mounted directly, no CoW
 
 	if err := m.StartTask(context.Background(), "task-ubd", s); err != nil {
 		t.Fatalf("starttask ubd path: %v", err)
 	}
-	// The kernel cmdline must carry ubd0=<base> directly (no overlay created).
+	// The kernel cmdline must carry ubd0=<resolved base> directly (no overlay
+	// created).
 	found := false
 	for _, a := range tl.args {
-		if a == "ubd0="+base {
+		if a == "ubd0="+resolvedBase {
 			found = true
 			break
 		}
@@ -161,7 +185,7 @@ func TestStartTask_OverlayFailureFailsClosed(t *testing.T) {
 	dir := t.TempDir()
 	base := filepath.Join(dir, "does-not-exist.qcow2") // absent: os.Stat fails
 
-	s := minimalSpec()
+	s := minimalSpec(base)
 	s.Workspace.BaseImage = base
 	s.Workspace.Overlay = filepath.Join(dir, "ov.qcow2")
 	s.Kernel.UseVhostBlk = true // correct config; only the backing file is missing

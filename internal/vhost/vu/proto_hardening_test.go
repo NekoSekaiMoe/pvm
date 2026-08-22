@@ -3,6 +3,8 @@ package vu
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
+	"io"
 	"net"
 	"os"
 	"testing"
@@ -38,8 +40,11 @@ func TestGetPutBufRoundTrip(t *testing.T) {
 	}
 	putBuf(buf)
 	buf2 := getBuf(900)
-	if &buf[0] != &buf2[0] { //nolint:govet // identity check is the point
-		t.Fatal("putBuf/getBuf did not reuse the pooled buffer")
+	// sync.Pool does NOT guarantee object identity after Put/Get (the GC may
+	// drop pooled objects between the two calls), so assert the stable
+	// contract instead: same bucket capacity, correct length.
+	if cap(buf2) != 1024 || len(buf2) != 900 {
+		t.Fatalf("getBuf(900): len=%d cap=%d, want len=900 cap=1024", len(buf2), cap(buf2))
 	}
 	putBuf(buf2)
 
@@ -120,9 +125,10 @@ func TestSendRecvBufferReuse(t *testing.T) {
 	}
 }
 
-// TestReplyPayloadIndependentOfReceiveBuffer ensures reply() copies its
-// payload into the send buffer immediately (the caller's slice may itself
-// alias the reusable receive buffer).
+// TestReplyPayloadIndependentOfReceiveBuffer ensures reply() uses an
+// independent send buffer: a reply payload slice that aliases the
+// reusable receive buffer must not self-overwrite while the reply is in
+// flight.
 func TestReplyPayloadIndependentOfReceiveBuffer(t *testing.T) {
 	server, client := toConnPair(t)
 
@@ -134,7 +140,7 @@ func TestReplyPayloadIndependentOfReceiveBuffer(t *testing.T) {
 			return
 		}
 		buf := make([]byte, 12+8)
-		if _, err := ioReadFull(client.c, buf); err != nil {
+		if _, err := io.ReadFull(client.c, buf); err != nil {
 			done <- err
 			return
 		}
@@ -154,34 +160,18 @@ func TestReplyPayloadIndependentOfReceiveBuffer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("recv: %v", err)
 	}
-	// Reply with a slice OF the receive buffer: reply must snapshot the
-	// bytes into the send buffer immediately, so overwriting the receive
-	// buffer afterwards cannot corrupt the in-flight reply.
+	// Reply with a slice OF the receive buffer: the reply must go out from
+	// an independent send buffer, so the bytes on the wire match the payload
+	// as of reply() even though the receive buffer is mutated afterwards.
 	if err := server.reply(m, m.payload[:8]); err != nil {
 		t.Fatalf("reply: %v", err)
 	}
 	for i := range m.payload {
-		m.payload[i] = 0x77 // overwrite after reply: client must still see 0x42s
+		m.payload[i] = 0x77 // mutate after reply: client must still see 0x42s
 	}
 	if err := <-done; err != nil {
 		t.Fatalf("client roundtrip: %v", err)
 	}
 }
 
-var errReplyMismatch = errCustom{"reply payload mismatch"}
-
-type errCustom struct{ msg string }
-
-func (e errCustom) Error() string { return e.msg }
-
-func ioReadFull(c *net.UnixConn, buf []byte) (int, error) {
-	total := 0
-	for total < len(buf) {
-		n, err := c.Read(buf[total:])
-		total += n
-		if err != nil {
-			return total, err
-		}
-	}
-	return total, nil
-}
+var errReplyMismatch = errors.New("reply payload mismatch")

@@ -211,7 +211,11 @@ func TestExtract_StripsSetuidSetgidSticky(t *testing.T) {
 		hdr  tar.Header
 		data []byte
 	}{
-		{tar.Header{Name: "suid", Typeflag: tar.TypeReg, Mode: int64(os.ModeSetuid|os.ModeSetgid|os.ModeSticky) | 0755, Size: 1}, []byte("x")},
+		// POSIX special bits live in the LOW bits of tar's Mode field: 04000
+		// setuid | 02000 setgid | 01000 sticky, combined with 0755. (Go's
+		// os.ModeSetuid flags are high-bit markers and would never round-trip
+		// through a tar header, making the strip check vacuous.)
+		{tar.Header{Name: "suid", Typeflag: tar.TypeReg, Mode: 0o7755, Size: 1}, []byte("x")},
 	})
 	if err := Extract(bytes.NewReader(data), dir, DefaultLimits()); err != nil {
 		t.Fatalf("Extract: %v", err)

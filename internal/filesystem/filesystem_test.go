@@ -55,9 +55,10 @@ func TestCreateExt4Image_RejectsRelativePath(t *testing.T) {
 }
 
 func TestCreateExt4Image_NotWorldReadable(t *testing.T) {
-	// The pre-created file must be 0600 even when the external tools are
-	// missing (the O_EXCL create happens before any subprocess). On success
-	// dd/mkfs must not have widened the mode either.
+	// On SUCCESS dd/mkfs must not have widened the 0600 mode. (The
+	// missing-tool path cannot verify anything about the mode: it removes
+	// the file before returning, so the test skips instead — do not read
+	// the old comment's claim that the error path "verifies" 0600.)
 	tmp := filepath.Join(t.TempDir(), "img.bin")
 	err := CreateExt4Image(tmp, 1)
 	if err != nil {

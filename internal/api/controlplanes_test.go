@@ -259,19 +259,22 @@ func TestAPI_EmptyListsAreArraysNotNull(t *testing.T) {
 		"/api/approvals",
 		"/api/audit/tk-empty",
 	} {
-		req, _ := http.NewRequest("GET", base+path, nil)
-		req.Header.Set("Authorization", "Bearer secret")
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			t.Fatalf("GET %s: %v", path, err)
-		}
-		body, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if resp.StatusCode != 200 {
-			t.Fatalf("GET %s: status=%d body=%s", path, resp.StatusCode, body)
-		}
-		if got := strings.TrimSpace(string(body)); got != "[]" {
-			t.Errorf("GET %s: empty state must serialize as [], got %s", path, got)
-		}
+		path := path
+		t.Run(path, func(t *testing.T) {
+			req, _ := http.NewRequest("GET", base+path, nil)
+			req.Header.Set("Authorization", "Bearer secret")
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("GET %s: %v", path, err)
+			}
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if resp.StatusCode != 200 {
+				t.Fatalf("GET %s: status=%d body=%s", path, resp.StatusCode, body)
+			}
+			if got := strings.TrimSpace(string(body)); got != "[]" {
+				t.Errorf("GET %s: empty state must serialize as [], got %s", path, got)
+			}
+		})
 	}
 }

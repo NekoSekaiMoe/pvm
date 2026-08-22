@@ -60,7 +60,13 @@ func TestBinaryPlugin_StdoutCap(t *testing.T) {
 	dir := t.TempDir()
 	script := filepath.Join(dir, "flood.sh")
 	body := `#!/bin/sh
-dd if=/dev/zero bs=1024 count=2048 2>/dev/null
+# Flood >1 MiB of stdout using ONLY /bin/sh builtins (printf in a loop):
+# no dd/coreutils dependency, so the cap test also runs on minimal hosts.
+i=0
+while [ "$i" -lt 129 ]; do
+	printf '%8192s' ''
+	i=$((i+1))
+done
 printf '{"error":""}\n'
 `
 	if err := os.WriteFile(script, []byte(body), 0o700); err != nil {

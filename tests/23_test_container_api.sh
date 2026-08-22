@@ -104,7 +104,10 @@ echo "   snapshot/restore gating ✓"
 
 # --- 5. containers/start request validation chain ---
 echo "--- containers/start validation"
-# bad name format
+# bad name format: assert the HTTP status like the rest of the chain (the
+# body check alone would pass on any 4xx/5xx).
+HTTP=$(http_code POST /containers/start '{"name":"bad name!"}')
+assert_status "$HTTP" "400" "start bad name rejection"
 OUT=$(req POST /containers/start '{"name":"bad name!"}')
 ERR=$(printf '%s' "$OUT" | jq -r 'has("error")')
 [ "$ERR" = "true" ] || { echo "❌ start bad name not rejected: $OUT"; exit 1; }

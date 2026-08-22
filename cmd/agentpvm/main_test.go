@@ -74,13 +74,13 @@ func TestIDRegex(t *testing.T) {
 	valid := []string{"agent-task", "tk_1", "ABC123", "a", "x-y_z0"}
 	invalid := []string{"", "../evil", "a/b", "a b", "a;b", "a$(id)", "evil,opt=x", "dot.name"}
 	for _, id := range valid {
-		if !idRegex.MatchString(id) {
-			t.Errorf("idRegex rejected valid id %q", id)
+		if !taskIDRe.MatchString(id) {
+			t.Errorf("taskIDRe rejected valid id %q", id)
 		}
 	}
 	for _, id := range invalid {
-		if idRegex.MatchString(id) {
-			t.Errorf("idRegex accepted invalid id %q", id)
+		if taskIDRe.MatchString(id) {
+			t.Errorf("taskIDRe accepted invalid id %q", id)
 		}
 	}
 }

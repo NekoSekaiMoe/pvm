@@ -21,7 +21,7 @@ fi
 go build -o bin/umlctl ./cmd/umlctl
 
 NAME="cgroup-limit-test"
-ROOTFS=rootfs-cgroup-test.img
+ROOTFS="$(pwd)/rootfs-cgroup-test.img"   # absolute: validateRootfs rejects relative paths
 CONSOLE_LOG=/var/lib/uml-container/containers/$NAME/logs/console.log
 UMLCTL_LOG=uml-cgroup-test.log
 

@@ -4,9 +4,11 @@ import (
 	"errors"
 	"os"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/cilium/ebpf"
+	"golang.org/x/sys/unix"
 )
 
 // newTestMap creates a tiny real eBPF map (array of one u32) so the registry
@@ -22,9 +24,16 @@ func newTestMap(t *testing.T) *ebpf.Map {
 	// Map creation needs privilege (or unprivileged BPF + MEMLOCK headroom);
 	// on hosts without it we skip, matching the ip/tc skips in
 	// network_test.go — the registry bookkeeping under test is pure Go state.
+	// Map creation needs privilege (or unprivileged BPF + MEMLOCK headroom);
+	// on hosts without it we skip, matching the ip/tc skips in
+	// network_test.go — the registry bookkeeping under test is pure Go state.
+	// ENOMEM is an environment-level allocation failure (kernel refuses to
+	// allocate map memory under pressure), not a defect under test.
 	if err != nil {
-		if errors.Is(err, os.ErrPermission) || strings.Contains(err.Error(), "operation not permitted") {
-			t.Skipf("eBPF map creation not permitted on this host (root/MEMLOCK required): %v", err)
+		if errors.Is(err, os.ErrPermission) || errors.Is(err, unix.EPERM) ||
+			errors.Is(err, syscall.ENOMEM) ||
+			strings.Contains(err.Error(), "operation not permitted") {
+			t.Skipf("eBPF map creation unavailable on this host (root/MEMLOCK/memory required): %v", err)
 		}
 		t.Fatalf("NewMapWithOptions: %v", err)
 	}

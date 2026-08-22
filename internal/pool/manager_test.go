@@ -186,24 +186,29 @@ func TestClaim_OnDemandCreation(t *testing.T) {
 }
 
 func TestParseMemMB(t *testing.T) {
-	valid := map[string]int{"512M": 512, "2G": 2048, "1024K": 1, "1GB": 1024, "0M": 0}
+	// KB values round UP to whole MB (a value below 1024 KB still costs at
+	// least 1 MB of quota); exact multiples are unchanged.
+	valid := map[string]int{"512M": 512, "2G": 2048, "1024K": 1, "1K": 1, "1023K": 1, "1GB": 1024, "0M": 0, "0K": 0}
 	for in, want := range valid {
-		got, err := parseMemMB(in)
-		if err != nil {
-			t.Errorf("parseMemMB(%q) unexpected error: %v", in, err)
-			continue
-		}
-		if got != want {
-			t.Errorf("parseMemMB(%q) = %d, want %d", in, got, want)
-		}
+		t.Run(in, func(t *testing.T) {
+			got, err := parseMemMB(in)
+			if err != nil {
+				t.Fatalf("parseMemMB(%q) unexpected error: %v", in, err)
+			}
+			if got != want {
+				t.Errorf("parseMemMB(%q) = %d, want %d", in, got, want)
+			}
+		})
 	}
 	// Strict parsing: malformed values and unknown/missing units are errors,
 	// never silent fallbacks ("1.5G" used to parse as 1 MB).
 	invalid := []string{"", "1.5G", "512", "512X", "M", "abc", "-512M", "1 Ti"}
 	for _, in := range invalid {
-		if got, err := parseMemMB(in); err == nil {
-			t.Errorf("parseMemMB(%q) = %d, want error", in, got)
-		}
+		t.Run(in, func(t *testing.T) {
+			if got, err := parseMemMB(in); err == nil {
+				t.Errorf("parseMemMB(%q) = %d, want error", in, got)
+			}
+		})
 	}
 }
 

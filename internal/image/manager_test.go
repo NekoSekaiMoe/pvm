@@ -1,6 +1,7 @@
 package image
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -50,17 +51,23 @@ func TestRegistryAllowlist(t *testing.T) {
 		{"docker.io", "ghcr.io/a/b", false},                     // restrictive override
 		{"docker.io,localhost:*", "localhost:5000/a", true},     // wildcard port entry
 		{"docker.io,localhost:5000", "localhost:5001/a", false}, // exact port mismatch
+		{"docker.io,localhost:*", "localhost/a", true},           // wildcard port matches portless host too
+		{"docker.io,[::1]:*", "[::1]:5000/a", true},            // bracketed IPv6, explicit port
+		{"docker.io,[::1]:*", "[::1]/a", true},                 // bracketed IPv6, no port
+		{"docker.io,127.0.0.1:*", "127.0.0.1/a", true},          // wildcard port, portless ref
 	}
-	for _, tc := range tests {
-		if tc.env == "" {
-			t.Setenv("PVM_REGISTRY_ALLOWLIST", "")
-			os.Unsetenv("PVM_REGISTRY_ALLOWLIST")
-		} else {
-			t.Setenv("PVM_REGISTRY_ALLOWLIST", tc.env)
-		}
-		if got := registryAllowed(tc.ref); got != tc.want {
-			t.Errorf("registryAllowed(%q) with env %q = %v, want %v", tc.ref, tc.env, got, tc.want)
-		}
+	for i, tc := range tests {
+		t.Run(fmt.Sprintf("%d: env=%s ref=%s want=%v", i, tc.env, tc.ref, tc.want), func(t *testing.T) {
+			if tc.env == "" {
+				t.Setenv("PVM_REGISTRY_ALLOWLIST", "")
+				os.Unsetenv("PVM_REGISTRY_ALLOWLIST")
+			} else {
+				t.Setenv("PVM_REGISTRY_ALLOWLIST", tc.env)
+			}
+			if got := registryAllowed(tc.ref); got != tc.want {
+				t.Errorf("registryAllowed(%q) with env %q = %v, want %v", tc.ref, tc.env, got, tc.want)
+			}
+		})
 	}
 }
 

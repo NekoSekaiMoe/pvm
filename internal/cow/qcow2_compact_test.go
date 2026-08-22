@@ -503,7 +503,12 @@ func TestCompact_TruncatedDataCluster(t *testing.T) {
 	if err == nil {
 		t.Fatal("Compact on truncated image: expected error, got nil")
 	}
-	if !strings.Contains(err.Error(), "read source cluster") {
+	if !strings.Contains(err.Error(), "read source cluster") &&
+		!strings.Contains(err.Error(), "exceeds file size") {
+		// The failure may surface either at the pre-read host validation
+		// (validateHostData: range exceeds the real file) or at the ReadAt
+		// itself (short read) — both fail loudly before any rebuild rename,
+		// which is what this test pins.
 		t.Errorf("error should come from the source-cluster read, got: %v", err)
 	}
 	// The original (truncated) file must survive untouched — no rename of
