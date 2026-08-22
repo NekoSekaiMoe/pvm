@@ -10,6 +10,7 @@ go_library(
         "//internal/container",
         "//internal/image",
         "//internal/network",
+        "//internal/snapshot",
         "//internal/spec",
         "//internal/state",
         "//internal/uml",
