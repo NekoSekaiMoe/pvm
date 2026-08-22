@@ -1,6 +1,7 @@
 package snapshot
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -85,7 +86,7 @@ func Clone(sourceID, newID string) error {
 
 	if _, err := os.Stat(srcOverlay); err == nil {
 		// Create a new overlay with srcOverlay as its backing image (zero-copy instant branch)
-		if err := cow.CreateOverlay(nil, srcOverlay, dstOverlay); err != nil {
+		if err := cow.CreateOverlay(context.Background(), srcOverlay, dstOverlay); err != nil {
 			// Fallback: copy overlay file directly
 			if err := copyFile(srcOverlay, dstOverlay); err != nil {
 				return fmt.Errorf("snapshot: failed to clone overlay: %w", err)
@@ -93,7 +94,7 @@ func Clone(sourceID, newID string) error {
 		}
 	} else if _, err := os.Stat(srcRootfs); err == nil {
 		// Base rootfs exists; create an overlay backed by the base rootfs
-		if err := cow.CreateOverlay(nil, srcRootfs, dstOverlay); err != nil {
+		if err := cow.CreateOverlay(context.Background(), srcRootfs, dstOverlay); err != nil {
 			// Fallback: copy rootfs
 			if err := copyFile(srcRootfs, filepath.Join(dstDir, "rootfs.img")); err != nil {
 				return fmt.Errorf("snapshot: failed to clone rootfs: %w", err)

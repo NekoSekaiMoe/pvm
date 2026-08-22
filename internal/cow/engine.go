@@ -68,8 +68,19 @@ type Qcow2Engine struct {
 }
 
 // NewEngine creates the default (qcow2) engine at root. Root defaults to
-// /var/lib/uml-container/cow when empty (overridable via PVM_COW_ROOT).
+// /var/lib/uml-container/cow when empty (overridable via PVM_COW_ROOT);
+// see ResolveRoot.
 func NewEngine(root string) *Qcow2Engine {
+	return &Qcow2Engine{root: ResolveRoot(root)}
+}
+
+// ResolveRoot resolves the engine storage root: a non-empty root wins,
+// otherwise PVM_COW_ROOT, else /var/lib/uml-container/cow. Callers that need
+// to derive paths next to the engine's volumes and snapshots (e.g. API
+// handlers stat-ing <root>/<id>.qcow2 before calling the engine) must use
+// this instead of the raw environment variable, or their paths silently
+// diverge from the engine's whenever the variable is empty.
+func ResolveRoot(root string) string {
 	if root == "" {
 		if v := os.Getenv("PVM_COW_ROOT"); v != "" {
 			root = v
@@ -77,7 +88,7 @@ func NewEngine(root string) *Qcow2Engine {
 			root = "/var/lib/uml-container/cow"
 		}
 	}
-	return &Qcow2Engine{root: root}
+	return root
 }
 
 func (e *Qcow2Engine) volumePath(name string) string {
@@ -130,7 +141,13 @@ func (e *Qcow2Engine) DeleteVolume(name string) error {
 	if _, err := os.Stat(path); err != nil {
 		return fmt.Errorf("cow: volume %q not found", name)
 	}
-	if hasRef, refName, _ := e.hasBackingReference(path); hasRef {
+	hasRef, refName, err := e.hasBackingReference(path)
+	if err != nil {
+		// Fail closed: without a successful reference scan we cannot know
+		// whether deleting would orphan live dependents.
+		return fmt.Errorf("cow: scan references of volume %q: %w", name, err)
+	}
+	if hasRef {
 		return fmt.Errorf("cow: cannot delete volume %q: referenced by %q", name, refName)
 	}
 	return os.Remove(path)
@@ -225,7 +242,13 @@ func (e *Qcow2Engine) DeleteSnapshot(snapshotName string) error {
 	if _, err := os.Stat(path); err != nil {
 		return fmt.Errorf("cow: snapshot %q not found", snapshotName)
 	}
-	if hasRef, refName, _ := e.hasBackingReference(path); hasRef {
+	hasRef, refName, err := e.hasBackingReference(path)
+	if err != nil {
+		// Fail closed, mirroring DeleteVolume: an unreadable root must not
+		// degrade into deleting a snapshot live dependents still need.
+		return fmt.Errorf("cow: scan references of snapshot %q: %w", snapshotName, err)
+	}
+	if hasRef {
 		return fmt.Errorf("cow: cannot delete snapshot %q: referenced by %q", snapshotName, refName)
 	}
 	return os.Remove(path)
@@ -377,6 +400,18 @@ func (e *Qcow2Engine) RollbackVolume(volumeName, snapshotName string) error {
 		return fmt.Errorf("cow: snapshot %q not found", snapshotName)
 	}
 
+	// The rollback REPLACES volPath in place (convert + rename). Any other
+	// volume or snapshot whose backing chain reaches volPath — clones,\t// dependent snapshots — would silently observe the rolled-back content.
+	// The rollback TARGET snapshot itself is the one permitted reference:
+	// it is the source of the restore, not a victim of it.
+	hasRef, refName, err := e.hasBackingReferenceExcluding(volPath, snapPath)
+	if err != nil {
+		return fmt.Errorf("cow: scan references of volume %q: %w", volumeName, err)
+	}
+	if hasRef {
+		return fmt.Errorf("cow: cannot rollback volume %q: %q is backed by it (delete or roll back the dependent first)", volumeName, refName)
+	}
+
 	tmpPath := filepath.Join(e.root, ".tmp-rb-"+volumeName+".qcow2")
 	_ = os.Remove(tmpPath)
 	if err := ConvertToQcow2(context.Background(), snapPath, tmpPath, ConvertDefaultOpt); err != nil {
@@ -394,6 +429,15 @@ func (e *Qcow2Engine) RollbackVolume(volumeName, snapshotName string) error {
 // hasBackingReference reports whether any existing volume or snapshot has a
 // backing file referencing targetPath.
 func (e *Qcow2Engine) hasBackingReference(targetPath string) (bool, string, error) {
+	return e.hasBackingReferenceExcluding(targetPath, "")
+}
+
+// hasBackingReferenceExcluding reports whether any existing volume or
+// snapshot OTHER than excludePath has a backing file referencing targetPath.
+// Every candidate is scanned (the match does not short-circuit on the first
+// hit) so the excluded file can never mask another dependent that also
+// references the target.
+func (e *Qcow2Engine) hasBackingReferenceExcluding(targetPath, excludePath string) (bool, string, error) {
 	entries, err := os.ReadDir(e.root)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -405,14 +449,23 @@ func (e *Qcow2Engine) hasBackingReference(targetPath string) (bool, string, erro
 	if err != nil {
 		absTarget = targetPath
 	}
+	absExclude := ""
+	if excludePath != "" {
+		if absExclude, err = filepath.Abs(excludePath); err != nil {
+			absExclude = excludePath
+		}
+	}
 	targetBase := filepath.Base(targetPath)
 	for _, ent := range entries {
 		if ent.IsDir() || filepath.Ext(ent.Name()) != ".qcow2" {
 			continue
 		}
 		p := filepath.Join(e.root, ent.Name())
-		absP, err := filepath.Abs(p)
-		if err == nil && (absP == absTarget || p == targetPath) {
+		absP, aerr := filepath.Abs(p)
+		if aerr == nil && (absP == absTarget || p == targetPath) {
+			continue
+		}
+		if aerr == nil && absExclude != "" && (absP == absExclude || p == excludePath) {
 			continue
 		}
 		img, err := openGuestImage(p)

@@ -210,6 +210,10 @@ func TestExtract_HardlinkSourceSymlinkRules(t *testing.T) {
 		name    string
 		entries []tarEntry
 		wantErr string // "" means Extract must succeed
+		// prepare seeds the destination dir BEFORE extraction, for cases
+		// that need pre-existing filesystem state (e.g. a hostile hardlink
+		// pointing at a symlink planted outside the archive).
+		prepare func(t *testing.T, dir string)
 		// validate runs the scenario-specific filesystem assertions after
 		// extraction (also after rejection, for wantErr cases).
 		validate func(t *testing.T, dir string)
@@ -283,18 +287,38 @@ func TestExtract_HardlinkSourceSymlinkRules(t *testing.T) {
 			},
 		},
 		{
+			// The escaping symlink must pre-exist ON DISK: if the archive
+			// itself carried the sub/sym member, extractSymlink would reject
+			// it first and this case would pass without ever exercising
+			// extractHardlink's Lstat/Readlink/boundary branch. Seeding the
+			// symlink outside the archive forces the hardlink path to be the
+			// one that detects the escape.
 			name: "escaping_relative_symlink_hardlink_rejected",
+			prepare: func(t *testing.T, dir string) {
+				if err := os.MkdirAll(filepath.Join(dir, "sub"), 0755); err != nil {
+					t.Fatalf("prepare mkdir sub: %v", err)
+				}
+				if err := os.Symlink("../../etc/passwd", filepath.Join(dir, "sub", "sym")); err != nil {
+					t.Fatalf("prepare symlink: %v", err)
+				}
+			},
 			entries: []tarEntry{
-				{tar.Header{Name: "sub", Typeflag: tar.TypeDir, Mode: 0755}, nil},
-				{tar.Header{Name: "sub/sym", Typeflag: tar.TypeSymlink, Linkname: "../../etc/passwd", Mode: 0777}, nil},
 				{tar.Header{Name: "h", Typeflag: tar.TypeLink, Linkname: "sub/sym", Mode: 0644}, nil},
 			},
-			wantErr: "escapes the destination",
+			wantErr: "escapes destination",
+			validate: func(t *testing.T, dir string) {
+				if _, err := os.Lstat(filepath.Join(dir, "h")); !os.IsNotExist(err) {
+					t.Fatalf("rejected hardlink must not exist on disk, stat err = %v", err)
+				}
+			},
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
+			if tc.prepare != nil {
+				tc.prepare(t, dir)
+			}
 			data := buildTar(t, tc.entries)
 			err := Extract(bytes.NewReader(data), dir, DefaultLimits())
 			if tc.wantErr != "" {

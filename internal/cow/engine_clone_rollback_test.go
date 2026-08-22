@@ -1,6 +1,7 @@
 package cow
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 )
@@ -75,9 +76,42 @@ func TestEngine_CloneAndRollbackVolume(t *testing.T) {
 		}
 	})
 
+	t.Run("RollbackVolumeWithDependentRejected", func(t *testing.T) {
+		// cloned-vol-2 is still backed by base-vol: replacing base-vol in
+		// place would silently swap the content under that live clone.
+		if err := e.RollbackVolume("base-vol", "snap-1"); err == nil {
+			t.Fatal("expected rollback to be rejected while a dependent still references the volume")
+		}
+	})
+
 	t.Run("RollbackVolume", func(t *testing.T) {
+		// Remove the dependents first: cloned-vol is backed by snap-1 and
+		// cloned-vol-2 by base-vol. The rollback TARGET snapshot snap-1 is
+		// the only remaining reference to base-vol and must not block it.
+		if err := e.DeleteVolume("cloned-vol"); err != nil {
+			t.Fatalf("DeleteVolume cloned-vol: %v", err)
+		}
+		if err := e.DeleteVolume("cloned-vol-2"); err != nil {
+			t.Fatalf("DeleteVolume cloned-vol-2: %v", err)
+		}
 		if err := e.RollbackVolume("base-vol", "snap-1"); err != nil {
 			t.Fatalf("RollbackVolume: %v", err)
+		}
+		// The rolled-back volume exists, is a standalone image the engine
+		// can open, and the rollback temp file did not survive.
+		volPath := filepath.Join(root, "base-vol.qcow2")
+		if _, err := os.Stat(volPath); err != nil {
+			t.Fatalf("rolled-back volume missing: %v", err)
+		}
+		info, err := e.GetVolumeInfo("base-vol")
+		if err != nil {
+			t.Fatalf("open rolled-back volume via engine: %v", err)
+		}
+		if info.DevicePath != volPath {
+			t.Errorf("GetVolumeInfo path = %q, want %q", info.DevicePath, volPath)
+		}
+		if _, err := os.Stat(filepath.Join(root, ".tmp-rb-base-vol.qcow2")); !os.IsNotExist(err) {
+			t.Fatalf("rollback temp file must not survive a successful rollback (stat err = %v)", err)
 		}
 	})
 
@@ -94,12 +128,9 @@ func TestEngine_CloneAndRollbackVolume(t *testing.T) {
 	})
 
 	t.Run("DeleteUnreferencedVolumeAndSnapshot", func(t *testing.T) {
-		if err := e.DeleteVolume("cloned-vol"); err != nil {
-			t.Fatalf("DeleteVolume cloned-vol: %v", err)
-		}
-		if err := e.DeleteVolume("cloned-vol-2"); err != nil {
-			t.Fatalf("DeleteVolume cloned-vol-2: %v", err)
-		}
+		// cloned-vol / cloned-vol-2 were already removed ahead of the
+		// rollback above; snap-1's (stale) backing still names base-vol, so
+		// it must go first — exactly the referenced-delete guard at work.
 		if err := e.DeleteSnapshot("snap-1"); err != nil {
 			t.Fatalf("DeleteSnapshot snap-1: %v", err)
 		}

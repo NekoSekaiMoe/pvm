@@ -1,6 +1,7 @@
 package snapshot
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -59,7 +60,7 @@ func Rollback(taskID, snapshotID string) error {
 		tmpOverlay := filepath.Join(dir, ".tmp-rb-overlay.qcow2")
 		_ = os.Remove(tmpOverlay)
 		// Branch from snapOverlay as new active overlay in temporary file
-		if err := cow.CreateOverlay(nil, snapOverlay, tmpOverlay); err != nil {
+		if err := cow.CreateOverlay(context.Background(), snapOverlay, tmpOverlay); err != nil {
 			// Fallback: copy file
 			if err := copyFile(snapOverlay, tmpOverlay); err != nil {
 				_ = os.Remove(tmpOverlay)

@@ -61,6 +61,20 @@ func TestClone(t *testing.T) {
 		if clonedState.PID != 0 {
 			t.Errorf("clonedState.PID = %d, want 0", clonedState.PID)
 		}
+
+		// The clone must produce disk artifacts, not just state: the source
+		// only has rootfs.img, so Clone either branches an overlay.qcow2 from
+		// it (CreateOverlay) or falls back to copying rootfs.img — assert at
+		// least one landed in the cloned task's directory.
+		dstDir, err := state.ContainerDir(dstID)
+		if err != nil {
+			t.Fatalf("ContainerDir cloned: %v", err)
+		}
+		if _, oerr := os.Stat(filepath.Join(dstDir, "overlay.qcow2")); oerr != nil {
+			if _, rerr := os.Stat(filepath.Join(dstDir, "rootfs.img")); rerr != nil {
+				t.Errorf("cloned dir has neither overlay.qcow2 nor rootfs.img (overlay: %v, rootfs: %v)", oerr, rerr)
+			}
+		}
 	})
 
 	t.Run("DuplicateTargetFails", func(t *testing.T) {

@@ -629,7 +629,13 @@ func NewE2BServer() (*echo.Echo, error) {
 				Reason:   "historical rollback to " + req.SnapshotID,
 			})
 		}
-		st, _ := state.LoadState(id)
+		st, err := state.LoadState(id)
+		if err != nil {
+			// The rollback itself succeeded, but a state that cannot be
+			// reloaded afterwards is an anomaly that must be surfaced, not
+			// hidden as a null "state" field inside a success response.
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": fmt.Sprintf("rollback succeeded but reloading state failed: %v", err)})
+		}
 		return c.JSON(http.StatusOK, map[string]interface{}{"status": "rolled_back", "id": id, "snapshot_id": req.SnapshotID, "state": st})
 	})
 
@@ -970,9 +976,15 @@ func NewE2BServer() (*echo.Echo, error) {
 			}
 			return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		}
-		engine := cow.NewEngine(os.Getenv("PVM_VOLUME_ROOT"))
-		volFile := filepath.Join(os.Getenv("PVM_VOLUME_ROOT"), id+".qcow2")
-		snapFile := filepath.Join(os.Getenv("PVM_VOLUME_ROOT"), "snap-"+id+".qcow2")
+		// Resolve the root ONCE and derive both the engine and the vol/snap
+		// paths from it: joining the raw environment variable diverges from
+		// NewEngine's fallback when PVM_VOLUME_ROOT is empty (Join("", ...) is
+		// CWD-relative), so the stat checks below would observe a different
+		// directory than the engine clones from.
+		volRoot := cow.ResolveRoot(os.Getenv("PVM_VOLUME_ROOT"))
+		engine := cow.NewEngine(volRoot)
+		volFile := filepath.Join(volRoot, id+".qcow2")
+		snapFile := filepath.Join(volRoot, "snap-"+id+".qcow2")
 		var path string
 		if _, err := os.Stat(volFile); err == nil {
 			path, err = engine.CloneVolume(id, req.NewID)
@@ -1005,7 +1017,7 @@ func NewE2BServer() (*echo.Echo, error) {
 		if !idRegex.MatchString(req.Snapshot) {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid snapshot format"})
 		}
-		engine := cow.NewEngine(os.Getenv("PVM_VOLUME_ROOT"))
+		engine := cow.NewEngine(cow.ResolveRoot(os.Getenv("PVM_VOLUME_ROOT")))
 		if err := engine.RollbackVolume(id, req.Snapshot); err != nil {
 			if strings.Contains(err.Error(), "not found") {
 				return c.JSON(http.StatusNotFound, map[string]string{"error": err.Error()})

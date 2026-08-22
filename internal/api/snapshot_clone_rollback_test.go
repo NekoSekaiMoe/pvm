@@ -116,4 +116,43 @@ func TestAPI_EventSnapshotLifecycle(t *testing.T) {
 	if recRb.Code != http.StatusOK {
 		t.Fatalf("POST rollback code = %d, body: %s", recRb.Code, recRb.Body.String())
 	}
+	var rbResp struct {
+		State *state.ContainerState `json:"state"`
+	}
+	if err := json.Unmarshal(recRb.Body.Bytes(), &rbResp); err != nil {
+		t.Fatalf("unmarshal rollback resp: %v", err)
+	}
+	if rbResp.State == nil {
+		t.Fatalf("rollback response must carry the reloaded state, got null: %s", recRb.Body.String())
+	}
+
+	// 6. Error scenarios: duplicate clone (409), unknown snapshot rollback
+	// (404), and a clone request missing new_id (400).
+	doReq := func(t *testing.T, path, body string) int {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, path, bytes.NewBufferString(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer test-secret")
+		rec := httptest.NewRecorder()
+		e.ServeHTTP(rec, req)
+		return rec.Code
+	}
+
+	t.Run("DuplicateCloneReturns409", func(t *testing.T) {
+		if code := doReq(t, "/api/tasks/"+taskID+"/clone", `{"new_id":"task-api-cloned"}`); code != http.StatusConflict {
+			t.Errorf("duplicate clone code = %d, want 409", code)
+		}
+	})
+
+	t.Run("UnknownSnapshotRollbackReturns404", func(t *testing.T) {
+		if code := doReq(t, "/api/tasks/"+taskID+"/rollback", `{"snapshot_id":"snap-does-not-exist"}`); code != http.StatusNotFound {
+			t.Errorf("unknown snapshot rollback code = %d, want 404", code)
+		}
+	})
+
+	t.Run("CloneMissingNewIDReturns400", func(t *testing.T) {
+		if code := doReq(t, "/api/tasks/"+taskID+"/clone", `{}`); code != http.StatusBadRequest {
+			t.Errorf("clone without new_id code = %d, want 400", code)
+		}
+	})
 }

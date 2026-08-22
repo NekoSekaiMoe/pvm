@@ -188,6 +188,26 @@ VOL_DEL_RESP=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE "http://127.0.0.
 [ "$VOL_DEL_RESP" = "204" ] || fail "delete volume failed with code $VOL_DEL_RESP"
 echo "   Delete Volume action deleted $VOL_CLONE_NAME ✓"
 
+# 4.4 Button Click: "Rollback Volume" (restore a volume snapshot)
+VOL_RB_NAME="ui-vol-rb"
+VOL_RB_CREATE_RESP=$(curl -s -X POST "http://127.0.0.1:$PORT/api/volumes" \
+    -H "$AUTH" -H "$JSON_HDR" \
+    -d "{\"name\":\"$VOL_RB_NAME\",\"driver\":\"builtin\"}")
+echo "$VOL_RB_CREATE_RESP" | grep -q "$VOL_RB_NAME" || fail "create rollback volume failed: $VOL_RB_CREATE_RESP"
+# Block files are provisioned out-of-band (the REST layer registers
+# metadata only); a fresh volume avoids the dependent-reference rejection.
+truncate -s 1M "$PVM_VOLUME_ROOT/$VOL_RB_NAME.qcow2"
+cp "$PVM_VOLUME_ROOT/$VOL_RB_NAME.qcow2" "$PVM_VOLUME_ROOT/snap-$VOL_RB_NAME.qcow2"
+
+VOL_RB_RESP=$(curl -s -X POST "http://127.0.0.1:$PORT/api/volumes/$VOL_RB_NAME/rollback" \
+    -H "$AUTH" -H "$JSON_HDR" \
+    -d "{\"snapshot\":\"$VOL_RB_NAME\"}")
+echo "$VOL_RB_RESP" | grep -q '"status":"rolled_back"' || fail "rollback volume failed: $VOL_RB_RESP"
+[ "$(head -c 3 "$PVM_VOLUME_ROOT/$VOL_RB_NAME.qcow2")" = "QFI" ] || fail "rolled-back volume is not a qcow2 image"
+VOL_RB_STATE=$(curl -s "http://127.0.0.1:$PORT/api/volumes/$VOL_RB_NAME" -H "$AUTH")
+echo "$VOL_RB_STATE" | grep -q "$VOL_RB_NAME" || fail "volume state missing after rollback: $VOL_RB_STATE"
+echo "   Rollback Volume action restored snapshot state ✓"
+
 # =========================================================================
 # Step 5: Simulate Approvals Page (approvals.vue)
 # =========================================================================

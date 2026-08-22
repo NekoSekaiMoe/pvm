@@ -1,6 +1,7 @@
 package snapshot
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -93,10 +94,15 @@ func CreateEventSnapshot(taskID, eventID, auditHash string, metadata map[string]
 	if _, err := os.Stat(overlaySrc); err == nil {
 		overlayDst = filepath.Join(targetDir, "overlay.qcow2")
 		// Create a new overlay branching from the current overlay (instant copy)
-		if err := cow.CreateOverlay(nil, overlaySrc, overlayDst); err != nil {
-			// Fallback: copy file
-			if data, rerr := os.ReadFile(overlaySrc); rerr == nil {
-				_ = os.WriteFile(overlayDst, data, 0644)
+		if err := cow.CreateOverlay(context.Background(), overlaySrc, overlayDst); err != nil {
+			// Fallback: stream-copy the file — a disk overlay can be far
+			// larger than memory, so never buffer it whole via ReadFile. When
+			// the fallback ALSO fails, abort the snapshot: recording a
+			// DiskOverlay that was never written and reporting success would
+			// corrupt later rollbacks that branch from this snapshot.
+			if cerr := copyFile(overlaySrc, overlayDst); cerr != nil {
+				os.RemoveAll(targetDir)
+				return nil, fmt.Errorf("snapshot: capture overlay: overlay branch: %v; fallback copy: %w", err, cerr)
 			}
 		}
 	}

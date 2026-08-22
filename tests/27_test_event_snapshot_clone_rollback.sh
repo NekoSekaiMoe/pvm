@@ -167,6 +167,11 @@ VOL_CREATE=$(curl -s -X POST "http://127.0.0.1:$PORT/api/volumes" \
     -d '{"name":"vol-test-01","driver":"builtin"}')
 echo "$VOL_CREATE" | grep -q "vol-test-01" || fail "volume create failed: $VOL_CREATE"
 
+# Provision the volume's block file out-of-band: the builtin driver's REST
+# surface registers metadata only — the block files under PVM_VOLUME_ROOT
+# are managed by the cow engine, the way an operator/tool would.
+truncate -s 1M "$PVM_VOLUME_ROOT/vol-test-01.qcow2"
+
 # Clone volume
 VOL_CLONE=$(curl -s -X POST "http://127.0.0.1:$PORT/api/volumes/vol-test-01/clone" \
     -H "$AUTH" -H "$JSON_HDR" \
@@ -177,6 +182,30 @@ echo "$VOL_CLONE" | grep -q '"status":"cloned"' || fail "volume clone failed: $V
 VOL_LIST=$(curl -s "http://127.0.0.1:$PORT/api/volumes" -H "$AUTH")
 echo "$VOL_LIST" | grep -q "vol-test-01-cloned" || fail "cloned volume not in list: $VOL_LIST"
 echo "   Volume cloned and listed successfully ✓"
+
+# Rollback: a dedicated volume is used because the clone above still backs
+# onto vol-test-01 — rolling a volume back while a dependent references it
+# is (correctly) rejected by the engine.
+VOL_RB_CREATE=$(curl -s -X POST "http://127.0.0.1:$PORT/api/volumes" \
+    -H "$AUTH" -H "$JSON_HDR" \
+    -d '{"name":"vol-rb-01","driver":"builtin"}')
+echo "$VOL_RB_CREATE" | grep -q "vol-rb-01" || fail "rollback volume create failed: $VOL_RB_CREATE"
+truncate -s 1M "$PVM_VOLUME_ROOT/vol-rb-01.qcow2"
+cp "$PVM_VOLUME_ROOT/vol-rb-01.qcow2" "$PVM_VOLUME_ROOT/snap-vol-rb-01.qcow2"
+
+VOL_RB=$(curl -s -X POST "http://127.0.0.1:$PORT/api/volumes/vol-rb-01/rollback" \
+    -H "$AUTH" -H "$JSON_HDR" \
+    -d '{"snapshot":"vol-rb-01"}')
+echo "$VOL_RB" | grep -q '"status":"rolled_back"' || fail "volume rollback failed: $VOL_RB"
+echo "$VOL_RB" | grep -q '"snapshot":"vol-rb-01"' || fail "volume rollback response missing snapshot: $VOL_RB"
+
+# Restored volume state: the block file was replaced by a standalone qcow2
+# of the snapshot, no temp file leaked, and the metadata record survives.
+[ "$(head -c 3 "$PVM_VOLUME_ROOT/vol-rb-01.qcow2")" = "QFI" ] || fail "rolled-back volume is not a qcow2 image"
+[ ! -e "$PVM_VOLUME_ROOT/.tmp-rb-vol-rb-01.qcow2" ] || fail "volume rollback temp file leaked"
+VOL_RB_AFTER=$(curl -s "http://127.0.0.1:$PORT/api/volumes/vol-rb-01" -H "$AUTH")
+echo "$VOL_RB_AFTER" | grep -q "vol-rb-01" || fail "volume record lost after rollback: $VOL_RB_AFTER"
+echo "   Volume rolled back to snapshot ✓"
 
 # =========================================================================
 # Part 5: CLI Subcommand Verification
