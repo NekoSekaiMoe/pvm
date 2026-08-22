@@ -45,6 +45,7 @@ BRIDGE="pvm_br_cow"
 MNT="mnt_cow"
 CONSOLE_LOG=/var/lib/uml-container/containers/$NAME/logs/console.log
 
+# shellcheck disable=SC2329  # invoked by `trap cleanup EXIT` below; 0.11.0 intermittently misses it
 cleanup() {
     # agentpvm and qemu-storage-daemon both carry "test-cow" in their argv
     # (task name / socket path), so this reaps both. UML's own argv contains
@@ -63,6 +64,7 @@ dd if=/dev/zero of="$IMG_NAME" bs=1M count=200 > /dev/null 2>&1
 mkfs.ext4 -q -F "$IMG_NAME"
 
 if [ ! -f "alpine.tar.gz" ]; then
+# shellcheck disable=SC2086  # ALPINE_ARCH is a uname -m arch word (x86_64/aarch64), never globs/splits
     EDGE_TAR=$(curl -s https://dl-cdn.alpinelinux.org/alpine/edge/releases/$ALPINE_ARCH/latest-releases.yaml | grep "file: alpine-minirootfs" | head -n 1 | awk '{print $2}')
     wget -q "https://dl-cdn.alpinelinux.org/alpine/edge/releases/$ALPINE_ARCH/${EDGE_TAR}" -O alpine.tar.gz
 fi

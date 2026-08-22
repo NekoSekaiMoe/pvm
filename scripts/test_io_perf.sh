@@ -38,6 +38,7 @@ mkfs.ext4 -q -F ${IMG_NAME}
 # Check if alpine minirootfs exists, otherwise download
 if [ ! -f "alpine.tar.gz" ]; then
     echo "Downloading Alpine Edge minirootfs..."
+# shellcheck disable=SC2086  # ALPINE_ARCH is a uname -m arch word (x86_64/aarch64), never globs/splits
     EDGE_TAR=$(curl -s https://dl-cdn.alpinelinux.org/alpine/edge/releases/$ALPINE_ARCH/latest-releases.yaml | grep "file: alpine-minirootfs" | head -n 1 | awk '{print $2}')
     wget -q "https://dl-cdn.alpinelinux.org/alpine/edge/releases/$ALPINE_ARCH/${EDGE_TAR}" -O alpine.tar.gz
 fi
@@ -129,6 +130,7 @@ run_one() {
     # or crash on failure) ends it early. -debug yields the full vhost protocol
     # log to the agentpvm log on failure. PVM_VHOST_BACKEND in env selects the
     # backend (default Go server; =qemu selects qemu-storage-daemon).
+    # shellcheck disable=SC2024  # ap_log sits in the repo cwd, written by the invoking user, not root
     sudo env "${env[@]}" timeout 120 ./agentpvm run -name "$name" -rootfs "${BASE_QCOW2}" \
         -kernel ./bin/linux -init /init.sh -debug \
         > "$ap_log" 2>&1 || true
