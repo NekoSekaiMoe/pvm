@@ -49,7 +49,10 @@ cat "$UMLCTL_LOG"
 echo "---- UML console ($CONSOLE_LOG) ----"
 sudo cat "$CONSOLE_LOG" 2>/dev/null || echo "(no console.log found)"
 
-if grep -q "HELLO_FROM_UML_CONTAINER" "$UMLCTL_LOG" "$CONSOLE_LOG" 2>/dev/null; then
+# console.log is root-only (0600 inside a 0700 dir — see internal/log
+# SetupConsoleLog hardening), and umlctl start runs under sudo, so grep the
+# console log via sudo too; a plain grep gets EACCES which 2>/dev/null hides.
+if grep -q "HELLO_FROM_UML_CONTAINER" "$UMLCTL_LOG" 2>/dev/null || sudo grep -q "HELLO_FROM_UML_CONTAINER" "$CONSOLE_LOG" 2>/dev/null; then
     echo "SUCCESS: UML booted and ran our init script!"
 else
     echo "FAILED: Did not find expected output from UML."
