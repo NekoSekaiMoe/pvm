@@ -20,8 +20,12 @@ mkdir -p "$PVM_STATE_ROOT" "$PVM_AUDIT_ROOT" "$PVM_CGROUP_ROOT"
 PORT=18098
 export PVM_API="http://127.0.0.1:$PORT"
 API="$PVM_API/api"
-AUTH="Authorization: Bearer secret"
-export API_SECRET="secret"
+# Random per-run API secret; the server reads the SAME value from $API_SECRET.
+API_SECRET=$(head -c32 /dev/urandom 2>/dev/null | od -An -tx1 | tr -d ' \n' || true)
+[ -n "$API_SECRET" ] || API_SECRET=$(openssl rand -hex 16 2>/dev/null || true)
+[ -n "$API_SECRET" ] || API_SECRET="s$RANDOM$RANDOM$RANDOM$RANDOM"
+export API_SECRET
+AUTH="Authorization: Bearer $API_SECRET"
 
 fail() { echo "❌ $1"; exit 1; }
 

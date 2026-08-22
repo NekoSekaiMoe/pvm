@@ -58,8 +58,12 @@ mkdir -p "$PVM_STATE_ROOT" "$PVM_AUDIT_ROOT" "$PVM_CGROUP_ROOT"
 
 PORT=18085
 API="http://127.0.0.1:$PORT/api"
-export API_SECRET="secret"
-AUTH="Authorization: Bearer secret"
+# Random per-run API secret; the server reads the SAME value from $API_SECRET.
+API_SECRET=$(head -c32 /dev/urandom 2>/dev/null | od -An -tx1 | tr -d ' \n' || true)
+[ -n "$API_SECRET" ] || API_SECRET=$(openssl rand -hex 16 2>/dev/null || true)
+[ -n "$API_SECRET" ] || API_SECRET="s$RANDOM$RANDOM$RANDOM$RANDOM"
+export API_SECRET
+AUTH="Authorization: Bearer $API_SECRET"
 
 echo "==> building agentpvm"
 go build -o "$TMP/agentpvm" ./cmd/agentpvm
@@ -71,6 +75,13 @@ for _ in $(seq 1 40); do
     if curl -sf -H "$AUTH" "$API/containers" >/dev/null 2>&1; then break; fi
     sleep 0.25
 done
+# The loop alone can fall through without the server ever being ready; the
+# poll's own curl doubles as the readiness probe (auth + startup combined).
+curl -sf -H "$AUTH" "$API/containers" >/dev/null || {
+    echo "❌ server did not become ready; $TMP/server.log contents:"
+    cat "$TMP/server.log"
+    exit 1
+}
 
 req() { # method path [json-body] -> body
     local m=$1 p=$2 b=${3:-}

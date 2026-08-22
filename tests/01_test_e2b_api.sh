@@ -7,8 +7,12 @@ echo "========== Test 01: E2B API Simulation =========="
 go build -o agentpvm cmd/agentpvm/main.go
 
 # Start the API server in the background (a secret is REQUIRED — the server
-# refuses to start without one; keep it in sync with the Bearer header below)
-export API_SECRET="secret"
+# refuses to start without one). Randomize it per run; the Bearer header
+# below is built from the same $API_SECRET so both sides always agree.
+API_SECRET=$(head -c32 /dev/urandom 2>/dev/null | od -An -tx1 | tr -d ' \n' || true)
+[ -n "$API_SECRET" ] || API_SECRET=$(openssl rand -hex 16 2>/dev/null || true)
+[ -n "$API_SECRET" ] || API_SECRET="s$RANDOM$RANDOM$RANDOM$RANDOM"
+export API_SECRET
 ./agentpvm api -port 8081 &
 API_PID=$!
 
@@ -25,7 +29,7 @@ done
 echo "Sending execution request to E2B API (no task id -> must be rejected)..."
 HTTP_STATUS=$(curl -s -o resp.json -w "%{http_code}" -X POST http://127.0.0.1:8081/api/exec \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer secret" \
+  -H "Authorization: Bearer $API_SECRET" \
   -d '{"cmd": "apk update && apk add python3"}')
 
 echo "API Response:"

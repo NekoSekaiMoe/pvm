@@ -42,7 +42,13 @@ CONSOLE_LOG=/var/lib/uml-container/containers/integration-test/logs/console.log
 # fb4ed76a hardened validateRootfs: the rootfs is interpolated into the UML
 # kernel cmdline (ubd0=...) and must be absolute — resolve against the cwd
 # of this script before invoking umlctl (sudo preserves the expanded path).
-sudo ./bin/umlctl start --name integration-test --kernel ./bin/linux --rootfs "$(pwd)/rootfs.img" --init /init.sh > "$UMLCTL_LOG" 2>&1 || true
+# A failed start must fail the script: dump umlctl's own log and exit now
+# (the old '|| true' masked startup failures).
+if ! sudo ./bin/umlctl start --name integration-test --kernel ./bin/linux --rootfs "$(pwd)/rootfs.img" --init /init.sh > "$UMLCTL_LOG" 2>&1; then
+    echo "FAILED: umlctl start exited nonzero — $UMLCTL_LOG contents:"
+    cat "$UMLCTL_LOG"
+    exit 1
+fi
 
 echo "---- umlctl output ($UMLCTL_LOG) ----"
 cat "$UMLCTL_LOG"
