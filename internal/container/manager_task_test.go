@@ -166,6 +166,38 @@ func TestStartTask(t *testing.T) {
 			},
 		},
 		{
+			// Optional fields (review fix): Runtime.Memory and BaseImage are
+			// optional — a spec that leaves both unset must pass the hoisted
+			// validation in StartTask and boot init-only, emitting NO mem=/
+			// ubd0=/root= kernel args (empty mem= or ubd0= would be a broken
+			// kernel parameter).
+			name:   "optional memory and rootfs omitted",
+			taskID: "task-opt",
+			setup: func(t *testing.T) *spec.TaskSpec {
+				s := minimalSpec("")
+				s.Runtime.Memory = ""
+				return s
+			},
+			assert: func(t *testing.T, tl *trackingLauncher, _ *spec.TaskSpec, taskID string, _ error) {
+				for _, a := range tl.args {
+					if strings.HasPrefix(a, "mem=") || strings.HasPrefix(a, "ubd0=") || strings.HasPrefix(a, "root=") {
+						t.Errorf("unset optional field emitted kernel arg %q: %v", a, tl.args)
+					}
+				}
+				joined := strings.Join(tl.args, "\n")
+				if !strings.Contains(joined, "init=/sbin/init") || !strings.Contains(joined, "rw") {
+					t.Errorf("base args missing: %v", tl.args)
+				}
+				st, ferr := state.LoadState(taskID)
+				if ferr != nil {
+					t.Fatalf("load state: %v", ferr)
+				}
+				if st.Status != state.StatusReview {
+					t.Errorf("status = %s, want review", st.Status)
+				}
+			},
+		},
+		{
 			// Overlay failure fails closed: when vhost IS enabled, a backing
 			// path that cannot be used (here: absent and outside the trusted
 			// roots, so it fails validation before CreateOverlay even runs)

@@ -172,8 +172,13 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 	if err := validateKernelField("init", s.Workspace.Init); err != nil {
 		return err
 	}
-	if err := validateMemory(s.Runtime.Memory); err != nil {
-		return err
+	// Runtime.Memory is an OPTIONAL spec field (spec.Validate checks it only
+	// when set): validate only when non-empty, so an unset memory boots
+	// without mem= instead of failing the whole task.
+	if s.Runtime.Memory != "" {
+		if err := validateMemory(s.Runtime.Memory); err != nil {
+			return err
+		}
 	}
 	if s.Network.Enabled && s.Network.TAP != "" {
 		if err := validateKernelField("tap device", s.Network.TAP); err != nil {
@@ -875,7 +880,16 @@ func buildLegacyArgs(ctx context.Context, cfg *config.ContainerConfig) ([]string
 		args = append(args, fmt.Sprintf("virtio_uml.device=%s:%d", cfg.VhostUserSocket, vhost.VirtioIDBlock))
 		args = append(args, "root=/dev/vda")
 	} else {
-		resolved, err := validateRootfs(cfg.Rootfs)
+		// The legacy umlctl default is a RELATIVE "rootfs.img" in the
+		// working directory, while validateRootfs requires absolute paths.
+		// Resolve to absolute BEFORE validating — filepath.Abs also cleans
+		// "./" noise; EvalSymlinks and the regular-file check still run
+		// inside validateRootfs on the resolved value.
+		abs, err := filepath.Abs(cfg.Rootfs)
+		if err != nil {
+			return nil, fmt.Errorf("container: rootfs %q cannot be made absolute: %w", cfg.Rootfs, err)
+		}
+		resolved, err := validateRootfs(abs)
 		if err != nil {
 			return nil, err
 		}
@@ -918,12 +932,20 @@ func buildTaskArgs(s *spec.TaskSpec, vhostSock, resolvedRootfs, egressAddr strin
 	if err := validateKernelField("init", s.Workspace.Init); err != nil {
 		return nil, err
 	}
-	if err := validateMemory(s.Runtime.Memory); err != nil {
-		return nil, err
+	// Runtime.Memory and the rootfs are OPTIONAL spec fields (spec.Validate
+	// checks each only when set): validate only when present and omit the
+	// matching kernel arg when unset — an empty mem=/ubd0= would be a broken
+	// kernel parameter, so nothing is appended for unset fields.
+	if s.Runtime.Memory != "" {
+		if err := validateMemory(s.Runtime.Memory); err != nil {
+			return nil, err
+		}
 	}
 	args := []string{
 		fmt.Sprintf("init=%s", s.Workspace.Init),
-		fmt.Sprintf("mem=%s", s.Runtime.Memory),
+	}
+	if s.Runtime.Memory != "" {
+		args = append(args, fmt.Sprintf("mem=%s", s.Runtime.Memory))
 	}
 	if s.Kernel.UseVhostBlk && vhostSock != "" {
 		if err := validateKernelField("vhost-user socket", vhostSock); err != nil {
@@ -931,7 +953,7 @@ func buildTaskArgs(s *spec.TaskSpec, vhostSock, resolvedRootfs, egressAddr strin
 		}
 		args = append(args, fmt.Sprintf("virtio_uml.device=%s:%d", vhostSock, vhost.VirtioIDBlock))
 		args = append(args, "root=/dev/vda")
-	} else {
+	} else if resolvedRootfs != "" {
 		resolved, err := validateRootfsContained(resolvedRootfs)
 		if err != nil {
 			return nil, err
@@ -940,6 +962,8 @@ func buildTaskArgs(s *spec.TaskSpec, vhostSock, resolvedRootfs, egressAddr strin
 		args = append(args, fmt.Sprintf("ubd0=%s", resolved))
 		args = append(args, "root=/dev/ubda")
 	}
+	// resolvedRootfs empty: no block device was provisioned (BaseImage
+	// unset), so the kernel boots init-only with no ubd0=/root= args.
 	args = append(args, "rw")
 	// Network device: vec0 (vector tap transport). Since Linux 6.16 the legacy
 	// UML net transports (CONFIG_UML_NET + eth0=tuntap/slip/daemon/...) are
