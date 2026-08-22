@@ -2,9 +2,22 @@ package filesystem
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 )
+
+// requireExt4Tools skips the test when the external binaries
+// CreateExt4Image shells out to (dd, mkfs.ext4) are unavailable, e.g. on a
+// minimal CI runner. With both present every CreateExt4Image error is fatal.
+func requireExt4Tools(t *testing.T) {
+	t.Helper()
+	for _, bin := range []string{"dd", "mkfs.ext4"} {
+		if _, err := exec.LookPath(bin); err != nil {
+			t.Skipf("%s not available: %v", bin, err)
+		}
+	}
+}
 
 func TestSetupOverlayfs_CreatesAllDirs(t *testing.T) {
 	base := t.TempDir()
@@ -27,48 +40,56 @@ func TestSetupOverlayfs_CreatesAllDirs(t *testing.T) {
 	}
 }
 
-func TestCreateExt4Image_RequiresBinaries(t *testing.T) {
-	// CreateExt4Image shells out to dd + mkfs.ext4. On a minimal CI/CI-runner
-	// without those tools it must report a clear error rather than silently
-	// succeeding; if they are present it must produce a non-empty file. We
-	// assert the non-error path is observable and the error path is reachable.
-	tmp := filepath.Join(t.TempDir(), "img.bin")
-	err := CreateExt4Image(tmp, 1)
-	if err == nil {
-		info, statErr := os.Stat(tmp)
-		if statErr != nil {
-			t.Fatalf("image reported created but stat failed: %v", statErr)
-		}
-		if info.Size() == 0 {
-			t.Errorf("created image is empty")
-		}
-		return
+func TestCreateExt4Image(t *testing.T) {
+	tests := []struct {
+		name string
+		// relative makes the image path relative; CreateExt4Image must
+		// reject it before invoking any external tool.
+		relative bool
+		// wantErr asserts the call fails (used by the relative-path case).
+		wantErr bool
+		// checkPerm asserts the created image keeps mode 0600 (dd/mkfs must
+		// not widen the mode the O_EXCL create set).
+		checkPerm bool
+	}{
+		{name: "rejects relative path", relative: true, wantErr: true},
+		{name: "creates non-empty image"},
+		{name: "keeps mode 0600", checkPerm: true},
 	}
-	// dd/mkfs.ext4 missing is acceptable in constrained envs; anything else isn't.
-	t.Logf("CreateExt4Image returned error (likely missing dd/mkfs.ext4): %v", err)
-}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			// The create-success scenarios need the real tools; the
+			// relative-path case must fail before any tool is invoked, so it
+			// runs regardless (and needs no binaries).
+			if !tc.relative {
+				requireExt4Tools(t)
+			}
 
-func TestCreateExt4Image_RejectsRelativePath(t *testing.T) {
-	if err := CreateExt4Image("relative.img", 1); err == nil {
-		t.Fatal("relative image path must be rejected")
-	}
-}
+			path := filepath.Join(t.TempDir(), "img.bin")
+			if tc.relative {
+				path = "relative.img"
+			}
+			err := CreateExt4Image(path, 1)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("relative image path must be rejected")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("CreateExt4Image: %v", err)
+			}
 
-func TestCreateExt4Image_NotWorldReadable(t *testing.T) {
-	// On SUCCESS dd/mkfs must not have widened the 0600 mode. (The
-	// missing-tool path cannot verify anything about the mode: it removes
-	// the file before returning, so the test skips instead — do not read
-	// the old comment's claim that the error path "verifies" 0600.)
-	tmp := filepath.Join(t.TempDir(), "img.bin")
-	err := CreateExt4Image(tmp, 1)
-	if err != nil {
-		t.Skipf("dd/mkfs.ext4 unavailable: %v", err)
-	}
-	fi, statErr := os.Stat(tmp)
-	if statErr != nil {
-		t.Fatalf("stat: %v", statErr)
-	}
-	if fi.Mode().Perm() != 0600 {
-		t.Fatalf("image mode = %v, want 0600", fi.Mode().Perm())
+			info, statErr := os.Stat(path)
+			if statErr != nil {
+				t.Fatalf("stat image: %v", statErr)
+			}
+			if info.Size() == 0 {
+				t.Errorf("created image is empty")
+			}
+			if tc.checkPerm && info.Mode().Perm() != 0600 {
+				t.Fatalf("image mode = %v, want 0600", info.Mode().Perm())
+			}
+		})
 	}
 }

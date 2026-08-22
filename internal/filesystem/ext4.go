@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 )
 
 // CreateExt4Image creates a new file and formats it as ext4.
@@ -25,11 +26,13 @@ func CreateExt4Image(path string, sizeMb int) error {
 	}
 	f.Close()
 
-	// Create sparse file or zero-filled
+	// Create sparse file or zero-filled. CombinedOutput captures dd's stderr
+	// (e.g. "no space left on device") so the failure is diagnosable; the
+	// message is distinct from the O_EXCL creation error above.
 	cmd := exec.Command("dd", "if=/dev/zero", fmt.Sprintf("of=%s", path), "bs=1M", fmt.Sprintf("count=%d", sizeMb))
-	if err := cmd.Run(); err != nil {
+	if out, err := cmd.CombinedOutput(); err != nil {
 		os.Remove(path)
-		return fmt.Errorf("failed to create image file: %v", err)
+		return fmt.Errorf("dd failed to fill image %q (output: %s): %w", path, strings.TrimSpace(string(out)), err)
 	}
 
 	// Format as ext4

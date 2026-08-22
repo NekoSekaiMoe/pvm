@@ -1,10 +1,12 @@
 package image
 
 import (
+	"archive/tar"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"io"
+	"math/rand"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -121,31 +123,43 @@ func Pull(imageRef string) error {
 		return fmt.Errorf("image %q: registry %q is not on the allowlist (PVM_REGISTRY_ALLOWLIST)", imageRef, registryHost(imageRef))
 	}
 	imgDir := DefaultDir
-	os.MkdirAll(imgDir, 0755)
+	if err := os.MkdirAll(imgDir, 0755); err != nil {
+		return fmt.Errorf("failed to create image directory %s: %v", imgDir, err)
+	}
 
 	// Collision-free store name: sha256(imageRef). See imageName.
 	safeName := strings.TrimSuffix(imageName(imageRef), ".img")
-	imgPath := filepath.Join(imgDir, imageName(imageRef))
+	imgPath := filepath.Join(imgDir, safeName+".img")
 
 	if _, err := os.Stat(imgPath); err == nil {
 		fmt.Printf("Image %s already exists\n", imageRef)
 		return nil
 	}
 
+	// Everything from here on writes into /var/lib and mounts a loop device
+	// (via sudo mount), which requires root. Fail fast with a clear error
+	// instead of a confusing mid-pull permission failure. The allowlist and
+	// already-exists fast-paths above stay usable unprivileged (unit tests
+	// and tests/22 rely on exactly those paths).
+	if os.Geteuid() != 0 {
+		return fmt.Errorf("image pull of %q requires root (current euid %d); rerun as root or via sudo", imageRef, os.Geteuid())
+	}
+
 	// Build on a temporary path and rename into place only after success, so a
 	// crashed/partial extraction can never be mistaken for a complete image on
 	// the next run (the Stat fast-path above would otherwise reuse it).
-	tmpImg, err := os.CreateTemp(imgDir, safeName+"-*.img.tmp")
+	// Pick an unused name WITHOUT creating the file: CreateExt4Image reserves
+	// the path atomically via O_CREATE|O_EXCL, and handing it an already-
+	// existing file would defeat that non-overwrite guarantee (the open would
+	// just fail with EEXIST).
+	tmpImgPath, err := unusedTempPath(imgDir, safeName+"-", ".img.tmp")
 	if err != nil {
-		return fmt.Errorf("failed to create temp image file: %v", err)
+		return fmt.Errorf("failed to allocate temp image path: %v", err)
 	}
-	tmpImgPath := tmpImg.Name()
 	// Whatever happens below, never leave a .tmp behind on failure.
 	cleanup := func() {
-		tmpImg.Close()
 		os.Remove(tmpImgPath)
 	}
-	tmpImg.Close()
 
 	// Create ext4 image (500MB default)
 	if err := filesystem.CreateExt4Image(tmpImgPath, 500); err != nil {
@@ -197,6 +211,18 @@ func Pull(imageRef string) error {
 	}
 	f.Close()
 
+	// Pre-check entry types BEFORE extracting anything: tarutil rejects
+	// device nodes/FIFOs/special members when it reaches them mid-stream, but
+	// by then part of the rootfs has already been written into the mounted
+	// image. Walking the tar up front makes the pull fail before any bytes
+	// land, with one clear error naming the offending entry. (Implemented in
+	// Pull rather than tarutil so the scan precedes the extraction call;
+	// tarutil keeps its per-entry defense-in-depth rejection.)
+	if err := checkTarEntryTypes(tarFile); err != nil {
+		cleanup()
+		return fmt.Errorf("refusing to extract image %q: %v", imageRef, err)
+	}
+
 	// Extract the exported layer tarball with the hardened tarutil extractor
 	// instead of `sudo tar -xf`: traversal/symlink/device-node members are
 	// rejected, special permission bits are stripped, and resource limits bound
@@ -229,6 +255,55 @@ func CreateLayer(containerID string) error {
 		return err
 	}
 	return filesystem.SetupOverlayfs(dir)
+}
+
+// unusedTempPath returns a path under dir, shaped prefix+random+suffix, that
+// does not currently exist (os.CreateTemp-style naming). Unlike os.CreateTemp
+// it does NOT create the file: callers that need atomic ownership take the
+// path themselves with O_CREATE|O_EXCL (see filesystem.CreateExt4Image). If
+// the name is taken between the check and that open, the open fails cleanly
+// with EEXIST, so the existence check here is only advisory.
+func unusedTempPath(dir, prefix, suffix string) (string, error) {
+	for i := 0; i < 10000; i++ {
+		cand := filepath.Join(dir, fmt.Sprintf("%s%d%s", prefix, rand.Int63(), suffix))
+		if _, err := os.Lstat(cand); err != nil {
+			if os.IsNotExist(err) {
+				return cand, nil
+			}
+			return "", err
+		}
+	}
+	return "", fmt.Errorf("no unused temporary name under %s after 10000 attempts", dir)
+}
+
+// checkTarEntryTypes walks the tarball at path and rejects any member whose
+// type the extractor does not support: device nodes (char/block), FIFOs, and
+// any other special entry. Regular files, directories, symlinks, hardlinks,
+// and PAX global headers (archive metadata, skipped by tarutil.Extract) pass.
+func checkTarEntryTypes(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("open layer tar for entry-type pre-check: %w", err)
+	}
+	defer f.Close()
+	tr := tar.NewReader(f)
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("read layer tar for entry-type pre-check: %w", err)
+		}
+		switch hdr.Typeflag {
+		case tar.TypeReg, tar.TypeDir, tar.TypeSymlink, tar.TypeLink, tar.TypeXGlobalHeader:
+			// Supported by tarutil.Extract; keep scanning.
+		case tar.TypeChar, tar.TypeBlock, tar.TypeFifo:
+			return fmt.Errorf("entry %q is a device node or FIFO (type %d); device/FIFO members are not supported", hdr.Name, hdr.Typeflag)
+		default:
+			return fmt.Errorf("entry %q has unsupported tar type %d", hdr.Name, hdr.Typeflag)
+		}
+	}
 }
 
 // MountLayer historically mounted a host overlay at <dir>/merged and returned,
