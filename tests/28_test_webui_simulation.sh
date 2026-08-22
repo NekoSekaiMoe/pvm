@@ -202,6 +202,13 @@ VOL_SNAP_RESP=$(curl -s -X POST "http://127.0.0.1:$PORT/api/volumes/$VOL_RB_NAME
     -d '{"snapshot":"ui-point"}')
 echo "$VOL_SNAP_RESP" | grep -q '"status":"created"' || fail "snapshot volume failed: $VOL_SNAP_RESP"
 
+# The rollback modal loads the volume's snapshot list for one-click pick.
+VOL_SNAP_LIST=$(curl -s "http://127.0.0.1:$PORT/api/volumes/$VOL_RB_NAME/snapshots" -H "$AUTH")
+echo "$VOL_SNAP_LIST" | grep -q '"name":"ui-point"' || fail "snapshot list missing ui-point: $VOL_SNAP_LIST"
+echo "$VOL_SNAP_LIST" | grep -q '"origin_volume":"'"$VOL_RB_NAME"'"' || fail "snapshot origin mismatch: $VOL_SNAP_LIST"
+
+echo "   Snapshot Volume action created ui-point and listed it ✓"
+
 VOL_RB_RESP=$(curl -s -X POST "http://127.0.0.1:$PORT/api/volumes/$VOL_RB_NAME/rollback" \
     -H "$AUTH" -H "$JSON_HDR" \
     -d "{\"snapshot\":\"ui-point\"}")

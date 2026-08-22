@@ -39,6 +39,9 @@
               </td>
               <td class="timeline-meta">{{ fmt(v.created_at) }}</td>
               <td>
+                <button class="btn btn-primary" style="font-size:0.75rem;padding:0.3rem 0.5rem;margin-right:0.3rem;" @click="snapshotVolumePrompt(v.volume_id)">
+                  📸 Snapshot
+                </button>
                 <button class="btn btn-primary" style="font-size:0.75rem;padding:0.3rem 0.5rem;margin-right:0.3rem;" @click="cloneVolumePrompt(v.volume_id)">
                   🐑 Clone
                 </button>
@@ -55,6 +58,27 @@
             </tr>
           </tbody>
         </table>
+      </div>
+    </div>
+
+    <!-- Snapshot Modal -->
+    <div v-if="snapshotModalVolume" class="modal-backdrop" role="dialog" aria-modal="true" @keydown.esc="snapshotModalVolume = null">
+      <div class="modal-box">
+        <h3>Snapshot Volume — {{ snapshotModalVolume }}</h3>
+        <p class="muted" style="font-size:0.85rem;margin-bottom:1rem;">Branch an instant Copy-on-Write snapshot of this volume (stored as snap-&lt;name&gt;.qcow2 by the cow engine).</p>
+
+        <div class="form-row full">
+          <label class="section-title" for="snapshot-name">Snapshot Name</label>
+          <input id="snapshot-name" v-model="snapshotName" placeholder="e.g. pre-migration" />
+        </div>
+
+        <div v-if="snapshotError" class="callout err">{{ snapshotError }}</div>
+        <div v-if="snapshotSuccess" class="callout allow" style="color:var(--success, #4ade80);background:rgba(74,222,128,0.1);padding:0.75rem;border-radius:0.5rem;margin-top:1rem;">{{ snapshotSuccess }}</div>
+
+        <div style="display:flex;justify-content:flex-end;gap:1rem;margin-top:1.5rem;">
+          <button class="btn btn-danger" @click="snapshotModalVolume = null">Close</button>
+          <button class="btn btn-primary" @click="executeSnapshotVolume">Create Snapshot</button>
+        </div>
       </div>
     </div>
 
@@ -87,8 +111,17 @@
         
         <div class="form-row full">
           <label class="section-title" for="rollback-snap-id">Snapshot Name</label>
-          <input id="rollback-snap-id" v-model="rollbackSnapName" placeholder="e.g. snap-1" />
+          <input id="rollback-snap-id" v-model="rollbackSnapName" placeholder="snapshot name, e.g. pre-migration" />
         </div>
+        <div v-if="rollbackSnapshots.length" class="form-row full">
+          <span class="muted" style="font-size:0.8rem;">Available snapshots (click to select):</span>
+          <div style="display:flex;flex-wrap:wrap;gap:0.4rem;margin-top:0.4rem;">
+            <button v-for="s in rollbackSnapshots" :key="s.name" type="button" class="pill allow" style="cursor:pointer;font-size:0.75rem;" :style="rollbackSnapName === s.name ? 'outline:2px solid var(--accent);' : ''" @click="rollbackSnapName = s.name">
+              {{ s.name }}
+            </button>
+          </div>
+        </div>
+        <p v-else-if="!rollbackSnapshotsLoading" class="muted" style="font-size:0.8rem;">No snapshots found for this volume — create one with the 📸 Snapshot action first.</p>
 
         <div v-if="rollbackError" class="callout err">{{ rollbackError }}</div>
         <div v-if="rollbackSuccess" class="callout allow" style="color:var(--success, #4ade80);background:rgba(74,222,128,0.1);padding:0.75rem;border-radius:0.5rem;margin-top:1rem;">{{ rollbackSuccess }}</div>
@@ -147,6 +180,11 @@ const searchQuery = ref('')
 const showCreateModal = ref(false)
 const errorMsg = ref('')
 
+const snapshotModalVolume = ref(null)
+const snapshotName = ref('')
+const snapshotError = ref('')
+const snapshotSuccess = ref('')
+
 const cloneModalVolume = ref(null)
 const cloneTargetID = ref('')
 const cloneError = ref('')
@@ -156,6 +194,8 @@ const rollbackModalVolume = ref(null)
 const rollbackSnapName = ref('')
 const rollbackError = ref('')
 const rollbackSuccess = ref('')
+const rollbackSnapshots = ref([])
+const rollbackSnapshotsLoading = ref(false)
 
 const form = ref({
   name: '',
@@ -199,6 +239,32 @@ const createVolume = async () => {
   }
 }
 
+const snapshotVolumePrompt = (id) => {
+  snapshotModalVolume.value = id
+  snapshotName.value = ''
+  snapshotError.value = ''
+  snapshotSuccess.value = ''
+}
+
+const executeSnapshotVolume = async () => {
+  snapshotError.value = ''
+  snapshotSuccess.value = ''
+  if (!snapshotName.value) {
+    snapshotError.value = 'Snapshot name is required (leave empty to let the server auto-generate one, or type a name)'
+    return
+  }
+  try {
+    await apiFetch(`/api/volumes/${encodeURIComponent(snapshotModalVolume.value)}/snapshots`, {
+      method: 'POST',
+      body: { snapshot: snapshotName.value }
+    })
+    snapshotSuccess.value = `Snapshot "${snapshotName.value}" created for ${snapshotModalVolume.value}`
+    refresh()
+  } catch (e) {
+    snapshotError.value = e.message
+  }
+}
+
 const cloneVolumePrompt = (id) => {
   cloneModalVolume.value = id
   cloneTargetID.value = `${id}-cloned`
@@ -225,11 +291,23 @@ const executeCloneVolume = async () => {
   }
 }
 
-const rollbackVolumePrompt = (id) => {
+const rollbackVolumePrompt = async (id) => {
   rollbackModalVolume.value = id
-  rollbackSnapName.value = `snap-${id}`
+  // Snapshot names are engine-global, NOT prefixed with the volume id —
+  // start empty and offer the volume's real snapshots for one-click pick.
+  rollbackSnapName.value = ''
   rollbackError.value = ''
   rollbackSuccess.value = ''
+  rollbackSnapshots.value = []
+  rollbackSnapshotsLoading.value = true
+  try {
+    const snaps = await apiFetch(`/api/volumes/${encodeURIComponent(id)}/snapshots`)
+    rollbackSnapshots.value = (snaps || []).filter(s => s.origin_volume === id)
+  } catch {
+    // Listing is a convenience hint; rollback still works with a typed name.
+  } finally {
+    rollbackSnapshotsLoading.value = false
+  }
 }
 
 const executeRollbackVolume = async () => {
