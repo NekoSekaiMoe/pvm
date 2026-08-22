@@ -545,12 +545,6 @@ func StartE2BServer(port int) error {
 		if err := c.Bind(&req); err != nil {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
 		}
-		// Replacing a task's gateway silently de-registers its audit trail
-		// (a nil ledger) and swaps its tool policy. Require an explicit force
-		// to override an existing registration.
-		if gateways.get(task) != nil && !req.Force {
-			return c.JSON(http.StatusConflict, map[string]string{"error": "policy gateway already registered for task; send force=true to override"})
-		}
 		// Keep decisions auditable: open the task's ledger instead of nil.
 		// Degrade to nil (gate still runs) only if the ledger cannot open.
 		l, lerr := audit.Open(task)
@@ -559,7 +553,17 @@ func StartE2BServer(port int) error {
 			l = nil
 		}
 		gw := policy.NewGateway(req.Rules, l)
-		RegisterPolicyGateway(task, gw)
+		// Replacing a task's gateway silently de-registers its audit trail
+		// (a nil ledger) and swaps its tool policy. Require an explicit force
+		// to override an existing registration. The check+write happens inside
+		// the registry's registerIfAbsent under ONE lock: a separate get()
+		// check here would let two concurrent registrations both pass and
+		// silently clobber each other.
+		if req.Force {
+			RegisterPolicyGateway(task, gw)
+		} else if !gateways.registerIfAbsent(task, gw) {
+			return c.JSON(http.StatusConflict, map[string]string{"error": "policy gateway already registered for task; send force=true to override"})
+		}
 		return c.JSON(http.StatusOK, map[string]interface{}{"status": "registered", "rules": gw.Rules()})
 	})
 
@@ -1072,6 +1076,20 @@ func (r *gatewayRegistry) get(taskID string) *policy.Gateway {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.data[taskID]
+}
+
+// registerIfAbsent installs g for taskID only when no gateway is registered
+// for it yet, checking AND writing under one lock so two concurrent callers
+// cannot both observe "absent" and silently clobber each other's
+// registration. Returns false when a gateway already exists (no write done).
+func (r *gatewayRegistry) registerIfAbsent(taskID string, g *policy.Gateway) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, ok := r.data[taskID]; ok {
+		return false
+	}
+	r.data[taskID] = g
+	return true
 }
 
 // RegisterGateway exposes the registry so the controller (agentpvm) can wire a

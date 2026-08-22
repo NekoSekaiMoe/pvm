@@ -9,11 +9,15 @@ import (
 	"testing"
 )
 
-// buildTar assembles an uncompressed tar from header/content specs.
-func buildTar(t *testing.T, entries []struct {
+// tarEntry is one archive member spec for buildTar: its tar header plus
+// (for regular files) its content.
+type tarEntry struct {
 	hdr  tar.Header
 	data []byte
-}) []byte {
+}
+
+// buildTar assembles an uncompressed tar from header/content specs.
+func buildTar(t *testing.T, entries []tarEntry) []byte {
 	t.Helper()
 	var buf bytes.Buffer
 	tw := tar.NewWriter(&buf)
@@ -35,10 +39,7 @@ func buildTar(t *testing.T, entries []struct {
 
 func TestExtract_HappyPath(t *testing.T) {
 	dir := t.TempDir()
-	data := buildTar(t, []struct {
-		hdr  tar.Header
-		data []byte
-	}{
+	data := buildTar(t, []tarEntry{
 		{tar.Header{Name: "etc", Typeflag: tar.TypeDir, Mode: 0755}, nil},
 		{tar.Header{Name: "etc/conf", Typeflag: tar.TypeReg, Mode: 0644, Size: 5}, []byte("hello")},
 	})
@@ -54,10 +55,7 @@ func TestExtract_HappyPath(t *testing.T) {
 func TestExtract_RejectsTraversalAndAbsolute(t *testing.T) {
 	for _, name := range []string{"../evil", "a/../../evil", "/etc/passwd", "./x/../../../evil"} {
 		dir := t.TempDir()
-		data := buildTar(t, []struct {
-			hdr  tar.Header
-			data []byte
-		}{
+		data := buildTar(t, []tarEntry{
 			{tar.Header{Name: name, Typeflag: tar.TypeReg, Mode: 0644, Size: 1}, []byte("x")},
 		})
 		err := Extract(bytes.NewReader(data), dir, DefaultLimits())
@@ -72,10 +70,7 @@ func TestExtract_RejectsTraversalAndAbsolute(t *testing.T) {
 
 func TestExtract_RejectsDeviceNode(t *testing.T) {
 	dir := t.TempDir()
-	data := buildTar(t, []struct {
-		hdr  tar.Header
-		data []byte
-	}{
+	data := buildTar(t, []tarEntry{
 		{tar.Header{Name: "dev/null", Typeflag: tar.TypeChar, Mode: 0666}, nil},
 	})
 	err := Extract(bytes.NewReader(data), dir, DefaultLimits())
@@ -89,10 +84,7 @@ func TestExtract_SymlinkRules(t *testing.T) {
 
 	t.Run("absolute_target_rejected", func(t *testing.T) {
 		dir := t.TempDir()
-		data := buildTar(t, []struct {
-			hdr  tar.Header
-			data []byte
-		}{
+		data := buildTar(t, []tarEntry{
 			{tar.Header{Name: "pivot", Typeflag: tar.TypeSymlink, Linkname: outside, Mode: 0777}, nil},
 		})
 		if err := Extract(bytes.NewReader(data), dir, DefaultLimits()); err == nil {
@@ -102,10 +94,7 @@ func TestExtract_SymlinkRules(t *testing.T) {
 
 	t.Run("escaping_relative_target_rejected", func(t *testing.T) {
 		dir := t.TempDir()
-		data := buildTar(t, []struct {
-			hdr  tar.Header
-			data []byte
-		}{
+		data := buildTar(t, []tarEntry{
 			{tar.Header{Name: "sub/pivot", Typeflag: tar.TypeSymlink, Linkname: "../../outside", Mode: 0777}, nil},
 		})
 		if err := Extract(bytes.NewReader(data), dir, DefaultLimits()); err == nil {
@@ -115,10 +104,7 @@ func TestExtract_SymlinkRules(t *testing.T) {
 
 	t.Run("internal_symlink_ok", func(t *testing.T) {
 		dir := t.TempDir()
-		data := buildTar(t, []struct {
-			hdr  tar.Header
-			data []byte
-		}{
+		data := buildTar(t, []tarEntry{
 			{tar.Header{Name: "real", Typeflag: tar.TypeReg, Mode: 0644, Size: 2}, []byte("ok")},
 			{tar.Header{Name: "link", Typeflag: tar.TypeSymlink, Linkname: "real", Mode: 0777}, nil},
 		})
@@ -130,10 +116,7 @@ func TestExtract_SymlinkRules(t *testing.T) {
 
 func TestExtract_PivotAttackRejected(t *testing.T) {
 	dir := t.TempDir()
-	data := buildTar(t, []struct {
-		hdr  tar.Header
-		data []byte
-	}{
+	data := buildTar(t, []tarEntry{
 		{tar.Header{Name: "sub", Typeflag: tar.TypeDir, Mode: 0755}, nil},
 		// ".." itself stays inside dest (resolves to the dest root)...
 		{tar.Header{Name: "sub/pivot", Typeflag: tar.TypeSymlink, Linkname: "..", Mode: 0777}, nil},
@@ -150,10 +133,7 @@ func TestExtract_LimitsEnforced(t *testing.T) {
 	t.Run("per_file_cap", func(t *testing.T) {
 		dir := t.TempDir()
 		big := make([]byte, 100)
-		data := buildTar(t, []struct {
-			hdr  tar.Header
-			data []byte
-		}{
+		data := buildTar(t, []tarEntry{
 			{tar.Header{Name: "big", Typeflag: tar.TypeReg, Mode: 0644, Size: int64(len(big))}, big},
 		})
 		limits := Limits{MaxFileSize: 50, MaxTotalBytes: 1000, MaxEntries: 10}
@@ -165,10 +145,7 @@ func TestExtract_LimitsEnforced(t *testing.T) {
 	t.Run("total_cap", func(t *testing.T) {
 		dir := t.TempDir()
 		chunk := make([]byte, 60)
-		data := buildTar(t, []struct {
-			hdr  tar.Header
-			data []byte
-		}{
+		data := buildTar(t, []tarEntry{
 			{tar.Header{Name: "a", Typeflag: tar.TypeReg, Mode: 0644, Size: int64(len(chunk))}, chunk},
 			{tar.Header{Name: "b", Typeflag: tar.TypeReg, Mode: 0644, Size: int64(len(chunk))}, chunk},
 		})
@@ -180,15 +157,9 @@ func TestExtract_LimitsEnforced(t *testing.T) {
 
 	t.Run("entry_cap", func(t *testing.T) {
 		dir := t.TempDir()
-		var specs []struct {
-			hdr  tar.Header
-			data []byte
-		}
+		var specs []tarEntry
 		for i := 0; i < 3; i++ {
-			specs = append(specs, struct {
-				hdr  tar.Header
-				data []byte
-			}{tar.Header{Name: string(rune('a' + i)), Typeflag: tar.TypeReg, Mode: 0644}, nil})
+			specs = append(specs, tarEntry{hdr: tar.Header{Name: string(rune('a' + i)), Typeflag: tar.TypeReg, Mode: 0644}})
 		}
 		data := buildTar(t, specs)
 		limits := Limits{MaxFileSize: 100, MaxTotalBytes: 100, MaxEntries: 2}
@@ -207,10 +178,7 @@ func TestExtract_LimitsEnforced(t *testing.T) {
 
 func TestExtract_StripsSetuidSetgidSticky(t *testing.T) {
 	dir := t.TempDir()
-	data := buildTar(t, []struct {
-		hdr  tar.Header
-		data []byte
-	}{
+	data := buildTar(t, []tarEntry{
 		// POSIX special bits live in the LOW bits of tar's Mode field: 04000
 		// setuid | 02000 setgid | 01000 sticky, combined with 0755. (Go's
 		// os.ModeSetuid flags are high-bit markers and would never round-trip

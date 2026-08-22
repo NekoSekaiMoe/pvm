@@ -17,6 +17,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -456,6 +457,13 @@ func (l *Ledger) Verify() (int, error) {
 		if int64(count) == seq && prev != hash {
 			return count, fmt.Errorf("audit: ledger head mismatch: watermark hash %s but record %d verifies to %s", hash, seq, prev)
 		}
+	} else if count > 0 {
+		// Observability only — verification semantics are unchanged (the
+		// chain itself stays authoritative). A ledger with records but no
+		// readable watermark is either pre-watermark legacy data or a
+		// deleted/corrupt head file; the latter silently disables the
+		// anti-truncation check, so surface it for operators.
+		log.Printf("audit: warning: ledger %q has %d record(s) but no readable head watermark (legacy data or missing/corrupt %s); anti-truncation check skipped", l.task, count, headFileName)
 	}
 	return count, nil
 }
@@ -477,6 +485,15 @@ func (l *Ledger) readHead() (seq int64, hash string, ok bool) {
 		return 0, "", false
 	}
 	return s, fields[1], true
+}
+
+// Head exposes the current head watermark for deployment-level observability
+// (monitoring, dashboards, liveness checks): seq is the highest appended
+// record number and hash its chain hash. ok=false when no readable head file
+// exists (fresh or pre-watermark legacy ledger). Read-only; it never touches
+// the ledger files.
+func (l *Ledger) Head() (seq int64, hash string, ok bool) {
+	return l.readHead()
 }
 
 // ReadAll returns the whole ledger in order. Used for RECONSTRUCT (plan.md §14.3).

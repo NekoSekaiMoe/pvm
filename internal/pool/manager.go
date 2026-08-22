@@ -304,6 +304,15 @@ func (m *Manager) claim(tenant string, tmpl Template, taskID string, logs *[]dec
 
 	// ---- phase 3: re-check quota under lock and commit ----
 	m.mu.Lock()
+	// Re-read the tenant's quota instead of reusing the phase-1 snapshot: a
+	// SetQuota call may have tightened (or loosened) the limits while the
+	// Factory ran without the lock, and the rechecks below must enforce the
+	// LATEST limits. A missing entry (never happens via SetQuota, which only
+	// installs) mirrors phase 1's default fallback.
+	q, ok = m.quotas[tenant]
+	if !ok {
+		q = DefaultQuota()
+	}
 	// Capacity may have changed while the lock was released.
 	if len(m.pool) >= m.capacity {
 		m.mu.Unlock()

@@ -125,26 +125,55 @@ func TestCreate_ExplicitDeadlineOutsideWindowRejected(t *testing.T) {
 	m := NewManager(nil)
 	m.now = func() time.Time { return baseTime }
 
-	// already expired relative to server now
-	if _, err := m.Create(Ticket{TaskID: "t1", Tool: "x", Deadline: baseTime.Add(-time.Minute)}); !errors.Is(err, ErrInvalidDeadline) {
-		t.Errorf("past deadline: expected ErrInvalidDeadline, got %v", err)
+	cases := []struct {
+		name    string
+		ticket  Ticket
+		wantErr error
+	}{
+		{
+			// already expired relative to server now
+			name:    "past deadline",
+			ticket:  Ticket{TaskID: "t1", Tool: "x", Deadline: baseTime.Add(-time.Minute)},
+			wantErr: ErrInvalidDeadline,
+		},
+		{
+			// more than 1h out
+			name:    "far-future deadline",
+			ticket:  Ticket{TaskID: "t2", Tool: "x", Deadline: baseTime.Add(90 * time.Minute)},
+			wantErr: ErrInvalidDeadline,
+		},
+		{
+			// a forged future CreatedAt must not launder an out-of-window deadline
+			name: "forged CreatedAt laundering deadline",
+			ticket: Ticket{
+				TaskID:    "t3",
+				Tool:      "x",
+				CreatedAt: baseTime.Add(2 * time.Hour),
+				// > now+1h even though <= CreatedAt+1h
+				Deadline: baseTime.Add(115 * time.Minute),
+			},
+			wantErr: ErrInvalidDeadline,
+		},
+		{
+			// in-window explicit deadline still accepted
+			name:    "valid explicit deadline accepted",
+			ticket:  Ticket{TaskID: "t4", Tool: "x", Deadline: baseTime.Add(30 * time.Minute)},
+			wantErr: nil,
+		},
 	}
-	// more than 1h out
-	if _, err := m.Create(Ticket{TaskID: "t2", Tool: "x", Deadline: baseTime.Add(90 * time.Minute)}); !errors.Is(err, ErrInvalidDeadline) {
-		t.Errorf("far-future deadline: expected ErrInvalidDeadline, got %v", err)
-	}
-	// a forged future CreatedAt must not launder an out-of-window deadline
-	if _, err := m.Create(Ticket{
-		TaskID:    "t3",
-		Tool:      "x",
-		CreatedAt: baseTime.Add(2 * time.Hour),
-		Deadline:  baseTime.Add(115 * time.Minute), // > now+1h even though <= CreatedAt+1h
-	}); !errors.Is(err, ErrInvalidDeadline) {
-		t.Errorf("forged CreatedAt laundering deadline: expected ErrInvalidDeadline, got %v", err)
-	}
-	// in-window explicit deadline still accepted
-	if _, err := m.Create(Ticket{TaskID: "t4", Tool: "x", Deadline: baseTime.Add(30 * time.Minute)}); err != nil {
-		t.Errorf("valid explicit deadline rejected: %v", err)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := m.Create(tc.ticket)
+			if tc.wantErr != nil {
+				if !errors.Is(err, tc.wantErr) {
+					t.Errorf("expected %v, got %v", tc.wantErr, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Errorf("valid explicit deadline rejected: %v", err)
+			}
+		})
 	}
 }
 

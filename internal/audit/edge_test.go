@@ -321,14 +321,30 @@ func TestLedger_FilePermissions(t *testing.T) {
 // would escape LedgerRoot or smuggle odd characters are rejected.
 func TestOpen_InvalidTaskIDs(t *testing.T) {
 	LedgerRoot = t.TempDir()
-	for _, id := range []string{"", "../escape", "a/b", "a.b", "has space", strings.Repeat("a", 129)} {
-		if _, err := Open(id); err == nil {
-			t.Errorf("Open(%q) accepted an invalid task id", id)
-		}
+	cases := []struct {
+		name    string
+		id      string
+		wantErr bool
+	}{
+		{name: "empty id", id: "", wantErr: true},
+		{name: "parent escape", id: "../escape", wantErr: true},
+		{name: "slash separated", id: "a/b", wantErr: true},
+		{name: "dot character", id: "a.b", wantErr: true},
+		{name: "embedded space", id: "has space", wantErr: true},
+		{name: "too long (129 chars)", id: strings.Repeat("a", 129), wantErr: true},
+		// Boundary: exactly 128 chars is fine.
+		{name: "boundary 128 chars", id: strings.Repeat("a", 128), wantErr: false},
 	}
-	// Boundary: exactly 128 chars is fine.
-	if _, err := Open(strings.Repeat("a", 128)); err != nil {
-		t.Errorf("Open(128 chars) rejected: %v", err)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Open(tc.id)
+			if tc.wantErr && err == nil {
+				t.Errorf("Open(%q) accepted an invalid task id", tc.id)
+			}
+			if !tc.wantErr && err != nil {
+				t.Errorf("Open(%q) rejected a valid task id: %v", tc.id, err)
+			}
+		})
 	}
 }
 

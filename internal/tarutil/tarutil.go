@@ -211,6 +211,13 @@ func extractFile(tr io.Reader, absDest, target, name string, mode int64, size in
 	if n != size {
 		return fmt.Errorf("tarutil: entry %q truncated: got %d of %d bytes", name, n, size)
 	}
+	// Explicit chmod: OpenFile applies perm only at create time, so an
+	// EXISTING file keeps its old mode (and would need the new one), and a
+	// new file's mode is masked by the process umask. Applying the archive's
+	// permission bits directly makes both deterministic.
+	if err := os.Chmod(target, perm); err != nil {
+		return fmt.Errorf("tarutil: chmod %s to %v: %w", name, perm, err)
+	}
 	return nil
 }
 
@@ -247,6 +254,15 @@ func extractHardlink(hdr *tar.Header, absDest, target string) error {
 	src := filepath.Clean(filepath.Join(absDest, hdr.Linkname))
 	if !strings.HasPrefix(src, absDest+string(filepath.Separator)) && src != absDest {
 		return fmt.Errorf("tarutil: hardlink target %q escapes the destination", hdr.Linkname)
+	}
+	// The SOURCE path is resolved by the kernel during link(2): a symlinked
+	// ancestor on it ("dir -> /etc" planted earlier, then a hardlink to
+	// "dir/passwd") would link a file OUTSIDE dest even though the member
+	// name itself stays inside. Guard the source path like the target's
+	// parent — only the final component of link(2)'s oldname is not
+	// dereferenced, every intermediate component is.
+	if err := checkNoSymlinkAncestor(absDest, src); err != nil {
+		return err
 	}
 	if err := checkNoSymlinkAncestor(absDest, filepath.Dir(target)); err != nil {
 		return err
