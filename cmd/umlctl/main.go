@@ -30,6 +30,13 @@ var idRegex = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 // iproute2 or smuggle extra arguments into the invoked commands.
 var netNameRegex = regexp.MustCompile(`^[a-zA-Z0-9._-]{1,15}$`)
 
+// validNetName applies netNameRegex plus the two names the charset alone
+// accepts but must never reach iproute2 or state-path derivation: "." and
+// ".." (they resolve to the current/parent directory in derived paths).
+func validNetName(name string) bool {
+	return name != "." && name != ".." && netNameRegex.MatchString(name)
+}
+
 // loadLaunchConfig loads a TaskSpec TOML but returns only the launch-relevant
 // subset. umlctl is a thin UML launcher: it deliberately ignores the control
 // planes (identity/egress/tools/approval/artifacts/lifecycle) which belong to
@@ -213,8 +220,8 @@ func main() {
 		if len(args) >= 2 {
 			subcmd := args[0]
 			name := args[1]
-			if !netNameRegex.MatchString(name) {
-				fmt.Printf("Invalid network name %q (want ^[a-zA-Z0-9._-]{1,15}$)\n", name)
+			if !validNetName(name) {
+				fmt.Printf("Invalid network name %q (want ^[a-zA-Z0-9._-]{1,15}$, not . or ..)\n", name)
 				os.Exit(1)
 			}
 			if subcmd == "create" {

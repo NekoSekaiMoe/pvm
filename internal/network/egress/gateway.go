@@ -254,6 +254,18 @@ func (g *Gateway) ListenForTask(ctx context.Context, taskID string) (*taskListen
 
 // Shutdown stops the proxy.
 func (g *Gateway) Shutdown(ctx context.Context) error {
+	// The shared upstream transport is NOT owned by the http.Server and
+	// outlives individual requests: whichever path is taken below (no server
+	// yet = global close before/without listening; graceful server
+	// shutdown), release its pooled keep-alive connections so a shut-down
+	// gateway stops holding upstream sockets. g.transport may itself be nil
+	// (zero-value Gateway, or nothing dialed yet) — handle that first.
+	g.mu.RLock()
+	tr := g.transport
+	g.mu.RUnlock()
+	if tr != nil {
+		tr.CloseIdleConnections()
+	}
 	if g.server == nil {
 		return nil
 	}
@@ -486,8 +498,14 @@ func (g *Gateway) dialCheckedTransport() *http.Transport {
 			return conn, nil
 		},
 		ResponseHeaderTimeout: 30 * time.Second,
-		IdleConnTimeout:       90 * time.Second,
-		MaxIdleConnsPerHost:   8,
+		// Bound the TLS handshake separately from the dial timeout: without
+		// it a TLS endpoint that accepts TCP but stalls the handshake pins a
+		// connection (and its goroutine) indefinitely.
+		TLSHandshakeTimeout: 10 * time.Second,
+		// ExpectContinueTimeout is deliberately NOT set: this gateway never
+		// sends Expect: 100-continue, so waiting budget for it is dead config.
+		IdleConnTimeout:     90 * time.Second,
+		MaxIdleConnsPerHost: 8,
 	}
 	return g.transport
 }

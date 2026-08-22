@@ -152,7 +152,16 @@ func (l *Ledger) loadTail() error {
 		l.lastHash = rec.ThisHash
 		l.seq = rec.Seq
 	}
-	l.readOffset = dec.InputOffset()
+	// Watermark from the ACTUAL file size, not json.Decoder.InputOffset():
+	// InputOffset stops after the last decoded token and excludes trailing
+	// framing bytes (e.g. the encoder's '\n'), leaving the watermark short of
+	// the true end. All size-vs-readOffset comparisons (incremental resume,
+	// truncation detection) must then use the same measure or they misjudge.
+	fi, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	l.readOffset = fi.Size()
 	return nil
 }
 
@@ -203,7 +212,14 @@ func (l *Ledger) refreshTailLocked() error {
 		l.lastHash = rec.ThisHash
 		l.seq = rec.Seq
 	}
-	l.readOffset += dec.InputOffset()
+	// Same measure as loadTail: the watermark is the real end-of-file at the
+	// moment decoding stopped (see the note there). Under the Append path the
+	// exclusive flock guarantees no peer appended between EOF and this stat.
+	fi, err = f.Stat()
+	if err != nil {
+		return err
+	}
+	l.readOffset = fi.Size()
 	return nil
 }
 
@@ -258,9 +274,27 @@ func (l *Ledger) Append(r Record) error {
 		l.seq-- // nothing was written; unwind so a retry reuses this seq
 		return err
 	}
-	if _, err := f.Write(buf.Bytes()); err != nil {
+	// Record the pre-write size: on a failed or short write the file must be
+	// rolled back to exactly this offset, or a torn half-record would sit at
+	// the tail and deserialize every later Append/Verify from that point on.
+	fi, err := f.Stat()
+	if err != nil {
 		l.seq--
-		return err
+		return fmt.Errorf("audit: stat ledger before write: %w", err)
+	}
+	preWrite := fi.Size()
+	if n, werr := f.Write(buf.Bytes()); werr != nil || n != buf.Len() {
+		l.seq--
+		// Remove any partially written bytes while the lock is still held.
+		// A failed truncate is reported alongside: it leaves a torn tail the
+		// operator must know about rather than hide.
+		if terr := f.Truncate(preWrite); terr != nil {
+			return fmt.Errorf("audit: write failed (%v) and rollback truncate to %d failed too: %w", werr, preWrite, terr)
+		}
+		if werr != nil {
+			return fmt.Errorf("audit: write ledger record: %w", werr)
+		}
+		return fmt.Errorf("audit: short write to ledger: %d of %d bytes", n, buf.Len())
 	}
 	l.lastHash = r.ThisHash
 	l.readOffset += int64(buf.Len())
@@ -367,8 +401,18 @@ func (l *Ledger) Verify() (int, error) {
 		prev = rec.ThisHash
 		count++
 	}
-	if seq, _, ok := l.readHead(); ok && int64(count) < seq {
-		return count, fmt.Errorf("audit: ledger truncated: head watermark records seq %d but only %d records verify", seq, count)
+	// Head watermark cross-check: the count must reach the recorded seq AND
+	// the last verified record must hash to the recorded head. A mismatch on
+	// either means records were removed or reordered after the watermark was
+	// written (a valid sub-chain does not excuse it). Legacy ledgers without a
+	// parseable head file skip the check entirely.
+	if seq, hash, ok := l.readHead(); ok {
+		if int64(count) < seq {
+			return count, fmt.Errorf("audit: ledger truncated: head watermark records seq %d but only %d records verify", seq, count)
+		}
+		if int64(count) == seq && prev != hash {
+			return count, fmt.Errorf("audit: ledger head mismatch: watermark hash %s but record %d verifies to %s", hash, seq, prev)
+		}
 	}
 	return count, nil
 }

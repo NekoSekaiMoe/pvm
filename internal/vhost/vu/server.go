@@ -111,10 +111,18 @@ type session struct {
 	closed   bool
 	pumpOnce sync.Once
 	pumpWg   sync.WaitGroup // tracks the pump goroutine
+	// pumpBusy counts pump batches currently in their UNLOCKED Phase 2
+	// (dev.process) — their elem SG slices point into the CURRENT mem
+	// table's mappings. SET_MEM_TABLE must wait for it to drop to zero
+	// before swapping/unmapping (see waitPumpIdleLocked).
+	pumpBusy int
+	pumpIdle *sync.Cond // signaled when pumpBusy reaches zero (bound to mu)
 }
 
 func newSession(dev *BlkDev, c *conn) *session {
-	return &session{dev: dev, c: c}
+	s := &session{dev: dev, c: c}
+	s.pumpIdle = sync.NewCond(&s.mu)
+	return s
 }
 
 // close tears the session down exactly once: it stops the control channel,
@@ -221,6 +229,11 @@ func (s *session) handle(m *msg) (bool, error) {
 		return true, s.c.reply(m, p[:])
 
 	case reqSetMemTable:
+		// The pump's Phase 2 (dev.process) runs WITHOUT s.mu and touches
+		// e.outSG/e.inSG slices into the OLD table's mappings: wait for
+		// every in-flight batch to reach Phase 3 BEFORE the swap unmaps
+		// those regions — racing it is a use-after-munmap (SIGSEGV).
+		s.waitPumpIdleLocked()
 		return false, s.mem.setMemTable(m.payload, m.takeFds())
 
 	case reqSetVringNum:
@@ -372,6 +385,16 @@ func (s *session) maybeStartPump() {
 	})
 }
 
+// waitPumpIdleLocked blocks until no pump batch is in its unlocked Phase
+// 2. Caller must hold s.mu; the pump decrements pumpBusy and broadcasts in
+// Phase 3 under the same lock, so the wakeup cannot be missed, and Phase 2
+// never takes s.mu so it always runs to completion.
+func (s *session) waitPumpIdleLocked() {
+	for s.pumpBusy > 0 {
+		s.pumpIdle.Wait()
+	}
+}
+
 // pump waits for kicks and drains the avail ring.
 //
 // Locking: s.mu is only held for the short pop/translateSG and push/notify
@@ -415,6 +438,8 @@ func (s *session) pump() {
 			}
 			// Phase 3 (locked): publish completions and interrupt the guest.
 			s.mu.Lock()
+			s.pumpBusy-- // batch left Phase 2; wake any SET_MEM_TABLE waiter
+			s.pumpIdle.Broadcast()
 			if s.closed {
 				s.mu.Unlock()
 				return
@@ -443,7 +468,10 @@ func (s *session) pump() {
 const pumpMaxBatch = 128
 
 // popBatch pops up to pumpMaxBatch elements under s.mu. It returns early
-// (empty batch) when the session is closed or the queue errors out.
+// (empty batch) when the session is closed or the queue errors out. A
+// non-empty batch marks the pump busy (its Phase 2 runs unlocked right
+// after) so a concurrent SET_MEM_TABLE waits instead of unmapping the
+// memory those elements' SG slices point into.
 func (s *session) popBatch() []*elem {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -465,6 +493,13 @@ func (s *session) popBatch() []*elem {
 			break
 		}
 		batch = append(batch, e)
+	}
+	if len(batch) > 0 {
+		// Batch enters Phase 2 (unlocked) the moment this returns; the
+		// increment happens under the SAME lock hold as the pops, so a
+		// SET_MEM_TABLE that acquires s.mu afterwards necessarily sees
+		// pumpBusy > 0 and waits.
+		s.pumpBusy++
 	}
 	return batch
 }

@@ -22,6 +22,12 @@ import (
 	"uml-container/internal/audit"
 )
 
+// ErrInvalidDeadline marks a caller-supplied Deadline outside the sane
+// acceptance window (already expired, or farther than 1h out, measured on
+// the manager's clock). The API layer maps it to 400 so clients see their
+// own bad input instead of a server error.
+var ErrInvalidDeadline = errors.New("approval: invalid deadline")
+
 // State of a ticket.
 type State string
 
@@ -82,14 +88,18 @@ func (m *Manager) Create(t Ticket) (string, error) {
 		t.Deadline = t.CreatedAt.Add(5 * time.Minute) // default approval window
 	} else {
 		// An explicit deadline is caller-supplied input: keep it inside a
-		// sane window. An already-expired ticket could launder a decision
-		// (auto-expire logic fires immediately); an arbitrarily distant one
-		// would pin a pending gate open forever.
-		if t.Deadline.Before(t.CreatedAt) {
-			return "", fmt.Errorf("approval: deadline %s is before creation time", t.Deadline.Format(time.RFC3339))
+		// sane window evaluated against the MANAGER's clock (m.now()), not the
+		// equally caller-supplied CreatedAt — otherwise a backdated CreatedAt
+		// launders an already-expired or arbitrarily distant deadline. An
+		// already-expired ticket could launder a decision (auto-expire logic
+		// fires immediately); an arbitrarily distant one would pin a pending
+		// gate open forever.
+		now := m.now()
+		if t.Deadline.Before(now) {
+			return "", fmt.Errorf("%w: deadline %s is before the current time %s", ErrInvalidDeadline, t.Deadline.Format(time.RFC3339), now.Format(time.RFC3339))
 		}
-		if t.Deadline.After(t.CreatedAt.Add(time.Hour)) {
-			return "", fmt.Errorf("approval: deadline %s is more than 1h after creation", t.Deadline.Format(time.RFC3339))
+		if t.Deadline.After(now.Add(time.Hour)) {
+			return "", fmt.Errorf("%w: deadline %s is more than 1h after the current time %s", ErrInvalidDeadline, t.Deadline.Format(time.RFC3339), now.Format(time.RFC3339))
 		}
 	}
 	t.State = StatePending

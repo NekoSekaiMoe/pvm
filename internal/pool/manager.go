@@ -9,6 +9,7 @@ package pool
 import (
 	"errors"
 	"fmt"
+	"log"
 	"math"
 	"strconv"
 	"sync"
@@ -183,7 +184,10 @@ func (m *Manager) Claim(tenant string, tmpl Template, taskID string) (string, er
 }
 
 // flushDecisions appends collected decisions to the audit ledger. Best-effort:
-// a failed append never fails the claim it describes.
+// a failed append never fails the claim it describes — but it is never
+// SILENT either: each failure is logged the same way the egress gateway's
+// record() logs its append failures, so a broken ledger surfaces in logs
+// instead of vanishing quota history.
 func (m *Manager) flushDecisions(logs []decisionLog) {
 	if m.ledger == nil {
 		return
@@ -193,15 +197,18 @@ func (m *Manager) flushDecisions(logs []decisionLog) {
 		if d.allow {
 			dec = audit.DecisionAllow
 		}
-		_ = m.ledger.Append(audit.Record{
+		if err := m.ledger.Append(audit.Record{
 			Phase: audit.PhaseGoalAuth, Subject: d.tenant, Action: "pool:claim",
 			Decision: dec, Reason: d.note,
-		})
+		}); err != nil {
+			log.Printf("pool: audit append failed for tenant %s: %v", d.tenant, err)
+		}
 	}
 }
 
-// recordDecision appends a decision to the caller's log buffer. Caller MUST
-// hold m.mu; no IO happens here.
+// recordDecision appends a decision to the caller-local log buffer. It
+// touches no shared Manager state and performs no IO, so it needs no lock —
+// neither m.mu nor any other.
 func recordDecision(out *[]decisionLog, tenant, why string, allow bool) {
 	*out = append(*out, decisionLog{allow: allow, tenant: tenant, note: why})
 }
@@ -284,18 +291,14 @@ func (m *Manager) claim(tenant string, tmpl Template, taskID string, logs *[]dec
 	m.mu.Unlock()
 
 	if !canCreate {
-		m.mu.Lock()
 		recordDecision(logs, tenant, "no capacity", false)
-		m.mu.Unlock()
 		return "", ErrNoCapacity
 	}
 
 	// ---- phase 2: Factory call WITHOUT the lock ----
 	id, err := m.Factory(tmpl)
 	if err != nil {
-		m.mu.Lock()
 		recordDecision(logs, tenant, "factory failed: "+err.Error(), false)
-		m.mu.Unlock()
 		return "", fmt.Errorf("%w: factory: %v", ErrNoCapacity, err)
 	}
 
@@ -307,9 +310,7 @@ func (m *Manager) claim(tenant string, tmpl Template, taskID string, logs *[]dec
 		if m.Destroyer != nil {
 			_ = m.Destroyer(id)
 		}
-		m.mu.Lock()
 		recordDecision(logs, tenant, "no capacity after race", false)
-		m.mu.Unlock()
 		return "", ErrNoCapacity
 	}
 	// Re-check hourly rate/concurrency/cpu/mem in case another claim sneaked
@@ -320,9 +321,7 @@ func (m *Manager) claim(tenant string, tmpl Template, taskID string, logs *[]dec
 		if m.Destroyer != nil {
 			_ = m.Destroyer(id) // don't leak the sandbox the factory just built
 		}
-		m.mu.Lock()
 		recordDecision(logs, tenant, "hourly task rate after factory", false)
-		m.mu.Unlock()
 		return "", fmt.Errorf("%w: hourly task rate for tenant %s changed during claim", ErrQuotaExceeded, tenant)
 	}
 	if m.running[tenant] >= q.MaxConcurrent || m.cpu[tenant]+tmpl.CPU > q.MaxCPU || m.memMB[tenant]+wantMB > q.MaxMemoryMB {
@@ -330,9 +329,7 @@ func (m *Manager) claim(tenant string, tmpl Template, taskID string, logs *[]dec
 		if m.Destroyer != nil {
 			_ = m.Destroyer(id) // don't leak the sandbox the factory just built
 		}
-		m.mu.Lock()
 		recordDecision(logs, tenant, "quota changed after factory", false)
-		m.mu.Unlock()
 		return "", fmt.Errorf("%w: quota for tenant %s changed during claim", ErrQuotaExceeded, tenant)
 	}
 	sb := &Sandbox{ID: id, Template: tmpl.Name, State: SandboxClaimed, TaskID: taskID, Tenant: tenant, CPU: tmpl.CPU, MemMB: wantMB, CreatedAt: now, ClaimedAt: now}
@@ -456,7 +453,9 @@ func parseMemMB(s string) (int, error) {
 	var mb int64
 	switch s[i:] {
 	case "K", "k", "KB", "kb":
-		mb = v / 1024
+		// Round UP to whole MB: a value below 1024 KB still consumes at least
+		// 1 MB of quota headroom, and truncation would let 1023K claim as 0 MB.
+		mb = (v + 1023) / 1024
 	case "M", "m", "MB", "mb":
 		mb = v
 	case "G", "g", "GB", "gb":

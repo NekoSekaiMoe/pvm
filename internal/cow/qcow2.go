@@ -24,6 +24,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"syscall"
 )
@@ -419,6 +420,12 @@ type qcow2Image struct {
 	mu           sync.RWMutex
 	l2cache      map[uint64][]uint64 // keyed by L2 table host offset
 	l2cacheBytes int                 // total bytes held by cached tables
+	// fileSize is the image length captured from the fd at open; every
+	// host-offset bound check below compares against it instead of trusting
+	// header-declared sizes.
+	fileSize uint64
+	// metaRanges caches the metadata host ranges (see metadataRanges).
+	metaRanges []hostRange
 }
 
 func (q *qcow2Image) Size() uint64 { return q.hdr.size }
@@ -562,6 +569,16 @@ func (q *qcow2Image) l2EntryAt(l2Off, l2Idx uint64) (uint64, error) {
 
 	entries := int(q.clusterSize / 8)
 	buf := make([]byte, q.clusterSize)
+	// Bound the read BEFORE issuing it: a corrupted or hostile L1 entry can
+	// name any offset. Require cluster alignment and a full table inside the
+	// real file, so corruption surfaces as a precise error instead of a
+	// vague ReadAt failure (or a wrapped impossible offset).
+	if l2Off%q.clusterSize != 0 {
+		return 0, fmt.Errorf("cow: L2 table offset %#x not cluster-aligned", l2Off)
+	}
+	if l2End := l2Off + q.clusterSize; l2End < l2Off || l2End > q.fileSize {
+		return 0, fmt.Errorf("cow: L2 table at %#x+%d bytes exceeds file size %d", l2Off, q.clusterSize, q.fileSize)
+	}
 	if _, err := q.f.ReadAt(buf, int64(l2Off)); err != nil {
 		return 0, fmt.Errorf("cow: read qcow2 L2 table at %#x: %w", l2Off, err)
 	}
@@ -616,6 +633,79 @@ func (q *qcow2Image) readUint64At(dst *uint64, off uint64) error {
 		return fmt.Errorf("cow: read qcow2 table at %#x: %w", off, err)
 	}
 	*dst = binary.BigEndian.Uint64(b[:])
+	return nil
+}
+
+// hostRange is a half-open [off, end) byte range in the image's host file.
+type hostRange struct{ off, end uint64 }
+
+// metadataRanges returns the sorted host-file ranges belonging to image
+// metadata: cluster 0 (header, extensions, backing name), the L1 table,
+// every L2 table referenced by a loaded L1 entry, the refcount table and
+// the refcount blocks it references. Direct data reads validated against
+// these ranges can never copy structural bytes into guest data (or into a
+// compacted rebuild). Computed once and cached under mu.
+func (q *qcow2Image) metadataRanges() []hostRange {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.metaRanges != nil {
+		return q.metaRanges
+	}
+	ranges := []hostRange{{0, q.clusterSize}}
+	if n := uint64(len(q.l1)); n > 0 {
+		ranges = append(ranges, hostRange{q.hdr.l1Offset, q.hdr.l1Offset + n*8})
+	}
+	for _, e := range q.l1 {
+		if c := e & l1eOffsetMask; c != 0 {
+			ranges = append(ranges, hostRange{c, c + q.clusterSize})
+		}
+	}
+	if q.hdr.refcountOffset != 0 && q.hdr.refcountClusters > 0 && q.hdr.refcountOffset < q.fileSize {
+		// Read at most what fits in the file (and cap the scan: real refcount
+		// tables are tiny; a hostile one must not drive a huge allocation).
+		tblLen := uint64(q.hdr.refcountClusters) * q.clusterSize
+		if avail := q.fileSize - q.hdr.refcountOffset; tblLen > avail {
+			tblLen = avail
+		}
+		if tblLen > 1<<22 {
+			tblLen = 1 << 22
+		}
+		if tblEnd := q.hdr.refcountOffset + tblLen; tblEnd <= q.fileSize {
+			ranges = append(ranges, hostRange{q.hdr.refcountOffset, tblEnd})
+			buf := make([]byte, tblLen)
+			if _, err := q.f.ReadAt(buf, int64(q.hdr.refcountOffset)); err == nil {
+				for i := uint64(0); i+8 <= tblLen; i += 8 {
+					c := binary.BigEndian.Uint64(buf[i:]) & l1eOffsetMask
+					if c != 0 && c+q.clusterSize <= q.fileSize {
+						ranges = append(ranges, hostRange{c, c + q.clusterSize})
+					}
+				}
+			}
+		}
+	}
+	sort.Slice(ranges, func(i, j int) bool { return ranges[i].off < ranges[j].off })
+	q.metaRanges = ranges
+	return ranges
+}
+
+// validateHostData checks that [off, off+n) is a legal DATA location for a
+// direct host read: cluster-aligned, inside the real file, and clear of every
+// metadata range. Compact uses it before trusting an L2 entry's host offset,
+// so a corrupt or hostile entry cannot make it copy metadata bytes (or read
+// past EOF) into the rebuilt image.
+func (q *qcow2Image) validateHostData(off, n uint64) error {
+	if off%q.clusterSize != 0 {
+		return fmt.Errorf("cow: host offset %#x not cluster-aligned", off)
+	}
+	end := off + n
+	if end < off || end > q.fileSize {
+		return fmt.Errorf("cow: host range [%#x,%#x) exceeds file size %#x", off, end, q.fileSize)
+	}
+	for _, r := range q.metadataRanges() {
+		if off < r.end && r.off < end {
+			return fmt.Errorf("cow: host range [%#x,%#x) overlaps image metadata [%#x,%#x)", off, end, r.off, r.end)
+		}
+	}
 	return nil
 }
 
@@ -698,11 +788,17 @@ func openGuestImageDepth(path string, depth int, visited map[chainKey]bool) (gue
 		clusterSize: uint64(1) << cb,
 		clusterMask: (uint64(1) << cb) - 1,
 	}
-	// Permission bits from the fd (see guestImage.Mode); captured before
-	// any parsing can fail so the field is always populated.
-	if st, err := f.Stat(); err == nil {
-		q.mode = st.Mode()
+	// Permission bits and the real file length from the fd (see
+	// guestImage.Mode): captured before any parsing can fail so the fields
+	// are always populated. fileSize anchors every host-offset bound check;
+	// header-declared sizes are not trusted for that.
+	st, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, fmt.Errorf("cow: stat %s: %w", path, err)
 	}
+	q.mode = st.Mode()
+	q.fileSize = uint64(st.Size())
 	q.hdr = qcow2Header{
 		size:             binary.BigEndian.Uint64(hdrBuf[0x18:]),
 		l1Size:           binary.BigEndian.Uint32(hdrBuf[0x24:]),
@@ -878,11 +974,12 @@ func openGuestImageDepth(path string, depth int, visited map[chainKey]bool) (gue
 		if !filepath.IsAbs(backingPath) {
 			backingPath = absBacking
 		}
-		if err := backingPathAllowed(path, backingPath); err != nil {
+		realBacking, err := backingPathAllowed(path, backingPath)
+		if err != nil {
 			f.Close()
 			return nil, err
 		}
-		backing, err := openGuestImageDepth(backingPath, depth+1, visited)
+		backing, err := openGuestImageDepth(realBacking, depth+1, visited)
 		if err != nil {
 			f.Close()
 			return nil, fmt.Errorf("cow: open backing of %s: %w", path, err)
@@ -899,7 +996,7 @@ func openGuestImageDepth(path string, depth int, visited map[chainKey]bool) (gue
 				path, q.backingFormat, backingPath, backing.Format())
 		}
 		q.backing = backing
-		q.backingAbs = backingPath // absolute; see filepath.Abs above
+		q.backingAbs = realBacking // symlink-resolved absolute path that passed containment
 	}
 	// Load the full L1 table into memory once at open: reads then resolve L1
 	// with no pread per cluster. Only entries covering the virtual size are
@@ -919,6 +1016,19 @@ func openGuestImageDepth(path string, depth int, visited map[chainKey]bool) (gue
 	if q.hdr.l1Offset%q.clusterSize != 0 {
 		f.Close()
 		return nil, fmt.Errorf("cow: L1 offset %#x not cluster-aligned in %s", q.hdr.l1Offset, path)
+	}
+	// Bound the allocation absolutely, then against the REAL file size
+	// captured at open: a hostile l1Size/l1Offset pair must not drive a huge
+	// make() or a ReadAt that wraps around or reads past EOF.
+	const maxL1TableBytes = 1 << 26 // 64 MiB ≈ 8M entries ≈ 512 TiB virtual @ 64K clusters
+	l1Bytes := load * 8
+	if l1Bytes > maxL1TableBytes {
+		f.Close()
+		return nil, fmt.Errorf("cow: L1 table %d bytes in %s exceeds the %d MiB cap", l1Bytes, path, maxL1TableBytes>>20)
+	}
+	if l1End := q.hdr.l1Offset + l1Bytes; l1End < q.hdr.l1Offset || l1End > q.fileSize {
+		f.Close()
+		return nil, fmt.Errorf("cow: L1 range [%#x,+%d bytes) exceeds file size %d in %s", q.hdr.l1Offset, l1Bytes, q.fileSize, path)
 	}
 	q.l1 = make([]uint64, load)
 	l1buf := make([]byte, load*8)

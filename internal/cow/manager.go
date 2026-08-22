@@ -179,20 +179,29 @@ func CommitOverlay(ctx context.Context, overlayFile, destImage string) error {
 // the directory of every base image it is handed, so overlays backed by user-
 // supplied base paths keep resolving.
 var (
-	backingRootsMu     sync.Mutex
-	staticBackingRoots = func() []string {
-		cowRoot := os.Getenv("PVM_COW_ROOT")
-		if cowRoot == "" {
-			cowRoot = "/var/lib/uml-container/cow"
-		}
-		stateRoot := os.Getenv("PVM_STATE_ROOT")
-		if stateRoot == "" {
-			stateRoot = "/var/lib/uml-container/containers"
-		}
-		return []string{cowRoot, "/var/lib/uml-container/images", stateRoot}
-	}()
+	backingRootsMu      sync.Mutex
 	dynamicBackingRoots = map[string]bool{}
 )
+
+// staticBackingRoots returns the environment-derived backing roots at CALL
+// time (not package init): tests flip PVM_COW_ROOT/PVM_STATE_ROOT via t.Setenv
+// after init has already run, and a daemon re-reading its config must not be
+// pinned to the values seen at process start. Defaults cover every storage
+// root PVM derives: engine root (PVM_COW_ROOT or
+// /var/lib/uml-container/cow), the image store
+// (/var/lib/uml-container/images) and the container state root
+// (PVM_STATE_ROOT or /var/lib/uml-container/containers).
+func staticBackingRoots() []string {
+	cowRoot := os.Getenv("PVM_COW_ROOT")
+	if cowRoot == "" {
+		cowRoot = "/var/lib/uml-container/cow"
+	}
+	stateRoot := os.Getenv("PVM_STATE_ROOT")
+	if stateRoot == "" {
+		stateRoot = "/var/lib/uml-container/containers"
+	}
+	return []string{cowRoot, "/var/lib/uml-container/images", stateRoot}
+}
 
 // RegisterBackingRoot whitelists dir as a permitted backing location for
 // qcow2 images opened later. CreateOverlay calls it with the resolved base
@@ -218,30 +227,47 @@ func validateBackingName(name string) error {
 	return validatePath(name)
 }
 
-// backingPathAllowed enforces containment of a RESOLVED backing path: it must
-// live under one of the managed roots, under the image's own directory tree,
-// or under a dynamically registered root. Relative names that climb out of
-// the image's directory with ".." therefore fail unless they land back in a
+// backingPathAllowed enforces containment of a backing path: it must live
+// under one of the managed roots, under the image's own directory tree, or
+// under a dynamically registered root. Relative names that climb out of the
+// image's directory with ".." therefore fail unless they land back in a
 // managed root, and absolute names pointing at arbitrary system files are
-// rejected outright.
-func backingPathAllowed(imagePath, resolved string) error {
+// rejected outright. Both the candidate path and every allowed root are
+// SYMLINK-RESOLVED before the containment comparison, and the resolved
+// candidate is returned so the caller opens exactly what was validated —
+// a lexical path that sneaks past via a symlink plant is otherwise
+// indistinguishable from a legitimate one.
+func backingPathAllowed(imagePath, candidate string) (string, error) {
+	real, err := filepath.EvalSymlinks(candidate)
+	if err != nil {
+		// Unresolvable backing (missing file, unreadable ancestor): reject
+		// rather than fall back to the lexical path — that fallback is the
+		// symlink-planting escape hatch.
+		return "", fmt.Errorf("cow: resolve backing %s: %w", candidate, err)
+	}
 	absImageDir, err := filepath.Abs(filepath.Dir(imagePath))
 	if err != nil {
-		return fmt.Errorf("cow: resolve image dir of %s: %w", imagePath, err)
+		return "", fmt.Errorf("cow: resolve image dir of %s: %w", imagePath, err)
 	}
 	candidates := []string{absImageDir}
 	backingRootsMu.Lock()
-	candidates = append(candidates, staticBackingRoots...)
+	candidates = append(candidates, staticBackingRoots()...)
 	for r := range dynamicBackingRoots {
 		candidates = append(candidates, r)
 	}
 	backingRootsMu.Unlock()
 	for _, root := range candidates {
-		if withinSubtree(resolved, root) {
-			return nil
+		realRoot, rerr := filepath.EvalSymlinks(root)
+		if rerr != nil {
+			// A root that cannot be resolved (missing/unreadable) simply
+			// cannot vouch for anything; other roots still apply.
+			continue
+		}
+		if withinSubtree(real, realRoot) {
+			return real, nil
 		}
 	}
-	return fmt.Errorf("cow: backing file %s (of %s) is outside all managed storage roots", resolved, imagePath)
+	return "", fmt.Errorf("cow: backing file %s (of %s) is outside all managed storage roots", real, imagePath)
 }
 
 // withinSubtree reports whether p equals or lives below dir (both absolute,

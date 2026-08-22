@@ -296,6 +296,10 @@ func (w *qcow2Writable) allocCluster() (uint64, error) {
 		return 0, fmt.Errorf("cow: host file size %#x not cluster-aligned", off)
 	}
 	w.fileSize += cs
+	// Keep the read-side bound (qcow2Image.fileSize, captured at open) in
+	// step with the grown file: l2EntryAt validates L2 offsets against it,
+	// and a freshly allocated L2 table legitimately lives at the old EOF.
+	w.qcow2Image.fileSize = w.fileSize
 	if err := w.bumpRefcount(off >> w.clusterBits); err != nil {
 		return 0, err
 	}
@@ -345,6 +349,7 @@ func (w *qcow2Writable) bumpRefcount(clusterIdx uint64) error {
 				return err
 			}
 			w.fileSize += w.clusterSize
+			w.qcow2Image.fileSize = w.fileSize // keep read-side bounds in sync (see allocCluster)
 			var b [8]byte
 			binary.BigEndian.PutUint64(b[:], blockOff)
 			if _, err := w.f.WriteAt(b[:], int64(w.hdr.refcountOffset+blockIdx*8)); err != nil {

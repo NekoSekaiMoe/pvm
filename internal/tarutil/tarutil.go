@@ -19,6 +19,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 )
 
@@ -68,13 +69,26 @@ func Extract(r io.Reader, dest string, limits Limits) error {
 	tr := tar.NewReader(r)
 	var total int64
 	var entries int64
+	// Intended directory modes, applied at the END of a successful extraction
+	// (see applyDirModes). Keyed by absolute path; later entries win, matching
+	// tar's last-writer-wins semantics.
+	dirModes := make(map[string]os.FileMode)
 	for {
 		hdr, err := tr.Next()
 		if err == io.EOF {
-			return nil
+			// Success: now that every member is extracted, restore the intended
+			// directory modes. A restrictive parent (e.g. 0555) must not bite
+			// before its children exist.
+			return applyDirModes(dirModes)
 		}
 		if err != nil {
 			return fmt.Errorf("tarutil: read tar: %w", err)
+		}
+		// PAX global extended headers ('g') are archive-wide metadata, not
+		// members: tar.Reader surfaces them as pseudo-entries. Skip them
+		// without counting against MaxEntries — they carry no extraction cost.
+		if hdr.Typeflag == tar.TypeXGlobalHeader {
+			continue
 		}
 		entries++
 		if entries > limits.MaxEntries {
@@ -90,7 +104,13 @@ func Extract(r io.Reader, dest string, limits Limits) error {
 			if err := checkNoSymlinkAncestor(absDest, target); err != nil {
 				return err
 			}
-			if err := os.MkdirAll(target, os.FileMode(hdr.Mode).Perm()); err != nil {
+			perm := os.FileMode(hdr.Mode).Perm() & 0777 //nolint:gosec // masked to permission bits (strips setuid/setgid/sticky)
+			// Record the intended mode even for pre-existing directories
+			// (last entry for a path wins). Create with owner-write added so
+			// nested members can still be created under it; the recorded mode
+			// is restored by applyDirModes after extraction completes.
+			dirModes[target] = perm
+			if err := os.MkdirAll(target, perm|0700); err != nil {
 				return fmt.Errorf("tarutil: mkdir %s: %w", name, err)
 			}
 		case tar.TypeReg:
@@ -118,6 +138,24 @@ func Extract(r io.Reader, dest string, limits Limits) error {
 			return fmt.Errorf("tarutil: unsupported entry type %d at %q; aborting", hdr.Typeflag, hdr.Name)
 		}
 	}
+}
+
+// applyDirModes restores the intended permission bits for extracted
+// directories, deepest path first. Ordering matters: a parent intended to
+// lose execute (e.g. 0666) would block chmod on its own children, so children
+// are finalized before their ancestors.
+func applyDirModes(dirModes map[string]os.FileMode) error {
+	paths := make([]string, 0, len(dirModes))
+	for p := range dirModes {
+		paths = append(paths, p)
+	}
+	sort.Slice(paths, func(i, j int) bool { return len(paths[i]) > len(paths[j]) })
+	for _, p := range paths {
+		if err := os.Chmod(p, dirModes[p]); err != nil {
+			return fmt.Errorf("tarutil: chmod dir %s to %v: %w", p, dirModes[p], err)
+		}
+	}
+	return nil
 }
 
 // safeName validates an archive member name and returns it cleaned relative

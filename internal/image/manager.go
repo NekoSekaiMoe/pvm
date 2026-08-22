@@ -33,6 +33,7 @@ func registryAllowed(imageRef string) bool {
 		return true
 	}
 	reg := registryHost(imageRef)
+	regHost, _ := splitHostPortRight(reg)
 	for _, ent := range strings.Split(spec, ",") {
 		ent = strings.TrimSpace(ent)
 		if ent == "" {
@@ -41,9 +42,13 @@ func registryAllowed(imageRef string) bool {
 		if ent == "*" {
 			return true
 		}
-		if host, port, ok := strings.Cut(ent, ":"); ok && port == "*" {
-			// Wildcard-port entry like "localhost:*": match that host on any port.
-			if h, _, ok2 := strings.Cut(reg, ":"); ok2 && h == host {
+		// Split entry and reference from the RIGHT so a bracketed IPv6 host
+		// ("[::1]:*" / "[::1]:5000") keeps its colons intact in the host part.
+		entHost, entPort := splitHostPortRight(ent)
+		if entPort == "*" {
+			// Wildcard-port entry like "localhost:*" or "[::1]:*": match that
+			// host with an explicit port OR with no port at all.
+			if entHost == regHost {
 				return true
 			}
 		}
@@ -52,6 +57,27 @@ func registryAllowed(imageRef string) bool {
 		}
 	}
 	return false
+}
+
+// splitHostPortRight splits "host:port" at the RIGHTMOST valid port suffix.
+// A suffix counts as a port only when it is "*" or all digits, so bare IPv6
+// hosts and registry names with colons elsewhere are left intact; bracketed
+// IPv6 forms ("[::1]:5000") split cleanly regardless.
+func splitHostPortRight(s string) (host, port string) {
+	i := strings.LastIndex(s, ":")
+	if i < 0 {
+		return s, ""
+	}
+	suffix := s[i+1:]
+	if suffix == "" || suffix == "*" {
+		return s[:i], suffix
+	}
+	for _, r := range suffix {
+		if r < '0' || r > '9' {
+			return s, "" // not a port suffix; the whole string is the host
+		}
+	}
+	return s[:i], suffix
 }
 
 // registryHost extracts the registry host from an OCI image reference.

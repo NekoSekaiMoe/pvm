@@ -157,6 +157,29 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 	if !idRegexp.MatchString(taskID) {
 		return fmt.Errorf("container: invalid task id %q (must match %s)", taskID, idRegexp.String())
 	}
+	// Full spec validation BEFORE any resource is touched (plan.md §3):
+	// the per-field checks below (mount paths, validateRootfs, TAP charset in
+	// buildTaskArgs) are defense in depth, not the gate. A spec that fails
+	// Validate must not open ledgers, persist state, or attach volumes.
+	if err := s.Validate(); err != nil {
+		return fmt.Errorf("container: invalid task spec: %w", err)
+	}
+	// Hoist the static kernel-command-line validations out of buildTaskArgs
+	// so a hostile spec fails BEFORE provisioning creates anything to clean
+	// up (attached volumes, qcow2 overlays, vhost daemons). The socket,
+	// egress address, volume host paths and resolved rootfs only exist later
+	// and stay validated at build time.
+	if err := validateKernelField("init", s.Workspace.Init); err != nil {
+		return err
+	}
+	if err := validateMemory(s.Runtime.Memory); err != nil {
+		return err
+	}
+	if s.Network.Enabled && s.Network.TAP != "" {
+		if err := validateKernelField("tap device", s.Network.TAP); err != nil {
+			return err
+		}
+	}
 
 	// Open the audit ledger for this task. Lives OUTSIDE the sandbox dir.
 	ledger, err := audit.Open(taskID)
@@ -347,6 +370,20 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 			_ = ledger.Append(audit.Record{Phase: audit.PhaseExec, Subject: taskID, Action: "rootfs", Decision: audit.DecisionConstrain, Reason: "ubd backend mounts base directly (no qcow2 CoW)"})
 		}
 	}
+
+	// A half-provisioned overlay must not outlive a failed launch: every
+	// failure path between here and overlayCommitted = true below returns
+	// before the task becomes authoritatively Running, and the stale qcow2
+	// (plus its backing registration) would be mistaken for a real task
+	// image by later snapshots/metadata walks.
+	overlayCommitted := false
+	defer func() {
+		if overlayCreated && !overlayCommitted {
+			if rmErr := os.Remove(overlayPath); rmErr != nil && !os.IsNotExist(rmErr) {
+				fmt.Printf("Warning: remove half-provisioned overlay %s: %v\n", overlayPath, rmErr)
+			}
+		}
+	}()
 
 	// vhost-user-blk backend over the overlay.
 	var sockPath string
@@ -546,6 +583,10 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 		cleanupVolumes()
 		return fmt.Errorf("container: audit task:start for %s: %w", taskID, err)
 	}
+	// The task is now authoritatively Running with its task:start evidence
+	// on disk: the overlay is a live task artifact, not half-provisioned
+	// state — the deferred removal above must leave it alone from here on.
+	overlayCommitted = true
 
 	if m.OnProvisioned != nil {
 		m.OnProvisioned(taskID, pid, tokenStr)
@@ -701,23 +742,85 @@ func validateKernelField(name, val string) error {
 }
 
 // validateRootfs additionally requires an absolute path with no '..'
-// element (it is interpolated into ubd0=<path>).
-func validateRootfs(val string) error {
+// element, a RESOLVABLE target and a regular file. It returns the fully
+// symlink-resolved path — callers must interpolate THAT into ubd0= so the
+// kernel mounts exactly what was validated: validating one path while
+// booting another leaves the symlink-swap window open.
+func validateRootfs(val string) (string, error) {
 	if err := validateKernelField("rootfs", val); err != nil {
-		return err
+		return "", err
 	}
 	if !filepath.IsAbs(val) {
-		return fmt.Errorf("container: rootfs %q must be an absolute path", val)
+		return "", fmt.Errorf("container: rootfs %q must be an absolute path", val)
 	}
 	// Reject '..' as a raw path element BEFORE cleaning: lexical dot-dot
 	// traversal (even when it stays inside the tree) has no business on a
 	// kernel command line.
 	for _, part := range strings.Split(val, string(filepath.Separator)) {
 		if part == ".." {
-			return fmt.Errorf("container: rootfs %q must not contain '..'", val)
+			return "", fmt.Errorf("container: rootfs %q must not contain '..'", val)
 		}
 	}
-	return nil
+	resolved, err := filepath.EvalSymlinks(val)
+	if err != nil {
+		return "", fmt.Errorf("container: rootfs %q cannot be resolved: %w", val, err)
+	}
+	fi, err := os.Stat(resolved)
+	if err != nil {
+		return "", fmt.Errorf("container: stat rootfs %q: %w", resolved, err)
+	}
+	// A device node, socket, fifo or directory named like an image must not
+	// reach ubd0= — only an approved regular image file may.
+	if !fi.Mode().IsRegular() {
+		return "", fmt.Errorf("container: rootfs %q is not a regular image file (%s)", resolved, fi.Mode().Type())
+	}
+	return resolved, nil
+}
+
+// containerImageRoots returns the roots a daemon-side rootfs may live under:
+// the image store, the CoW root and the container state root (overlays are
+// created there by StartTask). Read at CALL time so tests (t.Setenv) and
+// config changes take effect; PVM_IMAGE_ROOT accepts a colon-separated list
+// for deployments with several image stores.
+func containerImageRoots() []string {
+	roots := []string{"/var/lib/uml-container/images"}
+	if r := os.Getenv("PVM_IMAGE_ROOT"); r != "" {
+		roots = append(roots, filepath.SplitList(r)...)
+	}
+	if r := os.Getenv("PVM_COW_ROOT"); r != "" {
+		roots = append(roots, r)
+	} else {
+		roots = append(roots, "/var/lib/uml-container/cow")
+	}
+	if r := os.Getenv("PVM_STATE_ROOT"); r != "" {
+		roots = append(roots, r)
+	} else {
+		roots = append(roots, "/var/lib/uml-container/containers")
+	}
+	return roots
+}
+
+// validateRootfsContained adds the daemon-side containment rule on top of
+// validateRootfs: the resolved rootfs must sit inside one of the trusted
+// image roots. TaskSpec content arrives via the API from callers the daemon
+// does not fully trust, so unlike the legacy umlctl path (a local operator's
+// explicit --rootfs, validated by validateRootfs alone) it may not name any
+// arbitrary host file.
+func validateRootfsContained(val string) (string, error) {
+	resolved, err := validateRootfs(val)
+	if err != nil {
+		return "", err
+	}
+	for _, root := range containerImageRoots() {
+		realRoot, rerr := filepath.EvalSymlinks(root)
+		if rerr != nil {
+			continue // a root that cannot be resolved cannot vouch for anything
+		}
+		if resolved == realRoot || strings.HasPrefix(resolved, realRoot+string(filepath.Separator)) {
+			return resolved, nil
+		}
+	}
+	return "", fmt.Errorf("container: rootfs %q is outside the trusted image roots", resolved)
 }
 
 // validateMemory accepts only canonical numeric forms the UML kernel
@@ -758,10 +861,12 @@ func buildLegacyArgs(ctx context.Context, cfg *config.ContainerConfig) ([]string
 		args = append(args, fmt.Sprintf("virtio_uml.device=%s:%d", cfg.VhostUserSocket, vhost.VirtioIDBlock))
 		args = append(args, "root=/dev/vda")
 	} else {
-		if err := validateRootfs(cfg.Rootfs); err != nil {
+		resolved, err := validateRootfs(cfg.Rootfs)
+		if err != nil {
 			return nil, err
 		}
-		args = append(args, fmt.Sprintf("ubd0=%s", cfg.Rootfs))
+		// Boot exactly the path that passed validation (symlinks resolved).
+		args = append(args, fmt.Sprintf("ubd0=%s", resolved))
 		args = append(args, "root=/dev/ubda")
 	}
 	args = append(args, "rw")
@@ -813,17 +918,12 @@ func buildTaskArgs(s *spec.TaskSpec, vhostSock, resolvedRootfs, egressAddr strin
 		args = append(args, fmt.Sprintf("virtio_uml.device=%s:%d", vhostSock, vhost.VirtioIDBlock))
 		args = append(args, "root=/dev/vda")
 	} else {
-		if err := validateRootfs(resolvedRootfs); err != nil {
+		resolved, err := validateRootfsContained(resolvedRootfs)
+		if err != nil {
 			return nil, err
 		}
-		// ubd path: resolvedRootfs is the single source of truth that StartTask
-		// provisioned. StartTask sets it whenever BaseImage != "", so reaching
-		// here with it empty means BaseImage was empty too — there is nothing
-		// valid to fall back to. Don't re-derive from Workspace.Overlay/
-		// BaseImage: that would let an unprovisioned file onto the kernel
-		// command line and break the "cmdline matches what we created"
-		// invariant resolvedRootfs exists to enforce.
-		args = append(args, fmt.Sprintf("ubd0=%s", resolvedRootfs))
+		// Boot exactly the validated (resolved, contained) path.
+		args = append(args, fmt.Sprintf("ubd0=%s", resolved))
 		args = append(args, "root=/dev/ubda")
 	}
 	args = append(args, "rw")

@@ -106,9 +106,16 @@ func bufBucket(size int) int {
 	return b
 }
 
-// getBuf returns a buffer with at least n bytes (n rounded up to the bucket
-// size). The caller must return it via putBuf when done.
+// getBuf returns a buffer with at least n bytes. Sizes within the pooled
+// range (512B..64KiB, the advertised size_max) are served from the
+// power-of-two bucket pools; anything larger is a plain non-pooled
+// allocation — putBuf's capacity check simply ignores it on return. The
+// caller must return every buffer via putBuf when done; call sites never
+// duplicate the range decision.
 func getBuf(n int) []byte {
+	if n > bufPoolMinSize<<(bufPoolBuckets-1) {
+		return make([]byte, n) // oversized: not poolable
+	}
 	b := bufBucket(n)
 	if v := bufPools[b].Get(); v != nil {
 		return v.([]byte)[:n]
@@ -176,14 +183,9 @@ func (d *BlkDev) process(e *elem) (usedLen uint32, err error) {
 			usedLen = 1
 			break
 		}
-		// Bounce buffer from the pool for the common sizes; oversized
-		// (guest-coalesced) reads just allocate.
-		var buf []byte
-		if n <= bufPoolMinSize<<(bufPoolBuckets-1) {
-			buf = getBuf(n)
-		} else {
-			buf = make([]byte, n)
-		}
+		// Bounce buffer: pooled for common sizes, plain allocation for
+		// oversized (guest-coalesced) reads — getBuf owns that decision.
+		buf := getBuf(n)
 		m, rerr := d.be.ReadAt(buf, int64(h.sector)*512)
 		if rerr != nil && rerr != io.EOF {
 			status = blkSIOErr
@@ -200,13 +202,9 @@ func (d *BlkDev) process(e *elem) (usedLen uint32, err error) {
 			usedLen = 1
 			break
 		}
-		// Gather into a pooled bounce buffer instead of allocating per write.
-		var buf []byte
-		if n <= bufPoolMinSize<<(bufPoolBuckets-1) {
-			buf = getBuf(n)
-		} else {
-			buf = make([]byte, n)
-		}
+		// Gather into a bounce buffer: pooled when possible, plain otherwise
+		// (getBuf owns the range decision).
+		buf := getBuf(n)
 		sgGatherInto(dataOut, buf)
 		if _, err := d.be.WriteAt(buf, int64(h.sector)*512); err != nil {
 			status = blkSIOErr

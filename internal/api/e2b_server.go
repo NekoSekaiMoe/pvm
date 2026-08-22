@@ -390,18 +390,34 @@ func StartE2BServer(port int) error {
 			if root == "" {
 				return c.JSON(http.StatusBadRequest, map[string]string{"error": "path loading disabled: set PVM_SPEC_ROOT or send content"})
 			}
-			absRoot, err := filepath.Abs(root)
+			// Plain '=' assignments into the OUTER err — a ':=' here would
+			// shadow it and let a LoadFile failure slip past the check below,
+			// dereferencing a nil spec in the response.
+			var absRoot, abs string
+			absRoot, err = filepath.Abs(root)
 			if err != nil {
 				return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
 			}
-			abs, err := filepath.Abs(req.Path)
+			abs, err = filepath.Abs(req.Path)
 			if err != nil {
 				return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
 			}
-			if abs != absRoot && !strings.HasPrefix(abs, absRoot+string(filepath.Separator)) {
+			// Resolve symlinks BEFORE the containment check (same policy as
+			// validateHostPath): a lexical path inside PVM_SPEC_ROOT that
+			// symlinks outside must be rejected, and a root that itself contains
+			// symlinks must contain its RESOLVED children.
+			absRootR, rerr := filepath.EvalSymlinks(absRoot)
+			if rerr != nil {
+				return c.JSON(http.StatusBadRequest, map[string]string{"error": "cannot resolve PVM_SPEC_ROOT: " + rerr.Error()})
+			}
+			absR, rerr := filepath.EvalSymlinks(abs)
+			if rerr != nil {
+				return c.JSON(http.StatusBadRequest, map[string]string{"error": "cannot resolve spec path: " + rerr.Error()})
+			}
+			if absR != absRootR && !strings.HasPrefix(absR, absRootR+string(filepath.Separator)) {
 				return c.JSON(http.StatusBadRequest, map[string]string{"error": "path must stay inside PVM_SPEC_ROOT"})
 			}
-			s, err = spec.LoadFile(abs)
+			s, err = spec.LoadFile(absR)
 		} else if req.Content != "" {
 			s, err = spec.LoadString(req.Content)
 		} else {
@@ -472,6 +488,11 @@ func StartE2BServer(port int) error {
 		}
 		id, err := currentApprovals().Create(t)
 		if err != nil {
+			// Bad caller input (deadline outside the sane window) is a 400;
+			// everything else keeps the existing 409 (duplicate pending ticket).
+			if errors.Is(err, approval.ErrInvalidDeadline) {
+				return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+			}
 			return c.JSON(http.StatusConflict, map[string]string{"error": err.Error()})
 		}
 		return c.JSON(http.StatusOK, map[string]string{"id": id})

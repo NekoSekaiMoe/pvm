@@ -320,7 +320,13 @@ func (m *Manager) validateHostPath(hostPath string) error {
 	// Resolve symlinks of the nearest existing ancestor; trailing components
 	// don't exist yet (the plugin creates them) so EvalSymlinks would fail
 	// on the full path.
-	resolved := resolveExisting(clean)
+	resolved, err := resolveExisting(clean)
+	if err != nil {
+		// Resolution failed (raced deletion, unreadable ancestor): the
+		// containment verdict is UNKNOWN, not "inside" — reject rather than
+		// fall back to the weaker string-prefix check.
+		return fmt.Errorf("volume: HostPath %q not resolvable: %w", hostPath, err)
+	}
 	if resolved == resolvedBase {
 		return nil
 	}
@@ -332,8 +338,10 @@ func (m *Manager) validateHostPath(hostPath string) error {
 
 // resolveExisting returns p with all symlinks resolved for its longest
 // existing prefix; non-existing trailing components are appended verbatim
-// (they cannot carry symlinks yet).
-func resolveExisting(p string) string {
+// (they cannot carry symlinks yet). A resolution failure of an EXISTING
+// ancestor is propagated: callers must reject rather than fall back to the
+// lexical path, which would silently downgrade to string-prefix validation.
+func resolveExisting(p string) (string, error) {
 	suffix := ""
 	cur := p
 	for {
@@ -343,19 +351,18 @@ func resolveExisting(p string) string {
 		parent := filepath.Dir(cur)
 		if parent == cur {
 			// Reached the filesystem root without finding anything that
-			// exists; nothing to resolve.
-			return p
+			// exists; nothing to resolve (practically unreachable: "/"
+			// always lstats successfully).
+			return p, nil
 		}
 		suffix = filepath.Join(filepath.Base(cur), suffix)
 		cur = parent
 	}
 	resolved, err := filepath.EvalSymlinks(cur)
 	if err != nil {
-		// Raced deletion or unreadable ancestor: fall back to the lexical
-		// path — containment then relies on the string check as before.
-		return p
+		return "", fmt.Errorf("volume: resolve %q: %w", cur, err)
 	}
-	return filepath.Join(resolved, suffix)
+	return filepath.Join(resolved, suffix), nil
 }
 
 // Close releases all registered plugins.

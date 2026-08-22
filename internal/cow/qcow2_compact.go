@@ -347,7 +347,13 @@ func compactWalk(ctx context.Context, src *qcow2Image, dst *qcow2Writable, stats
 				// resolve() maps every offset of the cluster to `host` without
 				// consulting the backing (that holds for a trailing partial
 				// cluster too — only in-range bytes are ever read). Skip the
-				// per-cluster chain resolution entirely.
+				// per-cluster chain resolution entirely — but only after the
+				// host offset proves to be a legal data location (aligned, in
+				// file, clear of metadata): a corrupt L2 entry must not make
+				// compact copy structural bytes into the rebuilt image.
+				if verr := src.validateHostData(host, uint64(n)); verr != nil {
+					return fmt.Errorf("cow: compact: cluster %d: %w", clusterIdx, verr)
+				}
 				m, err = src.f.ReadAt(buf[:n], int64(host))
 			} else {
 				// Non-COPIED cluster: refcount may be > 1 (shared internal-

@@ -112,7 +112,8 @@ type WorkspaceSpec struct {
 	// Overlay is the per-sandbox qcow2 CoW path. If empty, a path under the
 	// container state dir is synthesized at start time.
 	Overlay string `toml:"overlay"`
-	// Init is the in-guest init command, e.g. "/init.sh", "/sbin/init".
+	// Init is the ABSOLUTE in-guest init path (the kernel command line's
+	// init=... must be absolute), e.g. "/init.sh", "/sbin/init".
 	Init string `toml:"init"`
 	// ExtraEnv is injected into the guest via the init contract. Values here
 	// are NOT secrets — secrets come from the Credential Broker at runtime.

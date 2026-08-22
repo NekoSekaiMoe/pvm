@@ -122,9 +122,15 @@ func AttachEgressFilter(tapName string) (*ebpf.Map, error) {
 	return m, nil
 }
 
-// DetachEgressFilter unregisters (and closes) the whitelist map previously
-// registered for tapName. Safe to call when nothing is attached.
-func DetachEgressFilter(tapName string) {
+// UnregisterWhitelistMap unregisters (and closes) the whitelist map
+// previously registered for tapName. Safe to call when nothing is attached.
+//
+// It deliberately does NOT touch the egress tc filter or the clsact qdisc:
+// the filter is installed via tc by LoadEgressFilter (internal/ebpf), which
+// does not record whether IT created the clsact qdisc — removing a qdisc our
+// caller did not own would break unrelated filters on the same device. The
+// operator tears the whole device down with the TAP anyway.
+func UnregisterWhitelistMap(tapName string) {
 	if m := WhitelistMapFor(tapName); m != nil {
 		unregisterWhitelistMap(tapName, m)
 	}

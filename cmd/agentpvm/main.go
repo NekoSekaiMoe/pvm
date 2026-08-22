@@ -180,7 +180,7 @@ func runCmd(args []string) {
 	if taskID == "" {
 		taskID = "agent-task"
 	}
-	if !idRegex.MatchString(taskID) {
+	if !taskIDRe.MatchString(taskID) {
 		fmt.Fprintln(os.Stderr, "Error: Invalid task id format")
 		os.Exit(1)
 	}
@@ -676,12 +676,8 @@ var (
 	_ = spec.SpecVersion
 )
 
-// idRegex validates task/container ids: same shape as every other package
-// (^[-_A-Za-z0-9]+$). Kept package-local rather than shared to avoid an extra
-// import; the inline regexp.MustCompile that used to live in runCmd now
-// reuses this single precompiled value.
-var idRegex = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
-
-// taskIDRe bounds the task id accepted by the gate subcommand before it
-// reaches audit.Open: 1..128 chars of [A-Za-z0-9_-].
+// taskIDRe is the SINGLE task/container id rule for this binary: same shape
+// as every other package (^[-_A-Za-z0-9]+$), bounded to 1..128 chars. Every
+// id check in agentpvm (runCmd's task id, the gate subcommand's bundle task
+// id) reuses it — one rule instead of two that can drift apart.
 var taskIDRe = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,128}$`)
