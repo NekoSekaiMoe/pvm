@@ -92,7 +92,8 @@ sudo umount mnt
 # vhost-user-blk; ubd cannot read qcow2). Convert the raw ext4 image to qcow2
 # ONCE using the pure-Go converter (no qemu-img dependency). Falls back to
 # qemu-img if the agentpvm binary somehow lacks the converter.
-BASE_QCOW2="perf_rootfs.qcow2"
+# Absolute path: validateRootfs (trusted-root validation) rejects relative paths.
+BASE_QCOW2="$(pwd)/perf_rootfs.qcow2"
 rm -f "${BASE_QCOW2}"
 if ./agentpvm cow -to-qcow2 "${IMG_NAME}" -overlay "${BASE_QCOW2}" 2>/dev/null; then
     echo "Built qcow2 base via pure-Go converter."

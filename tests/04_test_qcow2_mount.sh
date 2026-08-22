@@ -109,9 +109,9 @@ sudo umount "$MNT"
 if [ "$HAVE_QEMU_IMG" = "1" ]; then
     echo "Converting raw ext4 base to qcow2..."
     qemu-img convert -p -O qcow2 "$IMG_NAME" "$QCOW_NAME" > /dev/null
-    BASE="$QCOW_NAME"
+    BASE="$(pwd)/$QCOW_NAME"   # absolute: validateRootfs rejects relative paths
 else
-    BASE="$IMG_NAME"
+    BASE="$(pwd)/$IMG_NAME"
 fi
 
 # ---- 3) Host networking (same proven pattern as scripts/test_pkg_install.sh,
