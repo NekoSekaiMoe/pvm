@@ -182,7 +182,9 @@ func (m *Manager) Get(id string) (*Ticket, error) {
 func (m *Manager) Pending(taskID string) []Ticket {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	var out []Ticket
+	// Non-nil even when empty: /api/approvals serializes this directly and
+	// JSON clients expect [], not null.
+	out := make([]Ticket, 0, len(m.tickets))
 	for _, t := range m.tickets {
 		if t.State != StatePending {
 			continue

@@ -30,6 +30,8 @@ This directory contains shell-based integration and end-to-end (E2E) suites vali
 | `20_test_snapshot_security.sh`| No | Snapshot tarball directory structure integrity and destination overwrite protection |
 | `21_test_state_fsm_durability.sh`| No | Complete lifecycle FSM path (pending->completed), illegal edge rejection, quarantine |
 | `22_test_docker_image_pull.sh`| No | Docker image pull error handling and safeName sanitization |
+| `23_test_container_api.sh` | No | Container REST: list shape, logs/delete/snapshot/restore id validation, `/containers/start` validation chain (name/CPU/rootfs injection/memory) |
+| `24_test_tasks_audit_api.sh`| No | Task read API (`GET /tasks`, detail 400/404), unknown-task transition 404, `load-spec` path mode + `PVM_SPEC_ROOT` traversal defense, audit ledger read + chain verify |
 
 ---
 
@@ -38,7 +40,7 @@ This directory contains shell-based integration and end-to-end (E2E) suites vali
 ```bash
 # Run all unprivileged CI-safe suites (fails fast on first error)
 set -e
-for s in tests/{05,06,07,08,10,11,12,13,14,15,16,17,18,19,20,21,22}_*.sh; do
+for s in tests/{05,06,07,08,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24}_*.sh; do
     echo "Running $s..."
     ./"$s"
 done

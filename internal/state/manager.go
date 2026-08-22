@@ -283,7 +283,9 @@ func ListAll() ([]*ContainerState, error) {
 	if err != nil {
 		return nil, err
 	}
-	var out []*ContainerState
+	// Non-nil even when empty: JSON clients (/api/containers, /api/tasks)
+	// must see [], not null.
+	out := make([]*ContainerState, 0, len(dirs))
 	for _, d := range dirs {
 		if !d.IsDir() {
 			continue

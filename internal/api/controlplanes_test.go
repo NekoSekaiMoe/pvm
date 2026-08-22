@@ -242,3 +242,36 @@ func TestAPI_Gate_RejectSecret(t *testing.T) {
 		t.Error("gate should reject a diff containing a GitHub token")
 	}
 }
+
+// --- empty-list JSON contract ---
+
+// Nil Go slices marshal to JSON null; every list endpoint must emit [] so
+// array-expecting clients (WebUI, E2B SDKs) don't crash on empty state.
+// Regression test: state.ListAll, audit ReadAll, and approval.Pending all
+// used to return nil when empty.
+func TestAPI_EmptyListsAreArraysNotNull(t *testing.T) {
+	base := bootServer(t)
+	resetPlanes(t)
+
+	for _, path := range []string{
+		"/api/containers",
+		"/api/tasks",
+		"/api/approvals",
+		"/api/audit/tk-empty",
+	} {
+		req, _ := http.NewRequest("GET", base+path, nil)
+		req.Header.Set("Authorization", "Bearer secret")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("GET %s: %v", path, err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != 200 {
+			t.Fatalf("GET %s: status=%d body=%s", path, resp.StatusCode, body)
+		}
+		if got := strings.TrimSpace(string(body)); got != "[]" {
+			t.Errorf("GET %s: empty state must serialize as [], got %s", path, got)
+		}
+	}
+}

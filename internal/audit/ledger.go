@@ -397,12 +397,14 @@ func (l *Ledger) ReadAll() ([]Record, error) {
 	f, err := os.Open(l.path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, nil
+			// Missing ledger is still an empty list, not null: /api/audit/:id
+			// serializes the return value directly.
+			return []Record{}, nil
 		}
 		return nil, err
 	}
 	defer f.Close()
-	var out []Record
+	out := make([]Record, 0)
 	dec := json.NewDecoder(f)
 	for {
 		var r Record
