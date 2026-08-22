@@ -43,6 +43,12 @@ const (
 	// (see qcow2Image.l2cache). 32 MiB ≈ 4M entries ≈ 2 GiB of guest coverage
 	// per pass at 4 KiB clusters — far above any working set our workloads hit.
 	l2CacheMaxBytes = 32 << 20
+
+	// maxRefcountTableBytes caps the refcount-table scan in metadataRanges.
+	// Real tables are tiny (a handful of clusters); a header declaring more
+	// than 4 MiB of refcount table is corrupt or hostile and is rejected
+	// rather than scanned.
+	maxRefcountTableBytes = 1 << 22 // 4 MiB
 )
 
 const (
@@ -639,17 +645,22 @@ func (q *qcow2Image) readUint64At(dst *uint64, off uint64) error {
 // hostRange is a half-open [off, end) byte range in the image's host file.
 type hostRange struct{ off, end uint64 }
 
-// metadataRanges returns the sorted host-file ranges belonging to image
-// metadata: cluster 0 (header, extensions, backing name), the L1 table,
-// every L2 table referenced by a loaded L1 entry, the refcount table and
-// the refcount blocks it references. Direct data reads validated against
-// these ranges can never copy structural bytes into guest data (or into a
-// compacted rebuild). Computed once and cached under mu.
-func (q *qcow2Image) metadataRanges() []hostRange {
+// metadataRanges returns the sorted, MERGED host-file ranges belonging to
+// image metadata: cluster 0 (header, extensions, backing name), the L1
+// table, every L2 table referenced by a loaded L1 entry, the refcount
+// table and the refcount blocks it references. Adjacent or overlapping
+// ranges are coalesced, so the result increases strictly in both off and
+// end — the property validateHostData's binary search depends on. Direct
+// data reads validated against these ranges can never copy structural
+// bytes into guest data (or into a compacted rebuild). Computed once and
+// cached under mu. An error means the header's refcount declaration is
+// impossible (beyond EOF or past the scan cap) or the table is unreadable;
+// nothing is cached in that case.
+func (q *qcow2Image) metadataRanges() ([]hostRange, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	if q.metaRanges != nil {
-		return q.metaRanges
+		return q.metaRanges, nil
 	}
 	ranges := []hostRange{{0, q.clusterSize}}
 	if n := uint64(len(q.l1)); n > 0 {
@@ -660,32 +671,50 @@ func (q *qcow2Image) metadataRanges() []hostRange {
 			ranges = append(ranges, hostRange{c, c + q.clusterSize})
 		}
 	}
-	if q.hdr.refcountOffset != 0 && q.hdr.refcountClusters > 0 && q.hdr.refcountOffset < q.fileSize {
-		// Read at most what fits in the file (and cap the scan: real refcount
-		// tables are tiny; a hostile one must not drive a huge allocation).
+	if q.hdr.refcountOffset != 0 && q.hdr.refcountClusters > 0 {
+		// The DECLARED table must fit the real file exactly as the header
+		// claims, and inside the scan cap. Silently trimming tblLen would
+		// leave the tail of an oversized table free to be mistaken for data
+		// clusters; a hostile declaration must be rejected outright.
 		tblLen := uint64(q.hdr.refcountClusters) * q.clusterSize
-		if avail := q.fileSize - q.hdr.refcountOffset; tblLen > avail {
-			tblLen = avail
+		tblEnd := q.hdr.refcountOffset + tblLen
+		if tblEnd < q.hdr.refcountOffset || tblEnd > q.fileSize {
+			return nil, fmt.Errorf("cow: refcount table [%#x,%#x) exceeds file size %d",
+				q.hdr.refcountOffset, tblEnd, q.fileSize)
 		}
-		if tblLen > 1<<22 {
-			tblLen = 1 << 22
+		if tblLen > maxRefcountTableBytes {
+			return nil, fmt.Errorf("cow: refcount table %d bytes exceeds the %d MiB scan cap",
+				tblLen, maxRefcountTableBytes>>20)
 		}
-		if tblEnd := q.hdr.refcountOffset + tblLen; tblEnd <= q.fileSize {
-			ranges = append(ranges, hostRange{q.hdr.refcountOffset, tblEnd})
-			buf := make([]byte, tblLen)
-			if _, err := q.f.ReadAt(buf, int64(q.hdr.refcountOffset)); err == nil {
-				for i := uint64(0); i+8 <= tblLen; i += 8 {
-					c := binary.BigEndian.Uint64(buf[i:]) & l1eOffsetMask
-					if c != 0 && c+q.clusterSize <= q.fileSize {
-						ranges = append(ranges, hostRange{c, c + q.clusterSize})
-					}
-				}
+		ranges = append(ranges, hostRange{q.hdr.refcountOffset, tblEnd})
+		buf := make([]byte, tblLen)
+		if _, err := q.f.ReadAt(buf, int64(q.hdr.refcountOffset)); err != nil {
+			return nil, fmt.Errorf("cow: read refcount table at %#x: %w", q.hdr.refcountOffset, err)
+		}
+		for i := uint64(0); i+8 <= tblLen; i += 8 {
+			c := binary.BigEndian.Uint64(buf[i:]) & l1eOffsetMask
+			if c != 0 && c+q.clusterSize <= q.fileSize {
+				ranges = append(ranges, hostRange{c, c + q.clusterSize})
 			}
 		}
 	}
 	sort.Slice(ranges, func(i, j int) bool { return ranges[i].off < ranges[j].off })
-	q.metaRanges = ranges
-	return ranges
+	// Merge adjacent (off == end) or overlapping ranges in place. Merged
+	// ranges increase strictly in off AND end, so `end > off` is monotone
+	// across the slice; unsorted ends would break sort.Search below by
+	// hiding a long earlier range behind a shorter later one.
+	merged := ranges[:0]
+	for _, r := range ranges {
+		if n := len(merged); n > 0 && r.off <= merged[n-1].end {
+			if r.end > merged[n-1].end {
+				merged[n-1].end = r.end
+			}
+			continue
+		}
+		merged = append(merged, r)
+	}
+	q.metaRanges = merged
+	return merged, nil
 }
 
 // validateHostData checks that [off, off+n) is a legal DATA location for a
@@ -701,10 +730,19 @@ func (q *qcow2Image) validateHostData(off, n uint64) error {
 	if end < off || end > q.fileSize {
 		return fmt.Errorf("cow: host range [%#x,%#x) exceeds file size %#x", off, end, q.fileSize)
 	}
-	for _, r := range q.metadataRanges() {
-		if off < r.end && r.off < end {
-			return fmt.Errorf("cow: host range [%#x,%#x) overlaps image metadata [%#x,%#x)", off, end, r.off, r.end)
-		}
+	ranges, err := q.metadataRanges()
+	if err != nil {
+		return err
+	}
+	// Binary-search the first merged range whose end exceeds off (merged
+	// ranges increase strictly in off and end, so the predicate is
+	// monotone). Every earlier range ends at or before off and cannot
+	// intersect [off, end); if the candidate misses too, its off is >= end
+	// and every later range starts even further right, so they miss as
+	// well — checking that one candidate is sufficient.
+	i := sort.Search(len(ranges), func(i int) bool { return ranges[i].end > off })
+	if i < len(ranges) && off < ranges[i].end && ranges[i].off < end {
+		return fmt.Errorf("cow: host range [%#x,%#x) overlaps image metadata [%#x,%#x)", off, end, ranges[i].off, ranges[i].end)
 	}
 	return nil
 }

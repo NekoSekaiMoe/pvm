@@ -347,6 +347,12 @@ func resolveExisting(p string) (string, error) {
 	for {
 		if _, err := os.Lstat(cur); err == nil {
 			break
+		} else if !os.IsNotExist(err) {
+			// A permission or I/O error on an existing ancestor must propagate:
+			// only a genuinely missing component justifies walking up. Swallowing
+			// other errors here would let the loop settle on an unparsed path and
+			// silently downgrade validation to the lexical string check.
+			return "", fmt.Errorf("volume: lstat %q: %w", cur, err)
 		}
 		parent := filepath.Dir(cur)
 		if parent == cur {

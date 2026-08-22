@@ -522,6 +522,59 @@ func TestCompact_TruncatedDataCluster(t *testing.T) {
 	}
 }
 
+// TestCompact_RejectsHostileRefcountHeader: Compact's per-cluster
+// validateHostData must surface a refcount declaration that is impossible
+// (table beyond EOF) instead of silently trimming it — and must fail before
+// any rename, leaving the original overlay untouched.
+func TestCompact_RejectsHostileRefcountHeader(t *testing.T) {
+	dir := t.TempDir()
+	overlay, _ := buildOverlayWithWrites(t, dir, []writeOp{
+		{0, patterned(0x61, clusterSize)}, // first allocated cluster
+	})
+	// Sanity: the untampered image compacts fine — normal refcount-range
+	// scanning is unaffected by the new rejection paths.
+	if _, err := Compact(context.Background(), overlay); err != nil {
+		t.Fatalf("compact before tampering: %v", err)
+	}
+	st, err := os.Stat(overlay)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+
+	// Declare a refcount table running far past EOF in the header
+	// (refcount_clusters at 0x38), then compact the COPIED data cluster:
+	// validateHostData must reject the impossible declaration.
+	var rcBuf [4]byte
+	binary.BigEndian.PutUint32(rcBuf[:], 1<<20)
+	f, err := os.OpenFile(overlay, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatalf("open overlay: %v", err)
+	}
+	if _, err := f.WriteAt(rcBuf[:], 0x38); err != nil {
+		f.Close()
+		t.Fatalf("patch refcount_clusters: %v", err)
+	}
+	f.Close()
+
+	_, err = Compact(context.Background(), overlay)
+	if err == nil {
+		t.Fatal("Compact with hostile refcount header: expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "refcount table") {
+		t.Fatalf("error = %v, want 'refcount table'", err)
+	}
+	// The original file must survive untouched — no rename of a partial
+	// rebuild over it.
+	st2, err := os.Stat(overlay)
+	if err != nil {
+		t.Fatalf("stat after: %v", err)
+	}
+	if st2.Size() != st.Size() {
+		t.Errorf("overlay size after failed compact = %d, want %d (original must survive)",
+			st2.Size(), st.Size())
+	}
+}
+
 // TestQcow2_HeaderLengthUnaligned: header_length must be 8-byte aligned per
 // the qcow2 spec (qemu-img rejects unaligned values); our parser must too.
 func TestQcow2_HeaderLengthUnaligned(t *testing.T) {

@@ -2,6 +2,9 @@ package pool
 
 import (
 	"errors"
+	"fmt"
+	"math"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -209,6 +212,61 @@ func TestParseMemMB(t *testing.T) {
 				t.Errorf("parseMemMB(%q) = %d, want error", in, got)
 			}
 		})
+	}
+}
+
+// TestParseMemMB_KBMaxNoOverflow pins the overflow fix in the K→MB path:
+// the legacy (v+1023)/1024 formula wrapped negative on the largest int64 KB
+// value; the quotient+remainder form must yield the exact rounded-up MB
+// count (or a clean rejection where int is 32-bit).
+func TestParseMemMB_KBMaxNoOverflow(t *testing.T) {
+	var maxK int64 = math.MaxInt64
+	// Legacy-behavior contrast: the pre-add wraps here (var, not const, so
+	// the deliberate overflow compiles). This documents the old bug.
+	legacy := (maxK + 1023) / 1024
+	if legacy > 0 {
+		t.Fatalf("precondition: legacy (v+1023)/1024 should wrap negative on MaxInt64 K, got %d", legacy)
+	}
+	in := fmt.Sprintf("%dK", maxK)
+	want := maxK/1024 + 1 // MaxInt64 K = 1024*(2^53-1)+1023 K → 2^53 MB
+	got, err := parseMemMB(in)
+	if strconv.IntSize == 64 {
+		if err != nil {
+			t.Fatalf("parseMemMB(%q) unexpected error: %v", in, err)
+		}
+		if int64(got) != want {
+			t.Errorf("parseMemMB(%q) = %d, want %d (no wrap, no truncation)", in, got, want)
+		}
+	} else {
+		// On 32-bit int the MB count exceeds math.MaxInt32 and must be
+		// rejected by the pre-conversion bound check, not truncated.
+		if err == nil {
+			t.Fatalf("parseMemMB(%q) = %d, want rejection (exceeds platform int max)", in, got)
+		}
+	}
+}
+
+// TestParseMemMB_IntBoundary checks the int-conversion bound: an MB count
+// exactly at the platform int maximum is accepted; anything above it must be
+// rejected with a clear error rather than silently wrapping in int(mb).
+func TestParseMemMB_IntBoundary(t *testing.T) {
+	maxInt := int64(math.MaxInt)
+	atLimit := strconv.FormatInt(maxInt, 10) + "M"
+	got, err := parseMemMB(atLimit)
+	if err != nil {
+		t.Fatalf("parseMemMB(%q) unexpected error: %v", atLimit, err)
+	}
+	if int64(got) != maxInt {
+		t.Errorf("parseMemMB(%q) = %d, want %d", atLimit, got, maxInt)
+	}
+	// One MB beyond the platform int max must be rejected. This is only
+	// expressible on 32-bit platforms: on 64-bit no M/K value can exceed
+	// math.MaxInt (the G path already guards its own overflow upstream).
+	if maxInt < math.MaxInt64 {
+		over := strconv.FormatInt(maxInt+1, 10) + "M"
+		if got, err := parseMemMB(over); err == nil {
+			t.Errorf("parseMemMB(%q) = %d, want error (exceeds platform int max)", over, got)
+		}
 	}
 }
 

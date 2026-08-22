@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -539,5 +540,210 @@ func TestQcow2_ClusterBitsRange(t *testing.T) {
 				t.Fatalf("cluster_bits %d accepted, want rejection", tc.bits)
 			}
 		})
+	}
+}
+
+// craftMetaImage writes a minimal standalone qcow2 whose metadata geometry
+// is caller-controlled: an L1 table with one entry at cluster 1 pointing at
+// l2Host, a refcount table of one cluster at cluster 2 whose entries point
+// at the given refblock host offsets, refcount_clusters set as declared, and
+// a file of sizeBytes (extended sparsely past the crafted clusters). Only
+// the fields metadataRanges consults are filled in; everything else (the
+// extension area, refblock contents) stays zero, which satisfies the open
+// path (end-of-extensions marker, L1 bounds) by construction.
+func craftMetaImage(t *testing.T, path string, l2Host uint64, refblocks []uint64,
+	refcountClusters uint32, sizeBytes int64) {
+	t.Helper()
+	buf := make([]byte, 3*clusterSize)
+	copy(buf[0:4], qcow2Magic)
+	binary.BigEndian.PutUint32(buf[0x04:], qcow2Version3)
+	binary.BigEndian.PutUint32(buf[0x14:], clusterBits)
+	binary.BigEndian.PutUint64(buf[0x18:], clusterSize) // virtual size: 1 cluster
+	binary.BigEndian.PutUint32(buf[0x24:], 1)           // l1_size
+	binary.BigEndian.PutUint64(buf[0x28:], clusterSize) // l1 at cluster 1
+	binary.BigEndian.PutUint64(buf[0x30:], 2*clusterSize)
+	binary.BigEndian.PutUint32(buf[0x38:], refcountClusters)
+	binary.BigEndian.PutUint32(buf[0x60:], refcountOrder)
+	binary.BigEndian.PutUint32(buf[0x64:], qcow2HeaderLen)
+	binary.BigEndian.PutUint64(buf[clusterSize:], l2Host) // L1[0] -> L2 table
+	for i, rb := range refblocks {
+		binary.BigEndian.PutUint64(buf[2*clusterSize+uint64(i)*8:], rb)
+	}
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+	if err != nil {
+		t.Fatalf("create %s: %v", path, err)
+	}
+	if _, err := f.Write(buf); err != nil {
+		f.Close()
+		t.Fatalf("write %s: %v", path, err)
+	}
+	if err := f.Truncate(sizeBytes); err != nil {
+		f.Close()
+		t.Fatalf("truncate %s to %d: %v", path, sizeBytes, err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close %s: %v", path, err)
+	}
+}
+
+// openQcow2ForMeta opens path and returns its concrete qcow2 type so tests
+// can exercise metadataRanges/validateHostData directly.
+func openQcow2ForMeta(t *testing.T, path string) *qcow2Image {
+	t.Helper()
+	img, err := openGuestImage(path)
+	if err != nil {
+		t.Fatalf("open %s: %v", path, err)
+	}
+	q, ok := img.(*qcow2Image)
+	if !ok {
+		img.Close()
+		t.Fatalf("%s did not parse as qcow2", path)
+	}
+	t.Cleanup(func() { img.Close() })
+	return q
+}
+
+// TestMetadataRanges_RejectsOutOfRangeRefcountTable: a header declaring a
+// refcount table that runs past EOF must be rejected. The old behavior
+// silently trimmed the declaration, leaving the phantom tail unscanned and
+// free to be mistaken for data clusters.
+func TestMetadataRanges_RejectsOutOfRangeRefcountTable(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "img.qcow2")
+	// Declared table [2*cs, 6*cs) but the file is only 4 clusters long.
+	craftMetaImage(t, path, 4*clusterSize, nil, 4, 4*int64(clusterSize))
+	q := openQcow2ForMeta(t, path)
+
+	if _, err := q.metadataRanges(); err == nil {
+		t.Fatal("metadataRanges: expected out-of-range rejection, got nil")
+	} else if !strings.Contains(err.Error(), "exceeds file size") {
+		t.Fatalf("error = %v, want 'exceeds file size'", err)
+	}
+	// The rejection must propagate through validateHostData (the Compact
+	// path), not just the direct call. The query itself is fully in-file, so
+	// only the metadata scan can reject it.
+	if err := q.validateHostData(3*clusterSize, clusterSize); err == nil ||
+		!strings.Contains(err.Error(), "exceeds file size") {
+		t.Fatalf("validateHostData error = %v, want propagated 'exceeds file size'", err)
+	}
+}
+
+// TestMetadataRanges_RejectsOversizedRefcountScan: a declared table that
+// FITS the file but exceeds the 4 MiB scan cap is rejected too — a hostile
+// header must not drive the scan allocation, and silently trimming it is
+// exactly what the rejection replaces.
+func TestMetadataRanges_RejectsOversizedRefcountScan(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "img.qcow2")
+	// 1025 table clusters = 4,198,400 bytes > the 4 MiB cap, with the file
+	// grown (sparsely) to actually contain the full declaration.
+	tblLen := uint64(1025) * clusterSize
+	size := int64(2*clusterSize) + int64(tblLen)
+	craftMetaImage(t, path, 4*clusterSize, nil, 1025, size)
+	q := openQcow2ForMeta(t, path)
+
+	if _, err := q.metadataRanges(); err == nil {
+		t.Fatal("metadataRanges: expected scan-cap rejection, got nil")
+	} else if !strings.Contains(err.Error(), "scan cap") {
+		t.Fatalf("error = %v, want 'scan cap'", err)
+	}
+	if err := q.validateHostData(3*clusterSize, clusterSize); err == nil ||
+		!strings.Contains(err.Error(), "scan cap") {
+		t.Fatalf("validateHostData error = %v, want propagated 'scan cap'", err)
+	}
+}
+
+// TestMetadataRanges_NormalScanUnaffected: an image from our own create
+// path scans cleanly — ranges come back merged and disjoint, a real data
+// cluster validates as a legal data location, and metadata clusters still
+// overlap-reject exactly as before.
+func TestMetadataRanges_NormalScanUnaffected(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "img.qcow2")
+	if err := createQcow2(path, 8<<20, "", "", defaultOverlayOpt); err != nil {
+		t.Fatalf("createQcow2: %v", err)
+	}
+	writeGuestCluster(t, path, 3, patterned(0x61, clusterSize))
+	q := openQcow2ForMeta(t, path)
+
+	ranges, err := q.metadataRanges()
+	if err != nil {
+		t.Fatalf("metadataRanges: %v", err)
+	}
+	for i, r := range ranges {
+		if r.off >= r.end {
+			t.Fatalf("range %d empty: [%#x,%#x)", i, r.off, r.end)
+		}
+		if i > 0 && ranges[i-1].end > r.off {
+			t.Fatalf("ranges %d..%d overlap after merge: [%#x,%#x) vs [%#x,%#x)",
+				i-1, i, ranges[i-1].off, ranges[i-1].end, r.off, r.end)
+		}
+	}
+	// The written data cluster must validate as a legal data location.
+	l2Off := q.l1[0] & l1eOffsetMask
+	l2e, err := q.l2EntryAt(l2Off, 3)
+	if err != nil {
+		t.Fatalf("L2 entry: %v", err)
+	}
+	host := l2e & l2eOffsetMask
+	if host == 0 {
+		t.Fatal("guest cluster 3 not allocated")
+	}
+	if err := q.validateHostData(host, clusterSize); err != nil {
+		t.Fatalf("data cluster at %#x rejected: %v", host, err)
+	}
+	// Metadata locations must keep overlapping.
+	if err := q.validateHostData(0, clusterSize); err == nil {
+		t.Fatal("header cluster accepted as data location")
+	}
+	if err := q.validateHostData(l2Off, clusterSize); err == nil {
+		t.Fatal("L2 table cluster accepted as data location")
+	}
+}
+
+// TestMetadataRanges_MergesOverlappingRanges pins the merge + binary-search
+// contract: overlapping and adjacent metadata ranges coalesce into a
+// strictly increasing sequence, and validateHostData's single-candidate
+// binary search then gets every intersection decision right — including a
+// data range that ends exactly where the next merged range begins.
+func TestMetadataRanges_MergesOverlappingRanges(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "img.qcow2")
+	cs := uint64(clusterSize)
+	// Geometry (cluster indices): 0 header, 1 L1 (its single entry points
+	// at the L2 table in cluster 4), 2 refcount table (entries point at
+	// refblocks in cluster 1 — overlapping the L1 cluster — and cluster 4 —
+	// overlapping the L2 table), 3 free data gap, 4 shared L2/refblock.
+	craftMetaImage(t, path, 4*cs, []uint64{cs, 4 * cs}, 1, int64(5*cs))
+	q := openQcow2ForMeta(t, path)
+
+	ranges, err := q.metadataRanges()
+	if err != nil {
+		t.Fatalf("metadataRanges: %v", err)
+	}
+	// Raw ranges [0,cs) [cs,cs+8) [cs,2cs) [2cs,3cs) [4cs,5cs) [4cs,5cs)
+	// must merge (adjacency included) into exactly [0,3cs) and [4cs,5cs).
+	want := []hostRange{{0, 3 * cs}, {4 * cs, 5 * cs}}
+	if len(ranges) != len(want) {
+		t.Fatalf("merged ranges = %v, want %v", ranges, want)
+	}
+	for i, r := range ranges {
+		if r != want[i] {
+			t.Fatalf("merged range %d = [%#x,%#x), want [%#x,%#x)",
+				i, r.off, r.end, want[i].off, want[i].end)
+		}
+	}
+	// The gap cluster must validate as data: its end touches the second
+	// merged range's off exactly, so a sloppy candidate check (or an
+	// unmerged, non-monotone range list) would misreport an overlap.
+	if err := q.validateHostData(3*cs, cs); err != nil {
+		t.Fatalf("gap cluster rejected: %v", err)
+	}
+	// Clusters inside each merged range (including at its first byte) must
+	// still be rejected as data locations.
+	for _, off := range []uint64{0, cs, 2 * cs, 4 * cs} {
+		if err := q.validateHostData(off, cs); err == nil {
+			t.Fatalf("metadata cluster at %#x accepted as data location", off)
+		}
 	}
 }

@@ -353,8 +353,22 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 	if s.Workspace.BaseImage != "" {
 		if s.Kernel.UseVhostBlk {
 			// vhost path: wrap the qcow2 base in a per-task qcow2 overlay.
+			// The backing path comes from caller-supplied spec content, so it
+			// gets the SAME trusted-root + symlink-resolved validation as the
+			// rootfs the kernel boots (validateRootfsContained): a base outside
+			// the image roots — or a symlink escaping them — must never reach
+			// CreateOverlay, which would open it read-only and bind it into the
+			// overlay's backing chain. Boot/open exactly the resolved path.
+			resolvedBase, verr := validateRootfsContained(s.Workspace.BaseImage)
+			if verr != nil {
+				cleanupVolumes()
+				_ = ledger.Append(audit.Record{Phase: audit.PhaseExec, Subject: taskID, Action: "overlay", Decision: audit.DecisionDeny, Reason: "base image validation failed: " + verr.Error()})
+				_ = st.Transition(state.StatusFailed, state.ActorController, "base image validation failed: "+verr.Error())
+				state.SaveState(taskID, st)
+				return fmt.Errorf("container: base image %q for %s failed trusted-root validation: %w", s.Workspace.BaseImage, taskID, verr)
+			}
 			resolvedRootfs = overlayPath
-			if err := cow.CreateOverlay(ctx, s.Workspace.BaseImage, overlayPath); err != nil {
+			if err := cow.CreateOverlay(ctx, resolvedBase, overlayPath); err != nil {
 				cleanupVolumes()
 				_ = ledger.Append(audit.Record{Phase: audit.PhaseExec, Subject: taskID, Action: "overlay", Decision: audit.DecisionDeny, Reason: "qcow2 overlay failed: " + err.Error()})
 				_ = st.Transition(state.StatusFailed, state.ActorController, "overlay creation failed: "+err.Error())

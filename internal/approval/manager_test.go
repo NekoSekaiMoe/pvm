@@ -1,6 +1,7 @@
 package approval
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -61,6 +62,89 @@ func TestDecide_Reject(t *testing.T) {
 	}
 	if m.IsApproved("t", "x", nil) {
 		t.Error("rejected ticket should not count as approved")
+	}
+}
+
+// TestCreate_DefaultDeadlineIsServerNowPlus5m pins the default-deadline
+// semantics: the approval window is 5 minutes from the MANAGER's clock, and
+// a caller-supplied CreatedAt must NOT be used as the basis (a forged
+// future CreatedAt used to extend the ticket's life beyond now+5m).
+func TestCreate_DefaultDeadlineIsServerNowPlus5m(t *testing.T) {
+	m := NewManager(nil)
+	m.now = func() time.Time { return baseTime }
+
+	id, err := m.Create(Ticket{TaskID: "t", Tool: "x"})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	tk, err := m.Get(id)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if !tk.Deadline.Equal(baseTime.Add(5 * time.Minute)) {
+		t.Errorf("default deadline = %s, want %s (now+5m)", tk.Deadline, baseTime.Add(5*time.Minute))
+	}
+}
+
+// TestCreate_ForgedCreatedAtCannotExtendDefaultDeadline: a backdated or
+// future-forged CreatedAt must not lengthen the default approval window —
+// the deadline stays anchored to server-side now.
+func TestCreate_ForgedCreatedAtCannotExtendDefaultDeadline(t *testing.T) {
+	m := NewManager(nil)
+	m.now = func() time.Time { return baseTime }
+
+	// CreatedAt forged 1h in the past: old code would set deadline at
+	// CreatedAt+5m (already expired, ticket dead on arrival) — a denial, not
+	// an extension; the meaningful attack is the future-forged case below.
+	idPast, err := m.Create(Ticket{TaskID: "t-past", Tool: "x", CreatedAt: baseTime.Add(-time.Hour)})
+	if err != nil {
+		t.Fatalf("create(past): %v", err)
+	}
+	tkPast, _ := m.Get(idPast)
+	want := baseTime.Add(5 * time.Minute)
+	if !tkPast.Deadline.Equal(want) {
+		t.Errorf("backdated CreatedAt: deadline = %s, want %s (server now+5m)", tkPast.Deadline, want)
+	}
+
+	// CreatedAt forged 1h in the future: old code would set deadline at
+	// CreatedAt+5m, extending the ticket's life by an hour. Must stay now+5m.
+	idFuture, err := m.Create(Ticket{TaskID: "t-future", Tool: "x", CreatedAt: baseTime.Add(time.Hour)})
+	if err != nil {
+		t.Fatalf("create(future): %v", err)
+	}
+	tkFuture, _ := m.Get(idFuture)
+	if !tkFuture.Deadline.Equal(want) {
+		t.Errorf("forged future CreatedAt extended deadline: got %s, want %s", tkFuture.Deadline, want)
+	}
+}
+
+// TestCreate_ExplicitDeadlineOutsideWindowRejected keeps the window
+// semantics for explicit deadlines: they must lie in [now, now+1h] on the
+// MANAGER's clock, regardless of the caller-supplied CreatedAt.
+func TestCreate_ExplicitDeadlineOutsideWindowRejected(t *testing.T) {
+	m := NewManager(nil)
+	m.now = func() time.Time { return baseTime }
+
+	// already expired relative to server now
+	if _, err := m.Create(Ticket{TaskID: "t1", Tool: "x", Deadline: baseTime.Add(-time.Minute)}); !errors.Is(err, ErrInvalidDeadline) {
+		t.Errorf("past deadline: expected ErrInvalidDeadline, got %v", err)
+	}
+	// more than 1h out
+	if _, err := m.Create(Ticket{TaskID: "t2", Tool: "x", Deadline: baseTime.Add(90 * time.Minute)}); !errors.Is(err, ErrInvalidDeadline) {
+		t.Errorf("far-future deadline: expected ErrInvalidDeadline, got %v", err)
+	}
+	// a forged future CreatedAt must not launder an out-of-window deadline
+	if _, err := m.Create(Ticket{
+		TaskID:    "t3",
+		Tool:      "x",
+		CreatedAt: baseTime.Add(2 * time.Hour),
+		Deadline:  baseTime.Add(115 * time.Minute), // > now+1h even though <= CreatedAt+1h
+	}); !errors.Is(err, ErrInvalidDeadline) {
+		t.Errorf("forged CreatedAt laundering deadline: expected ErrInvalidDeadline, got %v", err)
+	}
+	// in-window explicit deadline still accepted
+	if _, err := m.Create(Ticket{TaskID: "t4", Tool: "x", Deadline: baseTime.Add(30 * time.Minute)}); err != nil {
+		t.Errorf("valid explicit deadline rejected: %v", err)
 	}
 }
 

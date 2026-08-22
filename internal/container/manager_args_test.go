@@ -73,7 +73,7 @@ func TestValidateRootfs(t *testing.T) {
 		{"space", "/var/li b/img", false},
 		{"empty", "", false},
 		{"nonexistent", filepath.Join(dir, "missing.img"), false}, // must resolve to a real file
-		{"directory not file", dir, false},                         // regular files only
+		{"directory not file", dir, false},                        // regular files only
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

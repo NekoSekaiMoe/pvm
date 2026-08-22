@@ -455,7 +455,14 @@ func parseMemMB(s string) (int, error) {
 	case "K", "k", "KB", "kb":
 		// Round UP to whole MB: a value below 1024 KB still consumes at least
 		// 1 MB of quota headroom, and truncation would let 1023K claim as 0 MB.
-		mb = (v + 1023) / 1024
+		// Quotient+remainder instead of the old (v+1023) pre-add: on the
+		// largest int64 K value the pre-add overflows and wraps negative,
+		// silently under-charging (actually crediting) quota.
+		kb := v
+		mb = kb / 1024
+		if kb%1024 != 0 {
+			mb++
+		}
 	case "M", "m", "MB", "mb":
 		mb = v
 	case "G", "g", "GB", "gb":
@@ -465,6 +472,11 @@ func parseMemMB(s string) (int, error) {
 		mb = v * 1024
 	default:
 		return 0, fmt.Errorf("unsupported or missing memory unit %q in %q", s[i:], s)
+	}
+	// math.MaxInt is MaxInt32 on 32-bit and MaxInt64 on 64-bit platforms;
+	// converting a larger MB count with int(mb) there would silently wrap.
+	if mb > int64(math.MaxInt) {
+		return 0, fmt.Errorf("memory value %q (%d MB) exceeds platform maximum %d MB", s, mb, int64(math.MaxInt))
 	}
 	return int(mb), nil
 }

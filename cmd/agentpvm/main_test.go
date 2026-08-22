@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"uml-container/internal/spec"
@@ -71,17 +72,54 @@ func TestResolveConfigPath_FallsBackToDefaults(t *testing.T) {
 }
 
 func TestIDRegex(t *testing.T) {
-	valid := []string{"agent-task", "tk_1", "ABC123", "a", "x-y_z0"}
-	invalid := []string{"", "../evil", "a/b", "a b", "a;b", "a$(id)", "evil,opt=x", "dot.name"}
-	for _, id := range valid {
-		if !taskIDRe.MatchString(id) {
-			t.Errorf("taskIDRe rejected valid id %q", id)
+	// sanitizeID turns an arbitrary ID string into a legal, recognizable
+	// subtest name (letters, digits, underscore, dash, dot).
+	sanitizeID := func(id string) string {
+		var b strings.Builder
+		for _, r := range id {
+			switch {
+			case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9',
+				r == '-', r == '_', r == '.':
+				b.WriteRune(r)
+			default:
+				b.WriteRune('_')
+			}
 		}
+		if b.Len() == 0 {
+			return "empty"
+		}
+		return b.String()
 	}
-	for _, id := range invalid {
-		if taskIDRe.MatchString(id) {
-			t.Errorf("taskIDRe accepted invalid id %q", id)
+
+	cases := []struct {
+		id    string
+		valid bool
+	}{
+		{"agent-task", true},
+		{"tk_1", true},
+		{"ABC123", true},
+		{"a", true},
+		{"x-y_z0", true},
+		{"", false},
+		{"../evil", false},
+		{"a/b", false},
+		{"a b", false},
+		{"a;b", false},
+		{"a$(id)", false},
+		{"evil,opt=x", false},
+		{"dot.name", false},
+	}
+	for _, tc := range cases {
+		tc := tc
+		verb := "rejects"
+		if tc.valid {
+			verb = "accepts"
 		}
+		t.Run(verb+"_"+sanitizeID(tc.id), func(t *testing.T) {
+			if got := taskIDRe.MatchString(tc.id); got != tc.valid {
+				t.Errorf("taskIDRe.MatchString(%q) = %v, want %v", tc.id, got, tc.valid)
+			}
+		})
 	}
 }
 

@@ -2,6 +2,7 @@ package volume
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -79,5 +80,50 @@ printf '{"error":""}\n'
 	_, err := p.Attach(context.Background(), &AttachRequest{VolumeID: "v1"})
 	if err == nil || !strings.Contains(err.Error(), "stdout exceeded") {
 		t.Fatalf("Attach err = %v, want stdout-cap error", err)
+	}
+}
+
+// TestResolveExisting_LstatErrorPropagates pins the Lstat-error fix in
+// resolveExisting: only a genuinely missing component justifies walking up;
+// a permission (or other non-ENOENT) error must propagate immediately
+// instead of settling on an unresolved path and silently downgrading
+// validation to the lexical string-prefix check.
+func TestResolveExisting_LstatErrorPropagates(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses directory permissions; Lstat would succeed")
+	}
+	base := t.TempDir()
+	gated := filepath.Join(base, "gated")
+	if err := os.Mkdir(gated, 0o000); err != nil {
+		t.Fatalf("mkdir gated: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(gated, 0o755) }) // let TempDir cleanup succeed
+
+	// Lstat of <base>/gated/child fails with EACCES (no search on gated).
+	// The walk must stop and return the error, not continue up to <base>.
+	p := filepath.Join(gated, "child")
+	_, err := resolveExisting(p)
+	if err == nil {
+		t.Fatal("resolveExisting silently accepted a Lstat permission error")
+	}
+	if !errors.Is(err, os.ErrPermission) {
+		t.Errorf("resolveExisting err = %v, want permission error", err)
+	}
+
+	// Through the public validation path the same scenario must be rejected
+	// (containment verdict unknown), never fall back to string-prefix checks.
+	m := NewManager(base)
+	if err := m.validateHostPath(p); err == nil {
+		t.Fatal("validateHostPath accepted a path whose ancestors cannot be lstat'd")
+	} else if !strings.Contains(err.Error(), "not resolvable") {
+		t.Errorf("validateHostPath err = %v, want not-resolvable rejection", err)
+	}
+
+	// Sanity: with the gate removed the same path resolves normally.
+	if err := os.Chmod(gated, 0o755); err != nil {
+		t.Fatalf("chmod gated: %v", err)
+	}
+	if _, err := resolveExisting(filepath.Join(gated, "child")); err != nil {
+		t.Errorf("resolveExisting after chmod: %v", err)
 	}
 }

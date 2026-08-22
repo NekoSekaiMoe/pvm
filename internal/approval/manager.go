@@ -81,20 +81,24 @@ func (m *Manager) Create(t Ticket) (string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	// The manager's clock is the only basis for validity: a caller-supplied
+	// CreatedAt must never extend a ticket's life, so both the default
+	// deadline and the explicit-deadline window are computed from a single
+	// server-side now.
+	now := m.now()
 	if t.CreatedAt.IsZero() {
-		t.CreatedAt = m.now()
+		t.CreatedAt = now
 	}
 	if t.Deadline.IsZero() {
-		t.Deadline = t.CreatedAt.Add(5 * time.Minute) // default approval window
+		t.Deadline = now.Add(5 * time.Minute) // default approval window
 	} else {
 		// An explicit deadline is caller-supplied input: keep it inside a
-		// sane window evaluated against the MANAGER's clock (m.now()), not the
+		// sane window evaluated against the MANAGER's clock, not the
 		// equally caller-supplied CreatedAt — otherwise a backdated CreatedAt
 		// launders an already-expired or arbitrarily distant deadline. An
 		// already-expired ticket could launder a decision (auto-expire logic
 		// fires immediately); an arbitrarily distant one would pin a pending
 		// gate open forever.
-		now := m.now()
 		if t.Deadline.Before(now) {
 			return "", fmt.Errorf("%w: deadline %s is before the current time %s", ErrInvalidDeadline, t.Deadline.Format(time.RFC3339), now.Format(time.RFC3339))
 		}

@@ -289,7 +289,12 @@ func (l *Ledger) Append(r Record) error {
 		// A failed truncate is reported alongside: it leaves a torn tail the
 		// operator must know about rather than hide.
 		if terr := f.Truncate(preWrite); terr != nil {
-			return fmt.Errorf("audit: write failed (%v) and rollback truncate to %d failed too: %w", werr, preWrite, terr)
+			return fmt.Errorf(
+				"audit: write failed (%v) and rollback truncate to %d failed too: %w",
+				werr,
+				preWrite,
+				terr,
+			)
 		}
 		if werr != nil {
 			return fmt.Errorf("audit: write ledger record: %w", werr)
@@ -306,19 +311,57 @@ func (l *Ledger) Append(r Record) error {
 	// record itself: a crash between the two leaves head lagging, which only
 	// weakens detection, never false-positives.
 	head := fmt.Sprintf("%d %s\n", r.Seq, r.ThisHash)
-	hf, err := os.OpenFile(l.headPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
+	if err := l.writeHeadAtomic(head); err != nil {
+		return err
+	}
+	return nil
+}
+
+// writeHeadAtomic atomically replaces the head watermark. The old O_TRUNC
+// write exposed an empty/partial watermark to a concurrent readHead between
+// truncate and the actual bytes landing; instead we write a 0600 temp file
+// in the SAME directory as the target (rename is only atomic within one
+// filesystem), fsync its contents, rename it over headPath, and fsync the
+// containing directory so the rename itself is durable. Rename's atomicity
+// means readHead observes either the complete old value or the complete new
+// value — never a torn one — with no extra locking. Every step propagates
+// its error and removes the temp file on failure so no debris accumulates.
+func (l *Ledger) writeHeadAtomic(head string) error {
+	dir := filepath.Dir(l.headPath)
+	// os.CreateTemp creates the file with mode 0600: evidence-grade, owner-only.
+	tmp, err := os.CreateTemp(dir, "."+headFileName+".tmp-*")
 	if err != nil {
+		return fmt.Errorf("audit: create head watermark temp file: %w", err)
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.WriteString(head); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
 		return fmt.Errorf("audit: write head watermark: %w", err)
 	}
-	_, werr := hf.WriteString(head)
-	cerr := hf.Close()
-	if werr != nil {
-		return fmt.Errorf("audit: write head watermark: %w", werr)
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return fmt.Errorf("audit: sync head watermark: %w", err)
 	}
-	if cerr != nil {
-		return fmt.Errorf("audit: close head watermark: %w", cerr)
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		return fmt.Errorf("audit: close head watermark: %w", err)
 	}
-	_ = os.Chmod(l.headPath, 0600)
+	if err := os.Rename(tmpName, l.headPath); err != nil {
+		os.Remove(tmpName)
+		return fmt.Errorf("audit: rename head watermark: %w", err)
+	}
+	// fsync the containing directory so the rename (not just the file data)
+	// survives a crash.
+	df, err := os.Open(dir)
+	if err != nil {
+		return fmt.Errorf("audit: open audit dir for fsync: %w", err)
+	}
+	defer df.Close()
+	if err := df.Sync(); err != nil {
+		return fmt.Errorf("audit: fsync audit dir: %w", err)
+	}
 	return nil
 }
 

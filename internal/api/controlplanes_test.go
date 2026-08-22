@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"uml-container/internal/approval"
 	"uml-container/internal/audit"
@@ -253,6 +254,10 @@ func TestAPI_EmptyListsAreArraysNotNull(t *testing.T) {
 	base := bootServer(t)
 	resetPlanes(t)
 
+	// Test-specific client with a finite timeout so both request execution
+	// and the response-body read below cannot wait indefinitely (the
+	// timeout covers the full exchange including reading the body).
+	client := &http.Client{Timeout: 10 * time.Second}
 	for _, path := range []string{
 		"/api/containers",
 		"/api/tasks",
@@ -263,7 +268,7 @@ func TestAPI_EmptyListsAreArraysNotNull(t *testing.T) {
 		t.Run(path, func(t *testing.T) {
 			req, _ := http.NewRequest("GET", base+path, nil)
 			req.Header.Set("Authorization", "Bearer secret")
-			resp, err := http.DefaultClient.Do(req)
+			resp, err := client.Do(req)
 			if err != nil {
 				t.Fatalf("GET %s: %v", path, err)
 			}
