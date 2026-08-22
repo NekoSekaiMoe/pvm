@@ -161,16 +161,12 @@ echo "   Invalid snapshot rollback returned 404 ✓"
 # =========================================================================
 echo "--- 4. Volume Cloning & Rollback ---"
 
-# Create volume
+# Create volume — the builtin driver provisions its qcow2 block image at
+# create time, so clone/snapshot/rollback below operate on real storage.
 VOL_CREATE=$(curl -s -X POST "http://127.0.0.1:$PORT/api/volumes" \
     -H "$AUTH" -H "$JSON_HDR" \
-    -d '{"name":"vol-test-01","driver":"builtin"}')
+    -d '{"name":"vol-test-01","driver":"builtin","size":1048576}')
 echo "$VOL_CREATE" | grep -q "vol-test-01" || fail "volume create failed: $VOL_CREATE"
-
-# Provision the volume's block file out-of-band: the builtin driver's REST
-# surface registers metadata only — the block files under PVM_VOLUME_ROOT
-# are managed by the cow engine, the way an operator/tool would.
-truncate -s 1M "$PVM_VOLUME_ROOT/vol-test-01.qcow2"
 
 # Clone volume
 VOL_CLONE=$(curl -s -X POST "http://127.0.0.1:$PORT/api/volumes/vol-test-01/clone" \
@@ -188,16 +184,22 @@ echo "   Volume cloned and listed successfully ✓"
 # is (correctly) rejected by the engine.
 VOL_RB_CREATE=$(curl -s -X POST "http://127.0.0.1:$PORT/api/volumes" \
     -H "$AUTH" -H "$JSON_HDR" \
-    -d '{"name":"vol-rb-01","driver":"builtin"}')
+    -d '{"name":"vol-rb-01","driver":"builtin","size":1048576}')
 echo "$VOL_RB_CREATE" | grep -q "vol-rb-01" || fail "rollback volume create failed: $VOL_RB_CREATE"
-truncate -s 1M "$PVM_VOLUME_ROOT/vol-rb-01.qcow2"
-cp "$PVM_VOLUME_ROOT/vol-rb-01.qcow2" "$PVM_VOLUME_ROOT/snap-vol-rb-01.qcow2"
+
+# Snapshot the volume via the REST endpoint (snap-<name>.qcow2 under the
+# cow root).
+VOL_SNAP=$(curl -s -X POST "http://127.0.0.1:$PORT/api/volumes/vol-rb-01/snapshots" \
+    -H "$AUTH" -H "$JSON_HDR" \
+    -d '{"snapshot":"rb-point"}')
+echo "$VOL_SNAP" | grep -q '"status":"created"' || fail "volume snapshot failed: $VOL_SNAP"
+echo "$VOL_SNAP" | grep -q 'snap-rb-point' || fail "volume snapshot response missing path: $VOL_SNAP"
 
 VOL_RB=$(curl -s -X POST "http://127.0.0.1:$PORT/api/volumes/vol-rb-01/rollback" \
     -H "$AUTH" -H "$JSON_HDR" \
-    -d '{"snapshot":"vol-rb-01"}')
+    -d '{"snapshot":"rb-point"}')
 echo "$VOL_RB" | grep -q '"status":"rolled_back"' || fail "volume rollback failed: $VOL_RB"
-echo "$VOL_RB" | grep -q '"snapshot":"vol-rb-01"' || fail "volume rollback response missing snapshot: $VOL_RB"
+echo "$VOL_RB" | grep -q '"snapshot":"rb-point"' || fail "volume rollback response missing snapshot: $VOL_RB"
 
 # Restored volume state: the block file was replaced by a standalone qcow2
 # of the snapshot, no temp file leaked, and the metadata record survives.

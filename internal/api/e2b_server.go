@@ -844,7 +844,13 @@ func NewE2BServer() (*echo.Echo, error) {
 	})
 
 	// --- Volumes (Cube parity: POST/GET/DELETE /volumes) ---
-	volStore := volume.NewStore("")
+	// One root for metadata AND blocks: records colocate with the cow
+	// engine's qcow2 files (PVM_VOLUME_ROOT, else the engine's PVM_COW_ROOT
+	// fallback via cow.ResolveRoot) so the registry and the block images it
+	// describes can never drift into different directories. volume.NewStore's
+	// own fallback (DefaultVolumeBaseDir) stays reserved for the plugin-mount
+	// manager — a separate concern (hostPath mounts, not block storage).
+	volStore := volume.NewStore(cow.ResolveRoot(os.Getenv("PVM_VOLUME_ROOT")))
 	// Volume API responses intentionally exclude Token and PrivateData: those
 	// are credentials for mount plugins (internal paths read them from the
 	// store), never for API clients.
@@ -870,6 +876,7 @@ func NewE2BServer() (*echo.Echo, error) {
 			Driver      string `json:"driver"`
 			Token       string `json:"token"`
 			PrivateData string `json:"private_data"`
+			Size        int64  `json:"size"`
 		}
 		if err := c.Bind(&req); err != nil {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
@@ -877,8 +884,41 @@ func NewE2BServer() (*echo.Echo, error) {
 		if req.Name == "" {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": "name required"})
 		}
+		// The builtin driver's volumes are cow block images: provision the
+		// qcow2 up front (size defaults to 64 MiB) so snapshot/clone/rollback
+		// operate on a real image instead of a metadata-only record. Other
+		// drivers (nfs, s3, plugin binaries) stay metadata-only — their
+		// storage is owned externally.
+		blockCreated := false
+		if req.Driver == "builtin" {
+			if req.Size < 0 || req.Size > 1<<40 {
+				return c.JSON(http.StatusBadRequest, map[string]string{"error": "size must be between 0 and 1 TiB"})
+			}
+			size := req.Size
+			if size == 0 {
+				size = 64 << 20
+			}
+			if _, err := cow.NewEngine(cow.ResolveRoot(os.Getenv("PVM_VOLUME_ROOT"))).CreateVolume(req.Name, uint64(size)); err != nil {
+				msg := err.Error()
+				switch {
+				case strings.Contains(msg, "already exists"):
+					return c.JSON(http.StatusConflict, map[string]string{"error": msg})
+				case strings.Contains(msg, "invalid"), strings.Contains(msg, "must not"), strings.Contains(msg, "size must be"):
+					return c.JSON(http.StatusBadRequest, map[string]string{"error": msg})
+				default:
+					return c.JSON(http.StatusInternalServerError, map[string]string{"error": msg})
+				}
+			}
+			blockCreated = true
+		}
 		rec := volume.VolumeRecord{VolumeID: req.Name, Name: req.Name, Driver: req.Driver, Token: req.Token, PrivateData: req.PrivateData}
 		if err := volStore.Create(rec); err != nil {
+			if blockCreated {
+				// Roll the freshly created block back out: the registry is the
+				// source of truth, and a block without a record would 409-block
+				// every future create of the same name.
+				_ = cow.NewEngine(cow.ResolveRoot(os.Getenv("PVM_VOLUME_ROOT"))).DeleteVolume(req.Name)
+			}
 			switch {
 			case errors.Is(err, volume.ErrInvalid):
 				return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
@@ -925,6 +965,43 @@ func NewE2BServer() (*echo.Echo, error) {
 	})
 	api.DELETE("/volumes/:id", func(c echo.Context) error {
 		id := c.Param("id")
+		if !idRegex.MatchString(id) {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid volume id"})
+		}
+		// Mounted volumes must be rejected BEFORE any block cleanup: the
+		// refcount lives in the record, so consult it first instead of
+		// deleting the image out from under a live mount.
+		rec, err := volStore.Get(id)
+		if err != nil {
+			switch {
+			case errors.Is(err, volume.ErrInvalid):
+				return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+			case errors.Is(err, volume.ErrNotFound):
+				return c.JSON(http.StatusNotFound, map[string]string{"error": err.Error()})
+			default:
+				return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			}
+		}
+		if rec.RefCount > 0 {
+			return c.JSON(http.StatusConflict, map[string]string{"error": fmt.Sprintf("volume %q is mounted (refcount=%d)", id, rec.RefCount)})
+		}
+		// Remove the block image (if this driver has one) through the
+		// engine's reference guard: dependents (clones, snapshots) veto the
+		// delete instead of being silently orphaned on a broken chain.
+		volRoot := cow.ResolveRoot(os.Getenv("PVM_VOLUME_ROOT"))
+		if _, serr := os.Stat(filepath.Join(volRoot, id+".qcow2")); serr == nil {
+			if derr := cow.NewEngine(volRoot).DeleteVolume(id); derr != nil {
+				msg := derr.Error()
+				switch {
+				case strings.Contains(msg, "referenced by"), strings.Contains(msg, "scan references"):
+					return c.JSON(http.StatusConflict, map[string]string{"error": msg})
+				case strings.Contains(msg, "not found"):
+					// Raced away underneath us; metadata still needs cleaning.
+				default:
+					return c.JSON(http.StatusInternalServerError, map[string]string{"error": msg})
+				}
+			}
+		}
 		if err := volStore.Delete(id); err != nil {
 			switch {
 			case errors.Is(err, volume.ErrInvalid):
@@ -998,6 +1075,13 @@ func NewE2BServer() (*echo.Echo, error) {
 				_ = volStore.Delete(req.NewID)
 				return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to clone volume: " + err.Error()})
 			}
+		} else {
+			// No block image: this is a metadata-only volume (non-builtin
+			// driver) or the image was lost. Cloning either is meaningless —
+			// fail honestly instead of returning a fake "cloned" with an
+			// empty path.
+			_ = volStore.Delete(req.NewID)
+			return c.JSON(http.StatusNotFound, map[string]string{"error": fmt.Sprintf("volume %q has no block image to clone", id)})
 		}
 		return c.JSON(http.StatusOK, map[string]string{"status": "cloned", "volume_id": req.NewID, "path": path})
 	})
@@ -1019,12 +1103,104 @@ func NewE2BServer() (*echo.Echo, error) {
 		}
 		engine := cow.NewEngine(cow.ResolveRoot(os.Getenv("PVM_VOLUME_ROOT")))
 		if err := engine.RollbackVolume(id, req.Snapshot); err != nil {
-			if strings.Contains(err.Error(), "not found") {
-				return c.JSON(http.StatusNotFound, map[string]string{"error": err.Error()})
+			msg := err.Error()
+			switch {
+			case strings.Contains(msg, "not found"):
+				return c.JSON(http.StatusNotFound, map[string]string{"error": msg})
+			case strings.Contains(msg, "cannot rollback"), strings.Contains(msg, "referenced by"), strings.Contains(msg, "backed by it"), strings.Contains(msg, "scan references"):
+				return c.JSON(http.StatusConflict, map[string]string{"error": msg})
+			default:
+				return c.JSON(http.StatusInternalServerError, map[string]string{"error": msg})
+			}
+		}
+		return c.JSON(http.StatusOK, map[string]string{"status": "rolled_back", "volume": id, "snapshot": req.Snapshot})
+	})
+
+	// POST /api/volumes/:id/snapshots — create a cow snapshot of a volume.
+	// Snapshot names are engine-global (snap-<name>.qcow2): :id selects the
+	// volume to branch from; an empty name auto-generates one.
+	api.POST("/volumes/:id/snapshots", func(c echo.Context) error {
+		id := c.Param("id")
+		if !idRegex.MatchString(id) {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid volume id"})
+		}
+		var req struct {
+			Snapshot string `json:"snapshot"`
+		}
+		if err := c.Bind(&req); err != nil {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+		}
+		name := req.Snapshot
+		if name == "" {
+			name = fmt.Sprintf("auto-%d", time.Now().UnixNano())
+		}
+		if !idRegex.MatchString(name) {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid snapshot name"})
+		}
+		path, err := cow.NewEngine(cow.ResolveRoot(os.Getenv("PVM_VOLUME_ROOT"))).CreateSnapshot(id, name)
+		if err != nil {
+			msg := err.Error()
+			switch {
+			case strings.Contains(msg, "not found"):
+				return c.JSON(http.StatusNotFound, map[string]string{"error": msg})
+			case strings.Contains(msg, "already exists"):
+				return c.JSON(http.StatusConflict, map[string]string{"error": msg})
+			case strings.Contains(msg, "invalid"), strings.Contains(msg, "must not"):
+				return c.JSON(http.StatusBadRequest, map[string]string{"error": msg})
+			default:
+				return c.JSON(http.StatusInternalServerError, map[string]string{"error": msg})
+			}
+		}
+		return c.JSON(http.StatusCreated, map[string]string{"status": "created", "volume": id, "snapshot": name, "path": path})
+	})
+
+	// GET /api/volumes/:id/snapshots — list cow snapshots originating from
+	// the volume (origin resolution walks the backing chain; snapshots whose
+	// chain no longer resolves report an empty origin and are not listed).
+	api.GET("/volumes/:id/snapshots", func(c echo.Context) error {
+		id := c.Param("id")
+		if !idRegex.MatchString(id) {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid volume id"})
+		}
+		snaps, err := cow.NewEngine(cow.ResolveRoot(os.Getenv("PVM_VOLUME_ROOT"))).ListSnapshots(id)
+		if err != nil {
+			if strings.Contains(err.Error(), "invalid") {
+				return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
 			}
 			return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		}
-		return c.JSON(http.StatusOK, map[string]string{"status": "rolled_back", "volume": id, "snapshot": req.Snapshot})
+		if snaps == nil {
+			snaps = []cow.Snapshot{}
+		}
+		return c.JSON(http.StatusOK, snaps)
+	})
+
+	// DELETE /api/volumes/:id/snapshots/:snap — delete a cow snapshot. The
+	// engine keys snapshots by GLOBAL name, so :snap addresses the image
+	// directly; the engine's reference guard rejects snapshots that live
+	// volumes still branch from.
+	api.DELETE("/volumes/:id/snapshots/:snap", func(c echo.Context) error {
+		if !idRegex.MatchString(c.Param("id")) {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid volume id"})
+		}
+		snap := c.Param("snap")
+		if !idRegex.MatchString(snap) {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid snapshot name"})
+		}
+		if err := cow.NewEngine(cow.ResolveRoot(os.Getenv("PVM_VOLUME_ROOT"))).DeleteSnapshot(snap); err != nil {
+			msg := err.Error()
+			switch {
+			case strings.Contains(msg, "not found"):
+				return c.JSON(http.StatusNotFound, map[string]string{"error": msg})
+			case strings.Contains(msg, "referenced by"), strings.Contains(msg, "scan references"):
+				return c.JSON(http.StatusConflict, map[string]string{"error": msg})
+			case strings.Contains(msg, "invalid"), strings.Contains(msg, "must not"):
+				return c.JSON(http.StatusBadRequest, map[string]string{"error": msg})
+			default:
+				return c.JSON(http.StatusInternalServerError, map[string]string{"error": msg})
+			}
+		}
+		return c.NoContent(http.StatusNoContent)
 	})
 
 	// --- Templates (Cube parity: /templates) ---
