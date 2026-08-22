@@ -81,8 +81,14 @@
                 >
                   ▶ Resume
                 </button>
-                <button class="btn btn-primary" @click="showTransitions(t)" style="font-size:0.75rem;padding:0.3rem 0.6rem;">
+                <button class="btn btn-primary" @click="showTransitions(t)" style="font-size:0.75rem;padding:0.3rem 0.6rem;margin-right:0.3rem;">
                   FSM
+                </button>
+                <button class="btn btn-primary" @click="openSnapshotModal(t)" style="font-size:0.75rem;padding:0.3rem 0.6rem;margin-right:0.3rem;">
+                  📸 Snaps
+                </button>
+                <button class="btn btn-primary" @click="cloneTaskPrompt(t.id)" style="font-size:0.75rem;padding:0.3rem 0.6rem;">
+                  🐑 Clone
                 </button>
               </td>
               <td>
@@ -121,6 +127,52 @@
           <button class="btn btn-danger" @click="selected = null">Close</button>
         </div>
         <div v-if="transError" class="callout err" style="margin-top:1rem;">{{ transError }}</div>
+      </div>
+    <!-- Snapshot modal -->
+    <div v-if="snapModalTask" class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="snap-modal-title" @keydown.esc="snapModalTask = null">
+      <div class="modal-box">
+        <h3 id="snap-modal-title">Event Snapshots — {{ snapModalTask.id }}</h3>
+        
+        <!-- Take Snapshot -->
+        <div class="input-group" style="margin-top:1rem;margin-bottom:1.5rem;">
+          <input v-model="snapEventId" placeholder="Event ID (e.g. step_042)" style="flex:0.6;" />
+          <button class="btn btn-primary" @click="takeSnapshot(snapModalTask.id)">Take Snapshot</button>
+        </div>
+
+        <!-- Snapshots List -->
+        <div class="table-container" style="max-height:250px;overflow-y:auto;">
+          <table>
+            <thead>
+              <tr>
+                <th>Snapshot ID</th>
+                <th>Event ID</th>
+                <th>Created</th>
+                <th>Action</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="s in taskSnapshots" :key="s.id">
+                <td class="mono" style="font-size:0.8rem;">{{ s.id }}</td>
+                <td>{{ s.event_id }}</td>
+                <td class="timeline-meta">{{ fmt(s.created_at) }}</td>
+                <td>
+                  <button class="btn btn-primary" style="font-size:0.75rem;padding:0.2rem 0.5rem;background:var(--accent);" @click="rollbackToSnap(snapModalTask.id, s.id)">
+                    ↩ Rollback
+                  </button>
+                </td>
+              </tr>
+              <tr v-if="taskSnapshots.length === 0">
+                <td colspan="4" class="muted" style="text-align:center;padding:1rem;">No event snapshots found.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div v-if="snapError" class="callout err" style="margin-top:1rem;">{{ snapError }}</div>
+
+        <div style="display:flex;justify-content:flex-end;margin-top:1.5rem;">
+          <button class="btn btn-danger" @click="snapModalTask = null">Close</button>
+        </div>
       </div>
     </div>
   </div>
@@ -211,6 +263,70 @@ const resumeTask = async (id) => {
     refresh()
   } catch (e) {
     alert(`Resume error: ${e.message}`)
+  }
+}
+
+// Clone
+const cloneTaskPrompt = async (id) => {
+  const newID = prompt(`Enter new task ID to clone ${id} into:`, `${id}-cloned`)
+  if (!newID) return
+  try {
+    await apiFetch(`/api/tasks/${encodeURIComponent(id)}/clone`, {
+      method: 'POST',
+      body: { new_id: newID }
+    })
+    refresh()
+  } catch (e) {
+    alert(`Clone error: ${e.message}`)
+  }
+}
+
+// Snapshots & Rollback
+const snapModalTask = ref(null)
+const taskSnapshots = ref([])
+const snapEventId = ref('')
+const snapError = ref('')
+
+const openSnapshotModal = async (t) => {
+  snapModalTask.value = t
+  snapError.value = ''
+  snapEventId.value = `step_${Date.now().toString().slice(-4)}`
+  await loadSnapshots(t.id)
+}
+
+const loadSnapshots = async (id) => {
+  try {
+    taskSnapshots.value = await apiFetch(`/api/tasks/${encodeURIComponent(id)}/snapshots`) || []
+  } catch (e) {
+    snapError.value = e.message
+  }
+}
+
+const takeSnapshot = async (id) => {
+  snapError.value = ''
+  try {
+    await apiFetch(`/api/tasks/${encodeURIComponent(id)}/snapshots`, {
+      method: 'POST',
+      body: { event_id: snapEventId.value || 'manual' }
+    })
+    await loadSnapshots(id)
+  } catch (e) {
+    snapError.value = e.message
+  }
+}
+
+const rollbackToSnap = async (id, snapId) => {
+  if (!confirm(`Are you sure you want to rollback ${id} to snapshot ${snapId}?`)) return
+  snapError.value = ''
+  try {
+    await apiFetch(`/api/tasks/${encodeURIComponent(id)}/rollback`, {
+      method: 'POST',
+      body: { snapshot_id: snapId }
+    })
+    refresh()
+    alert(`Successfully rolled back to ${snapId}`)
+  } catch (e) {
+    snapError.value = e.message
   }
 }
 

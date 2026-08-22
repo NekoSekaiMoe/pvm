@@ -436,27 +436,92 @@ func trimExt(p string) string {
 }
 
 func snapshotCmd(args []string) {
-	if len(args) < 3 {
-		fmt.Println("Usage: agentpvm snapshot [export|import] <id> <file.tgz>")
+	if len(args) < 1 {
+		fmt.Println("Usage: agentpvm snapshot [export|import|create|list|clone|rollback]")
 		os.Exit(1)
 	}
-	sub, id, file := args[0], args[1], args[2]
-	if sub == "export" {
+	sub := args[0]
+	switch sub {
+	case "export":
+		if len(args) < 3 {
+			fmt.Println("Usage: agentpvm snapshot export <id> <file.tgz>")
+			os.Exit(1)
+		}
+		id, file := args[1], args[2]
 		if err := snapshot.Export(id, file); err != nil {
 			fmt.Printf("Export failed: %v\n", err)
 			os.Exit(1)
-		} else {
-			fmt.Println("Snapshot exported successfully to", file)
 		}
-	} else if sub == "import" {
+		fmt.Println("Snapshot exported successfully to", file)
+	case "import":
+		if len(args) < 3 {
+			fmt.Println("Usage: agentpvm snapshot import <id> <file.tgz>")
+			os.Exit(1)
+		}
+		id, file := args[1], args[2]
 		if err := snapshot.Import(file, id); err != nil {
 			fmt.Printf("Import failed: %v\n", err)
 			os.Exit(1)
-		} else {
-			fmt.Println("Snapshot imported successfully as", id)
 		}
-	} else {
-		fmt.Println("Usage: agentpvm snapshot [export|import] <id> <file.tgz>")
+		fmt.Println("Snapshot imported successfully as", id)
+	case "create":
+		if len(args) < 3 {
+			fmt.Println("Usage: agentpvm snapshot create <id> <event_id> [audit_hash]")
+			os.Exit(1)
+		}
+		id, eventID := args[1], args[2]
+		auditHash := ""
+		if len(args) >= 4 {
+			auditHash = args[3]
+		}
+		snap, err := snapshot.CreateEventSnapshot(id, eventID, auditHash, nil)
+		if err != nil {
+			fmt.Printf("Create snapshot failed: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("Event snapshot created: %s (event=%s, hash=%s)\n", snap.ID, snap.EventID, snap.AuditHash)
+	case "list":
+		if len(args) < 2 {
+			fmt.Println("Usage: agentpvm snapshot list <id>")
+			os.Exit(1)
+		}
+		id := args[1]
+		list, err := snapshot.ListEventSnapshots(id)
+		if err != nil {
+			fmt.Printf("List snapshots failed: %v\n", err)
+			os.Exit(1)
+		}
+		if len(list) == 0 {
+			fmt.Println("(no snapshots)")
+			return
+		}
+		for _, s := range list {
+			fmt.Printf("%s\t%s\t%s\t%s\n", s.ID, s.EventID, s.AuditHash, s.CreatedAt.Format(time.RFC3339))
+		}
+	case "clone":
+		if len(args) < 3 {
+			fmt.Println("Usage: agentpvm snapshot clone <src_id> <dst_id>")
+			os.Exit(1)
+		}
+		srcID, dstID := args[1], args[2]
+		if err := snapshot.Clone(srcID, dstID); err != nil {
+			fmt.Printf("Clone failed: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("Cloned %s -> %s successfully\n", srcID, dstID)
+	case "rollback":
+		if len(args) < 3 {
+			fmt.Println("Usage: agentpvm snapshot rollback <id> <snap_id>")
+			os.Exit(1)
+		}
+		id, snapID := args[1], args[2]
+		if err := snapshot.Rollback(id, snapID); err != nil {
+			fmt.Printf("Rollback failed: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("Rolled back %s to %s successfully\n", id, snapID)
+	default:
+		fmt.Println("Usage: agentpvm snapshot [export|import|create|list|clone|rollback]")
 		os.Exit(1)
 	}
 }

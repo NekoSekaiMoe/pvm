@@ -21,6 +21,7 @@ import (
 	"uml-container/internal/cgroup"
 	"uml-container/internal/config"
 	"uml-container/internal/container"
+	"uml-container/internal/cow"
 	"uml-container/internal/image"
 	"uml-container/internal/lifecycle"
 	"uml-container/internal/policy"
@@ -249,6 +250,56 @@ func StartE2BServer(port int) error {
 	})
 	// End of restore container
 
+	// Clone container
+	api.POST("/containers/:id/clone", func(c echo.Context) error {
+		id := c.Param("id")
+		if !idRegex.MatchString(id) {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "Invalid container ID"})
+		}
+		var req struct {
+			NewID string `json:"new_id"`
+		}
+		if err := c.Bind(&req); err != nil || req.NewID == "" {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "new_id is required"})
+		}
+		if !idRegex.MatchString(req.NewID) {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "Invalid new_id format"})
+		}
+		if err := snapshot.Clone(id, req.NewID); err != nil {
+			if strings.Contains(err.Error(), "already exists") {
+				return c.JSON(http.StatusConflict, map[string]string{"error": err.Error()})
+			}
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		}
+		return c.JSON(http.StatusOK, map[string]string{"status": "cloned", "id": req.NewID, "source_id": id})
+	})
+
+	// Rollback container
+	api.POST("/containers/:id/rollback", func(c echo.Context) error {
+		id := c.Param("id")
+		if !idRegex.MatchString(id) {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "Invalid container ID"})
+		}
+		var req struct {
+			SnapshotID string `json:"snapshot_id"`
+		}
+		if err := c.Bind(&req); err != nil || req.SnapshotID == "" {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "snapshot_id is required"})
+		}
+		if !idRegex.MatchString(req.SnapshotID) {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "Invalid snapshot_id format"})
+		}
+		release := taskLock(id)
+		defer release()
+		if err := snapshot.Rollback(id, req.SnapshotID); err != nil {
+			if strings.Contains(err.Error(), "not found") {
+				return c.JSON(http.StatusNotFound, map[string]string{"error": err.Error()})
+			}
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		}
+		return c.JSON(http.StatusOK, map[string]string{"status": "rolled_back", "id": id, "snapshot_id": req.SnapshotID})
+	})
+
 	// Pull image
 	api.POST("/images/pull", func(c echo.Context) error {
 		type PullReq struct {
@@ -434,6 +485,147 @@ func StartE2BServer(port int) error {
 			"spec":        s,
 			"fingerprint": s.Fingerprint(),
 		})
+	})
+
+	// --- Event Snapshots & Task Clone / Rollback ---
+
+	// POST /api/tasks/:id/snapshots — create event-level snapshot
+	api.POST("/tasks/:id/snapshots", func(c echo.Context) error {
+		id := c.Param("id")
+		if !idRegex.MatchString(id) {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid task id"})
+		}
+		var req struct {
+			EventID   string            `json:"event_id"`
+			AuditHash string            `json:"audit_hash"`
+			Metadata  map[string]string `json:"metadata"`
+		}
+		_ = c.Bind(&req)
+		snap, err := snapshot.CreateEventSnapshot(id, req.EventID, req.AuditHash, req.Metadata)
+		if err != nil {
+			if strings.Contains(err.Error(), "not found") {
+				return c.JSON(http.StatusNotFound, map[string]string{"error": err.Error()})
+			}
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		}
+		return c.JSON(http.StatusOK, snap)
+	})
+
+	// GET /api/tasks/:id/snapshots — list event snapshots for a task
+	api.GET("/tasks/:id/snapshots", func(c echo.Context) error {
+		id := c.Param("id")
+		if !idRegex.MatchString(id) {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid task id"})
+		}
+		list, err := snapshot.ListEventSnapshots(id)
+		if err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		}
+		return c.JSON(http.StatusOK, list)
+	})
+
+	// GET /api/tasks/:id/snapshots/:snapId — get event snapshot detail
+	api.GET("/tasks/:id/snapshots/:snapId", func(c echo.Context) error {
+		id := c.Param("id")
+		snapId := c.Param("snapId")
+		if !idRegex.MatchString(id) || !idRegex.MatchString(snapId) {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid id format"})
+		}
+		snap, err := snapshot.GetEventSnapshot(id, snapId)
+		if err != nil {
+			return c.JSON(http.StatusNotFound, map[string]string{"error": err.Error()})
+		}
+		return c.JSON(http.StatusOK, snap)
+	})
+
+	// DELETE /api/tasks/:id/snapshots/:snapId — delete event snapshot
+	api.DELETE("/tasks/:id/snapshots/:snapId", func(c echo.Context) error {
+		id := c.Param("id")
+		snapId := c.Param("snapId")
+		if !idRegex.MatchString(id) || !idRegex.MatchString(snapId) {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid id format"})
+		}
+		if err := snapshot.DeleteEventSnapshot(id, snapId); err != nil {
+			if strings.Contains(err.Error(), "not found") {
+				return c.JSON(http.StatusNotFound, map[string]string{"error": err.Error()})
+			}
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		}
+		return c.String(http.StatusOK, "Deleted")
+	})
+
+	// POST /api/tasks/:id/clone — instant clone a task
+	api.POST("/tasks/:id/clone", func(c echo.Context) error {
+		id := c.Param("id")
+		if !idRegex.MatchString(id) {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid source task id"})
+		}
+		var req struct {
+			NewID string `json:"new_id"`
+		}
+		if err := c.Bind(&req); err != nil || req.NewID == "" {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "new_id is required"})
+		}
+		if !idRegex.MatchString(req.NewID) {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid new_id format"})
+		}
+		if err := snapshot.Clone(id, req.NewID); err != nil {
+			if strings.Contains(err.Error(), "already exists") {
+				return c.JSON(http.StatusConflict, map[string]string{"error": err.Error()})
+			}
+			if strings.Contains(err.Error(), "not found") {
+				return c.JSON(http.StatusNotFound, map[string]string{"error": err.Error()})
+			}
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		}
+		if l, lerr := audit.Open(req.NewID); lerr == nil {
+			_ = l.Append(audit.Record{
+				Phase:    audit.PhaseExec,
+				Subject:  "system",
+				Action:   "clone",
+				Params:   map[string]string{"source_id": id},
+				Decision: audit.DecisionAllow,
+				Reason:   "instant clone from " + id,
+			})
+		}
+		return c.JSON(http.StatusOK, map[string]string{"status": "cloned", "id": req.NewID, "source_id": id})
+	})
+
+	// POST /api/tasks/:id/rollback — historical rollback
+	api.POST("/tasks/:id/rollback", func(c echo.Context) error {
+		id := c.Param("id")
+		if !idRegex.MatchString(id) {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid task id"})
+		}
+		var req struct {
+			SnapshotID string `json:"snapshot_id"`
+		}
+		if err := c.Bind(&req); err != nil || req.SnapshotID == "" {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "snapshot_id is required"})
+		}
+		if !idRegex.MatchString(req.SnapshotID) {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid snapshot_id format"})
+		}
+		release := taskLock(id)
+		defer release()
+		if err := snapshot.Rollback(id, req.SnapshotID); err != nil {
+			if strings.Contains(err.Error(), "not found") {
+				return c.JSON(http.StatusNotFound, map[string]string{"error": err.Error()})
+			}
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		}
+		if l, lerr := audit.Open(id); lerr == nil {
+			_ = l.Append(audit.Record{
+				Phase:    audit.PhaseExec,
+				Subject:  "human",
+				Action:   "rollback",
+				Params:   map[string]string{"snapshot_id": req.SnapshotID},
+				Decision: audit.DecisionAllow,
+				Reason:   "historical rollback to " + req.SnapshotID,
+			})
+		}
+		st, _ := state.LoadState(id)
+		return c.JSON(http.StatusOK, map[string]interface{}{"status": "rolled_back", "id": id, "snapshot_id": req.SnapshotID, "state": st})
 	})
 
 	// --- Audit ledger (plan.md §14) ---
@@ -735,6 +927,72 @@ func StartE2BServer(port int) error {
 			}
 		}
 		return c.NoContent(http.StatusNoContent)
+	})
+
+	// POST /api/volumes/:id/clone — clone volume via CoW
+	api.POST("/volumes/:id/clone", func(c echo.Context) error {
+		id := c.Param("id")
+		if !idRegex.MatchString(id) {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid volume id"})
+		}
+		var req struct {
+			NewID string `json:"new_id"`
+		}
+		if err := c.Bind(&req); err != nil || req.NewID == "" {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "new_id is required"})
+		}
+		if !idRegex.MatchString(req.NewID) {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid new_id format"})
+		}
+		rec, err := volStore.Get(id)
+		if err != nil {
+			if errors.Is(err, volume.ErrNotFound) {
+				return c.JSON(http.StatusNotFound, map[string]string{"error": err.Error()})
+			}
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		}
+		newRec := volume.VolumeRecord{
+			VolumeID:    req.NewID,
+			Name:        req.NewID,
+			Driver:      rec.Driver,
+			Token:       rec.Token,
+			PrivateData: rec.PrivateData,
+			CreatedAt:   time.Now().UTC(),
+		}
+		if err := volStore.Create(newRec); err != nil {
+			if errors.Is(err, volume.ErrExists) {
+				return c.JSON(http.StatusConflict, map[string]string{"error": err.Error()})
+			}
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		}
+		engine := cow.NewEngine(os.Getenv("PVM_VOLUME_ROOT"))
+		path, _ := engine.CloneVolume(id, req.NewID)
+		return c.JSON(http.StatusOK, map[string]string{"status": "cloned", "volume_id": req.NewID, "path": path})
+	})
+
+	// POST /api/volumes/:id/rollback — rollback volume to snapshot
+	api.POST("/volumes/:id/rollback", func(c echo.Context) error {
+		id := c.Param("id")
+		if !idRegex.MatchString(id) {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid volume id"})
+		}
+		var req struct {
+			Snapshot string `json:"snapshot"`
+		}
+		if err := c.Bind(&req); err != nil || req.Snapshot == "" {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "snapshot is required"})
+		}
+		if !idRegex.MatchString(req.Snapshot) {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid snapshot format"})
+		}
+		engine := cow.NewEngine(os.Getenv("PVM_VOLUME_ROOT"))
+		if err := engine.RollbackVolume(id, req.Snapshot); err != nil {
+			if strings.Contains(err.Error(), "not found") {
+				return c.JSON(http.StatusNotFound, map[string]string{"error": err.Error()})
+			}
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		}
+		return c.JSON(http.StatusOK, map[string]string{"status": "rolled_back", "volume": id, "snapshot": req.Snapshot})
 	})
 
 	// --- Templates (Cube parity: /templates) ---

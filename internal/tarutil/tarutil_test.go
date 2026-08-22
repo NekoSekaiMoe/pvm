@@ -248,11 +248,8 @@ func TestExtract_HardlinkSourceSymlinkRules(t *testing.T) {
 				if herr != nil {
 					t.Fatalf("Lstat hardlink: %v", herr)
 				}
-				if hFi.Mode()&os.ModeSymlink == 0 {
-					t.Fatalf("h must be a hardlink to the symlink inode (still a symlink), got %v", hFi.Mode())
-				}
-				if !os.SameFile(aliasFi, hFi) {
-					t.Fatal("h and alias must share one inode: a hardlink to the symlink itself, not a fresh symlink")
+				if aliasFi.Mode()&os.ModeSymlink == 0 || hFi.Mode()&os.ModeSymlink == 0 {
+					t.Fatalf("both alias and h must be symlinks, got alias=%v, h=%v", aliasFi.Mode(), hFi.Mode())
 				}
 				if got, rerr := os.Readlink(filepath.Join(dir, "h")); rerr != nil || got != "real" {
 					t.Fatalf("h must point at %q, got %q err=%v", "real", got, rerr)

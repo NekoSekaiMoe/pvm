@@ -55,6 +55,8 @@ type Engine interface {
 	CreateSnapshot(sourceName, snapshotName string) (string, error)
 	DeleteSnapshot(snapshotName string) error
 	ListSnapshots(volumeName string) ([]Snapshot, error)
+	CloneVolume(sourceVolume, newVolume string) (string, error)
+	RollbackVolume(volumeName, snapshotName string) error
 }
 
 // Qcow2Engine is the qcow2-file backend. Each volume is a standalone qcow2
@@ -308,3 +310,73 @@ func (e *Qcow2Engine) ListSnapshots(volumeName string) ([]Snapshot, error) {
 	}
 	return out, nil
 }
+
+// CloneVolume creates a new volume instantly via Copy-on-Write branching from an existing volume or snapshot.
+func (e *Qcow2Engine) CloneVolume(sourceVolume, newVolume string) (string, error) {
+	if err := validateName("source", sourceVolume); err != nil {
+		return "", err
+	}
+	if err := validateName("volume", newVolume); err != nil {
+		return "", err
+	}
+	if strings.HasPrefix(newVolume, "snap-") {
+		return "", fmt.Errorf("cow: volume name %q must not start with %q (reserved for snapshots)", newVolume, "snap-")
+	}
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	srcPath := e.volumePath(sourceVolume)
+	if _, err := os.Stat(srcPath); err != nil {
+		srcPath = e.snapshotPath(sourceVolume)
+		if _, err2 := os.Stat(srcPath); err2 != nil {
+			return "", fmt.Errorf("cow: source volume or snapshot %q not found", sourceVolume)
+		}
+	}
+
+	dstPath := e.volumePath(newVolume)
+	if _, err := os.Stat(dstPath); err == nil {
+		return "", fmt.Errorf("cow: target volume %q already exists", newVolume)
+	}
+
+	if err := os.MkdirAll(e.root, 0755); err != nil {
+		return "", err
+	}
+
+	if err := CreateOverlay(context.Background(), srcPath, dstPath); err != nil {
+		return "", err
+	}
+	return dstPath, nil
+}
+
+// RollbackVolume resets a volume to a previous snapshot state.
+func (e *Qcow2Engine) RollbackVolume(volumeName, snapshotName string) error {
+	if err := validateName("volume", volumeName); err != nil {
+		return err
+	}
+	if err := validateName("snapshot", snapshotName); err != nil {
+		return err
+	}
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	volPath := e.volumePath(volumeName)
+	if _, err := os.Stat(volPath); err != nil {
+		return fmt.Errorf("cow: volume %q not found", volumeName)
+	}
+
+	snapPath := e.snapshotPath(snapshotName)
+	if _, err := os.Stat(snapPath); err != nil {
+		return fmt.Errorf("cow: snapshot %q not found", snapshotName)
+	}
+
+	tmpPath := filepath.Join(e.root, ".tmp-rb-"+volumeName+".qcow2")
+	_ = os.Remove(tmpPath)
+	if err := CreateOverlay(context.Background(), snapPath, tmpPath); err != nil {
+		return fmt.Errorf("cow: create rollback overlay: %w", err)
+	}
+
+	return os.Rename(tmpPath, volPath)
+}
+

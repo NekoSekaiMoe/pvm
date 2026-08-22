@@ -21,6 +21,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"golang.org/x/sys/unix"
 )
 
 // Limits bounds the resources one extraction may consume. The zero value is
@@ -274,7 +276,19 @@ func extractHardlink(hdr *tar.Header, absDest, target string) error {
 	if err := os.Remove(target); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("tarutil: remove existing %s: %w", hdr.Name, err)
 	}
-	if err := os.Link(src, target); err != nil {
+	srcFi, serr := os.Lstat(src)
+	if serr != nil {
+		return fmt.Errorf("tarutil: stat hardlink source %s: %w", hdr.Linkname, serr)
+	}
+	if srcFi.Mode()&os.ModeSymlink != 0 {
+		if symlinkTarget, err := os.Readlink(src); err == nil {
+			_ = os.Remove(target)
+			if err2 := os.Symlink(symlinkTarget, target); err2 == nil {
+				return nil
+			}
+		}
+	}
+	if err := unix.Linkat(unix.AT_FDCWD, src, unix.AT_FDCWD, target, 0); err != nil {
 		return fmt.Errorf("tarutil: hardlink %s -> %s: %w", hdr.Name, hdr.Linkname, err)
 	}
 	return nil

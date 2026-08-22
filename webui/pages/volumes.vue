@@ -39,7 +39,13 @@
               </td>
               <td class="timeline-meta">{{ fmt(v.created_at) }}</td>
               <td>
-                <button class="btn btn-danger" style="font-size:0.8rem;" @click="deleteVolume(v.volume_id)" :disabled="v.refcount > 0" :title="v.refcount > 0 ? 'Cannot delete mounted volume' : 'Delete volume'">
+                <button class="btn btn-primary" style="font-size:0.75rem;padding:0.3rem 0.5rem;margin-right:0.3rem;" @click="cloneVolumePrompt(v.volume_id)">
+                  🐑 Clone
+                </button>
+                <button class="btn btn-primary" style="font-size:0.75rem;padding:0.3rem 0.5rem;margin-right:0.3rem;background:var(--accent);" @click="rollbackVolumePrompt(v.volume_id)">
+                  ↩ Rollback
+                </button>
+                <button class="btn btn-danger" style="font-size:0.75rem;padding:0.3rem 0.5rem;" @click="deleteVolume(v.volume_id)" :disabled="v.refcount > 0" :title="v.refcount > 0 ? 'Cannot delete mounted volume' : 'Delete volume'">
                   Delete
                 </button>
               </td>
@@ -141,15 +147,32 @@ const createVolume = async () => {
   }
 }
 
-const deleteVolume = async (id) => {
-  if (!confirm(`Delete persistent volume ${id}?`)) return
+const cloneVolumePrompt = async (id) => {
+  const newID = prompt(`Enter new volume ID to clone ${id} into:`, `${id}-cloned`)
+  if (!newID) return
   try {
-    await apiFetch(`/api/volumes/${encodeURIComponent(id)}`, {
-      method: 'DELETE'
+    await apiFetch(`/api/volumes/${encodeURIComponent(id)}/clone`, {
+      method: 'POST',
+      body: { new_id: newID }
     })
     refresh()
   } catch (e) {
-    alert(`Error deleting volume: ${e.message}`)
+    alert(`Clone error: ${e.message}`)
+  }
+}
+
+const rollbackVolumePrompt = async (id) => {
+  const snapshot = prompt(`Enter snapshot name to rollback volume ${id} to:`, `snap-${id}`)
+  if (!snapshot) return
+  try {
+    await apiFetch(`/api/volumes/${encodeURIComponent(id)}/rollback`, {
+      method: 'POST',
+      body: { snapshot }
+    })
+    refresh()
+    alert(`Successfully rolled back volume ${id} to ${snapshot}`)
+  } catch (e) {
+    alert(`Rollback error: ${e.message}`)
   }
 }
 
