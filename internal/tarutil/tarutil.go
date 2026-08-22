@@ -258,10 +258,11 @@ func extractHardlink(hdr *tar.Header, absDest, target string) error {
 	// The SOURCE path is resolved by the kernel during link(2): a symlinked
 	// ancestor on it ("dir -> /etc" planted earlier, then a hardlink to
 	// "dir/passwd") would link a file OUTSIDE dest even though the member
-	// name itself stays inside. Guard the source path like the target's
-	// parent — only the final component of link(2)'s oldname is not
-	// dereferenced, every intermediate component is.
-	if err := checkNoSymlinkAncestor(absDest, src); err != nil {
+	// name itself stays inside. link(2) does not dereference the FINAL
+	// component of its oldname, so a hardlink whose source name itself is a
+	// symlink (linking over a symlink target name) stays a legitimate,
+	// in-dest operation — guard only the intermediate components of src.
+	if err := checkNoSymlinkAncestor(absDest, filepath.Dir(src)); err != nil {
 		return err
 	}
 	if err := checkNoSymlinkAncestor(absDest, filepath.Dir(target)); err != nil {

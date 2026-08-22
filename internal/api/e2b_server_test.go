@@ -5,6 +5,8 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -393,5 +395,77 @@ func TestAPI_TemplateAliasAndDeleteByAlias(t *testing.T) {
 	resp, _ = doJSON(t, "GET", base, "/api/templates/"+readyID, nil)
 	if resp.StatusCode != 404 {
 		t.Fatalf("template must be gone after delete, got %d", resp.StatusCode)
+	}
+}
+
+func TestValidateAPIRootfs_ResolvesSymlinksAndKeepsFormatChecks(t *testing.T) {
+	root := t.TempDir()
+	// The image root itself is reached through a symlink (e.g. /var/lib on a
+	// symlinked mount): BOTH sides must be resolved before containment.
+	realDir := filepath.Join(root, "images-real")
+	if err := os.MkdirAll(realDir, 0755); err != nil {
+		t.Fatalf("mkdir image dir: %v", err)
+	}
+	aliasDir := filepath.Join(root, "images-alias")
+	if err := os.Symlink(realDir, aliasDir); err != nil {
+		t.Fatalf("symlink image dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(realDir, "alpine.img"), []byte("x"), 0644); err != nil {
+		t.Fatalf("seed image: %v", err)
+	}
+
+	// Input-format and absolute-path checks fire BEFORE any resolution and
+	// keep their messages.
+	for _, tc := range []struct{ in, want string }{
+		{"", "rootfs is required"},
+		{"/a b", "whitespace"},
+		{"/a:b", "whitespace"},
+		{"relative/path", "absolute path"},
+	} {
+		if _, err := validateRootfsUnder(tc.in, aliasDir); err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Fatalf("rootfs %q: want error containing %q, got %v", tc.in, tc.want, err)
+		}
+	}
+
+	// A rootfs reached through the symlinked image root resolves to the real
+	// trusted path, which is what the caller must keep using.
+	got, err := validateRootfsUnder(filepath.Join(aliasDir, "alpine.img"), aliasDir)
+	if err != nil {
+		t.Fatalf("valid rootfs through symlinked image dir: %v", err)
+	}
+	if want := filepath.Join(realDir, "alpine.img"); got != want {
+		t.Fatalf("resolved rootfs = %q, want the trusted resolved path %q", got, want)
+	}
+
+	// A symlinked final component inside the image root resolves to its
+	// in-root target.
+	if err := os.Symlink("alpine.img", filepath.Join(realDir, "current.img")); err != nil {
+		t.Fatalf("symlink image: %v", err)
+	}
+	got, err = validateRootfsUnder(filepath.Join(aliasDir, "current.img"), aliasDir)
+	if err != nil {
+		t.Fatalf("symlinked final component: %v", err)
+	}
+	if want := filepath.Join(realDir, "alpine.img"); got != want {
+		t.Fatalf("resolved symlinked rootfs = %q, want %q", got, want)
+	}
+
+	// Symlink swap: the raw path sits under the image root, but resolves
+	// outside it — must be rejected by the post-resolution containment check
+	// (the swapped-to file must EXIST so resolution succeeds and the escape
+	// is caught by containment, not by a resolve error).
+	elsewhere := filepath.Join(root, "elsewhere")
+	if err := os.MkdirAll(elsewhere, 0755); err != nil {
+		t.Fatalf("mkdir elsewhere: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(elsewhere, "evil.img"), []byte("x"), 0644); err != nil {
+		t.Fatalf("seed evil image: %v", err)
+	}
+	if err := os.Symlink(elsewhere, filepath.Join(realDir, "swapped")); err != nil {
+		t.Fatalf("symlink swap: %v", err)
+	}
+	if _, err := validateRootfsUnder(filepath.Join(aliasDir, "swapped", "evil.img"), aliasDir); err == nil ||
+		!strings.Contains(err.Error(), "rootfs must live under") {
+		t.Fatalf("symlink-swapped rootfs must be rejected post-resolution, got %v", err)
 	}
 }

@@ -199,3 +199,51 @@ func TestExtract_StripsSetuidSetgidSticky(t *testing.T) {
 		t.Fatalf("perm = %v, want 0755", fi.Mode().Perm())
 	}
 }
+
+func TestExtract_HardlinkSourceSymlinkRules(t *testing.T) {
+	// link(2) dereferences every INTERMEDIATE component of its oldname but
+	// never the final one. A symlinked ancestor of the hardlink source is
+	// therefore a pivot out of dest and must stay rejected, while a source
+	// name that is ITSELF a symlink (hardlinking over a symlink target name)
+	// is a legitimate in-dest operation and must be accepted.
+	t.Run("intermediate_symlinked_ancestor_rejected", func(t *testing.T) {
+		dir := t.TempDir()
+		data := buildTar(t, []tarEntry{
+			{tar.Header{Name: "real", Typeflag: tar.TypeDir, Mode: 0755}, nil},
+			{tar.Header{Name: "real/data", Typeflag: tar.TypeReg, Mode: 0644, Size: 4}, []byte("data")},
+			{tar.Header{Name: "pivot", Typeflag: tar.TypeSymlink, Linkname: "real", Mode: 0777}, nil},
+			{tar.Header{Name: "h", Typeflag: tar.TypeLink, Linkname: "pivot/data", Mode: 0644}, nil},
+		})
+		err := Extract(bytes.NewReader(data), dir, DefaultLimits())
+		if err == nil || !strings.Contains(err.Error(), "traverses symlink") {
+			t.Fatalf("hardlink through symlinked source ancestor must be rejected with traverses-symlink error, got: %v", err)
+		}
+		if _, serr := os.Lstat(filepath.Join(dir, "h")); serr == nil {
+			t.Fatal("rejected hardlink must not exist")
+		}
+	})
+
+	t.Run("final_source_component_symlink_accepted", func(t *testing.T) {
+		dir := t.TempDir()
+		data := buildTar(t, []tarEntry{
+			{tar.Header{Name: "real", Typeflag: tar.TypeReg, Mode: 0644, Size: 4}, []byte("data")},
+			{tar.Header{Name: "alias", Typeflag: tar.TypeSymlink, Linkname: "real", Mode: 0777}, nil},
+			{tar.Header{Name: "h", Typeflag: tar.TypeLink, Linkname: "alias", Mode: 0644}, nil},
+		})
+		if err := Extract(bytes.NewReader(data), dir, DefaultLimits()); err != nil {
+			t.Fatalf("hardlink whose final source component is a symlink must be accepted, got: %v", err)
+		}
+		// link(2) did not dereference "alias": h is a second name for the
+		// symlink inode itself, so it reads back as the same symlink.
+		fi, err := os.Lstat(filepath.Join(dir, "h"))
+		if err != nil {
+			t.Fatalf("Lstat hardlink: %v", err)
+		}
+		if fi.Mode()&os.ModeSymlink == 0 {
+			t.Fatalf("h must be a hardlink to the symlink inode (still a symlink), got %v", fi.Mode())
+		}
+		if got, rerr := os.Readlink(filepath.Join(dir, "h")); rerr != nil || got != "real" {
+			t.Fatalf("h must point at \"real\", got %q err=%v", got, rerr)
+		}
+	})
+}

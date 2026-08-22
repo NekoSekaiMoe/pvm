@@ -394,11 +394,13 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 	// failure path between here and overlayCommitted = true below returns
 	// before the task becomes authoritatively Running, and the stale qcow2
 	// (plus its backing registration) would be mistaken for a real task
-	// image by later snapshots/metadata walks.
+	// image by later snapshots/metadata walks. cow.RemoveOverlay (not a bare
+	// os.Remove) also drops the backing-root registration CreateOverlay
+	// recorded for this overlay; it tolerates a missing overlay file itself.
 	overlayCommitted := false
 	defer func() {
 		if overlayCreated && !overlayCommitted {
-			if rmErr := os.Remove(overlayPath); rmErr != nil && !os.IsNotExist(rmErr) {
+			if rmErr := cow.RemoveOverlay(overlayPath); rmErr != nil {
 				fmt.Printf("Warning: remove half-provisioned overlay %s: %v\n", overlayPath, rmErr)
 			}
 		}

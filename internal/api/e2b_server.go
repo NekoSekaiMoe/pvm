@@ -132,10 +132,14 @@ func StartE2BServer(port int) error {
 		// The kernel re-splits argv on whitespace, so an unvalidated value can
 		// inject arbitrary kernel parameters (hostfs_volume=/:/mnt, init=...)
 		// or point the sandbox at another task's disk. Constrain it to an
-		// absolute path inside the image root, with no traversal/whitespace.
-		if err := validateAPIRootfs(req.Rootfs); err != nil {
+		// absolute path inside the image root, with no traversal/whitespace,
+		// and keep the RESOLVED path so later stages (buildLegacyArgs /
+		// validateRootfs) use the trusted path that was actually checked.
+		resolvedRootfs, err := validateAPIRootfs(req.Rootfs)
+		if err != nil {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
 		}
+		req.Rootfs = resolvedRootfs
 
 		mgr := container.NewManager(nil)
 		mgr.Autopause = autoMgr
@@ -1191,26 +1195,48 @@ var idRegex = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 // UML kernel command line (ubd0=<path>) and the kernel re-splits argv on
 // whitespace, so anything but a plain absolute path inside the image root is
 // an injection primitive (extra kernel parameters, another task's disk, ...).
-func validateAPIRootfs(rootfs string) error {
+// It returns the symlink-RESOLVED trusted path for the caller to use.
+func validateAPIRootfs(rootfs string) (string, error) {
+	return validateRootfsUnder(rootfs, image.DefaultDir)
+}
+
+// validateRootfsUnder is validateAPIRootfs with an injectable root, so the
+// symlink-resolution semantics are testable without the (root-owned)
+// production image dir. Error messages name the given root.
+func validateRootfsUnder(rootfs, root string) (string, error) {
 	if rootfs == "" {
-		return errors.New("rootfs is required")
+		return "", errors.New("rootfs is required")
 	}
 	if strings.ContainsAny(rootfs, " \t\n\r,") || strings.Contains(rootfs, ":") {
-		return errors.New("rootfs must not contain whitespace, comma, or colon")
+		return "", errors.New("rootfs must not contain whitespace, comma, or colon")
 	}
 	if !filepath.IsAbs(rootfs) {
-		return errors.New("rootfs must be an absolute path")
+		return "", errors.New("rootfs must be an absolute path")
 	}
 	clean := filepath.Clean(rootfs)
 	for _, part := range strings.Split(clean, string(filepath.Separator)) {
 		if part == ".." {
-			return errors.New("rootfs must not contain '..'")
+			return "", errors.New("rootfs must not contain '..'")
 		}
 	}
-	if clean != image.DefaultDir && !strings.HasPrefix(clean, image.DefaultDir+string(filepath.Separator)) {
-		return fmt.Errorf("rootfs must live under %s", image.DefaultDir)
+	// Resolve symlinks on BOTH sides BEFORE the containment check and return
+	// the resolved path. A raw-string prefix check would accept a symlinked
+	// rootfs name that later re-resolves elsewhere (symlink-swap window
+	// between validation and use); handing the caller the resolved trusted
+	// path closes that window — buildLegacyArgs/validateRootfs operate on
+	// exactly what was checked.
+	resolved, err := filepath.EvalSymlinks(clean)
+	if err != nil {
+		return "", fmt.Errorf("rootfs %s does not resolve: %w", clean, err)
 	}
-	return nil
+	resolvedRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return "", fmt.Errorf("image dir %s does not resolve: %w", root, err)
+	}
+	if resolved != resolvedRoot && !strings.HasPrefix(resolved, resolvedRoot+string(filepath.Separator)) {
+		return "", fmt.Errorf("rootfs must live under %s", root)
+	}
+	return resolved, nil
 }
 
 // taskTransitionMu gives per-task mutual exclusion for the /transition
