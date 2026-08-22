@@ -416,15 +416,17 @@ func TestValidateAPIRootfs_ResolvesSymlinksAndKeepsFormatChecks(t *testing.T) {
 
 	// Input-format and absolute-path checks fire BEFORE any resolution and
 	// keep their messages.
-	for _, tc := range []struct{ in, want string }{
-		{"", "rootfs is required"},
-		{"/a b", "whitespace"},
-		{"/a:b", "whitespace"},
-		{"relative/path", "absolute path"},
+	for _, tc := range []struct{ name, in, want string }{
+		{"empty_rootfs", "", "rootfs is required"},
+		{"space_in_path", "/a b", "whitespace"},
+		{"colon_in_path", "/a:b", "whitespace"},
+		{"relative_path", "relative/path", "absolute path"},
 	} {
-		if _, err := validateRootfsUnder(tc.in, aliasDir); err == nil || !strings.Contains(err.Error(), tc.want) {
-			t.Fatalf("rootfs %q: want error containing %q, got %v", tc.in, tc.want, err)
-		}
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := validateRootfsUnder(tc.in, aliasDir); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("rootfs %q: want error containing %q, got %v", tc.in, tc.want, err)
+			}
+		})
 	}
 
 	// A rootfs reached through the symlinked image root resolves to the real

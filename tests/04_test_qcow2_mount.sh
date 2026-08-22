@@ -43,8 +43,12 @@ fi
 # root and the state root. A repo-cwd path — even absolute — is rejected
 # ("outside the trusted image roots") before UML ever boots.
 IMG_DIR=/var/lib/uml-container/images
-IMG_NAME="$IMG_DIR/cow_rootfs.img"
-QCOW_NAME="$IMG_DIR/cow_rootfs.qcow2"
+# Isolate this run's images in a per-run subdirectory of the trusted root:
+# concurrent runs (or leftovers of a crashed one) must not overwrite or
+# delete each other's files. cleanup below removes ONLY this directory.
+RUN_DIR="$IMG_DIR/cow-test-$(date +%s)-$$-$RANDOM"
+IMG_NAME="$RUN_DIR/cow_rootfs.img"
+QCOW_NAME="$RUN_DIR/cow_rootfs.qcow2"
 NAME="test-cow"
 TAP="tap_cow"
 BRIDGE="pvm_br_cow"
@@ -61,13 +65,13 @@ cleanup() {
     sudo ip link delete "$TAP" 2>/dev/null || true
     sudo umount "$MNT" 2>/dev/null || true
     rm -rf "$MNT"
-    sudo rm -f "$IMG_NAME" "$QCOW_NAME"
+    sudo rm -rf "$RUN_DIR"
 }
 trap cleanup EXIT
 
 # ---- 1) Build a REAL rootfs (alpine + init), not a bare mkfs image ----
 echo "Creating alpine rootfs (under trusted image root $IMG_DIR)..."
-sudo mkdir -p "$IMG_DIR"
+sudo mkdir -p "$RUN_DIR"
 sudo dd if=/dev/zero of="$IMG_NAME" bs=1M count=200 > /dev/null 2>&1
 sudo mkfs.ext4 -q -F "$IMG_NAME"
 

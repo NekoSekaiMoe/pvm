@@ -87,10 +87,15 @@ type Manager struct {
 	memMB   map[string]int         // tenant -> mem sum
 	hourly  map[string][]time.Time // tenant -> task start times (last hour)
 	// pendingCleanups records sandboxes whose teardown after a rejected
-	// claim/warm FAILED and must be retried (see destroyAsync). The old code
+	// claim/warm FAILED and must be retried (see destroy). The old code
 	// discarded those Destroyer errors and silently leaked the sandbox.
 	// Guarded by m.mu.
 	pendingCleanups map[string]string // sandbox ID -> cleanup reason
+
+	// cleanupSweeping marks an in-flight RetryCleanups sweep so concurrent
+	// sweeps serialize instead of running Destroyer twice on the same
+	// sandbox. Guarded by m.mu.
+	cleanupSweeping bool
 
 	// now supplies the current time for hourly-window pruning and sandbox
 	// timestamps. A func field (defaulting to time.Now via NewManager) so
@@ -161,7 +166,7 @@ func (m *Manager) Warm(tmpl Template, n int) int {
 			m.mu.Unlock()
 			// Don't leak a sandbox we can't keep; a failed teardown is
 			// queued for the retry sweep instead of being discarded.
-			m.destroyAsync(id, "warm capacity recheck")
+			m.destroy(id, "warm capacity recheck")
 			break
 		}
 		m.pool = append(m.pool, &Sandbox{
@@ -322,7 +327,7 @@ func (m *Manager) claim(tenant string, tmpl Template, taskID string, logs *[]dec
 	// Capacity may have changed while the lock was released.
 	if len(m.pool) >= m.capacity {
 		m.mu.Unlock()
-		m.destroyAsync(id, "capacity race after factory")
+		m.destroy(id, "capacity race after factory")
 		recordDecision(logs, tenant, "no capacity after race", false)
 		return "", ErrNoCapacity
 	}
@@ -337,14 +342,14 @@ func (m *Manager) claim(tenant string, tmpl Template, taskID string, logs *[]dec
 	// N concurrent claims could blow past MaxTasksPerHour together.
 	if len(m.hourly[tenant]) >= q.MaxTasksPerHour {
 		m.mu.Unlock()
-		m.destroyAsync(id, "hourly quota recheck after factory")
+		m.destroy(id, "hourly quota recheck after factory")
 		recordDecision(logs, tenant, "hourly task rate after factory", false)
 		return "", fmt.Errorf("%w: hourly task rate for tenant %s changed during claim", ErrQuotaExceeded, tenant)
 	}
 	if m.running[tenant] >= q.MaxConcurrent || m.cpu[tenant]+tmpl.CPU > q.MaxCPU ||
 		memExceeded(q.MaxMemoryMB, m.memMB[tenant], wantMB) {
 		m.mu.Unlock()
-		m.destroyAsync(id, "quota recheck after factory")
+		m.destroy(id, "quota recheck after factory")
 		recordDecision(logs, tenant, "quota changed after factory", false)
 		return "", fmt.Errorf("%w: quota for tenant %s changed during claim", ErrQuotaExceeded, tenant)
 	}
@@ -356,13 +361,14 @@ func (m *Manager) claim(tenant string, tmpl Template, taskID string, logs *[]dec
 	return id, nil
 }
 
-// destroyAsync tears down a sandbox built for a claim/warm that was
-// subsequently rejected. A Destroyer failure is NOT discarded: the id and
-// reason are recorded in pendingCleanups for RetryCleanups, so a flaky
-// teardown surfaces in logs and gets retried instead of leaking the sandbox
-// with no trace. Callers must NOT hold m.mu (Destroyer is external); the
-// rejection returned to the caller is unaffected either way.
-func (m *Manager) destroyAsync(id, reason string) {
+// destroy tears down a sandbox built for a claim/warm that was subsequently
+// rejected. It runs SYNCHRONOUSLY on the caller's goroutine — Destroyer is
+// an external call and can block the rejection path — so callers must NOT
+// hold m.mu. A Destroyer failure is NOT discarded: the id and reason are
+// recorded in pendingCleanups for RetryCleanups, so a flaky teardown
+// surfaces in logs and gets retried instead of leaking the sandbox with no
+// trace; the rejection returned to the caller is unaffected either way.
+func (m *Manager) destroy(id, reason string) {
 	if m.Destroyer == nil {
 		return
 	}
@@ -384,17 +390,31 @@ func (m *Manager) queueCleanupLocked(id, reason string) {
 }
 
 // RetryCleanups re-attempts destruction of every sandbox queued by a failed
-// post-rejection teardown. Best-effort and race-free: successful retries are
-// removed from the queue; persistent failures stay queued for the next
-// sweep (wire a periodic ticker to this for a reaper). The Destroyer runs
-// WITHOUT m.mu held.
+// post-rejection teardown. Sweeps are serialized: while one is running the
+// cleanupSweeping flag makes concurrent calls return immediately, so two
+// snapshots of the queue cannot run Destroyer on the same sandbox twice
+// (ids are snapshotted under the lock, but Destroyer runs without it).
+// Best-effort and race-free: successful retries are removed from the queue;
+// persistent failures stay queued for the next sweep (wire a periodic
+// ticker to this for a reaper). The Destroyer runs WITHOUT m.mu held.
 func (m *Manager) RetryCleanups() {
 	m.mu.Lock()
+	if m.cleanupSweeping {
+		m.mu.Unlock()
+		return
+	}
+	m.cleanupSweeping = true
 	ids := make([]string, 0, len(m.pendingCleanups))
 	for id := range m.pendingCleanups {
 		ids = append(ids, id)
 	}
 	m.mu.Unlock()
+	// Clear the flag on EVERY exit path once the sweep has processed.
+	defer func() {
+		m.mu.Lock()
+		m.cleanupSweeping = false
+		m.mu.Unlock()
+	}()
 	if m.Destroyer == nil {
 		return
 	}

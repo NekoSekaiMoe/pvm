@@ -360,14 +360,9 @@ func TestBytesAccounting_ConnectTunnelUploadOnly(t *testing.T) {
 		}
 	}
 
-	// Give the gateway's hijack time to fully release the server-side
-	// background read: net/http flushes the 200 response BEFORE aborting
-	// that read, so a client write racing the abort can lose its first byte
-	// to the read's 1-byte buffer (a pre-existing tunnel race — see
-	// TestConnectTunnelOpaque_NoInject, which flakes on it). Delaying here
-	// keeps this accounting test deterministic.
-	time.Sleep(100 * time.Millisecond)
-
+	// Write IMMEDIATELY after the 200: handleConnect now completes the
+	// hijack before answering, so the client's first tunnel byte can no
+	// longer race (and lose itself to) the server's background read.
 	if _, err := conn.Write([]byte(upload)); err != nil {
 		t.Fatalf("write upload: %v", err)
 	}
@@ -464,12 +459,9 @@ func TestConnectTunnelOpaque_NoInject(t *testing.T) {
 		}
 	}
 
-	// Delay past the hijack window: net/http flushes the CONNECT 200 BEFORE
-	// aborting its 1-byte background read, so a payload written immediately
-	// can lose its first byte to that read (pre-existing race, not the
-	// property under test). Sleeping keeps this test deterministic.
-	time.Sleep(100 * time.Millisecond)
-
+	// Write IMMEDIATELY: handleConnect completes the hijack before sending
+	// the 200, so the full payload must arrive intact with no delay — this
+	// also regression-tests that the handoff race is gone.
 	if _, err := conn.Write(payload); err != nil {
 		t.Fatalf("write tunnel payload: %v", err)
 	}

@@ -6,6 +6,7 @@ import (
 	"math"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -584,5 +585,66 @@ func TestClaim_FailedCleanupQueuedAndRetried(t *testing.T) {
 		}
 	default:
 		t.Error("retry sweep did not attempt destruction")
+	}
+}
+
+// TestRetryCleanups_ConcurrentSweepsSerialized pins the cleanupSweeping
+// contract: two concurrent RetryCleanups must not both run Destroyer over
+// the same queue. The Destroyer blocks on a gate; with serialization the
+// second sweep returns immediately while the first is still inside
+// Destroyer, so every sandbox is destroyed exactly once. Without the flag
+// both sweeps snapshot the queue and each destroys every id twice.
+func TestRetryCleanups_ConcurrentSweepsSerialized(t *testing.T) {
+	m := NewManager(2, tmpLedger(t))
+	m.mu.Lock()
+	m.pendingCleanups["a"] = "test"
+	m.pendingCleanups["b"] = "test"
+	m.mu.Unlock()
+
+	gate := make(chan struct{})
+	var mu sync.Mutex
+	calls := make(map[string]int)
+	m.Destroyer = func(id string) error {
+		<-gate
+		mu.Lock()
+		calls[id]++
+		mu.Unlock()
+		return nil
+	}
+
+	done := make(chan struct{}, 2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			m.RetryCleanups()
+			done <- struct{}{}
+		}()
+	}
+	// With serialization the second sweep returns while the first is still
+	// blocked inside Destroyer; without it BOTH block and nobody returns
+	// until the gate opens — open it after a grace period either way.
+	got := 0
+	select {
+	case <-done:
+		got = 1
+	case <-time.After(500 * time.Millisecond):
+	}
+	close(gate)
+	for got < 2 {
+		select {
+		case <-done:
+			got++
+		case <-time.After(2 * time.Second):
+			t.Fatal("RetryCleanups did not return")
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	for id, n := range calls {
+		if n != 1 {
+			t.Fatalf("sandbox %q destroyed %d times, want exactly 1 (sweeps must serialize)", id, n)
+		}
+	}
+	if got := m.PendingCleanups(); got != 0 {
+		t.Fatalf("pending cleanups = %d, want 0 after successful sweep", got)
 	}
 }

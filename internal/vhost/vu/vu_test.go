@@ -394,10 +394,25 @@ func TestServerHandshake(t *testing.T) {
 // with 0600 sockets (run with -race to also cover the surrounding state).
 func TestServeConcurrentUmaskSafe(t *testing.T) {
 	const n = 8
+	// probe differs from the 0o077 Serve installs, so a leaked (or wrongly
+	// restored) Serve window cannot masquerade as the surrounding umask.
+	const probe = 0o022
 	dirs := make([]string, n)
 	for i := range dirs {
 		dirs[i] = t.TempDir()
 	}
+
+	// Park the process umask on the probe value BEFORE any goroutine runs:
+	// every correctly serialized Serve must save and restore exactly this
+	// value, and the post-wg check below asserts it survived all n runs.
+	umaskMu.Lock()
+	origUmask := unix.Umask(probe)
+	umaskMu.Unlock()
+	defer func() { // never leak the probe past this test
+		umaskMu.Lock()
+		unix.Umask(origUmask)
+		umaskMu.Unlock()
+	}()
 	var wg sync.WaitGroup
 	errs := make(chan error, n)
 	for i := 0; i < n; i++ {
@@ -434,5 +449,15 @@ func TestServeConcurrentUmaskSafe(t *testing.T) {
 	close(errs)
 	for err := range errs {
 		t.Error(err)
+	}
+
+	// Read the process umask back under the same lock Serve uses, restoring
+	// the saved original FIRST so a failing assertion cannot leak the probe:
+	// each serialized Serve must have restored the probe value it saw.
+	umaskMu.Lock()
+	cur := unix.Umask(origUmask)
+	umaskMu.Unlock()
+	if cur != probe {
+		t.Errorf("process umask after concurrent Serve = %o, want probe %o restored", cur, probe)
 	}
 }

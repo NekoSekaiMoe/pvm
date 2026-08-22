@@ -15,15 +15,32 @@ echo "Testing QoS Configuration CLI..."
 # output and accept only success or the tc-level error.
 QOS_OUT=$(./agentpvm network qos tap_test 10mbit 2>&1) && QOS_RC=0 || QOS_RC=$?
 echo "$QOS_OUT"
-case "$QOS_OUT" in
-    *"failed to setup QoS"*|"")
-        echo "✅ QoS CLI structure passed (tc-level failure is expected without root/tap)"
-        ;;
-    *)
-        echo "❌ QoS CLI failed unexpectedly (rc=$QOS_RC)"
-        exit 1
-        ;;
-esac
+if [ "$QOS_RC" -eq 0 ]; then
+    # Success path (e.g. root host with the device present): the CLI must
+    # have printed the confirmation line.
+    case "$QOS_OUT" in
+        *"QoS limit set to"*)
+            echo "✅ QoS CLI structure passed (tc limit applied)"
+            ;;
+        *)
+            echo "❌ QoS CLI rc=0 but unexpected output"
+            exit 1
+            ;;
+    esac
+else
+    # A nonzero rc is EXPECTED only as the tc-level environment failure
+    # (no root / no tap_test device); empty or any other nonzero output is
+    # a real CLI regression (bad flags, rate rejected by the whitelist).
+    case "$QOS_OUT" in
+        *"failed to setup QoS"*)
+            echo "✅ QoS CLI structure passed (tc-level failure is expected without root/tap)"
+            ;;
+        *)
+            echo "❌ QoS CLI failed unexpectedly (rc=$QOS_RC)"
+            exit 1
+            ;;
+    esac
+fi
 
 echo "Testing eBPF Whitelist Configuration CLI..."
 # Without root / a pinned bpffs map (typical CI) the update must fail

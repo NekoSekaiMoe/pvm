@@ -354,11 +354,32 @@ func (g *Gateway) handleConnect(w http.ResponseWriter, r *http.Request, task str
 		http.Error(w, "hijack unsupported", http.StatusInternalServerError)
 		return
 	}
-	w.WriteHeader(http.StatusOK)
-	clientConn, _, err := hj.Hijack()
+	// Complete the hijack BEFORE sending the 200. WriteHeader on a still
+	// live connection flushes the response while net/http's background read
+	// is settling, and that handoff can swallow the first byte of a client
+	// that pipelines tunnel bytes right behind the CONNECT. With the hijack
+	// done first, the connection is fully ours before we answer.
+	clientConn, brw, err := hj.Hijack()
 	if err != nil {
 		targetConn.Close()
 		return
+	}
+	// The hijacked ResponseWriter can no longer be written to, so the
+	// CONNECT success response is emitted on the raw connection.
+	if _, err := clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")); err != nil {
+		targetConn.Close()
+		clientConn.Close()
+		return
+	}
+	// Client bytes the hijacked bufio.Reader already buffered (a client
+	// that wrote past the 200 early) must be forwarded, not lost to the
+	// raw-connection pipes below.
+	if n := brw.Reader.Buffered(); n > 0 {
+		if _, err := io.CopyN(targetConn, brw.Reader, int64(n)); err != nil {
+			targetConn.Close()
+			clientConn.Close()
+			return
+		}
 	}
 	g.record(task, r, DecisionAllow, "CONNECT "+v.host)
 	// Only the upload direction (client → upstream) is billed; see pipe.
