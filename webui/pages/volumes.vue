@@ -62,14 +62,14 @@
     </div>
 
     <!-- Snapshot Modal -->
-    <div v-if="snapshotModalVolume" class="modal-backdrop" role="dialog" aria-modal="true" @keydown.esc="snapshotModalVolume = null">
+    <div v-if="snapshotModalVolume" ref="snapshotModalEl" class="modal-backdrop" role="dialog" aria-modal="true" tabindex="-1" @keydown.esc="snapshotModalVolume = null">
       <div class="modal-box">
         <h3>Snapshot Volume — {{ snapshotModalVolume }}</h3>
         <p class="muted" style="font-size:0.85rem;margin-bottom:1rem;">Branch an instant Copy-on-Write snapshot of this volume (stored as snap-&lt;name&gt;.qcow2 by the cow engine).</p>
 
         <div class="form-row full">
           <label class="section-title" for="snapshot-name">Snapshot Name</label>
-          <input id="snapshot-name" v-model="snapshotName" placeholder="e.g. pre-migration" />
+          <input id="snapshot-name" v-model="snapshotName" placeholder="e.g. pre-migration (leave empty to auto-generate)" />
         </div>
 
         <div v-if="snapshotError" class="callout err">{{ snapshotError }}</div>
@@ -83,7 +83,7 @@
     </div>
 
     <!-- Clone Modal -->
-    <div v-if="cloneModalVolume" class="modal-backdrop" role="dialog" aria-modal="true" @keydown.esc="cloneModalVolume = null">
+    <div v-if="cloneModalVolume" ref="cloneModalEl" class="modal-backdrop" role="dialog" aria-modal="true" tabindex="-1" @keydown.esc="cloneModalVolume = null">
       <div class="modal-box">
         <h3>Clone Volume — {{ cloneModalVolume }}</h3>
         <p class="muted" style="font-size:0.85rem;margin-bottom:1rem;">Create an instant Copy-on-Write branch of this persistent volume.</p>
@@ -104,7 +104,7 @@
     </div>
 
     <!-- Rollback Modal -->
-    <div v-if="rollbackModalVolume" class="modal-backdrop" role="dialog" aria-modal="true" @keydown.esc="rollbackModalVolume = null">
+    <div v-if="rollbackModalVolume" ref="rollbackModalEl" class="modal-backdrop" role="dialog" aria-modal="true" tabindex="-1" @keydown.esc="rollbackModalVolume = null">
       <div class="modal-box">
         <h3>Rollback Volume — {{ rollbackModalVolume }}</h3>
         <p class="muted" style="font-size:0.85rem;margin-bottom:1rem;">Restore volume to a previously created snapshot point.</p>
@@ -172,7 +172,7 @@
 </template>
 
 <script setup>
-import { ref, computed } from 'vue'
+import { ref, computed, nextTick } from 'vue'
 import { apiFetch, usePoll } from '~/composables/useApi'
 
 const volumes = ref([])
@@ -181,16 +181,19 @@ const showCreateModal = ref(false)
 const errorMsg = ref('')
 
 const snapshotModalVolume = ref(null)
+const snapshotModalEl = ref(null)
 const snapshotName = ref('')
 const snapshotError = ref('')
 const snapshotSuccess = ref('')
 
 const cloneModalVolume = ref(null)
+const cloneModalEl = ref(null)
 const cloneTargetID = ref('')
 const cloneError = ref('')
 const cloneSuccess = ref('')
 
 const rollbackModalVolume = ref(null)
+const rollbackModalEl = ref(null)
 const rollbackSnapName = ref('')
 const rollbackError = ref('')
 const rollbackSuccess = ref('')
@@ -244,21 +247,25 @@ const snapshotVolumePrompt = (id) => {
   snapshotName.value = ''
   snapshotError.value = ''
   snapshotSuccess.value = ''
+  // Focus the dialog container so keyboard events (Esc) reach it
+  // immediately — without this, focus stays on the trigger button outside
+  // the backdrop and @keydown.esc never fires.
+  nextTick(() => snapshotModalEl.value?.focus())
 }
 
 const executeSnapshotVolume = async () => {
   snapshotError.value = ''
   snapshotSuccess.value = ''
-  if (!snapshotName.value) {
-    snapshotError.value = 'Snapshot name is required (leave empty to let the server auto-generate one, or type a name)'
-    return
-  }
+  // An empty name is valid: the server auto-generates one
+  // (POST /api/volumes/:id/snapshots). Only let the server reject
+  // genuinely invalid input.
   try {
-    await apiFetch(`/api/volumes/${encodeURIComponent(snapshotModalVolume.value)}/snapshots`, {
+    const res = await apiFetch(`/api/volumes/${encodeURIComponent(snapshotModalVolume.value)}/snapshots`, {
       method: 'POST',
       body: { snapshot: snapshotName.value }
     })
-    snapshotSuccess.value = `Snapshot "${snapshotName.value}" created for ${snapshotModalVolume.value}`
+    const name = (res && res.snapshot) || snapshotName.value || '(auto-generated)'
+    snapshotSuccess.value = `Snapshot "${name}" created for ${snapshotModalVolume.value}`
     refresh()
   } catch (e) {
     snapshotError.value = e.message
@@ -270,6 +277,7 @@ const cloneVolumePrompt = (id) => {
   cloneTargetID.value = `${id}-cloned`
   cloneError.value = ''
   cloneSuccess.value = ''
+  nextTick(() => cloneModalEl.value?.focus())
 }
 
 const executeCloneVolume = async () => {
@@ -298,6 +306,7 @@ const rollbackVolumePrompt = async (id) => {
   rollbackSnapName.value = ''
   rollbackError.value = ''
   rollbackSuccess.value = ''
+  nextTick(() => rollbackModalEl.value?.focus())
   rollbackSnapshots.value = []
   rollbackSnapshotsLoading.value = true
   try {

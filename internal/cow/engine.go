@@ -23,7 +23,7 @@ var nameRe = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,128}$`)
 
 func validateName(kind, name string) error {
 	if !nameRe.MatchString(name) {
-		return fmt.Errorf("cow: invalid %s name %q (must match %s)", kind, name, nameRe.String())
+		return fmt.Errorf("cow: %w %s name %q (must match %s)", ErrInvalid, kind, name, nameRe.String())
 	}
 	return nil
 }
@@ -111,10 +111,10 @@ func (e *Qcow2Engine) CreateVolume(name string, sizeBytes uint64) (string, error
 	// unaffected: snapshot "snap-x" maps to snap-snap-x.qcow2, which cannot
 	// collide with any volume name.
 	if strings.HasPrefix(name, "snap-") {
-		return "", fmt.Errorf("cow: volume name %q must not start with %q (reserved for snapshots)", name, "snap-")
+		return "", fmt.Errorf("cow: volume name %q must not start with %q (reserved for snapshots): %w", name, "snap-", ErrInvalid)
 	}
 	if sizeBytes == 0 {
-		return "", fmt.Errorf("cow: volume size must be > 0")
+		return "", fmt.Errorf("cow: volume size must be > 0: %w", ErrInvalid)
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -123,7 +123,7 @@ func (e *Qcow2Engine) CreateVolume(name string, sizeBytes uint64) (string, error
 	}
 	path := e.volumePath(name)
 	if _, err := os.Stat(path); err == nil {
-		return "", fmt.Errorf("cow: volume %q already exists", name)
+		return "", fmt.Errorf("cow: volume %q %w", name, ErrExists)
 	}
 	if err := createQcow2(path, sizeBytes, "", "", defaultOverlayOpt); err != nil {
 		return "", err
@@ -139,16 +139,16 @@ func (e *Qcow2Engine) DeleteVolume(name string) error {
 	defer e.mu.Unlock()
 	path := e.volumePath(name)
 	if _, err := os.Stat(path); err != nil {
-		return fmt.Errorf("cow: volume %q not found", name)
+		return fmt.Errorf("cow: volume %q %w", name, ErrNotFound)
 	}
 	hasRef, refName, err := e.hasBackingReference(path)
 	if err != nil {
 		// Fail closed: without a successful reference scan we cannot know
 		// whether deleting would orphan live dependents.
-		return fmt.Errorf("cow: scan references of volume %q: %w", name, err)
+		return fmt.Errorf("cow: %w of volume %q: %w", ErrRefScan, name, err)
 	}
 	if hasRef {
-		return fmt.Errorf("cow: cannot delete volume %q: referenced by %q", name, refName)
+		return fmt.Errorf("cow: cannot delete volume %q: %w %q", name, ErrReferenced, refName)
 	}
 	return os.Remove(path)
 }
@@ -160,7 +160,7 @@ func (e *Qcow2Engine) GetVolumeInfo(name string) (*Volume, error) {
 	path := e.volumePath(name)
 	img, err := openGuestImage(path)
 	if err != nil {
-		return nil, fmt.Errorf("cow: volume %q not found: %w", name, err)
+		return nil, fmt.Errorf("cow: volume %q %w: %w", name, ErrNotFound, err)
 	}
 	defer img.Close()
 	// The file may be deleted concurrently (GetVolumeInfo runs without the
@@ -216,12 +216,12 @@ func (e *Qcow2Engine) CreateSnapshot(sourceName, snapshotName string) (string, e
 		// also try as snapshot source
 		srcPath = e.snapshotPath(sourceName)
 		if _, err2 := os.Stat(srcPath); err2 != nil {
-			return "", fmt.Errorf("cow: source %q not found", sourceName)
+			return "", fmt.Errorf("cow: source %q %w", sourceName, ErrNotFound)
 		}
 	}
 	dstPath := e.snapshotPath(snapshotName)
 	if _, err := os.Stat(dstPath); err == nil {
-		return "", fmt.Errorf("cow: snapshot %q already exists", snapshotName)
+		return "", fmt.Errorf("cow: snapshot %q %w", snapshotName, ErrExists)
 	}
 	if err := os.MkdirAll(e.root, 0755); err != nil {
 		return "", err
@@ -240,16 +240,16 @@ func (e *Qcow2Engine) DeleteSnapshot(snapshotName string) error {
 	defer e.mu.Unlock()
 	path := e.snapshotPath(snapshotName)
 	if _, err := os.Stat(path); err != nil {
-		return fmt.Errorf("cow: snapshot %q not found", snapshotName)
+		return fmt.Errorf("cow: snapshot %q %w", snapshotName, ErrNotFound)
 	}
 	hasRef, refName, err := e.hasBackingReference(path)
 	if err != nil {
 		// Fail closed, mirroring DeleteVolume: an unreadable root must not
 		// degrade into deleting a snapshot live dependents still need.
-		return fmt.Errorf("cow: scan references of snapshot %q: %w", snapshotName, err)
+		return fmt.Errorf("cow: %w of snapshot %q: %w", ErrRefScan, snapshotName, err)
 	}
 	if hasRef {
-		return fmt.Errorf("cow: cannot delete snapshot %q: referenced by %q", snapshotName, refName)
+		return fmt.Errorf("cow: cannot delete snapshot %q: %w %q", snapshotName, ErrReferenced, refName)
 	}
 	return os.Remove(path)
 }
@@ -349,7 +349,7 @@ func (e *Qcow2Engine) CloneVolume(sourceVolume, newVolume string) (string, error
 		return "", err
 	}
 	if strings.HasPrefix(newVolume, "snap-") {
-		return "", fmt.Errorf("cow: volume name %q must not start with %q (reserved for snapshots)", newVolume, "snap-")
+		return "", fmt.Errorf("cow: volume name %q must not start with %q (reserved for snapshots): %w", newVolume, "snap-", ErrInvalid)
 	}
 
 	e.mu.Lock()
@@ -359,13 +359,13 @@ func (e *Qcow2Engine) CloneVolume(sourceVolume, newVolume string) (string, error
 	if _, err := os.Stat(srcPath); err != nil {
 		srcPath = e.snapshotPath(sourceVolume)
 		if _, err2 := os.Stat(srcPath); err2 != nil {
-			return "", fmt.Errorf("cow: source volume or snapshot %q not found", sourceVolume)
+			return "", fmt.Errorf("cow: source volume or snapshot %q %w", sourceVolume, ErrNotFound)
 		}
 	}
 
 	dstPath := e.volumePath(newVolume)
 	if _, err := os.Stat(dstPath); err == nil {
-		return "", fmt.Errorf("cow: target volume %q already exists", newVolume)
+		return "", fmt.Errorf("cow: target volume %q %w", newVolume, ErrExists)
 	}
 
 	if err := os.MkdirAll(e.root, 0755); err != nil {
@@ -392,12 +392,12 @@ func (e *Qcow2Engine) RollbackVolume(volumeName, snapshotName string) error {
 
 	volPath := e.volumePath(volumeName)
 	if _, err := os.Stat(volPath); err != nil {
-		return fmt.Errorf("cow: volume %q not found", volumeName)
+		return fmt.Errorf("cow: volume %q %w", volumeName, ErrNotFound)
 	}
 
 	snapPath := e.snapshotPath(snapshotName)
 	if _, err := os.Stat(snapPath); err != nil {
-		return fmt.Errorf("cow: snapshot %q not found", snapshotName)
+		return fmt.Errorf("cow: snapshot %q %w", snapshotName, ErrNotFound)
 	}
 
 	// The rollback REPLACES volPath in place (convert + rename). Any other
@@ -406,10 +406,10 @@ func (e *Qcow2Engine) RollbackVolume(volumeName, snapshotName string) error {
 	// it is the source of the restore, not a victim of it.
 	hasRef, refName, err := e.hasBackingReferenceExcluding(volPath, snapPath)
 	if err != nil {
-		return fmt.Errorf("cow: scan references of volume %q: %w", volumeName, err)
+		return fmt.Errorf("cow: %w of volume %q: %w", ErrRefScan, volumeName, err)
 	}
 	if hasRef {
-		return fmt.Errorf("cow: cannot rollback volume %q: %q is backed by it (delete or roll back the dependent first)", volumeName, refName)
+		return fmt.Errorf("cow: cannot rollback volume %q: %q %w (delete or roll back the dependent first)", volumeName, refName, ErrBackedBy)
 	}
 
 	tmpPath := filepath.Join(e.root, ".tmp-rb-"+volumeName+".qcow2")
@@ -461,11 +461,18 @@ func (e *Qcow2Engine) hasBackingReferenceExcluding(targetPath, excludePath strin
 			continue
 		}
 		p := filepath.Join(e.root, ent.Name())
-		absP, aerr := filepath.Abs(p)
-		if aerr == nil && (absP == absTarget || p == targetPath) {
+		// Fall back to the ORIGINAL path when Abs fails, mirroring the
+		// absTarget/absExclude handling above: on resolution failure the
+		// skip checks must still compare raw paths, or the target file and
+		// the excluded snapshot would be scanned as mere candidates.
+		absP := p
+		if ap, aerr := filepath.Abs(p); aerr == nil {
+			absP = ap
+		}
+		if absP == absTarget || p == targetPath {
 			continue
 		}
-		if aerr == nil && absExclude != "" && (absP == absExclude || p == excludePath) {
+		if absExclude != "" && (absP == absExclude || p == excludePath) {
 			continue
 		}
 		img, err := openGuestImage(p)
@@ -490,4 +497,3 @@ func (e *Qcow2Engine) hasBackingReferenceExcluding(targetPath, excludePath strin
 	}
 	return false, "", nil
 }
-

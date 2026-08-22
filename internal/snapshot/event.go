@@ -235,5 +235,11 @@ func DeleteEventSnapshot(taskID, snapshotID string) error {
 		}
 		return err
 	}
+	// Refuse while a live backing chain (this container's active overlay,
+	// a clone's, or a sibling snapshot's) still reaches this snapshot's
+	// overlay — deleting it would corrupt the chain at the next read.
+	if err := PrepareDeleteEventSnapshot(taskID, snapshotID); err != nil {
+		return err
+	}
 	return os.RemoveAll(targetDir)
 }
