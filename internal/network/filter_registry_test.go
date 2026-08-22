@@ -58,9 +58,15 @@ func TestWhitelistRegistry_PerTapIsolation(t *testing.T) {
 	if got := WhitelistMapFor("tapA"); got != m1 {
 		t.Fatalf("tapA map = %v, want the registered map", got)
 	}
+	// WhitelistMapFor takes a registry reference; pair every lookup with a
+	// release so the deferred unregisters below actually close the maps
+	// instead of parking retired entries on the global retired list (a
+	// bare defer m.Close() never touches the refcount).
+	ReleaseWhitelistMap("tapA", m1)
 	if got := WhitelistMapFor("tapB"); got != m2 {
 		t.Fatalf("tapB map = %v, want the registered map", got)
 	}
+	ReleaseWhitelistMap("tapB", m2)
 }
 
 // TestWhitelistRegistry_ReattachClosesOldMap pins the fd-leak fix: attaching
@@ -78,9 +84,14 @@ func TestWhitelistRegistry_ReattachClosesOldMap(t *testing.T) {
 	if fd := m1.FD(); fd != -1 {
 		t.Fatalf("old map still open after re-attach (fd %d), want closed", fd)
 	}
-	if got := WhitelistMapFor("tapC"); got != m2 {
+	got := WhitelistMapFor("tapC")
+	if got != m2 {
 		t.Fatalf("tapC map = %v, want the replacement map", got)
 	}
+	// Drop the lookup reference BEFORE unregistering so the unregister
+	// closes m2 for real instead of retiring it with a live refcount
+	// (which would strand the entry on the global retired list).
+	ReleaseWhitelistMap("tapC", m2)
 	unregisterWhitelistMap("tapC", m2)
 }
 
@@ -91,7 +102,19 @@ func TestWhitelistRegistry_ReattachClosesOldMap(t *testing.T) {
 func TestWhitelistRegistry_ReattachKeepsReferencedMapAlive(t *testing.T) {
 	m1 := newTestMap(t)
 	m2 := newTestMap(t)
-	defer m2.Close()
+
+	// Drain every reference this test acquires BEFORE unregistering both
+	// maps, so a midway Fatalf still cleans up: releasing the retired m1
+	// closes it through the registry, and unregistering the current m2
+	// after its release closes it too. A bare defer m.Close() would close
+	// the fd without touching the refcount, stranding retired entries on
+	// the global state shared by every test in this package.
+	t.Cleanup(func() {
+		ReleaseWhitelistMap("tapE", m1)
+		ReleaseWhitelistMap("tapE", m2)
+		unregisterWhitelistMap("tapE", m1)
+		unregisterWhitelistMap("tapE", m2)
+	})
 
 	registerWhitelistMap("tapE", m1)
 	held := WhitelistMapFor("tapE") // take a reference on m1
@@ -133,6 +156,7 @@ func TestWhitelistRegistry_UnregisterOnlyOwnMap(t *testing.T) {
 	if got := WhitelistMapFor("tapD"); got != m1 {
 		t.Fatalf("tapD map = %v, want original registration kept", got)
 	}
+	ReleaseWhitelistMap("tapD", m1) // drop the lookup reference
 	unregisterWhitelistMap("tapD", m1)
 	if got := WhitelistMapFor("tapD"); got != nil {
 		t.Fatalf("tapD map = %v after unregister, want nil", got)

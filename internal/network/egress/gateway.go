@@ -437,6 +437,12 @@ func (g *Gateway) handleHTTP(w http.ResponseWriter, r *http.Request, task string
 		if isSSRFDialError(err) {
 			reason = "target resolved to private IP (SSRF floor)"
 		}
+		// Bill the request-body bytes the countingReader already handed to
+		// the transport (and that left the sandbox) before the failure: a
+		// partially transmitted body counts toward BytesUsed with the same
+		// convention as the normal response path below, which bills
+		// reqBytes.total() after io.Copy.
+		g.addBytes(task, reqBytes.total())
 		g.record(task, r, DecisionBlock, reason)
 		code := http.StatusBadGateway
 		if isSSRFDialError(err) {

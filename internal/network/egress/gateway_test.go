@@ -236,13 +236,79 @@ func TestBytesAccounting_HTTPRequestBodyOnly(t *testing.T) {
 	}
 }
 
+// TestBytesAccounting_UpstreamErrorBillsForwardedBody pins the billing on
+// handleHTTP's upstream-error branch: when the upstream dies mid-request,
+// the request-body bytes the countingReader already read (and forwarded)
+// must land in BytesUsed — without an addBytes on that branch a partially
+// transmitted body would egress for free.
+func TestBytesAccounting_UpstreamErrorBillsForwardedBody(t *testing.T) {
+	const bodySize = 32 // bytes the client POSTs through the gateway
+	// Backend from hell: hijacks the connection, consumes the request head
+	// plus a slice of the (chunked) forwarded body, then slams the socket
+	// without ever answering. RoundTrip fails mid-transfer, so only the
+	// upstream-error branch can do the accounting.
+	be := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hj, ok := w.(http.Hijacker)
+		if !ok {
+			t.Error("backend does not support hijack")
+			return
+		}
+		conn, brw, err := hj.Hijack()
+		if err != nil {
+			t.Errorf("hijack: %v", err)
+			return
+		}
+		defer conn.Close()
+		// Bound the read so a broken gateway cannot wedge this handler
+		// (and the t.Cleanup be.Close below) forever.
+		_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		// The server has already consumed the request head, so the bufio
+		// is positioned on the chunked-body framing. Consume only part of
+		// the first chunk on the wire (its size line plus a slice of the
+		// data) before killing the connection mid-transfer.
+		if _, err := io.ReadFull(brw.Reader, make([]byte, 16)); err != nil {
+			return
+		}
+		conn.Close()
+	}))
+	t.Cleanup(be.Close)
+	host := stripPort(strings.TrimPrefix(be.URL, "http://"))
+	pol := &Policy{AllowDomains: []string{host}}
+	g := startGateway(t, pol)
+
+	tr := &http.Transport{Proxy: func(*http.Request) (*url.URL, error) {
+		return url.Parse("http://" + g.Addr())
+	}}
+	c := &http.Client{Transport: tr, Timeout: 5 * time.Second}
+
+	body := strings.Repeat("B", bodySize)
+	req, _ := http.NewRequest("POST", be.URL, strings.NewReader(body))
+	req.Header.Set("X-Task-Id", "t1")
+	resp, err := c.Do(req)
+	if err != nil {
+		t.Fatalf("do: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status = %d, want %d (upstream-error branch)", resp.StatusCode, http.StatusBadGateway)
+	}
+	// The error branch bills BEFORE writing the 502, so once the client
+	// observes the response the counter has settled. The transport drains
+	// the whole small body through the countingReader in one pass before
+	// the upstream kills the connection, so exactly bodySize bytes were
+	// forwarded — and must be accounted, never zero.
+	if got := g.BytesUsed("t1"); got != int64(bodySize) {
+		t.Fatalf("BytesUsed = %d, want %d (body forwarded to a failing upstream must still count)", got, bodySize)
+	}
+}
+
 // TestBytesAccounting_ConnectTunnelUploadOnly pins that the CONNECT tunnel
 // bills exactly the client→upstream copy: bytes the target sends back
 // (download direction, here a different size) must not count.
 func TestBytesAccounting_ConnectTunnelUploadOnly(t *testing.T) {
 	const (
 		upload   = "EGRESS-PAYLOAD"        // 14 bytes client → target
-		download = "DOWNSTREAM-RESPONSE!!" // 20 bytes target → client
+		download = "DOWNSTREAM-RESPONSE!!" // 21 bytes target → client
 	)
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
