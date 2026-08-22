@@ -48,6 +48,20 @@ func loadLaunchConfig(path string) (*spec.TaskSpec, error) {
 	return spec.LoadFile(path)
 }
 
+// ephemeralFalseExplicit reports whether the caller explicitly passed
+// -ephemeral=false on this FlagSet. The -config merge only flips ephemeral
+// ON from the spec, so an explicit CLI opt-out must win over the file
+// (same flag-beats-file rule as every other boolean override).
+func ephemeralFalseExplicit(fs *flag.FlagSet) bool {
+	explicitFalse := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "ephemeral" && f.Value.String() == "false" {
+			explicitFalse = true
+		}
+	})
+	return explicitFalse
+}
+
 func main() {
 	if len(os.Args) < 2 {
 		fmt.Println("Usage: umlctl [start|image|logs|ps|network]")
@@ -67,6 +81,7 @@ func main() {
 		netTap := startCmd.String("tap", "", "Network tap device (optional)")
 		initCmd := startCmd.String("init", "/sbin/init", "Init command inside container")
 		overlay := startCmd.Bool("overlay", false, "Use overlayfs (rootfs is base image)")
+		ephemeral := startCmd.Bool("ephemeral", false, "Non-persistent container: read-only rootfs, discard container state after exit")
 		rm := startCmd.Bool("rm", false, "Remove container and state after exit")
 		it := startCmd.Bool("it", false, "Interactive mode (direct shell login, bypass logs)")
 		volume := startCmd.String("volume", "", "Host directory to mount via hostfs (e.g. /host:/container)")
@@ -108,6 +123,13 @@ func main() {
 				if s.Kernel.Virtio {
 					*virtio = true
 				}
+				// Same flip-on rule for ephemeral: workspace.ephemeral=true in the
+				// config enables non-persistent mode unless the caller explicitly
+				// passed -ephemeral=false (flag.Visit detects explicit setting,
+				// mirroring agentpvm run's boolean override handling).
+				if s.Workspace.Ephemeral && !ephemeralFalseExplicit(startCmd) {
+					*ephemeral = true
+				}
 			} else {
 				fmt.Printf("Warning: -config %s load failed: %v\n", *configPath, err)
 			}
@@ -139,6 +161,15 @@ func main() {
 			UseVirtio:   *virtio,
 			Init:        *initCmd,
 			NetworkTap:  *netTap,
+			Ephemeral:   *ephemeral,
+		}
+
+		// Ephemeral and overlay clone are mutually exclusive: an ephemeral
+		// container boots its rootfs read-only, so copying the base into a
+		// private layer would be pure waste.
+		if *ephemeral && *overlay {
+			fmt.Println("Error: -ephemeral and -overlay are mutually exclusive (ephemeral boots the rootfs read-only, no layer is cloned)")
+			os.Exit(1)
 		}
 
 		if *overlay {
@@ -182,8 +213,11 @@ func main() {
 		fmt.Printf("Starting container %s...\n", *name)
 		err = manager.Start(ctx, cfg)
 
-		if *rm {
-			fmt.Println("Cleaning up container state and files (--rm)...")
+		// Ephemeral implies -rm: discard the container dir (state, logs) after
+		// exit so nothing of the run persists. The clone guard is the same as
+		// -rm: while clones still branch from this container, keep the files.
+		if *rm || *ephemeral {
+			fmt.Println("Cleaning up container state and files...")
 			// A clone's overlay backing reaches into this container's dir;
 			// keep the files while clones still branch from it.
 			if perr := snapshot.PrepareDelete(*name); perr != nil {

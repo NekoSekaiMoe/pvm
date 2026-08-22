@@ -30,6 +30,14 @@ init      = "/sbin/init"
 # `qemu-img convert -O qcow2` (no qemu binaries needed). Keeps snapshot
 # exports / state dirs small. vhost path only; non-fatal on failure.
 compact_on_exit = true
+# Non-persistent sandbox: boots the rootfs READ-ONLY (kernel "ro" + a
+# read-only vhost-user-blk backend) and never creates a qcow2 overlay, so no
+# guest write can reach the host disk. Writable scratch space is tmpfs
+# mounted by an ephemeral-aware guest init (see uml/init-ephemeral.sh).
+# Declared [[volumes]] are STILL attached and preserved — explicit mounts
+# are user intent. Mutually exclusive with compact_on_exit and overlay
+# (there is no overlay to compact or place). CLI override: -ephemeral.
+# ephemeral = false
 
 [kernel]
 path          = "./bin/linux"

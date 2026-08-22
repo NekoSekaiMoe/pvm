@@ -91,3 +91,35 @@ func TestStartBlk_PrepareStateDir(t *testing.T) {
 		t.Errorf("container dir %s was not prepared: %v", dir, err)
 	}
 }
+
+// TestStartBlkReadOnly_GoBackend: the read-only variant serves a socket and
+// opens the image through the read-only backend (O_RDONLY fd + write-rejecting
+// wrapper). The socket lifecycle matches StartBlk.
+func TestStartBlkReadOnly_GoBackend(t *testing.T) {
+	useTempState(t)
+	dir := t.TempDir()
+	img := filepath.Join(dir, "base.img")
+	if err := os.WriteFile(img, make([]byte, 1<<20), 0644); err != nil {
+		t.Fatalf("write image: %v", err)
+	}
+	t.Setenv("PVM_VHOST_BACKEND", "")
+	sock, closer, err := StartBlkReadOnly("c-ro", img)
+	if err != nil {
+		t.Fatalf("StartBlkReadOnly: %v", err)
+	}
+	defer closer.Close()
+	defer os.Remove(sock)
+	if _, err := os.Stat(sock); err != nil {
+		t.Fatalf("socket not published: %v", err)
+	}
+}
+
+// TestStartBlkReadOnly_BadImage: a missing image fails before serving.
+func TestStartBlkReadOnly_BadImage(t *testing.T) {
+	useTempState(t)
+	t.Setenv("PVM_VHOST_BACKEND", "")
+	_, _, err := StartBlkReadOnly("c-ro-bad", filepath.Join(t.TempDir(), "missing.img"))
+	if err == nil {
+		t.Fatal("expected error for missing image")
+	}
+}

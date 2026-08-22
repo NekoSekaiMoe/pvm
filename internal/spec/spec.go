@@ -128,6 +128,19 @@ type WorkspaceSpec struct {
 	// the base directly and has no overlay to compact. Non-fatal: a compact
 	// failure is logged + audited but does not flip a clean task to Failed.
 	CompactOnExit bool `toml:"compact_on_exit"`
+
+	// Ephemeral makes the sandbox's disk writes non-persistent: the root
+	// filesystem is mounted read-only (kernel cmdline "ro" instead of "rw",
+	// plus a read-only block backend on the vhost path) and NO per-task qcow2
+	// overlay is created — nothing the guest could persist ever reaches the
+	// host disk. Writable scratch space is the guest's responsibility: an
+	// ephemeral-aware init mounts tmpfs on /tmp, /var/tmp, /run, /dev/shm
+	// (see uml/init-ephemeral.sh for the reference implementation). Declared
+	// persistent volumes are still attached and preserved — explicit volume
+	// mounts are user intent and are NOT discarded. Mutually exclusive with
+	// compact_on_exit (nothing to compact) and workspace.overlay (no overlay
+	// is ever created).
+	Ephemeral bool `toml:"ephemeral"`
 }
 
 // KernelSpec selects the UML kernel binary and its launch mode.
@@ -423,6 +436,18 @@ func (s *TaskSpec) Validate() error {
 		}
 		if err := validateImagePath(f.field, f.val); err != nil {
 			errs = append(errs, err)
+		}
+	}
+	// Ephemeral consistency: an ephemeral sandbox never creates a qcow2
+	// overlay, so the overlay lifecycle knobs are meaningless. Rejecting
+	// them beats silently ignoring — a spec that asks to compact (or place)
+	// an overlay that will never exist is almost certainly a config error.
+	if s.Workspace.Ephemeral {
+		if s.Workspace.CompactOnExit {
+			errs = append(errs, errors.New("spec: workspace.compact_on_exit conflicts with workspace.ephemeral (ephemeral tasks create no overlay to compact)"))
+		}
+		if s.Workspace.Overlay != "" {
+			errs = append(errs, errors.New("spec: workspace.overlay conflicts with workspace.ephemeral (ephemeral tasks never create an overlay)"))
 		}
 	}
 	if s.Identity.TTL != "" {

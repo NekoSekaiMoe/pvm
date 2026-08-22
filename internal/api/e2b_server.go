@@ -110,10 +110,11 @@ func NewE2BServer() (*echo.Echo, error) {
 	// Start a container via shelling out to umlctl to ensure proper isolation
 	api.POST("/containers/start", func(c echo.Context) error {
 		type StartReq struct {
-			Name   string `json:"name"`
-			Rootfs string `json:"rootfs"`
-			Mem    string `json:"mem"`
-			CPU    int    `json:"cpu"`
+			Name      string `json:"name"`
+			Rootfs    string `json:"rootfs"`
+			Mem       string `json:"mem"`
+			CPU       int    `json:"cpu"`
+			Ephemeral bool   `json:"ephemeral"`
 		}
 		var req StartReq
 		if err := c.Bind(&req); err != nil {
@@ -165,6 +166,10 @@ func NewE2BServer() (*echo.Echo, error) {
 			Memory:      strconv.FormatInt(memBytes, 10),
 			MemoryBytes: memBytes,
 			CPU:         req.CPU,
+			// Ephemeral mounts the rootfs read-only: nothing the guest writes
+			// persists (see ContainerConfig.Ephemeral). Writable scratch is
+			// the guest init's tmpfs — /init.sh consumers mount it themselves.
+			Ephemeral: req.Ephemeral,
 		}
 
 		if err := mgr.Start(context.Background(), cfg); err != nil {

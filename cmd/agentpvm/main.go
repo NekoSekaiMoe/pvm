@@ -125,6 +125,7 @@ func runCmd(args []string) {
 	initCmd := fs.String("init", "", "Override workspace.init (in-guest init command)")
 	netEnabled := fs.Bool("net", false, "Enable guest networking (overrides network.enabled)")
 	netTap := fs.String("net-tap", "", "Host TAP device name (overrides network.tap)")
+	ephemeral := fs.Bool("ephemeral", false, "Non-persistent sandbox (overrides workspace.ephemeral): read-only rootfs, no qcow2 overlay")
 	fs.Parse(args)
 
 	if *debug {
@@ -151,9 +152,13 @@ func runCmd(args []string) {
 	// able to turn OFF a config-provided network.enabled=true), so only
 	// apply the override when the flag was actually given on the command line.
 	netGiven := false
+	ephemeralGiven := false
 	fs.Visit(func(f *flag.Flag) {
-		if f.Name == "net" {
+		switch f.Name {
+		case "net":
 			netGiven = true
+		case "ephemeral":
+			ephemeralGiven = true
 		}
 	})
 	if *rootfs != "" {
@@ -171,6 +176,17 @@ func runCmd(args []string) {
 	if *netTap != "" {
 		s.Network.Enabled = true // a TAP name implies the caller wants networking
 		s.Network.TAP = *netTap
+	}
+	if ephemeralGiven {
+		s.Workspace.Ephemeral = *ephemeral
+	}
+	// Re-validate after the overrides: a CLI flip can introduce cross-field
+	// conflicts the config file alone would have caught (e.g. -ephemeral over
+	// a config with compact_on_exit=true — an ephemeral task has no overlay
+	// to compact, so the combination must fail here, not mid-boot).
+	if err := s.Validate(); err != nil {
+		fmt.Fprintf(os.Stderr, "config: overrides leave spec invalid: %v\n", err)
+		os.Exit(1)
 	}
 
 	taskID := *name

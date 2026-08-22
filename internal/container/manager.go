@@ -373,20 +373,37 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 				return fmt.Errorf("container: base image %q for %s failed trusted-root validation: %w", s.Workspace.BaseImage, taskID, verr)
 			}
 			resolvedRootfs = overlayPath
-			if err := cow.CreateOverlay(ctx, resolvedBase, overlayPath); err != nil {
-				cleanupVolumes()
-				_ = ledger.Append(audit.Record{Phase: audit.PhaseExec, Subject: taskID, Action: "overlay", Decision: audit.DecisionDeny, Reason: "qcow2 overlay failed: " + err.Error()})
-				_ = st.Transition(state.StatusFailed, state.ActorController, "overlay creation failed: "+err.Error())
-				state.SaveState(taskID, st)
-				return fmt.Errorf("container: create qcow2 overlay for %s: %w", taskID, err)
+			if s.Workspace.Ephemeral {
+				// Ephemeral: serve the base READ-ONLY directly — no overlay is
+				// created, so no guest write can ever reach the host disk. This
+				// is belt-and-suspenders with the kernel cmdline "ro": a
+				// malicious guest init that remounts the root rw still hits a
+				// read-only block device (VIRTIO_BLK_F_RO) and an O_RDONLY fd.
+				resolvedRootfs = resolvedBase
+				_ = ledger.Append(audit.Record{Phase: audit.PhaseExec, Subject: taskID, Action: "rootfs", Decision: audit.DecisionConstrain, Reason: "ephemeral mode: base image served read-only (no qcow2 overlay)"})
+			} else {
+				if err := cow.CreateOverlay(ctx, resolvedBase, overlayPath); err != nil {
+					cleanupVolumes()
+					_ = ledger.Append(audit.Record{Phase: audit.PhaseExec, Subject: taskID, Action: "overlay", Decision: audit.DecisionDeny, Reason: "qcow2 overlay failed: " + err.Error()})
+					_ = st.Transition(state.StatusFailed, state.ActorController, "overlay creation failed: "+err.Error())
+					state.SaveState(taskID, st)
+					return fmt.Errorf("container: create qcow2 overlay for %s: %w", taskID, err)
+				}
+				overlayCreated = true
 			}
-			overlayCreated = true
 		} else {
 			// ubd path: mount the base directly (no CoW). Works with raw or
 			// qcow2-as-flat-file; ubd reads raw bytes, so callers normally pass
 			// a raw ext4 image here. Recorded as a constrained isolation level.
 			resolvedRootfs = s.Workspace.BaseImage
-			_ = ledger.Append(audit.Record{Phase: audit.PhaseExec, Subject: taskID, Action: "rootfs", Decision: audit.DecisionConstrain, Reason: "ubd backend mounts base directly (no qcow2 CoW)"})
+			if s.Workspace.Ephemeral {
+				// Ephemeral on the ubd path: the cmdline "ro" (buildTaskArgs)
+				// is the write barrier — ubd has no host-side read-only backend,
+				// so this audit row records the weaker guarantee explicitly.
+				_ = ledger.Append(audit.Record{Phase: audit.PhaseExec, Subject: taskID, Action: "rootfs", Decision: audit.DecisionConstrain, Reason: "ephemeral mode: ubd backend mounts base with ro cmdline (no qcow2 CoW)"})
+			} else {
+				_ = ledger.Append(audit.Record{Phase: audit.PhaseExec, Subject: taskID, Action: "rootfs", Decision: audit.DecisionConstrain, Reason: "ubd backend mounts base directly (no qcow2 CoW)"})
+			}
 		}
 	}
 
@@ -411,7 +428,17 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 	var vhostBackend io.Closer
 	var egressAddr string // host:port of this task's dedicated egress listener
 	if s.Kernel.UseVhostBlk && s.Workspace.BaseImage != "" {
-		sock, backend, err := vhost.StartBlk(taskID, resolvedRootfs)
+		var sock string
+		var backend io.Closer
+		var err error
+		if s.Workspace.Ephemeral {
+			// Ephemeral sandboxes serve the base image through a read-only
+			// backend (VIRTIO_BLK_F_RO + O_RDONLY fd) instead of a writable
+			// overlay — see the provisioning block above.
+			sock, backend, err = vhost.StartBlkReadOnly(taskID, resolvedRootfs)
+		} else {
+			sock, backend, err = vhost.StartBlk(taskID, resolvedRootfs)
+		}
 		if err != nil {
 			cleanupVolumes()
 			_ = st.Transition(state.StatusFailed, state.ActorController, "vhost daemon failed: "+err.Error())
@@ -899,7 +926,13 @@ func buildLegacyArgs(ctx context.Context, cfg *config.ContainerConfig) ([]string
 		args = append(args, fmt.Sprintf("ubd0=%s", resolved))
 		args = append(args, "root=/dev/ubda")
 	}
-	args = append(args, "rw")
+	// Root mount mode: ephemeral sandboxes mount the rootfs read-only so
+	// nothing the guest writes persists (same contract as buildTaskArgs).
+	if cfg.Ephemeral {
+		args = append(args, "ro")
+	} else {
+		args = append(args, "rw")
+	}
 	// Network device: vec0 (see buildTaskArgs — legacy eth0=tuntap is gone in
 	// Linux >= 6.16, only the vector transport remains).
 	if cfg.NetworkTap != "" {
@@ -966,7 +999,15 @@ func buildTaskArgs(s *spec.TaskSpec, vhostSock, resolvedRootfs, egressAddr strin
 	}
 	// resolvedRootfs empty: no block device was provisioned (BaseImage
 	// unset), so the kernel boots init-only with no ubd0=/root= args.
-	args = append(args, "rw")
+	// Root mount mode: ephemeral sandboxes boot read-only — no guest write
+	// can reach the host disk. Writable scratch space is the guest init's
+	// tmpfs (see uml/init-ephemeral.sh); persistent volumes (hostfs mounts)
+	// are unaffected by the root's mount mode.
+	if s.Workspace.Ephemeral {
+		args = append(args, "ro")
+	} else {
+		args = append(args, "rw")
+	}
 	// Network device: vec0 (vector tap transport). Since Linux 6.16 the legacy
 	// UML net transports (CONFIG_UML_NET + eth0=tuntap/slip/daemon/...) are
 	// GONE — only CONFIG_UML_NET_VECTOR remains, so the kernel only parses

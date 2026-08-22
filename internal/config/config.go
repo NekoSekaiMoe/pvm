@@ -19,6 +19,12 @@ type ContainerConfig struct {
 	UseVirtio       bool   `json:"use_virtio"`
 	VhostUserSocket string `json:"vhost_user_socket"`
 	NetworkTap      string `json:"network_tap"`
+
+	// Ephemeral boots the rootfs read-only (kernel cmdline "ro"): nothing
+	// the guest writes persists. The legacy Start path has no overlay to
+	// skip, so this is purely the ro/rw cmdline switch (umlctl -ephemeral
+	// additionally discards the container dir after exit).
+	Ephemeral bool `json:"ephemeral"`
 }
 
 // ParseMemory parses strings like "512M", "1G" into bytes

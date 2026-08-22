@@ -36,6 +36,7 @@ This directory contains shell-based integration and end-to-end (E2E) suites vali
 | `26_test_full_feature_e2e.sh`| No | One task's full cross-plane lifecycle: load-spec → FSM → tool gateway (allow/deny/approve) → approval → pause/resume → gate release → completed → destroy → audit chain |
 | `27_test_event_snapshot_clone_rollback.sh` | No | Event-level snapshots, instant task/container cloning (zero-copy CoW branching), historical rollback with audit verification |
 | `28_test_webui_simulation.sh` | No | End-to-end verification of Nuxt 3 WebUI SPA routes, metrics, and page-dependent REST workflows |
+| `29_test_ephemeral_mode.sh` | No | Ephemeral (non-persistent) sandboxes: `workspace.ephemeral` spec validation + conflicts, `agentpvm run -ephemeral` override re-validation, no-overlay residue on failed launch, `umlctl -ephemeral` (mutual exclusion + state-dir discard), `/containers/start` ephemeral field |
 
 ---
 
@@ -44,7 +45,7 @@ This directory contains shell-based integration and end-to-end (E2E) suites vali
 ```bash
 # Run all unprivileged CI-safe suites (fails fast on first error)
 set -e
-for s in tests/{05,06,07,08,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28}_*.sh; do
+for s in tests/{05,06,07,08,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29}_*.sh; do
     echo "Running $s..."
     ./"$s"
 done

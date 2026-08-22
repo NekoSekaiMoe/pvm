@@ -363,3 +363,77 @@ func TestBuildTaskArgs_AcceptsLegitFixture(t *testing.T) {
 		}
 	}
 }
+
+// TestBuildTaskArgs_EphemeralReadOnly: ephemeral specs mount the root
+// read-only ("ro" instead of "rw") — the cmdline half of the non-persistent
+// contract (the vhost read-only backend is the other half).
+func TestBuildTaskArgs_EphemeralReadOnly(t *testing.T) {
+	cases := []struct {
+		name      string
+		ephemeral bool
+		want      string
+	}{
+		{"persistent", false, "rw"},
+		{"ephemeral", true, "ro"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s := &spec.TaskSpec{
+				Workspace: spec.WorkspaceSpec{Init: "/init.sh", Ephemeral: c.ephemeral},
+			}
+			args, err := buildTaskArgs(s, "", "", "", nil)
+			if err != nil {
+				t.Fatalf("buildTaskArgs: %v", err)
+			}
+			sawWant, sawOther := false, false
+			for _, a := range args {
+				switch a {
+				case c.want:
+					sawWant = true
+				case "rw", "ro":
+					sawOther = true
+				}
+			}
+			if !sawWant {
+				t.Errorf("args missing %q: %v", c.want, args)
+			}
+			if sawOther {
+				t.Errorf("args carry both ro and rw: %v", args)
+			}
+		})
+	}
+}
+
+// TestBuildLegacyArgs_EphemeralReadOnly: the legacy path mirrors the spec
+// path — cfg.Ephemeral boots "ro".
+func TestBuildLegacyArgs_EphemeralReadOnly(t *testing.T) {
+	root := t.TempDir()
+	rootfs := filepath.Join(root, "rootfs.img")
+	if err := os.WriteFile(rootfs, []byte("img"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.ContainerConfig{
+		Init:      "/init.sh",
+		Memory:    "512M",
+		Rootfs:    rootfs,
+		Ephemeral: true,
+	}
+	args, err := buildLegacyArgs(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("buildLegacyArgs: %v", err)
+	}
+	for _, a := range args {
+		if a == "rw" {
+			t.Fatalf("ephemeral legacy args contain rw: %v", args)
+		}
+	}
+	sawRO := false
+	for _, a := range args {
+		if a == "ro" {
+			sawRO = true
+		}
+	}
+	if !sawRO {
+		t.Fatalf("legacy args missing ro: %v", args)
+	}
+}

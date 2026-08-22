@@ -4,7 +4,10 @@ load("@rules_go//go:def.bzl", "go_test")
 # integration tests. All deps are test deps.
 go_test(
     name = "integrationtest_test",
-    srcs = ["flows_test.go"],
+    srcs = [
+        "ephemeral_test.go",
+        "flows_test.go",
+    ],
     deps = [
         "//internal/approval",
         "//internal/artifact",

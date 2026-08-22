@@ -86,6 +86,39 @@ func OpenWritable(path string) (WritableBackend, error) {
 	return &qcow2Writable{qcow2Image: q, fileSize: uint64(st.Size())}, nil
 }
 
+// OpenReadOnly opens path as a READ-ONLY backend: raw images are used
+// directly, qcow2 images (and their backing chain) are parsed but every
+// write is rejected. It satisfies the same WritableBackend interface so the
+// vhost-user-blk server (internal/vhost/vu) can consume it unchanged — the
+// virtio-blk device advertises VIRTIO_BLK_F_RO and rejects guest writes at
+// the device level, so the backend's WriteAt error is a second line of
+// defense (a read-only fd backs it: even a bug in the ro plumbing cannot
+// mutate the image). Used by ephemeral (non-persistent) sandboxes.
+func OpenReadOnly(path string) (WritableBackend, error) {
+	img, err := openGuestImage(path)
+	if err != nil {
+		return nil, err
+	}
+	return &readOnlyBackend{img: img}, nil
+}
+
+// readOnlyBackend adapts a guestImage (opened O_RDONLY by openGuestImage)
+// to WritableBackend with writes failing closed.
+type readOnlyBackend struct {
+	img guestImage
+}
+
+func (r *readOnlyBackend) ReadAt(p []byte, off int64) (int, error) { return r.img.ReadAt(p, off) }
+func (r *readOnlyBackend) Size() int64                            { return int64(r.img.Size()) }
+func (r *readOnlyBackend) Sync() error                            { return nil }
+func (r *readOnlyBackend) Close() error                           { return r.img.Close() }
+
+// WriteAt always fails: the backing fd is read-only, so the kernel would
+// refuse the write anyway — surface an explicit error instead.
+func (r *readOnlyBackend) WriteAt(p []byte, off int64) (int, error) {
+	return 0, fmt.Errorf("cow: read-only backend: write of %d bytes at offset %d rejected", len(p), off)
+}
+
 type rawWritable struct{ rawImage }
 
 func (r *rawWritable) WriteAt(p []byte, off int64) (int, error) { return r.f.WriteAt(p, off) }

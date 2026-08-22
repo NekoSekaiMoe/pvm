@@ -35,23 +35,42 @@ const (
 // dir. The returned closer tears the backend down (server or subprocess);
 // callers must also remove the socket path.
 func StartBlk(containerID string, imagePath string) (string, io.Closer, error) {
+	return startBlkMode(containerID, imagePath, false)
+}
+
+// StartBlkReadOnly starts a READ-ONLY vhost-user-blk backend: the device
+// advertises VIRTIO_BLK_F_RO and rejects guest writes, and the underlying
+// image is opened O_RDONLY. Used by ephemeral (non-persistent) sandboxes,
+// which serve the base image directly instead of a writable CoW overlay.
+func StartBlkReadOnly(containerID string, imagePath string) (string, io.Closer, error) {
+	return startBlkMode(containerID, imagePath, true)
+}
+
+// startBlkMode dispatches to the configured backend (pure-Go default,
+// PVM_VHOST_BACKEND=qemu fallback) with the requested write mode.
+func startBlkMode(containerID string, imagePath string, readOnly bool) (string, io.Closer, error) {
 	if os.Getenv("PVM_VHOST_BACKEND") == "qemu" {
-		return startQemuDaemon(containerID, imagePath)
+		return startQemuDaemon(containerID, imagePath, readOnly)
 	}
-	return startGoServer(containerID, imagePath)
+	return startGoServer(containerID, imagePath, readOnly)
 }
 
 // startGoServer runs the pure-Go vhost-user-blk server in-process.
-func startGoServer(containerID string, imagePath string) (string, io.Closer, error) {
+func startGoServer(containerID string, imagePath string, readOnly bool) (string, io.Closer, error) {
 	socketPath, err := prepareSocket(containerID)
 	if err != nil {
 		return "", nil, err
 	}
-	be, err := cow.OpenWritable(imagePath)
+	var be cow.WritableBackend
+	if readOnly {
+		be, err = cow.OpenReadOnly(imagePath)
+	} else {
+		be, err = cow.OpenWritable(imagePath)
+	}
 	if err != nil {
 		return "", nil, fmt.Errorf("vhost: open image: %w", err)
 	}
-	dev, err := vu.NewBlkDev(be, false)
+	dev, err := vu.NewBlkDev(be, readOnly)
 	if err != nil {
 		be.Close()
 		return "", nil, fmt.Errorf("vhost: blk device: %w", err)
@@ -111,7 +130,8 @@ func (q *qemuDaemon) Close() error {
 
 // startQemuDaemon launches qemu-storage-daemon as a subprocess serving a
 // vhost-user-blk socket (reference backend; requires qemu installed).
-func startQemuDaemon(containerID string, imagePath string) (string, io.Closer, error) {
+// readOnly switches the export to writable=off.
+func startQemuDaemon(containerID string, imagePath string, readOnly bool) (string, io.Closer, error) {
 	socketPath, err := prepareSocket(containerID)
 	if err != nil {
 		return "", nil, err
@@ -136,10 +156,15 @@ func startQemuDaemon(containerID string, imagePath string) (string, io.Closer, e
 		aioMode = "io_uring"
 	}
 
+	writable := "on"
+	if readOnly {
+		writable = "off"
+	}
+
 	cmd := exec.Command("qemu-storage-daemon",
 		"--blockdev", fmt.Sprintf("driver=file,node-name=disk0,filename=%s,aio=%s", imagePath, aioMode),
 		"--blockdev", fmt.Sprintf("driver=%s,node-name=format0,file=disk0", formatDriver),
-		"--export", fmt.Sprintf("type=vhost-user-blk,id=export0,node-name=format0,addr.type=unix,addr.path=%s,writable=on", socketPath),
+		"--export", fmt.Sprintf("type=vhost-user-blk,id=export0,node-name=format0,addr.type=unix,addr.path=%s,writable=%s", socketPath, writable),
 	)
 
 	if err := cmd.Start(); err != nil {

@@ -7,6 +7,7 @@
         <NuxtLink to="/" class="nav-link">Containers</NuxtLink>
         <NuxtLink to="/images" class="nav-link">Images</NuxtLink>
         <NuxtLink to="/tasks" class="nav-link">Tasks</NuxtLink>
+        <NuxtLink to="/ephemeral" class="nav-link">Ephemeral</NuxtLink>
         <NuxtLink to="/volumes" class="nav-link">Volumes</NuxtLink>
         <NuxtLink to="/templates" class="nav-link">Templates</NuxtLink>
         <NuxtLink to="/pool" class="nav-link">Pool &amp; Quota</NuxtLink>
