@@ -37,8 +37,14 @@ if [ ! -x ./bin/linux ]; then
     exit 0
 fi
 
-IMG_NAME="cow_rootfs.img"
-QCOW_NAME="cow_rootfs.qcow2"
+# Base images must live inside a TRUSTED image root: StartTask validates
+# workspace.base_image with validateRootfsContained (containerImageRoots),
+# which only accepts /var/lib/uml-container/images, $PVM_IMAGE_ROOT, the CoW
+# root and the state root. A repo-cwd path — even absolute — is rejected
+# ("outside the trusted image roots") before UML ever boots.
+IMG_DIR=/var/lib/uml-container/images
+IMG_NAME="$IMG_DIR/cow_rootfs.img"
+QCOW_NAME="$IMG_DIR/cow_rootfs.qcow2"
 NAME="test-cow"
 TAP="tap_cow"
 BRIDGE="pvm_br_cow"
@@ -54,14 +60,16 @@ cleanup() {
     sudo ./bin/umlctl network rm "$BRIDGE" >/dev/null 2>&1 || true
     sudo ip link delete "$TAP" 2>/dev/null || true
     sudo umount "$MNT" 2>/dev/null || true
-    rm -rf "$MNT" "$IMG_NAME" "$QCOW_NAME"
+    rm -rf "$MNT"
+    sudo rm -f "$IMG_NAME" "$QCOW_NAME"
 }
 trap cleanup EXIT
 
 # ---- 1) Build a REAL rootfs (alpine + init), not a bare mkfs image ----
-echo "Creating alpine rootfs..."
-dd if=/dev/zero of="$IMG_NAME" bs=1M count=200 > /dev/null 2>&1
-mkfs.ext4 -q -F "$IMG_NAME"
+echo "Creating alpine rootfs (under trusted image root $IMG_DIR)..."
+sudo mkdir -p "$IMG_DIR"
+sudo dd if=/dev/zero of="$IMG_NAME" bs=1M count=200 > /dev/null 2>&1
+sudo mkfs.ext4 -q -F "$IMG_NAME"
 
 if [ ! -f "alpine.tar.gz" ]; then
 # shellcheck disable=SC2086  # ALPINE_ARCH is a uname -m arch word (x86_64/aarch64), never globs/splits
@@ -110,10 +118,10 @@ sudo umount "$MNT"
 # ----    Either way agentpvm builds a per-task pure-Go qcow2 CoW overlay. ----
 if [ "$HAVE_QEMU_IMG" = "1" ]; then
     echo "Converting raw ext4 base to qcow2..."
-    qemu-img convert -p -O qcow2 "$IMG_NAME" "$QCOW_NAME" > /dev/null
-    BASE="$(pwd)/$QCOW_NAME"   # absolute: validateRootfs rejects relative paths
+    sudo qemu-img convert -p -O qcow2 "$IMG_NAME" "$QCOW_NAME" > /dev/null
+    BASE="$QCOW_NAME"   # absolute AND inside the trusted image root (see IMG_DIR above)
 else
-    BASE="$(pwd)/$IMG_NAME"
+    BASE="$IMG_NAME"
 fi
 
 # ---- 3) Host networking (same proven pattern as scripts/test_pkg_install.sh,

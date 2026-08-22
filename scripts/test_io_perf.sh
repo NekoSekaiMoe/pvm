@@ -93,14 +93,20 @@ sudo umount mnt
 # vhost-user-blk; ubd cannot read qcow2). Convert the raw ext4 image to qcow2
 # ONCE using the pure-Go converter (no qemu-img dependency). Falls back to
 # qemu-img if the agentpvm binary somehow lacks the converter.
-# Absolute path: validateRootfs (trusted-root validation) rejects relative paths.
-BASE_QCOW2="$(pwd)/perf_rootfs.qcow2"
-rm -f "${BASE_QCOW2}"
-if ./agentpvm cow -to-qcow2 "${IMG_NAME}" -overlay "${BASE_QCOW2}" 2>/dev/null; then
+# The base must be absolute AND inside a trusted image root: StartTask's
+# validateRootfsContained (containerImageRoots) rejects anything outside
+# /var/lib/uml-container/images, $PVM_IMAGE_ROOT, the CoW root or the state
+# root — including repo-cwd paths. sudo because this script runs as the CI
+# user while the image store is root-owned.
+IMG_DIR=/var/lib/uml-container/images
+sudo mkdir -p "${IMG_DIR}"
+BASE_QCOW2="${IMG_DIR}/perf_rootfs.qcow2"
+sudo rm -f "${BASE_QCOW2}"
+if sudo ./agentpvm cow -to-qcow2 "${IMG_NAME}" -overlay "${BASE_QCOW2}" 2>/dev/null; then
     echo "Built qcow2 base via pure-Go converter."
 elif command -v qemu-img >/dev/null 2>&1; then
     echo "Pure-Go converter unavailable; falling back to qemu-img convert."
-    qemu-img convert -p -O qcow2 "${IMG_NAME}" "${BASE_QCOW2}" >/dev/null
+    sudo qemu-img convert -p -O qcow2 "${IMG_NAME}" "${BASE_QCOW2}" >/dev/null
 else
     echo "FATAL: cannot build qcow2 base (no pure-Go converter and no qemu-img)."
     exit 1
