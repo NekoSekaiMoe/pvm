@@ -135,8 +135,9 @@ const filteredContainers = computed(() => {
 
 const fetchContainers = async () => {
   try {
-    const list = await apiFetch('/api/containers')
-    containers.value = list || []
+    // API guarantees [] (never null) for empty lists — regression-locked by
+    // TestAPI_EmptyListsAreArraysNotNull; assign directly like approvals.vue.
+    containers.value = await apiFetch('/api/containers')
   } catch (e) {
     console.error(e)
   }
