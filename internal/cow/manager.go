@@ -112,6 +112,9 @@ func createOverlayValidated(ctx context.Context, baseImage, overlayFile string, 
 		if err := os.Remove(overlayFile); err != nil {
 			return fmt.Errorf("cow: remove stale overlay: %w", err)
 		}
+		// The destroyed overlay's backing authorization ends with it, so a
+		// recreated overlay cannot keep its predecessor's base dir valid.
+		unregisterOverlayBacking(overlayFile)
 	}
 
 	// Sniff the backing format by magic and derive the virtual size from the
@@ -120,12 +123,22 @@ func createOverlayValidated(ctx context.Context, baseImage, overlayFile string, 
 	if err != nil {
 		return fmt.Errorf("cow: open backing image: %w", err)
 	}
+	// Snapshot everything createQcow2 needs from the backing BEFORE Close:
+	// a closed image is never read again, even though today's Size/Format
+	// implementations are pure field reads.
 	virtualSize := backing.Size()
+	backingFormat := backing.Format()
 	backing.Close()
-	// Record the base image's directory as an allowed backing root so this
-	// overlay (and any descendant) can resolve its backing on later opens.
-	RegisterBackingRoot(filepath.Dir(absBase))
-	return createQcow2(overlayFile, virtualSize, baseImage, backing.Format(), opt)
+	if err := createQcow2(overlayFile, virtualSize, baseImage, backingFormat, opt); err != nil {
+		return err
+	}
+	// Authorize the base image's directory for THIS overlay only, and only
+	// for as long as the overlay exists: later opens (vhost serving,
+	// convertToRaw, Compact) resolve the backing through this scoped root,
+	// and it is dropped when the overlay/base association ends (RemoveOverlay
+	// or the stale-overlay replacement above).
+	registerOverlayBacking(overlayFile, filepath.Dir(absBase))
+	return nil
 }
 
 // isQcow2 reports whether path begins with the qcow2 magic ("QFI\xfb"). A
@@ -171,16 +184,43 @@ func CommitOverlay(ctx context.Context, overlayFile, destImage string) error {
 	return convertToRaw(ctx, overlayFile, destImage)
 }
 
-// backingRoots are the directory trees inside which a qcow2 header's backing
-// reference must resolve. Defaults cover every storage root PVM derives:
-// engine root (PVM_COW_ROOT or /var/lib/uml-container/cow), the image store
-// (/var/lib/uml-container/images) and the container state root (PVM_STATE_ROOT
-// or /var/lib/uml-container/containers). CreateOverlay additionally registers
-// the directory of every base image it is handed, so overlays backed by user-
-// supplied base paths keep resolving.
+// RemoveOverlay deletes the overlay at overlayFile and ends the backing
+// authorization CreateOverlay recorded for it, so dynamic backing roots
+// cannot outlive their overlays. Use this — not a bare os.Remove — when
+// tearing down overlays created by CreateOverlay. Removing an overlay this
+// process never created (or that is already gone) is fine: the file removal
+// is idempotent and there is simply no authorization to drop.
+func RemoveOverlay(overlayFile string) error {
+	if err := validatePath(overlayFile); err != nil {
+		return err
+	}
+	abs, err := filepath.Abs(overlayFile)
+	if err != nil {
+		return fmt.Errorf("cow: resolve overlay path: %w", err)
+	}
+	if err := os.Remove(abs); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("cow: remove overlay: %w", err)
+	}
+	// The overlay/base association ends with the file.
+	unregisterOverlayBacking(abs)
+	return nil
+}
+
+// dynamicBackingRoots are the LIFECYCLE-SCOPED backing roots: unlike the
+// static roots (see staticBackingRoots), none of them lives for the whole
+// process. CreateOverlay authorizes the resolved base image's directory
+// for the overlay it creates, and the authorization is dropped when that
+// overlay/base association ends — RemoveOverlay, or the stale-overlay
+// replacement inside createOverlayValidated itself. Roots are refcounted
+// because N overlays may share one base: the dir stays allowed until the
+// last overlay using it is gone, so stale dirs cannot stay valid
+// indefinitely and the map cannot grow without bound once overlays are
+// torn down. RegisterBackingRoot/UnregisterBackingRoot expose the same
+// refcounted pair for ad-hoc (test) authorization.
 var (
 	backingRootsMu      sync.Mutex
-	dynamicBackingRoots = map[string]bool{}
+	dynamicBackingRoots = map[string]int{}    // abs dir -> live authorizations
+	overlayBackingDirs  = map[string]string{} // abs overlay -> abs base dir it authorized
 )
 
 // staticBackingRoots returns the environment-derived backing roots at CALL
@@ -204,16 +244,81 @@ func staticBackingRoots() []string {
 }
 
 // RegisterBackingRoot whitelists dir as a permitted backing location for
-// qcow2 images opened later. CreateOverlay calls it with the resolved base
-// image's directory; tests can use it for temp dirs.
+// qcow2 images opened later. Authorizations are refcounted: pair every
+// call with UnregisterBackingRoot(dir) once the reason for authorizing it
+// ends, so roots cannot outlive their users. CreateOverlay does not use
+// this pair — it uses the overlay-scoped registerOverlayBacking below, so
+// its authorizations end with the overlay automatically.
 func RegisterBackingRoot(dir string) {
 	abs, err := filepath.Abs(dir)
 	if err != nil {
 		return
 	}
 	backingRootsMu.Lock()
-	dynamicBackingRoots[abs] = true
+	dynamicBackingRoots[abs]++
 	backingRootsMu.Unlock()
+}
+
+// UnregisterBackingRoot drops one RegisterBackingRoot authorization of
+// dir. The directory stops being an allowed backing root as soon as no
+// authorization (and no live overlay) still references it.
+func UnregisterBackingRoot(dir string) {
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return
+	}
+	unregisterBackingRoot(abs)
+}
+
+// unregisterBackingRoot decrements (dropping at zero) the refcount of an
+// already-absolute root. backingRootsMu synchronizes the update with
+// backingPathAllowed's snapshot and with overlay registration.
+func unregisterBackingRoot(abs string) {
+	backingRootsMu.Lock()
+	if n := dynamicBackingRoots[abs]; n <= 1 {
+		delete(dynamicBackingRoots, abs)
+	} else {
+		dynamicBackingRoots[abs] = n - 1
+	}
+	backingRootsMu.Unlock()
+}
+
+// registerOverlayBacking authorizes baseDir for the lifetime of the
+// overlay at overlayPath: the root stays allowed while later opens resolve
+// that overlay's backing, and is dropped by unregisterOverlayBacking when
+// the overlay/base association ends.
+func registerOverlayBacking(overlayPath, baseDir string) {
+	backingRootsMu.Lock()
+	defer backingRootsMu.Unlock()
+	// Re-registering an overlay path (e.g. the file was deleted externally
+	// and is recreated) must not leak the previous base dir's refcount.
+	if old, ok := overlayBackingDirs[overlayPath]; ok && old != baseDir {
+		if n := dynamicBackingRoots[old]; n <= 1 {
+			delete(dynamicBackingRoots, old)
+		} else {
+			dynamicBackingRoots[old] = n - 1
+		}
+	}
+	dynamicBackingRoots[baseDir]++
+	overlayBackingDirs[overlayPath] = baseDir
+}
+
+// unregisterOverlayBacking ends the backing authorization
+// registerOverlayBacking recorded for overlayPath (a no-op for overlays
+// this process never created).
+func unregisterOverlayBacking(overlayPath string) {
+	backingRootsMu.Lock()
+	defer backingRootsMu.Unlock()
+	baseDir, ok := overlayBackingDirs[overlayPath]
+	if !ok {
+		return
+	}
+	delete(overlayBackingDirs, overlayPath)
+	if n := dynamicBackingRoots[baseDir]; n <= 1 {
+		delete(dynamicBackingRoots, baseDir)
+	} else {
+		dynamicBackingRoots[baseDir] = n - 1
+	}
 }
 
 // validateBackingName syntactically validates the raw backing name stored in
@@ -229,7 +334,7 @@ func validateBackingName(name string) error {
 
 // backingPathAllowed enforces containment of a backing path: it must live
 // under one of the managed roots, under the image's own directory tree, or
-// under a dynamically registered root. Relative names that climb out of the
+// under a lifecycle-scoped dynamic root. Relative names that climb out of the
 // image's directory with ".." therefore fail unless they land back in a
 // managed root, and absolute names pointing at arbitrary system files are
 // rejected outright. Both the candidate path and every allowed root are
@@ -277,7 +382,10 @@ func withinSubtree(p, dir string) bool {
 	if err != nil {
 		return false
 	}
-	return rel == "." || (!strings.HasPrefix(rel, "..") && rel != "")
+	// p escapes dir only when rel IS ".." or begins with a "../" element.
+	// Children whose names merely start with ".." (e.g. "..cache") are
+	// ordinary in-tree names and must stay allowed.
+	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, "../"))
 }
 
 // validatePath rejects empty, comma-bearing, NUL-bearing and option/protocol

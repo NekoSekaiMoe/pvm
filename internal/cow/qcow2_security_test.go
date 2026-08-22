@@ -71,6 +71,7 @@ func craftHeader(t *testing.T, path string, size uint64, backing, format string)
 func TestOpen_RejectsBackingCycle(t *testing.T) {
 	dir := t.TempDir()
 	RegisterBackingRoot(dir)
+	defer UnregisterBackingRoot(dir)
 	a := filepath.Join(dir, "a.qcow2")
 	b := filepath.Join(dir, "b.qcow2")
 	craftHeader(t, a, clusterSize, b, "")
@@ -84,6 +85,7 @@ func TestOpen_RejectsBackingCycle(t *testing.T) {
 func TestOpen_RejectsSelfBackingCycle(t *testing.T) {
 	dir := t.TempDir()
 	RegisterBackingRoot(dir)
+	defer UnregisterBackingRoot(dir)
 	a := filepath.Join(dir, "self.qcow2")
 	craftHeader(t, a, clusterSize, a, "")
 	_, err := openGuestImage(a)
@@ -95,6 +97,7 @@ func TestOpen_RejectsSelfBackingCycle(t *testing.T) {
 func TestOpen_RejectsChainDeeperThanLimit(t *testing.T) {
 	dir := t.TempDir()
 	RegisterBackingRoot(dir)
+	defer UnregisterBackingRoot(dir)
 	const depth = maxBackingChainDepth + 10
 	names := make([]string, depth)
 	for i := range names {
@@ -131,6 +134,7 @@ func TestOpen_RejectsAbsoluteBackingOutsideRoots(t *testing.T) {
 func TestOpen_RejectsSystemFileBacking(t *testing.T) {
 	dir := t.TempDir()
 	RegisterBackingRoot(dir)
+	defer UnregisterBackingRoot(dir)
 	img := filepath.Join(dir, "overlay.qcow2")
 	craftHeader(t, img, clusterSize, "/etc/hostname", "")
 	_, err := openGuestImage(img)
@@ -146,6 +150,7 @@ func TestOpen_RejectsRelativeBackingTraversal(t *testing.T) {
 		t.Fatal(err)
 	}
 	RegisterBackingRoot(sub)
+	defer UnregisterBackingRoot(sub)
 	img := filepath.Join(sub, "overlay.qcow2")
 	// Resolves to dir/escape.img — outside sub AND outside every registered
 	// root (only sub itself is registered).
@@ -195,11 +200,137 @@ func readFull(t *testing.T, path string, buf []byte) (int, error) {
 func TestOpen_RejectsOversizedVirtualSize(t *testing.T) {
 	dir := t.TempDir()
 	RegisterBackingRoot(dir)
+	defer UnregisterBackingRoot(dir)
 	img := filepath.Join(dir, "huge.qcow2")
 	craftHeader(t, img, maxVirtualSize+clusterSize, "", "")
 	_, err := openGuestImage(img)
 	if err == nil || !strings.Contains(err.Error(), "cap") {
 		t.Fatalf("expected virtual-size cap rejection, got: %v", err)
+	}
+}
+
+func TestDivCeil(t *testing.T) {
+	// A zero divisor must be an error, never a panic.
+	if _, err := divCeil(10, 0); err == nil {
+		t.Fatal("divCeil(10, 0) should reject a zero divisor")
+	}
+	// Non-exact ceiling division near the uint64 limit: the naive
+	// (a+b-1)/b wraps here; the overflow-safe path must return the exact
+	// ceiling 2^64/3.
+	got, err := divCeil(^uint64(0)-1, 3)
+	if err != nil {
+		t.Fatalf("divCeil(^uint64(0)-1, 3): %v", err)
+	}
+	if want := ^uint64(0) / 3; got != want {
+		t.Fatalf("divCeil(^uint64(0)-1, 3) = %d, want %d", got, want)
+	}
+	// Exact division at the uint64 max succeeds (no spurious overflow).
+	if got, err = divCeil(^uint64(0), 1); err != nil || got != ^uint64(0) {
+		t.Fatalf("divCeil(^uint64(0), 1) = %d, %v; want %d, nil", got, err, ^uint64(0))
+	}
+	// Ordinary anchors: ceiling for inexact, identity for exact.
+	if got, err = divCeil(10, 4); err != nil || got != 3 {
+		t.Fatalf("divCeil(10, 4) = %d, %v; want 3, nil", got, err)
+	}
+	if got, err = divCeil(8, 4); err != nil || got != 2 {
+		t.Fatalf("divCeil(8, 4) = %d, %v; want 2, nil", got, err)
+	}
+}
+
+// TestBackingRoots_LifecycleScoped verifies that overlay-authorized backing
+// roots end with the overlay that authorized them instead of lingering for
+// the life of the process, and that a shared base dir stays authorized until
+// the LAST overlay using it is removed.
+func TestBackingRoots_LifecycleScoped(t *testing.T) {
+	baseDir := t.TempDir()
+	// A different tree: only the overlay-scoped registration (or a manual
+	// one) can authorize baseDir.
+	overlayDir := t.TempDir()
+	base := filepath.Join(baseDir, "base.raw")
+	mustWriteRaw(t, base, 0, patterned(0x5a, clusterSize))
+
+	// probe asserts whether baseDir currently authorizes backing opens.
+	// The probe image lives in overlayDir, so its own directory never
+	// covers baseDir.
+	probe := func() error {
+		p := filepath.Join(overlayDir, "probe.qcow2")
+		craftHeader(t, p, clusterSize, base, "raw")
+		_, err := openGuestImage(p)
+		return err
+	}
+
+	overlay := filepath.Join(overlayDir, "ov.qcow2")
+	if err := CreateOverlay(context.Background(), base, overlay); err != nil {
+		t.Fatalf("CreateOverlay: %v", err)
+	}
+	if err := probe(); err != nil {
+		t.Fatalf("backing root should be authorized while the overlay lives: %v", err)
+	}
+
+	// A second overlay over the same base keeps the root alive after the
+	// first is removed (refcounted, not dropped early).
+	overlay2 := filepath.Join(overlayDir, "ov2.qcow2")
+	if err := CreateOverlay(context.Background(), base, overlay2); err != nil {
+		t.Fatalf("CreateOverlay (2nd): %v", err)
+	}
+	if err := RemoveOverlay(overlay); err != nil {
+		t.Fatalf("RemoveOverlay: %v", err)
+	}
+	if err := probe(); err != nil {
+		t.Fatalf("backing root must survive while another overlay uses it: %v", err)
+	}
+
+	// Last association gone -> the root is gone too.
+	if err := RemoveOverlay(overlay2); err != nil {
+		t.Fatalf("RemoveOverlay (2nd): %v", err)
+	}
+	if err := probe(); err == nil || !strings.Contains(err.Error(), "managed storage roots") {
+		t.Fatalf("expected backing-root rejection after the last overlay was removed, got: %v", err)
+	}
+}
+
+// TestBackingRoots_RecreateDropsStaleRoot verifies that replacing a stale
+// overlay (same path, different base) ends the OLD base dir's authorization
+// while keeping the new one.
+func TestBackingRoots_RecreateDropsStaleRoot(t *testing.T) {
+	baseDir1 := t.TempDir()
+	baseDir2 := t.TempDir()
+	overlayDir := t.TempDir()
+	base1 := filepath.Join(baseDir1, "base.raw")
+	base2 := filepath.Join(baseDir2, "base.raw")
+	mustWriteRaw(t, base1, 0, patterned(0x11, clusterSize))
+	mustWriteRaw(t, base2, 0, patterned(0x22, clusterSize))
+
+	// probeWith asserts whether base is currently an authorized backing.
+	probeWith := func(base string) error {
+		p := filepath.Join(overlayDir, "probe.qcow2")
+		craftHeader(t, p, clusterSize, base, "raw")
+		_, err := openGuestImage(p)
+		return err
+	}
+
+	overlay := filepath.Join(overlayDir, "ov.qcow2")
+	if err := CreateOverlay(context.Background(), base1, overlay); err != nil {
+		t.Fatalf("CreateOverlay: %v", err)
+	}
+	// Recreate at the same path over the other base: the stale overlay is
+	// destroyed, and baseDir1's authorization must end with it.
+	if err := CreateOverlay(context.Background(), base2, overlay); err != nil {
+		t.Fatalf("CreateOverlay (recreate): %v", err)
+	}
+	if err := probeWith(base1); err == nil || !strings.Contains(err.Error(), "managed storage roots") {
+		t.Fatalf("expected the replaced base dir to be deauthorized, got: %v", err)
+	}
+	// The new base dir, by contrast, stays authorized...
+	if err := probeWith(base2); err != nil {
+		t.Fatalf("recreated overlay's base dir should stay authorized: %v", err)
+	}
+	// ...until the recreated overlay itself is removed.
+	if err := RemoveOverlay(overlay); err != nil {
+		t.Fatalf("RemoveOverlay: %v", err)
+	}
+	if err := probeWith(base2); err == nil || !strings.Contains(err.Error(), "managed storage roots") {
+		t.Fatalf("expected deauthorization after RemoveOverlay, got: %v", err)
 	}
 }
 

@@ -560,10 +560,20 @@ func (q *qcow2Image) l1Entry(l1Idx uint64) (uint64, error) {
 
 // l2EntryAt returns the raw L2 entry at index l2Idx of the table stored at
 // host offset l2Off, serving hits from the in-memory cache and loading the
-// whole table on a miss. One cached table replaces clusterSize/8 preads per
-// pass with zero; entries are returned by value so the write path can mutate
-// the cached slice under the same lock without racing readers.
+// whole table on a miss. l2Idx is bounds-checked before any indexing: an
+// out-of-range index surfaces as an error, never a panic. One cached table
+// replaces clusterSize/8 preads per pass with zero; entries are always READ
+// while the lock is held and returned by value, so the write path can
+// mutate the cached slices under the same lock without racing readers —
+// indexing a shared slice after q.mu.Unlock() would race the rewrite and
+// eviction paths that run under it.
 func (q *qcow2Image) l2EntryAt(l2Off, l2Idx uint64) (uint64, error) {
+	// Every cached or freshly loaded table holds exactly clusterSize/8
+	// entries; validate the index up front so no indexing below can run
+	// out of range.
+	if entries := q.clusterSize / 8; l2Idx >= entries {
+		return 0, fmt.Errorf("cow: L2 index %d out of range for cluster size %d (max %d entries)", l2Idx, q.clusterSize, entries)
+	}
 	q.mu.RLock()
 	tbl, ok := q.l2cache[l2Off]
 	if ok {
@@ -604,14 +614,20 @@ func (q *qcow2Image) l2EntryAt(l2Off, l2Idx uint64) (uint64, error) {
 		q.l2cacheBytes = 0
 	}
 	if existing, ok2 := q.l2cache[l2Off]; ok2 {
-		// Another goroutine inserted it while we were reading.
+		// Another goroutine inserted it while we were reading. Read the
+		// entry NOW: existing is the shared cached slice, and once the lock
+		// is released updateL2Cache may rewrite it concurrently.
+		e := existing[l2Idx]
 		q.mu.Unlock()
-		return existing[l2Idx], nil
+		return e, nil
 	}
 	q.l2cache[l2Off] = loaded
 	q.l2cacheBytes += len(loaded) * 8
+	// loaded escapes into the shared cache above; same rule — read the
+	// entry before releasing the lock.
+	e := loaded[l2Idx]
 	q.mu.Unlock()
-	return loaded[l2Idx], nil
+	return e, nil
 }
 
 // updateL2Cache writes val into the cached copy of the table at l2Off (if it
@@ -820,23 +836,19 @@ func openGuestImageDepth(path string, depth int, visited map[chainKey]bool) (gue
 		f.Close()
 		return nil, fmt.Errorf("cow: qcow2 incompatible features %#x in %s unsupported", inc, path)
 	}
+	// Permission bits and the real file length come from the SAME stat the
+	// open already took (see guestImage.Mode), captured before any parsing
+	// can fail so the fields are always populated. fileSize anchors every
+	// host-offset bound check below; header-declared sizes are not trusted
+	// for that.
 	q := &qcow2Image{
 		f:           f,
 		clusterBits: cb,
 		clusterSize: uint64(1) << cb,
 		clusterMask: (uint64(1) << cb) - 1,
+		mode:        fi.Mode(),
+		fileSize:    uint64(fi.Size()),
 	}
-	// Permission bits and the real file length from the fd (see
-	// guestImage.Mode): captured before any parsing can fail so the fields
-	// are always populated. fileSize anchors every host-offset bound check;
-	// header-declared sizes are not trusted for that.
-	st, err := f.Stat()
-	if err != nil {
-		f.Close()
-		return nil, fmt.Errorf("cow: stat %s: %w", path, err)
-	}
-	q.mode = st.Mode()
-	q.fileSize = uint64(st.Size())
 	q.hdr = qcow2Header{
 		size:             binary.BigEndian.Uint64(hdrBuf[0x18:]),
 		l1Size:           binary.BigEndian.Uint32(hdrBuf[0x24:]),
