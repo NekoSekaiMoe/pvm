@@ -181,13 +181,32 @@ const toml = computed(() => {
   return lines.join('\n') + '\n'
 })
 
+// Request sequencing for validate: only the LATEST click may update the
+// UI — a stale slow response (or its error) arriving after a newer click
+// must not overwrite the newer result. An incrementing ID suffices: there
+// is nothing to cancel server-side (load-spec is a pure validation), so
+// AbortController plumbing would add noise without changing behavior.
+let validateSeq = 0
+
 const validate = async () => {
+  // Local gate before any request: an invalid cpu field is reflected into
+  // specError and the validation stops here — the generated TOML stays
+  // visible for inspection, but no request is sent (the server would only
+  // echo the same broken integer back).
+  if (cpuError.value) {
+    fingerprint.value = ''
+    specError.value = cpuError.value
+    return
+  }
+  const seq = ++validateSeq
   fingerprint.value = ''
   specError.value = ''
   try {
     const r = await apiFetch('/api/tasks/load-spec', { method: 'POST', body: { content: toml.value } })
+    if (seq !== validateSeq) return
     fingerprint.value = r.fingerprint
   } catch (e) {
+    if (seq !== validateSeq) return
     specError.value = e.message
   }
 }

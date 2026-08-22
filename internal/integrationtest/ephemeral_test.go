@@ -44,6 +44,35 @@ func hasArgPrefix(args []string, prefix string) bool {
 	return false
 }
 
+// assertEphemeralCmdline asserts the shared ephemeral kernel command-line
+// contract as table-driven subtests, parameterized per backend: the exact
+// standalone "ro" token (never "rw" — root=/dev/ubda contains "ro" as a
+// substring but proves nothing about the mount mode), the backend's root
+// device argument, and its block-device arguments (read-only marker present,
+// plain writable marker absent). Backend-specific lifecycle, overlay and
+// audit assertions stay in the calling tests — only the cmdline contract
+// is shared.
+func assertEphemeralCmdline(t *testing.T, args []string, backend, root, wantDev, noDev string) {
+	t.Helper()
+	cases := []struct {
+		name string
+		ok   bool
+	}{
+		{backend + ": standalone ro token", hasArgToken(args, "ro")},
+		{backend + ": no rw token", !hasArgToken(args, "rw")},
+		{backend + ": root device " + root, hasArgToken(args, root)},
+		{backend + ": block device " + wantDev, hasArgPrefix(args, wantDev)},
+		{backend + ": no writable device " + noDev, !hasArgPrefix(args, noDev)},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if !c.ok {
+				t.Errorf("ephemeral %s cmdline contract violated: %v", backend, args)
+			}
+		})
+	}
+}
+
 // TestFlow_EphemeralVhostNoOverlay drives StartTask with an ephemeral spec on
 // the vhost path: the base image is validated and served read-only through a
 // real vhost-user-blk socket (pure-Go backend), no overlay file appears in
@@ -76,18 +105,9 @@ func TestFlow_EphemeralVhostNoOverlay(t *testing.T) {
 		t.Fatalf("starttask: %v", err)
 	}
 
-	// 1. Kernel cmdline: read-only root, vhost device, no rw. Token-exact:
-	// "ro" must appear as a standalone argument; root=/dev/vda contains
-	// "ro" as a substring but proves nothing about the mount mode.
-	if !hasArgToken(l.args, "ro") || hasArgToken(l.args, "rw") {
-		t.Errorf("ephemeral cmdline not read-only: %v", l.args)
-	}
-	if !hasArgToken(l.args, "root=/dev/vda") {
-		t.Errorf("vhost root device missing: %v", l.args)
-	}
-	if !hasArgPrefix(l.args, "virtio_uml.device=") {
-		t.Errorf("virtio_uml.device missing: %v", l.args)
-	}
+	// 1. Kernel cmdline contract (table-driven; see assertEphemeralCmdline).
+	// vhost: root=/dev/vda behind virtio_uml.device=, never a ubd device.
+	assertEphemeralCmdline(t, l.args, "vhost", "root=/dev/vda", "virtio_uml.device=", "ubd0")
 
 	// 2. No overlay was created: the task dir must not contain rootfs.qcow2
 	// (only state.json / logs / the transient vhost socket).
@@ -164,19 +184,10 @@ func TestFlow_EphemeralUbdReadOnly(t *testing.T) {
 		t.Fatalf("starttask: %v", err)
 	}
 
-	// Token-exact read-only assertions plus the UBD device-level marker:
-	// ephemeral boots ubd0r= (host-side O_RDONLY device), never plain
-	// ubd0=, and "ro" must be a standalone argument (root=/dev/ubda
-	// contains "ro" as a substring but proves nothing about the mode).
-	if !hasArgToken(l.args, "ro") || hasArgToken(l.args, "rw") {
-		t.Errorf("ephemeral ubd cmdline not read-only: %v", l.args)
-	}
-	if !hasArgPrefix(l.args, "ubd0r=") || hasArgPrefix(l.args, "ubd0=") {
-		t.Errorf("ephemeral ubd device not read-only (want ubd0r=): %v", l.args)
-	}
-	if !hasArgToken(l.args, "root=/dev/ubda") {
-		t.Errorf("ubd root device missing: %v", l.args)
-	}
+	// Kernel cmdline contract (table-driven; see assertEphemeralCmdline).
+	// ubd: root=/dev/ubda behind the device-level read-only marker ubd0r=,
+	// never a plain (writable) ubd0= device.
+	assertEphemeralCmdline(t, l.args, "ubd", "root=/dev/ubda", "ubd0r=", "ubd0=")
 
 	// No overlay on the ubd path either (it never creates one, but the
 	// ephemeral flag must not change that).
