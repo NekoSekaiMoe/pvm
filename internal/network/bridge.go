@@ -66,7 +66,9 @@ func SetupBridge(bridgeName string, tapName string, gatewayIP string) (err error
 			if ipForwardRefCount <= 0 {
 				ipForwardRefCount = 0
 				if ipForwardOriginal != "" {
-					exec.Command("sysctl", "-w", fmt.Sprintf("net.ipv4.ip_forward=%s", ipForwardOriginal)).Run()
+					// Through execRun (not a direct exec.Command) so test stubs
+					// intercept the rollback write too; best-effort as before.
+					_ = execRun("sysctl", "-w", fmt.Sprintf("net.ipv4.ip_forward=%s", ipForwardOriginal))
 				}
 			}
 			ipForwardMu.Unlock()
@@ -182,7 +184,9 @@ func DeleteBridge(bridgeName string, gatewayIP string) error {
 	if ipForwardRefCount <= 0 {
 		ipForwardRefCount = 0
 		if ipForwardOriginal != "" {
-			if err := exec.Command("sysctl", "-w", fmt.Sprintf("net.ipv4.ip_forward=%s", ipForwardOriginal)).Run(); err != nil {
+			// Through execRun so test stubs intercept the restore write like
+			// every other external command.
+			if err := execRun("sysctl", "-w", fmt.Sprintf("net.ipv4.ip_forward=%s", ipForwardOriginal)); err != nil {
 				ipForwardMu.Unlock()
 				return fmt.Errorf("failed to restore net.ipv4.ip_forward=%s: %v", ipForwardOriginal, err)
 			}
@@ -232,11 +236,24 @@ func bridgeSubnet(bridgeName string) string {
 		return ""
 	}
 	for _, a := range addrs {
-		if a.IPNet != nil {
-			return a.IPNet.String()
+		// netlink reports interface ADDRESSES (host bits set, e.g.
+		// 10.200.1.5/24); mask to the canonical subnet so teardown uses the
+		// same CIDR SetupBridge installed its rules with (10.200.1.0/24).
+		if s := maskedSubnet(a.IPNet); s != "" {
+			return s
 		}
 	}
 	return ""
+}
+
+// maskedSubnet returns the canonical network string for ipnet with the host
+// bits of its IP cleared (ipnet.IP.Mask(ipnet.Mask)). Returns "" for a
+// nil/empty ipnet, so callers can treat it as "nothing addressable".
+func maskedSubnet(ipnet *net.IPNet) string {
+	if ipnet == nil || ipnet.IP == nil || ipnet.Mask == nil {
+		return ""
+	}
+	return (&net.IPNet{IP: ipnet.IP.Mask(ipnet.Mask), Mask: ipnet.Mask}).String()
 }
 
 // isDeviceNotExist reports whether err from `ip link delete` indicates the

@@ -362,8 +362,11 @@ func (g *Gateway) handleConnect(w http.ResponseWriter, r *http.Request, task str
 	}
 	g.record(task, r, DecisionAllow, "CONNECT "+v.host)
 	// Only the upload direction (client → upstream) is billed; see pipe.
-	go pipe(targetConn, clientConn, task, g, false) // upstream → client (download)
-	go pipe(clientConn, targetConn, task, g, true)  // client → upstream (egress)
+	// NOTE argument order: pipe(dst, src) — io.Copy(dst, src) — so the
+	// billed copy below reads FROM the client connection (the sandbox's
+	// own outbound bytes); the return copy is free.
+	go pipe(targetConn, clientConn, task, g, true)  // client → upstream (egress, billed)
+	go pipe(clientConn, targetConn, task, g, false) // upstream → client (download)
 }
 
 // handleHTTP handles plain HTTP requests (body visible, method/size enforced).
@@ -396,6 +399,13 @@ func (g *Gateway) handleHTTP(w http.ResponseWriter, r *http.Request, task string
 		}
 		bodyReader = &io.LimitedReader{R: r.Body, N: pol.MaxRequestBody + 1}
 	}
+	// Bill ONLY the sandbox→upstream direction, exactly like the CONNECT
+	// tunnel's billed client→upstream copy: wrap the request body in a
+	// counting reader so BytesUsed accumulates the request body bytes the
+	// guest actually sent. Response (downstream) bytes must NOT count
+	// against the egress budget — both proxy modes then compare the same
+	// direction against MaxNetworkMB.
+	reqBytes := &countingReader{src: bodyReader}
 	// Forward the SAME path the policy view evaluated (viewFromHTTP /
 	// normalizePath): whatever cleaning the policy saw, the upstream must
 	// receive too — the proxy must not forward a raw "//a/../b" that the
@@ -404,7 +414,7 @@ func (g *Gateway) handleHTTP(w http.ResponseWriter, r *http.Request, task string
 	outURL := *r.URL
 	outURL.Path = normalizePath(outURL.Path)
 	outURL.RawPath = "" // re-encode from the normalized Path
-	outReq, err := http.NewRequest(r.Method, outURL.String(), bodyReader)
+	outReq, err := http.NewRequest(r.Method, outURL.String(), reqBytes)
 	if err != nil {
 		http.Error(w, "egress: bad request", http.StatusBadRequest)
 		return
@@ -437,9 +447,11 @@ func (g *Gateway) handleHTTP(w http.ResponseWriter, r *http.Request, task string
 	}
 	defer resp.Body.Close()
 	// Detect if the client exceeded the request-body cap; if so, we cannot
-	// trust the upstream's response and abort with 413 instead.
+	// trust the upstream's response and abort with 413 instead. The body
+	// WAS forwarded upstream, so those bytes still count against the task.
 	if pol.MaxRequestBody > 0 {
 		if lr, ok := bodyReader.(*io.LimitedReader); ok && lr.N <= 0 {
+			g.addBytes(task, reqBytes.total())
 			g.record(task, r, DecisionBlock, "chunked request body exceeded cap")
 			http.Error(w, "egress: request too large", http.StatusRequestEntityTooLarge)
 			return
@@ -456,9 +468,12 @@ func (g *Gateway) handleHTTP(w http.ResponseWriter, r *http.Request, task string
 		}
 	}
 	w.WriteHeader(resp.StatusCode)
-	n, _ := io.Copy(w, src)
-	g.addBytes(task, n)
-	g.record(task, r, DecisionAllow, fmt.Sprintf("%s %s -> %d (%dB)", r.Method, v.host, resp.StatusCode, n))
+	respN, _ := io.Copy(w, src)
+	// Bill the request-body bytes (sandbox → upstream), NOT respN: the
+	// response flows downstream and is the same direction the CONNECT
+	// tunnel leaves unbilled.
+	g.addBytes(task, reqBytes.total())
+	g.record(task, r, DecisionAllow, fmt.Sprintf("%s %s -> %d (req %dB, resp %dB)", r.Method, v.host, resp.StatusCode, reqBytes.total(), respN))
 }
 
 // dialCheckedTransport returns the gateway's shared upstream transport.
@@ -756,6 +771,26 @@ func methodAllowed(method string, allowed []string) bool {
 	return false
 }
 
+// countingReader counts the bytes read through it (atomically, because the
+// transport drains the request body on its write goroutine while handleHTTP
+// may read the counter). handleHTTP bills ONLY this sandbox→upstream stream,
+// mirroring the CONNECT tunnel's billable client→upstream copy in pipe.
+type countingReader struct {
+	src io.Reader
+	n   int64
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.src.Read(p)
+	if n > 0 {
+		atomic.AddInt64(&c.n, int64(n))
+	}
+	return n, err
+}
+
+// total returns the number of bytes counted so far.
+func (c *countingReader) total() int64 { return atomic.LoadInt64(&c.n) }
+
 // pipe shuttles bytes between two connections and accounts bytes.
 // pipe relays bytes from src to dst. bill reports whether the copied bytes
 // count against the task's egress budget: only the client→upstream direction
@@ -782,7 +817,10 @@ func (g *Gateway) addBytes(task string, n int64) {
 	atomic.AddInt64(p, n)
 }
 
-// BytesUsed returns total egress bytes accounted to a task.
+// BytesUsed returns total egress bytes accounted to a task — the
+// sandbox→upstream direction only (HTTP request bodies; CONNECT tunnel
+// uploads). Downstream/response bytes are not included, so comparisons
+// against a MaxNetworkMB-style upload budget are direction-consistent.
 func (g *Gateway) BytesUsed(task string) int64 {
 	g.bytesOutMu.Lock()
 	defer g.bytesOutMu.Unlock()

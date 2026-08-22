@@ -1,8 +1,9 @@
 package network
 
 import (
-	"strconv"
 	"errors"
+	"net"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -204,6 +205,12 @@ func TestSetupBridge_RollbackAfterRefcount(t *testing.T) {
 			t.Errorf("rollback missing %q in:\n%s", want, gotCalls)
 		}
 	}
+	// The rollback's restore write must ALSO go through execRun so stubs
+	// intercept it (the failOn stub fails it — the discard is intentional;
+	// what matters is that the invocation was recorded at all).
+	if !strings.Contains(gotCalls, "sysctl -w net.ipv4.ip_forward=0") {
+		t.Errorf("rollback did not restore original ip_forward via execRun:\n%s", gotCalls)
+	}
 }
 
 // TestDeleteBridge_EmptyGatewayIPStillTeardowns pins that DeleteBridge with
@@ -222,6 +229,69 @@ func TestDeleteBridge_EmptyGatewayIPStillTeardowns(t *testing.T) {
 	}
 	if !strings.Contains(got, "ip link delete pvmtest-gone0 type bridge") {
 		t.Errorf("missing link teardown:\n%s", got)
+	}
+}
+
+// TestDeleteBridge_RestoresIPForwardViaExecRun pins that the ip_forward
+// restore write issued by DeleteBridge goes through the execRun abstraction
+// (interceptable by test stubs), not a direct exec.Command the stubs cannot
+// see: with a live registration (refcount 1, original "0") the teardown must
+// emit the restore sysctl, drop the refcount to 0 and clear the original.
+func TestDeleteBridge_RestoresIPForwardViaExecRun(t *testing.T) {
+	resetForwardState(t)
+	ipForwardMu.Lock()
+	ipForwardRefCount = 1
+	ipForwardOriginal = "0"
+	ipForwardMu.Unlock()
+
+	calls := stubExecRun(t)
+	if err := DeleteBridge("pvmtest-restore0", ""); err != nil {
+		t.Fatalf("DeleteBridge returned error: %v", err)
+	}
+	want := "sysctl -w net.ipv4.ip_forward=0"
+	gotCalls := strings.Join(*calls, "\n")
+	if !strings.Contains(gotCalls, want) {
+		t.Errorf("missing restore write %q in:\n%s", want, gotCalls)
+	}
+	ipForwardMu.Lock()
+	refc := ipForwardRefCount
+	orig := ipForwardOriginal
+	ipForwardMu.Unlock()
+	if refc != 0 {
+		t.Errorf("ip_forward refcount = %d after DeleteBridge, want 0", refc)
+	}
+	if orig != "" {
+		t.Errorf("ipForwardOriginal = %q after restore, want cleared", orig)
+	}
+}
+
+// TestMaskedSubnet pins the host-bit masking in bridgeSubnet's derivation:
+// netlink reports interface ADDRESSES (host bits set), but teardown must use
+// the canonical masked network so the -D rules match what SetupBridge added.
+func TestMaskedSubnet(t *testing.T) {
+	_, canon, err := net.ParseCIDR("10.200.1.5/24")
+	if err != nil {
+		t.Fatalf("ParseCIDR: %v", err)
+	}
+	// Simulate what netlink returns: IP carries the host bits.
+	hostBits := &net.IPNet{IP: net.ParseIP("10.200.1.5"), Mask: canon.Mask}
+	if got := maskedSubnet(hostBits); got != "10.200.1.0/24" {
+		t.Errorf("maskedSubnet(10.200.1.5/24) = %q, want 10.200.1.0/24", got)
+	}
+	// Degenerate inputs stay "empty" (nothing addressable).
+	for _, c := range []struct {
+		name  string
+		ipnet *net.IPNet
+	}{
+		{"nil", nil},
+		{"nil ip", &net.IPNet{Mask: net.CIDRMask(24, 32)}},
+		{"nil mask", &net.IPNet{IP: net.ParseIP("10.0.0.1")}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			if got := maskedSubnet(c.ipnet); got != "" {
+				t.Errorf("maskedSubnet(%v) = %q, want empty", c.ipnet, got)
+			}
+		})
 	}
 }
 

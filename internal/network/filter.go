@@ -15,38 +15,125 @@ import (
 // AttachEgressFilter call (racing writers), leaked the previous map's fd,
 // and let one container's policy updates land in another container's map.
 // The registry keys maps by tap name so each container owns its own map.
+//
+// Maps handed out by WhitelistMapFor are reference-counted: a re-attach
+// that replaces a registered map must not close it while callers still
+// hold it. The replaced map is retired and closed only once its last
+// outstanding reference is released (ReleaseWhitelistMap).
 var (
-	whitelistMu   sync.Mutex
-	whitelistMaps = map[string]*ebpf.Map{}
+	whitelistMu sync.Mutex
+	// whitelistTaps holds the current registration for each tap.
+	whitelistTaps = map[string]*whitelistEntry{}
+	// whitelistRetired holds replaced/unregistered entries that still have
+	// outstanding references; each is closed once its refcount drains.
+	whitelistRetired = map[string][]*whitelistEntry{}
 )
 
+// whitelistEntry is one registered (or retired) map plus the number of
+// references handed out via WhitelistMapFor that have not been released.
+type whitelistEntry struct {
+	m    *ebpf.Map
+	refs int
+	dead bool // replaced or unregistered; close as soon as refs drains
+}
+
 // WhitelistMapFor returns the eBPF whitelist map registered for tapName, or
-// nil when no egress filter is attached to it.
+// nil when no egress filter is attached to it. The returned map is kept
+// alive until the caller releases it with ReleaseWhitelistMap: a concurrent
+// re-attach replaces the registration but defers closing the old map until
+// every outstanding reference is gone.
 func WhitelistMapFor(tapName string) *ebpf.Map {
 	whitelistMu.Lock()
 	defer whitelistMu.Unlock()
-	return whitelistMaps[tapName]
+	e := whitelistTaps[tapName]
+	if e == nil {
+		return nil
+	}
+	e.refs++
+	return e.m
 }
 
-// registerWhitelistMap stores m under tapName, closing and dropping any map
-// previously registered for the same tap (re-attach replaces the filter).
+// ReleaseWhitelistMap drops one reference previously taken via
+// WhitelistMapFor. When the map was replaced or unregistered in the
+// meantime and this was the last outstanding reference, the map is closed
+// here. Releasing a map that is not (or no longer) registered for tapName,
+// or that has no outstanding references, is a no-op.
+func ReleaseWhitelistMap(tapName string, m *ebpf.Map) {
+	whitelistMu.Lock()
+	defer whitelistMu.Unlock()
+	e := entryForLocked(tapName, m)
+	if e == nil || e.refs <= 0 {
+		return
+	}
+	e.refs--
+	if e.dead && e.refs == 0 {
+		closeRetiredLocked(tapName, e)
+	}
+}
+
+// entryForLocked finds the live-or-retired entry holding m. Caller holds
+// whitelistMu.
+func entryForLocked(tapName string, m *ebpf.Map) *whitelistEntry {
+	if e := whitelistTaps[tapName]; e != nil && e.m == m {
+		return e
+	}
+	for _, e := range whitelistRetired[tapName] {
+		if e.m == m {
+			return e
+		}
+	}
+	return nil
+}
+
+// retireLocked marks e dead: closed immediately when no caller still holds
+// a reference, otherwise parked on the retired list until its last
+// reference is released. Caller holds whitelistMu.
+func retireLocked(tapName string, e *whitelistEntry) {
+	e.dead = true
+	if e.refs > 0 {
+		whitelistRetired[tapName] = append(whitelistRetired[tapName], e)
+		return
+	}
+	e.m.Close()
+}
+
+// closeRetiredLocked removes a drained retired entry from the retired list
+// and closes its map. Caller holds whitelistMu.
+func closeRetiredLocked(tapName string, e *whitelistEntry) {
+	for i, r := range whitelistRetired[tapName] {
+		if r == e {
+			retired := whitelistRetired[tapName]
+			whitelistRetired[tapName] = append(retired[:i], retired[i+1:]...)
+			break
+		}
+	}
+	e.m.Close()
+}
+
+// registerWhitelistMap stores m under tapName (re-attach replaces the
+// filter). The previously registered map is retired: closed right away
+// when nobody references it, otherwise kept alive until its references
+// drain — callers may still hold it via WhitelistMapFor.
 func registerWhitelistMap(tapName string, m *ebpf.Map) {
 	whitelistMu.Lock()
 	defer whitelistMu.Unlock()
-	if old := whitelistMaps[tapName]; old != nil && old != m {
-		old.Close()
+	if old := whitelistTaps[tapName]; old != nil {
+		if old.m == m {
+			return // same map re-registered: keep the entry (and its refs)
+		}
+		retireLocked(tapName, old)
 	}
-	whitelistMaps[tapName] = m
+	whitelistTaps[tapName] = &whitelistEntry{m: m}
 }
 
-// unregisterWhitelistMap drops (and closes) the map for tapName if it is
-// still the one registered.
+// unregisterWhitelistMap drops (and closes, once unreferenced) the map for
+// tapName if it is still the one registered.
 func unregisterWhitelistMap(tapName string, m *ebpf.Map) {
 	whitelistMu.Lock()
 	defer whitelistMu.Unlock()
-	if cur := whitelistMaps[tapName]; cur == m {
-		m.Close()
-		delete(whitelistMaps, tapName)
+	if e := whitelistTaps[tapName]; e != nil && e.m == m {
+		retireLocked(tapName, e)
+		delete(whitelistTaps, tapName)
 	}
 }
 
@@ -122,8 +209,9 @@ func AttachEgressFilter(tapName string) (*ebpf.Map, error) {
 	return m, nil
 }
 
-// UnregisterWhitelistMap unregisters (and closes) the whitelist map
-// previously registered for tapName. Safe to call when nothing is attached.
+// UnregisterWhitelistMap unregisters (and closes, once unreferenced) the
+// whitelist map previously registered for tapName. Safe to call when
+// nothing is attached.
 //
 // It deliberately does NOT touch the egress tc filter or the clsact qdisc:
 // the filter is installed via tc by LoadEgressFilter (internal/ebpf), which
@@ -131,7 +219,10 @@ func AttachEgressFilter(tapName string) (*ebpf.Map, error) {
 // caller did not own would break unrelated filters on the same device. The
 // operator tears the whole device down with the TAP anyway.
 func UnregisterWhitelistMap(tapName string) {
-	if m := WhitelistMapFor(tapName); m != nil {
-		unregisterWhitelistMap(tapName, m)
+	whitelistMu.Lock()
+	defer whitelistMu.Unlock()
+	if e := whitelistTaps[tapName]; e != nil {
+		retireLocked(tapName, e)
+		delete(whitelistTaps, tapName)
 	}
 }

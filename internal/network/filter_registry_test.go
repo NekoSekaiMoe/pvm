@@ -24,9 +24,6 @@ func newTestMap(t *testing.T) *ebpf.Map {
 	// Map creation needs privilege (or unprivileged BPF + MEMLOCK headroom);
 	// on hosts without it we skip, matching the ip/tc skips in
 	// network_test.go — the registry bookkeeping under test is pure Go state.
-	// Map creation needs privilege (or unprivileged BPF + MEMLOCK headroom);
-	// on hosts without it we skip, matching the ip/tc skips in
-	// network_test.go — the registry bookkeeping under test is pure Go state.
 	// ENOMEM is an environment-level allocation failure (kernel refuses to
 	// allocate map memory under pressure), not a defect under test.
 	if err != nil {
@@ -85,6 +82,42 @@ func TestWhitelistRegistry_ReattachClosesOldMap(t *testing.T) {
 		t.Fatalf("tapC map = %v, want the replacement map", got)
 	}
 	unregisterWhitelistMap("tapC", m2)
+}
+
+// TestWhitelistRegistry_ReattachKeepsReferencedMapAlive pins the
+// refcounting contract: a map obtained via WhitelistMapFor stays open
+// across a re-attach that replaces it, and is closed only once the caller
+// releases its (last) reference — never immediately under its feet.
+func TestWhitelistRegistry_ReattachKeepsReferencedMapAlive(t *testing.T) {
+	m1 := newTestMap(t)
+	m2 := newTestMap(t)
+	defer m2.Close()
+
+	registerWhitelistMap("tapE", m1)
+	held := WhitelistMapFor("tapE") // take a reference on m1
+	if held != m1 {
+		t.Fatalf("tapE map = %v, want the registered m1", held)
+	}
+
+	registerWhitelistMap("tapE", m2) // re-attach while m1 is referenced
+	if fd := m1.FD(); fd == -1 {
+		t.Fatal("referenced map closed by re-attach; must stay alive until released")
+	}
+	if got := WhitelistMapFor("tapE"); got != m2 {
+		t.Fatalf("tapE map = %v, want the replacement m2", got)
+	}
+	ReleaseWhitelistMap("tapE", m2) // drop the lookup reference we just took
+
+	ReleaseWhitelistMap("tapE", m1) // last reference on the retired map
+	if fd := m1.FD(); fd != -1 {
+		t.Fatalf("retired map still open after last release (fd %d), want closed", fd)
+	}
+
+	// The replacement itself still closes on unregister (no references).
+	unregisterWhitelistMap("tapE", m2)
+	if fd := m2.FD(); fd != -1 {
+		t.Fatalf("replacement map still open after unregister (fd %d), want closed", fd)
+	}
 }
 
 // TestWhitelistRegistry_UnregisterOnlyOwnMap pins that unregistering with a
