@@ -13,6 +13,7 @@ import (
 	"uml-container/internal/container"
 	"uml-container/internal/image"
 	"uml-container/internal/network"
+	"uml-container/internal/snapshot"
 	"uml-container/internal/spec"
 	"uml-container/internal/state"
 	"uml-container/internal/uml"
@@ -183,9 +184,15 @@ func main() {
 
 		if *rm {
 			fmt.Println("Cleaning up container state and files (--rm)...")
-			dir, err := state.ContainerDir(*name)
-			if err == nil {
-				os.RemoveAll(dir)
+			// A clone's overlay backing reaches into this container's dir;
+			// keep the files while clones still branch from it.
+			if perr := snapshot.PrepareDelete(*name); perr != nil {
+				fmt.Printf("Warning: keeping container %s files: %v\n", *name, perr)
+			} else {
+				dir, err := state.ContainerDir(*name)
+				if err == nil {
+					os.RemoveAll(dir)
+				}
 			}
 		}
 

@@ -3,8 +3,10 @@ load("@rules_go//go:def.bzl", "go_library", "go_test")
 go_library(
     name = "cow",
     srcs = [
+        "backing.go",
         "convert.go",
         "engine.go",
+        "errors.go",
         "manager.go",
         "qcow2.go",
         "qcow2_compact.go",
@@ -20,6 +22,7 @@ go_test(
         "compact_helpers_test.go",
         "convert_test.go",
         "engine_clone_rollback_test.go",
+        "engine_errors_test.go",
         "engine_prefix_test.go",
         "engine_test.go",
         "manager_test.go",

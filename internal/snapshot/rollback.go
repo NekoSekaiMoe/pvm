@@ -59,13 +59,20 @@ func Rollback(taskID, snapshotID string) error {
 	if _, err := os.Stat(snapOverlay); err == nil {
 		tmpOverlay := filepath.Join(dir, ".tmp-rb-overlay.qcow2")
 		_ = os.Remove(tmpOverlay)
-		// Branch from snapOverlay as new active overlay in temporary file
-		if err := cow.CreateOverlay(context.Background(), snapOverlay, tmpOverlay); err != nil {
-			// Fallback: copy file
-			if err := copyFile(snapOverlay, tmpOverlay); err != nil {
-				_ = os.Remove(tmpOverlay)
-				return fmt.Errorf("snapshot: failed to restore overlay: %w", err)
-			}
+		// Flatten the snapshot into a STANDALONE image (mirrors
+		// cow.RollbackVolume's convert+rename): the restored overlay must NOT
+		// keep backing into the snapshot file under <dir>/snapshots/ —
+		// deleting that event snapshot later would break the live chain.
+		// Branching is NOT a fallback here: the snapshot's own backing IS the
+		// live overlay path, so an overlay branched from the snapshot and
+		// renamed over the live file creates a reference CYCLE (live → snap
+		// → live) — exactly the pre-flattening behavior, which left the disk
+		// unopenable after every rollback (the copyFile fallback was the same
+		// class of bug: a self-referential overlay). If conversion fails,
+		// abort with the disk untouched.
+		if err := cow.ConvertToQcow2(context.Background(), snapOverlay, tmpOverlay, cow.ConvertDefaultOpt); err != nil {
+			_ = os.Remove(tmpOverlay)
+			return fmt.Errorf("snapshot: failed to restore overlay: %w", err)
 		}
 		if err := os.Rename(tmpOverlay, currOverlay); err != nil {
 			_ = os.Remove(tmpOverlay)

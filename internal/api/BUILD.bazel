@@ -35,6 +35,7 @@ go_test(
         "e2b_server_test.go",
         "secret_required_test.go",
         "snapshot_clone_rollback_test.go",
+        "volumes_test.go",
     ],
     embed = [":api"],
     deps = [

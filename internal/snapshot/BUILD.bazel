@@ -4,6 +4,8 @@ go_library(
     name = "snapshot",
     srcs = [
         "clone.go",
+        "clone_refs.go",
+        "delete_guard.go",
         "event.go",
         "rollback.go",
         "tar_archive.go",
@@ -20,11 +22,16 @@ go_library(
 go_test(
     name = "snapshot_test",
     srcs = [
+        "clone_refs_test.go",
         "clone_rollback_test.go",
         "event_snapshot_test.go",
+        "rollback_guard_test.go",
         "tar_archive_links_test.go",
         "tar_archive_test.go",
     ],
     embed = [":snapshot"],
-    deps = ["//internal/state"],
+    deps = [
+        "//internal/cow",
+        "//internal/state",
+    ],
 )

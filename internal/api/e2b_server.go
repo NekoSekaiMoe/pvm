@@ -216,6 +216,16 @@ func NewE2BServer() (*echo.Echo, error) {
 		if err != nil {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
 		}
+		// A clone's overlay backing reaches INTO this container's directory
+		// (absolute backing path recorded in the qcow2 header). Refuse to
+		// delete while live clones branch from it; PrepareDelete also drops
+		// this container's own marker from its parent when it IS a clone.
+		if err := snapshot.PrepareDelete(id); err != nil {
+			if errors.Is(err, snapshot.ErrHasClones) {
+				return c.JSON(http.StatusConflict, map[string]string{"error": err.Error()})
+			}
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		}
 		if err := os.RemoveAll(dir); err != nil {
 			return c.JSON(http.StatusInternalServerError, map[string]string{"error": fmt.Sprintf("failed to remove container dir: %v", err)})
 		}
@@ -551,6 +561,9 @@ func NewE2BServer() (*echo.Echo, error) {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid id format"})
 		}
 		if err := snapshot.DeleteEventSnapshot(id, snapId); err != nil {
+			if errors.Is(err, snapshot.ErrSnapshotInUse) {
+				return c.JSON(http.StatusConflict, map[string]string{"error": err.Error()})
+			}
 			if strings.Contains(err.Error(), "not found") {
 				return c.JSON(http.StatusNotFound, map[string]string{"error": err.Error()})
 			}
@@ -901,9 +914,9 @@ func NewE2BServer() (*echo.Echo, error) {
 			if _, err := cow.NewEngine(cow.ResolveRoot(os.Getenv("PVM_VOLUME_ROOT"))).CreateVolume(req.Name, uint64(size)); err != nil {
 				msg := err.Error()
 				switch {
-				case strings.Contains(msg, "already exists"):
+				case errors.Is(err, cow.ErrExists):
 					return c.JSON(http.StatusConflict, map[string]string{"error": msg})
-				case strings.Contains(msg, "invalid"), strings.Contains(msg, "must not"), strings.Contains(msg, "size must be"):
+				case errors.Is(err, cow.ErrInvalid):
 					return c.JSON(http.StatusBadRequest, map[string]string{"error": msg})
 				default:
 					return c.JSON(http.StatusInternalServerError, map[string]string{"error": msg})
@@ -991,14 +1004,13 @@ func NewE2BServer() (*echo.Echo, error) {
 		volRoot := cow.ResolveRoot(os.Getenv("PVM_VOLUME_ROOT"))
 		if _, serr := os.Stat(filepath.Join(volRoot, id+".qcow2")); serr == nil {
 			if derr := cow.NewEngine(volRoot).DeleteVolume(id); derr != nil {
-				msg := derr.Error()
 				switch {
-				case strings.Contains(msg, "referenced by"), strings.Contains(msg, "scan references"):
-					return c.JSON(http.StatusConflict, map[string]string{"error": msg})
-				case strings.Contains(msg, "not found"):
+				case errors.Is(derr, cow.ErrReferenced), errors.Is(derr, cow.ErrRefScan):
+					return c.JSON(http.StatusConflict, map[string]string{"error": derr.Error()})
+				case errors.Is(derr, cow.ErrNotFound):
 					// Raced away underneath us; metadata still needs cleaning.
 				default:
-					return c.JSON(http.StatusInternalServerError, map[string]string{"error": msg})
+					return c.JSON(http.StatusInternalServerError, map[string]string{"error": derr.Error()})
 				}
 			}
 		}
@@ -1062,26 +1074,23 @@ func NewE2BServer() (*echo.Echo, error) {
 		engine := cow.NewEngine(volRoot)
 		volFile := filepath.Join(volRoot, id+".qcow2")
 		snapFile := filepath.Join(volRoot, "snap-"+id+".qcow2")
-		var path string
-		if _, err := os.Stat(volFile); err == nil {
-			path, err = engine.CloneVolume(id, req.NewID)
-			if err != nil {
+		// CloneVolume resolves the source itself and falls back to the
+		// snap-<id>.qcow2 image when <id>.qcow2 is absent, so BOTH cases
+		// clone by volume id; the stats only decide whether any image exists.
+		if _, verr := os.Stat(volFile); verr != nil {
+			if _, serr := os.Stat(snapFile); serr != nil {
+				// No block image: this is a metadata-only volume (non-builtin
+				// driver) or the image was lost. Cloning either is meaningless —
+				// fail honestly instead of returning a fake "cloned" with an
+				// empty path.
 				_ = volStore.Delete(req.NewID)
-				return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to clone volume: " + err.Error()})
+				return c.JSON(http.StatusNotFound, map[string]string{"error": fmt.Sprintf("volume %q has no block image to clone", id)})
 			}
-		} else if _, err := os.Stat(snapFile); err == nil {
-			path, err = engine.CloneVolume(id, req.NewID)
-			if err != nil {
-				_ = volStore.Delete(req.NewID)
-				return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to clone volume: " + err.Error()})
-			}
-		} else {
-			// No block image: this is a metadata-only volume (non-builtin
-			// driver) or the image was lost. Cloning either is meaningless —
-			// fail honestly instead of returning a fake "cloned" with an
-			// empty path.
+		}
+		path, err := engine.CloneVolume(id, req.NewID)
+		if err != nil {
 			_ = volStore.Delete(req.NewID)
-			return c.JSON(http.StatusNotFound, map[string]string{"error": fmt.Sprintf("volume %q has no block image to clone", id)})
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to clone volume: " + err.Error()})
 		}
 		return c.JSON(http.StatusOK, map[string]string{"status": "cloned", "volume_id": req.NewID, "path": path})
 	})
@@ -1105,9 +1114,9 @@ func NewE2BServer() (*echo.Echo, error) {
 		if err := engine.RollbackVolume(id, req.Snapshot); err != nil {
 			msg := err.Error()
 			switch {
-			case strings.Contains(msg, "not found"):
+			case errors.Is(err, cow.ErrNotFound):
 				return c.JSON(http.StatusNotFound, map[string]string{"error": msg})
-			case strings.Contains(msg, "cannot rollback"), strings.Contains(msg, "referenced by"), strings.Contains(msg, "backed by it"), strings.Contains(msg, "scan references"):
+			case errors.Is(err, cow.ErrBackedBy), errors.Is(err, cow.ErrReferenced), errors.Is(err, cow.ErrRefScan):
 				return c.JSON(http.StatusConflict, map[string]string{"error": msg})
 			default:
 				return c.JSON(http.StatusInternalServerError, map[string]string{"error": msg})
@@ -1141,11 +1150,11 @@ func NewE2BServer() (*echo.Echo, error) {
 		if err != nil {
 			msg := err.Error()
 			switch {
-			case strings.Contains(msg, "not found"):
+			case errors.Is(err, cow.ErrNotFound):
 				return c.JSON(http.StatusNotFound, map[string]string{"error": msg})
-			case strings.Contains(msg, "already exists"):
+			case errors.Is(err, cow.ErrExists):
 				return c.JSON(http.StatusConflict, map[string]string{"error": msg})
-			case strings.Contains(msg, "invalid"), strings.Contains(msg, "must not"):
+			case errors.Is(err, cow.ErrInvalid):
 				return c.JSON(http.StatusBadRequest, map[string]string{"error": msg})
 			default:
 				return c.JSON(http.StatusInternalServerError, map[string]string{"error": msg})
@@ -1164,7 +1173,7 @@ func NewE2BServer() (*echo.Echo, error) {
 		}
 		snaps, err := cow.NewEngine(cow.ResolveRoot(os.Getenv("PVM_VOLUME_ROOT"))).ListSnapshots(id)
 		if err != nil {
-			if strings.Contains(err.Error(), "invalid") {
+			if errors.Is(err, cow.ErrInvalid) {
 				return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
 			}
 			return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
@@ -1190,11 +1199,11 @@ func NewE2BServer() (*echo.Echo, error) {
 		if err := cow.NewEngine(cow.ResolveRoot(os.Getenv("PVM_VOLUME_ROOT"))).DeleteSnapshot(snap); err != nil {
 			msg := err.Error()
 			switch {
-			case strings.Contains(msg, "not found"):
+			case errors.Is(err, cow.ErrNotFound):
 				return c.JSON(http.StatusNotFound, map[string]string{"error": msg})
-			case strings.Contains(msg, "referenced by"), strings.Contains(msg, "scan references"):
+			case errors.Is(err, cow.ErrReferenced), errors.Is(err, cow.ErrRefScan):
 				return c.JSON(http.StatusConflict, map[string]string{"error": msg})
-			case strings.Contains(msg, "invalid"), strings.Contains(msg, "must not"):
+			case errors.Is(err, cow.ErrInvalid):
 				return c.JSON(http.StatusBadRequest, map[string]string{"error": msg})
 			default:
 				return c.JSON(http.StatusInternalServerError, map[string]string{"error": msg})

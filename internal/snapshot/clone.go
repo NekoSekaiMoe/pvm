@@ -84,6 +84,7 @@ func Clone(sourceID, newID string) error {
 	dstOverlay := filepath.Join(dstDir, "overlay.qcow2")
 	srcRootfs := filepath.Join(srcDir, "rootfs.img")
 
+	storageBranched := false
 	if _, err := os.Stat(srcOverlay); err == nil {
 		// Create a new overlay with srcOverlay as its backing image (zero-copy instant branch)
 		if err := cow.CreateOverlay(context.Background(), srcOverlay, dstOverlay); err != nil {
@@ -92,6 +93,7 @@ func Clone(sourceID, newID string) error {
 				return fmt.Errorf("snapshot: failed to clone overlay: %w", err)
 			}
 		}
+		storageBranched = true
 	} else if _, err := os.Stat(srcRootfs); err == nil {
 		// Base rootfs exists; create an overlay backed by the base rootfs
 		if err := cow.CreateOverlay(context.Background(), srcRootfs, dstOverlay); err != nil {
@@ -99,6 +101,21 @@ func Clone(sourceID, newID string) error {
 			if err := copyFile(srcRootfs, filepath.Join(dstDir, "rootfs.img")); err != nil {
 				return fmt.Errorf("snapshot: failed to clone rootfs: %w", err)
 			}
+		}
+		storageBranched = true
+	}
+	if storageBranched {
+		// Both branches above leave the clone's backing chain reaching into
+		// srcDir: CreateOverlay records an ABSOLUTE backing path there, and
+		// copyFile byte-copies the source's own backing reference. Record the
+		// parent link so deleting the source container is vetoed while this
+		// clone lives (PrepareDelete), instead of silently corrupting it.
+		if err := registerCloneRef(sourceID, newID); err != nil {
+			return fmt.Errorf("snapshot: register clone reference: %w", err)
+		}
+		if err := os.WriteFile(filepath.Join(dstDir, cloneParentFile), []byte(sourceID), 0644); err != nil {
+			unregisterCloneRef(sourceID, newID)
+			return fmt.Errorf("snapshot: record clone parent: %w", err)
 		}
 	}
 
