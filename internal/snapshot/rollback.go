@@ -56,14 +56,19 @@ func Rollback(taskID, snapshotID string) error {
 	snapOverlay := filepath.Join(targetSnapDir, "overlay.qcow2")
 	currOverlay := filepath.Join(dir, "overlay.qcow2")
 	if _, err := os.Stat(snapOverlay); err == nil {
-		_ = cow.RemoveOverlay(currOverlay)
-		_ = os.Remove(currOverlay)
-		// Branch from snapOverlay as new active overlay
-		if err := cow.CreateOverlay(nil, snapOverlay, currOverlay); err != nil {
+		tmpOverlay := filepath.Join(dir, ".tmp-rb-overlay.qcow2")
+		_ = os.Remove(tmpOverlay)
+		// Branch from snapOverlay as new active overlay in temporary file
+		if err := cow.CreateOverlay(nil, snapOverlay, tmpOverlay); err != nil {
 			// Fallback: copy file
-			if data, rerr := os.ReadFile(snapOverlay); rerr == nil {
-				_ = os.WriteFile(currOverlay, data, 0644)
+			if err := copyFile(snapOverlay, tmpOverlay); err != nil {
+				_ = os.Remove(tmpOverlay)
+				return fmt.Errorf("snapshot: failed to restore overlay: %w", err)
 			}
+		}
+		if err := os.Rename(tmpOverlay, currOverlay); err != nil {
+			_ = os.Remove(tmpOverlay)
+			return fmt.Errorf("snapshot: failed to replace overlay: %w", err)
 		}
 	}
 
@@ -76,9 +81,13 @@ func Rollback(taskID, snapshotID string) error {
 
 	snapStatePath := filepath.Join(targetSnapDir, "state.json")
 	targetState := &state.ContainerState{}
+	stateLoaded := false
 	if stateBytes, err := os.ReadFile(snapStatePath); err == nil {
-		_ = json.Unmarshal(stateBytes, targetState)
-	} else if currentState != nil {
+		if err := json.Unmarshal(stateBytes, targetState); err == nil {
+			stateLoaded = true
+		}
+	}
+	if !stateLoaded && currentState != nil {
 		targetState = &state.ContainerState{
 			ID:          currentState.ID,
 			Name:        currentState.Name,

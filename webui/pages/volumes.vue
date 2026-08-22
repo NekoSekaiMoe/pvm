@@ -58,6 +58,48 @@
       </div>
     </div>
 
+    <!-- Clone Modal -->
+    <div v-if="cloneModalVolume" class="modal-backdrop" role="dialog" aria-modal="true" @keydown.esc="cloneModalVolume = null">
+      <div class="modal-box">
+        <h3>Clone Volume — {{ cloneModalVolume }}</h3>
+        <p class="muted" style="font-size:0.85rem;margin-bottom:1rem;">Create an instant Copy-on-Write branch of this persistent volume.</p>
+        
+        <div class="form-row full">
+          <label class="section-title" for="clone-vol-id">New Volume ID</label>
+          <input id="clone-vol-id" v-model="cloneTargetID" placeholder="e.g. workspace-data-clone" />
+        </div>
+
+        <div v-if="cloneError" class="callout err">{{ cloneError }}</div>
+        <div v-if="cloneSuccess" class="callout allow" style="color:var(--success, #4ade80);background:rgba(74,222,128,0.1);padding:0.75rem;border-radius:0.5rem;margin-top:1rem;">{{ cloneSuccess }}</div>
+
+        <div style="display:flex;justify-content:flex-end;gap:1rem;margin-top:1.5rem;">
+          <button class="btn btn-danger" @click="cloneModalVolume = null">Close</button>
+          <button class="btn btn-primary" @click="executeCloneVolume">Clone</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Rollback Modal -->
+    <div v-if="rollbackModalVolume" class="modal-backdrop" role="dialog" aria-modal="true" @keydown.esc="rollbackModalVolume = null">
+      <div class="modal-box">
+        <h3>Rollback Volume — {{ rollbackModalVolume }}</h3>
+        <p class="muted" style="font-size:0.85rem;margin-bottom:1rem;">Restore volume to a previously created snapshot point.</p>
+        
+        <div class="form-row full">
+          <label class="section-title" for="rollback-snap-id">Snapshot Name</label>
+          <input id="rollback-snap-id" v-model="rollbackSnapName" placeholder="e.g. snap-1" />
+        </div>
+
+        <div v-if="rollbackError" class="callout err">{{ rollbackError }}</div>
+        <div v-if="rollbackSuccess" class="callout allow" style="color:var(--success, #4ade80);background:rgba(74,222,128,0.1);padding:0.75rem;border-radius:0.5rem;margin-top:1rem;">{{ rollbackSuccess }}</div>
+
+        <div style="display:flex;justify-content:flex-end;gap:1rem;margin-top:1.5rem;">
+          <button class="btn btn-danger" @click="rollbackModalVolume = null">Close</button>
+          <button class="btn btn-primary" @click="executeRollbackVolume">Rollback</button>
+        </div>
+      </div>
+    </div>
+
     <!-- Create Modal -->
     <div v-if="showCreateModal" class="modal-backdrop">
       <div class="modal-box">
@@ -105,6 +147,16 @@ const searchQuery = ref('')
 const showCreateModal = ref(false)
 const errorMsg = ref('')
 
+const cloneModalVolume = ref(null)
+const cloneTargetID = ref('')
+const cloneError = ref('')
+const cloneSuccess = ref('')
+
+const rollbackModalVolume = ref(null)
+const rollbackSnapName = ref('')
+const rollbackError = ref('')
+const rollbackSuccess = ref('')
+
 const form = ref({
   name: '',
   driver: 'builtin',
@@ -147,32 +199,67 @@ const createVolume = async () => {
   }
 }
 
-const cloneVolumePrompt = async (id) => {
-  const newID = prompt(`Enter new volume ID to clone ${id} into:`, `${id}-cloned`)
-  if (!newID) return
+const cloneVolumePrompt = (id) => {
+  cloneModalVolume.value = id
+  cloneTargetID.value = `${id}-cloned`
+  cloneError.value = ''
+  cloneSuccess.value = ''
+}
+
+const executeCloneVolume = async () => {
+  cloneError.value = ''
+  cloneSuccess.value = ''
+  if (!cloneTargetID.value) {
+    cloneError.value = 'Target volume ID is required'
+    return
+  }
   try {
-    await apiFetch(`/api/volumes/${encodeURIComponent(id)}/clone`, {
+    await apiFetch(`/api/volumes/${encodeURIComponent(cloneModalVolume.value)}/clone`, {
       method: 'POST',
-      body: { new_id: newID }
+      body: { new_id: cloneTargetID.value }
     })
+    cloneSuccess.value = `Successfully cloned to ${cloneTargetID.value}`
     refresh()
   } catch (e) {
-    alert(`Clone error: ${e.message}`)
+    cloneError.value = e.message
   }
 }
 
-const rollbackVolumePrompt = async (id) => {
-  const snapshot = prompt(`Enter snapshot name to rollback volume ${id} to:`, `snap-${id}`)
-  if (!snapshot) return
+const rollbackVolumePrompt = (id) => {
+  rollbackModalVolume.value = id
+  rollbackSnapName.value = `snap-${id}`
+  rollbackError.value = ''
+  rollbackSuccess.value = ''
+}
+
+const executeRollbackVolume = async () => {
+  rollbackError.value = ''
+  rollbackSuccess.value = ''
+  if (!rollbackSnapName.value) {
+    rollbackError.value = 'Snapshot name is required'
+    return
+  }
   try {
-    await apiFetch(`/api/volumes/${encodeURIComponent(id)}/rollback`, {
+    await apiFetch(`/api/volumes/${encodeURIComponent(rollbackModalVolume.value)}/rollback`, {
       method: 'POST',
-      body: { snapshot }
+      body: { snapshot: rollbackSnapName.value }
+    })
+    rollbackSuccess.value = `Successfully rolled back volume ${rollbackModalVolume.value} to ${rollbackSnapName.value}`
+    refresh()
+  } catch (e) {
+    rollbackError.value = e.message
+  }
+}
+
+const deleteVolume = async (id) => {
+  if (!confirm(`Are you sure you want to delete volume ${id}?`)) return
+  try {
+    await apiFetch(`/api/volumes/${encodeURIComponent(id)}`, {
+      method: 'DELETE'
     })
     refresh()
-    alert(`Successfully rolled back volume ${id} to ${snapshot}`)
   } catch (e) {
-    alert(`Rollback error: ${e.message}`)
+    alert(`Delete error: ${e.message}`)
   }
 }
 

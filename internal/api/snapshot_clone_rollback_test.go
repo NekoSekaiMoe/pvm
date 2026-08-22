@@ -19,99 +19,21 @@ import (
 func setupTestServer(t *testing.T) (*echo.Echo, string) {
 	t.Helper()
 	tmp := t.TempDir()
-	os.Setenv("PVM_STATE_ROOT", filepath.Join(tmp, "containers"))
-	os.Setenv("PVM_AUDIT_ROOT", filepath.Join(tmp, "audit"))
-	os.Setenv("PVM_VOLUME_ROOT", filepath.Join(tmp, "volumes"))
-	os.Setenv("API_SECRET", "test-secret")
+	t.Setenv("PVM_STATE_ROOT", filepath.Join(tmp, "containers"))
+	t.Setenv("PVM_AUDIT_ROOT", filepath.Join(tmp, "audit"))
+	t.Setenv("PVM_VOLUME_ROOT", filepath.Join(tmp, "volumes"))
+	t.Setenv("API_SECRET", "test-secret")
 
-	e := echo.New()
-	api := e.Group("/api")
-
-	// 1. Task snapshots
-	api.POST("/tasks/:id/snapshots", func(c echo.Context) error {
-		id := c.Param("id")
-		if !idRegex.MatchString(id) {
-			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid task id"})
-		}
-		var req struct {
-			EventID   string            `json:"event_id"`
-			AuditHash string            `json:"audit_hash"`
-			Metadata  map[string]string `json:"metadata"`
-		}
-		_ = c.Bind(&req)
-		snap, err := snapshot.CreateEventSnapshot(id, req.EventID, req.AuditHash, req.Metadata)
-		if err != nil {
-			return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
-		}
-		return c.JSON(http.StatusOK, snap)
+	origStateRoot := state.RootDir
+	state.RootDir = filepath.Join(tmp, "containers")
+	t.Cleanup(func() {
+		state.RootDir = origStateRoot
 	})
 
-	api.GET("/tasks/:id/snapshots", func(c echo.Context) error {
-		id := c.Param("id")
-		if !idRegex.MatchString(id) {
-			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid task id"})
-		}
-		list, err := snapshot.ListEventSnapshots(id)
-		if err != nil {
-			return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
-		}
-		return c.JSON(http.StatusOK, list)
-	})
-
-	api.GET("/tasks/:id/snapshots/:snapId", func(c echo.Context) error {
-		id := c.Param("id")
-		snapId := c.Param("snapId")
-		if !idRegex.MatchString(id) || !idRegex.MatchString(snapId) {
-			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid id format"})
-		}
-		snap, err := snapshot.GetEventSnapshot(id, snapId)
-		if err != nil {
-			return c.JSON(http.StatusNotFound, map[string]string{"error": err.Error()})
-		}
-		return c.JSON(http.StatusOK, snap)
-	})
-
-	// 2. Clone
-	api.POST("/tasks/:id/clone", func(c echo.Context) error {
-		id := c.Param("id")
-		if !idRegex.MatchString(id) {
-			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid source task id"})
-		}
-		var req struct {
-			NewID string `json:"new_id"`
-		}
-		if err := c.Bind(&req); err != nil || req.NewID == "" {
-			return c.JSON(http.StatusBadRequest, map[string]string{"error": "new_id is required"})
-		}
-		if !idRegex.MatchString(req.NewID) {
-			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid new_id format"})
-		}
-		if err := snapshot.Clone(id, req.NewID); err != nil {
-			return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
-		}
-		return c.JSON(http.StatusOK, map[string]string{"status": "cloned", "id": req.NewID, "source_id": id})
-	})
-
-	// 3. Rollback
-	api.POST("/tasks/:id/rollback", func(c echo.Context) error {
-		id := c.Param("id")
-		if !idRegex.MatchString(id) {
-			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid task id"})
-		}
-		var req struct {
-			SnapshotID string `json:"snapshot_id"`
-		}
-		if err := c.Bind(&req); err != nil || req.SnapshotID == "" {
-			return c.JSON(http.StatusBadRequest, map[string]string{"error": "snapshot_id is required"})
-		}
-		if !idRegex.MatchString(req.SnapshotID) {
-			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid snapshot_id format"})
-		}
-		if err := snapshot.Rollback(id, req.SnapshotID); err != nil {
-			return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
-		}
-		return c.JSON(http.StatusOK, map[string]string{"status": "rolled_back", "id": id, "snapshot_id": req.SnapshotID})
-	})
+	e, err := NewE2BServer()
+	if err != nil {
+		t.Fatalf("NewE2BServer: %v", err)
+	}
 
 	return e, tmp
 }
@@ -132,6 +54,7 @@ func TestAPI_EventSnapshotLifecycle(t *testing.T) {
 	body := `{"event_id":"step-1","audit_hash":"hash-123","metadata":{"action":"init"}}`
 	req := httptest.NewRequest(http.MethodPost, "/api/tasks/"+taskID+"/snapshots", bytes.NewBufferString(body))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer test-secret")
 	rec := httptest.NewRecorder()
 	e.ServeHTTP(rec, req)
 
@@ -148,6 +71,7 @@ func TestAPI_EventSnapshotLifecycle(t *testing.T) {
 
 	// 2. GET /api/tasks/:id/snapshots
 	reqList := httptest.NewRequest(http.MethodGet, "/api/tasks/"+taskID+"/snapshots", nil)
+	reqList.Header.Set("Authorization", "Bearer test-secret")
 	recList := httptest.NewRecorder()
 	e.ServeHTTP(recList, reqList)
 
@@ -161,6 +85,7 @@ func TestAPI_EventSnapshotLifecycle(t *testing.T) {
 
 	// 3. GET /api/tasks/:id/snapshots/:snapId
 	reqGet := httptest.NewRequest(http.MethodGet, "/api/tasks/"+taskID+"/snapshots/"+snap.ID, nil)
+	reqGet.Header.Set("Authorization", "Bearer test-secret")
 	recGet := httptest.NewRecorder()
 	e.ServeHTTP(recGet, reqGet)
 
@@ -172,6 +97,7 @@ func TestAPI_EventSnapshotLifecycle(t *testing.T) {
 	cloneBody := `{"new_id":"task-api-cloned"}`
 	reqClone := httptest.NewRequest(http.MethodPost, "/api/tasks/"+taskID+"/clone", bytes.NewBufferString(cloneBody))
 	reqClone.Header.Set("Content-Type", "application/json")
+	reqClone.Header.Set("Authorization", "Bearer test-secret")
 	recClone := httptest.NewRecorder()
 	e.ServeHTTP(recClone, reqClone)
 
@@ -183,6 +109,7 @@ func TestAPI_EventSnapshotLifecycle(t *testing.T) {
 	rbBody := `{"snapshot_id":"` + snap.ID + `"}`
 	reqRb := httptest.NewRequest(http.MethodPost, "/api/tasks/"+taskID+"/rollback", bytes.NewBufferString(rbBody))
 	reqRb.Header.Set("Content-Type", "application/json")
+	reqRb.Header.Set("Authorization", "Bearer test-secret")
 	recRb := httptest.NewRecorder()
 	e.ServeHTTP(recRb, reqRb)
 

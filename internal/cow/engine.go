@@ -130,6 +130,9 @@ func (e *Qcow2Engine) DeleteVolume(name string) error {
 	if _, err := os.Stat(path); err != nil {
 		return fmt.Errorf("cow: volume %q not found", name)
 	}
+	if hasRef, refName, _ := e.hasBackingReference(path); hasRef {
+		return fmt.Errorf("cow: cannot delete volume %q: referenced by %q", name, refName)
+	}
 	return os.Remove(path)
 }
 
@@ -221,6 +224,9 @@ func (e *Qcow2Engine) DeleteSnapshot(snapshotName string) error {
 	path := e.snapshotPath(snapshotName)
 	if _, err := os.Stat(path); err != nil {
 		return fmt.Errorf("cow: snapshot %q not found", snapshotName)
+	}
+	if hasRef, refName, _ := e.hasBackingReference(path); hasRef {
+		return fmt.Errorf("cow: cannot delete snapshot %q: referenced by %q", snapshotName, refName)
 	}
 	return os.Remove(path)
 }
@@ -373,10 +379,62 @@ func (e *Qcow2Engine) RollbackVolume(volumeName, snapshotName string) error {
 
 	tmpPath := filepath.Join(e.root, ".tmp-rb-"+volumeName+".qcow2")
 	_ = os.Remove(tmpPath)
-	if err := CreateOverlay(context.Background(), snapPath, tmpPath); err != nil {
+	if err := ConvertToQcow2(context.Background(), snapPath, tmpPath, ConvertDefaultOpt); err != nil {
+		_ = os.Remove(tmpPath)
 		return fmt.Errorf("cow: create rollback overlay: %w", err)
 	}
 
-	return os.Rename(tmpPath, volPath)
+	if err := os.Rename(tmpPath, volPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	return nil
+}
+
+// hasBackingReference reports whether any existing volume or snapshot has a
+// backing file referencing targetPath.
+func (e *Qcow2Engine) hasBackingReference(targetPath string) (bool, string, error) {
+	entries, err := os.ReadDir(e.root)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, "", nil
+		}
+		return false, "", err
+	}
+	absTarget, err := filepath.Abs(targetPath)
+	if err != nil {
+		absTarget = targetPath
+	}
+	targetBase := filepath.Base(targetPath)
+	for _, ent := range entries {
+		if ent.IsDir() || filepath.Ext(ent.Name()) != ".qcow2" {
+			continue
+		}
+		p := filepath.Join(e.root, ent.Name())
+		absP, err := filepath.Abs(p)
+		if err == nil && (absP == absTarget || p == targetPath) {
+			continue
+		}
+		img, err := openGuestImage(p)
+		if err != nil {
+			continue
+		}
+		qi, ok := img.(*qcow2Image)
+		if !ok || qi.backingName == "" {
+			img.Close()
+			continue
+		}
+		ref := false
+		if qi.backingAbs == absTarget || qi.backingAbs == targetPath {
+			ref = true
+		} else if qi.backingName == targetBase || filepath.Base(qi.backingName) == targetBase {
+			ref = true
+		}
+		img.Close()
+		if ref {
+			return true, ent.Name(), nil
+		}
+	}
+	return false, "", nil
 }
 

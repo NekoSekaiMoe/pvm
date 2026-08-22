@@ -2,6 +2,7 @@ package snapshot
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sync"
@@ -12,6 +13,25 @@ import (
 )
 
 var cloneMu sync.Mutex
+
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
+	if _, err := io.Copy(out, in); err != nil {
+		return err
+	}
+	return out.Sync()
+}
 
 // Clone performs an instant Copy-on-Write clone of an existing container/task.
 // It branches the disk overlay in O(1) time and initializes a clean, isolated
@@ -67,9 +87,7 @@ func Clone(sourceID, newID string) error {
 		// Create a new overlay with srcOverlay as its backing image (zero-copy instant branch)
 		if err := cow.CreateOverlay(nil, srcOverlay, dstOverlay); err != nil {
 			// Fallback: copy overlay file directly
-			if data, rerr := os.ReadFile(srcOverlay); rerr == nil {
-				_ = os.WriteFile(dstOverlay, data, 0644)
-			} else {
+			if err := copyFile(srcOverlay, dstOverlay); err != nil {
 				return fmt.Errorf("snapshot: failed to clone overlay: %w", err)
 			}
 		}
@@ -77,8 +95,8 @@ func Clone(sourceID, newID string) error {
 		// Base rootfs exists; create an overlay backed by the base rootfs
 		if err := cow.CreateOverlay(nil, srcRootfs, dstOverlay); err != nil {
 			// Fallback: copy rootfs
-			if data, rerr := os.ReadFile(srcRootfs); rerr == nil {
-				_ = os.WriteFile(filepath.Join(dstDir, "rootfs.img"), data, 0644)
+			if err := copyFile(srcRootfs, filepath.Join(dstDir, "rootfs.img")); err != nil {
+				return fmt.Errorf("snapshot: failed to clone rootfs: %w", err)
 			}
 		}
 	}

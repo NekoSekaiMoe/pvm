@@ -282,8 +282,21 @@ func extractHardlink(hdr *tar.Header, absDest, target string) error {
 	}
 	if srcFi.Mode()&os.ModeSymlink != 0 {
 		if symlinkTarget, err := os.Readlink(src); err == nil {
+			// Resolve target relative to src's parent directory
+			resolved := symlinkTarget
+			if !filepath.IsAbs(resolved) {
+				resolved = filepath.Clean(filepath.Join(filepath.Dir(src), symlinkTarget))
+			}
+			// Guard against escape from dest
+			if !strings.HasPrefix(resolved, absDest+string(filepath.Separator)) && resolved != absDest {
+				return fmt.Errorf("tarutil: hardlink to symlink %s escapes destination: %s", hdr.Linkname, symlinkTarget)
+			}
+			relTarget, rerr := filepath.Rel(filepath.Dir(target), resolved)
+			if rerr != nil {
+				return fmt.Errorf("tarutil: rel target: %w", rerr)
+			}
 			_ = os.Remove(target)
-			if err2 := os.Symlink(symlinkTarget, target); err2 == nil {
+			if err2 := os.Symlink(relTarget, target); err2 == nil {
 				return nil
 			}
 		}

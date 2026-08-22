@@ -47,8 +47,8 @@ type ExecResponse struct {
 	ExitCode int    `json:"exitCode"`
 }
 
-// StartE2BServer starts a REST API compatible with E2B SDK and serves the WebUI
-func StartE2BServer(port int) error {
+// NewE2BServer configures and returns an Echo instance with all E2B API and WebUI routes.
+func NewE2BServer() (*echo.Echo, error) {
 	e := echo.New()
 
 	// Shared lifecycle manager: injected into container.Managers created by
@@ -78,7 +78,7 @@ func StartE2BServer(port int) error {
 	// refuses the symmetric default, see cmd/agentpvm approvalCmd).
 	apiSecret := os.Getenv("API_SECRET")
 	if apiSecret == "" {
-		return errors.New("API_SECRET environment variable is required (refusing to start the API with no authentication)")
+		return nil, errors.New("API_SECRET environment variable is required (refusing to start the API with no authentication)")
 	}
 	apiSecretBytes := []byte(apiSecret)
 	api.Use(middleware.KeyAuth(func(key string, c echo.Context) (bool, error) {
@@ -268,6 +268,9 @@ func StartE2BServer(port int) error {
 		if err := snapshot.Clone(id, req.NewID); err != nil {
 			if strings.Contains(err.Error(), "already exists") {
 				return c.JSON(http.StatusConflict, map[string]string{"error": err.Error()})
+			}
+			if strings.Contains(err.Error(), "not found") {
+				return c.JSON(http.StatusNotFound, map[string]string{"error": err.Error()})
 			}
 			return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		}
@@ -500,7 +503,9 @@ func StartE2BServer(port int) error {
 			AuditHash string            `json:"audit_hash"`
 			Metadata  map[string]string `json:"metadata"`
 		}
-		_ = c.Bind(&req)
+		if err := c.Bind(&req); err != nil {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "bad request: " + err.Error()})
+		}
 		snap, err := snapshot.CreateEventSnapshot(id, req.EventID, req.AuditHash, req.Metadata)
 		if err != nil {
 			if strings.Contains(err.Error(), "not found") {
@@ -966,7 +971,22 @@ func StartE2BServer(port int) error {
 			return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		}
 		engine := cow.NewEngine(os.Getenv("PVM_VOLUME_ROOT"))
-		path, _ := engine.CloneVolume(id, req.NewID)
+		volFile := filepath.Join(os.Getenv("PVM_VOLUME_ROOT"), id+".qcow2")
+		snapFile := filepath.Join(os.Getenv("PVM_VOLUME_ROOT"), "snap-"+id+".qcow2")
+		var path string
+		if _, err := os.Stat(volFile); err == nil {
+			path, err = engine.CloneVolume(id, req.NewID)
+			if err != nil {
+				_ = volStore.Delete(req.NewID)
+				return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to clone volume: " + err.Error()})
+			}
+		} else if _, err := os.Stat(snapFile); err == nil {
+			path, err = engine.CloneVolume(id, req.NewID)
+			if err != nil {
+				_ = volStore.Delete(req.NewID)
+				return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to clone volume: " + err.Error()})
+			}
+		}
 		return c.JSON(http.StatusOK, map[string]string{"status": "cloned", "volume_id": req.NewID, "path": path})
 	})
 
@@ -1217,6 +1237,15 @@ func StartE2BServer(port int) error {
 		HTML5:      true,
 	}))
 
+	return e, nil
+}
+
+// StartE2BServer starts a REST API compatible with E2B SDK and serves the WebUI on the given port.
+func StartE2BServer(port int) error {
+	e, err := NewE2BServer()
+	if err != nil {
+		return err
+	}
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
 	fmt.Printf("E2B-compatible API & WebUI Server listening on %s\n", addr)
 	return e.Start(addr)

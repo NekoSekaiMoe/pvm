@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# 28_test_webui_simulation.sh — end-to-end simulation of WebUI user interactions,
-# SPA routes, and frontend button click workflows across all Nuxt 3 pages.
+# 28_test_webui_simulation.sh — end-to-end verification of WebUI HTML5 SPA
+# routing, static assets, and page-dependent REST API workflows.
 # Does NOT require a UML kernel; safe to run in CI.
 
 set -euo pipefail
@@ -28,12 +28,15 @@ echo "=== Starting agentpvm WebUI server on port $PORT ==="
 "$TMP/agentpvm" webui --port "$PORT" >"$TMP/webui.log" 2>&1 &
 SRV=$!
 
-for i in $(seq 1 30); do
+READY=0
+for _ in $(seq 1 30); do
     if curl -s "http://127.0.0.1:$PORT/" >/dev/null 2>&1; then
+        READY=1
         break
     fi
     sleep 0.1
 done
+[ "$READY" = "1" ] || fail "webui server failed to become ready on port $PORT"
 
 AUTH="Authorization: Bearer $SECRET"
 JSON_HDR="Content-Type: application/json"
@@ -168,11 +171,13 @@ VOL_CREATE_RESP=$(curl -s -X POST "http://127.0.0.1:$PORT/api/volumes" \
     -H "$AUTH" -H "$JSON_HDR" \
     -d "{\"name\":\"$VOL_NAME\",\"driver\":\"builtin\"}")
 echo "$VOL_CREATE_RESP" | grep -q "$VOL_NAME" || fail "create volume failed: $VOL_CREATE_RESP"
-echo "   Create Volume modal created $VOL_NAME ✓"
+API_VOL_ID=$(echo "$VOL_CREATE_RESP" | jq -r .volume_id 2>/dev/null || echo "$VOL_NAME")
+[ -n "$API_VOL_ID" ] && [ "$API_VOL_ID" != "null" ] || API_VOL_ID="$VOL_NAME"
+echo "   Create Volume modal created $API_VOL_ID ✓"
 
 # 4.2 Button Click: "Clone Volume"
 VOL_CLONE_NAME="ui-vol-alpha-clone"
-VOL_CLONE_RESP=$(curl -s -X POST "http://127.0.0.1:$PORT/api/volumes/$VOL_NAME/clone" \
+VOL_CLONE_RESP=$(curl -s -X POST "http://127.0.0.1:$PORT/api/volumes/$API_VOL_ID/clone" \
     -H "$AUTH" -H "$JSON_HDR" \
     -d "{\"new_id\":\"$VOL_CLONE_NAME\"}")
 echo "$VOL_CLONE_RESP" | grep -q '"status":"cloned"' || fail "clone volume failed: $VOL_CLONE_RESP"

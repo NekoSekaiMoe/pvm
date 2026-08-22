@@ -237,9 +237,9 @@ func TestExtract_HardlinkSourceSymlinkRules(t *testing.T) {
 				{tar.Header{Name: "h", Typeflag: tar.TypeLink, Linkname: "alias", Mode: 0644}, nil},
 			},
 			validate: func(t *testing.T, dir string) {
-				// link(2) did not dereference "alias": h is a second name
-				// for the symlink inode itself, so it reads back as the same
-				// symlink AND shares that symlink's inode.
+				// alias is a symlink. Hardlinking a symlink produces an equivalent
+				// symlink pointing to the same real target (either via shared inode
+				// or safe re-relativized symlink).
 				aliasFi, aerr := os.Lstat(filepath.Join(dir, "alias"))
 				if aerr != nil {
 					t.Fatalf("Lstat alias: %v", aerr)
@@ -256,6 +256,41 @@ func TestExtract_HardlinkSourceSymlinkRules(t *testing.T) {
 				}
 			},
 		},
+		{
+			name: "deep_relative_symlink_hardlinked_at_root",
+			entries: []tarEntry{
+				{tar.Header{Name: "sub", Typeflag: tar.TypeDir, Mode: 0755}, nil},
+				{tar.Header{Name: "target_file", Typeflag: tar.TypeReg, Mode: 0644, Size: 4}, []byte("test")},
+				{tar.Header{Name: "sub/sym", Typeflag: tar.TypeSymlink, Linkname: "../target_file", Mode: 0777}, nil},
+				{tar.Header{Name: "root_h", Typeflag: tar.TypeLink, Linkname: "sub/sym", Mode: 0644}, nil},
+			},
+			validate: func(t *testing.T, dir string) {
+				rootHFi, err := os.Lstat(filepath.Join(dir, "root_h"))
+				if err != nil {
+					t.Fatalf("Lstat root_h: %v", err)
+				}
+				if rootHFi.Mode()&os.ModeSymlink == 0 {
+					t.Fatalf("root_h must be a symlink")
+				}
+				got, err := os.Readlink(filepath.Join(dir, "root_h"))
+				if err != nil {
+					t.Fatalf("Readlink root_h: %v", err)
+				}
+				// root_h is at root, so target_file should be "target_file" (not "../target_file")
+				if got != "target_file" {
+					t.Fatalf("root_h target must be re-relativized to 'target_file', got %q", got)
+				}
+			},
+		},
+		{
+			name: "escaping_relative_symlink_hardlink_rejected",
+			entries: []tarEntry{
+				{tar.Header{Name: "sub", Typeflag: tar.TypeDir, Mode: 0755}, nil},
+				{tar.Header{Name: "sub/sym", Typeflag: tar.TypeSymlink, Linkname: "../../etc/passwd", Mode: 0777}, nil},
+				{tar.Header{Name: "h", Typeflag: tar.TypeLink, Linkname: "sub/sym", Mode: 0644}, nil},
+			},
+			wantErr: "escapes the destination",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -271,7 +306,9 @@ func TestExtract_HardlinkSourceSymlinkRules(t *testing.T) {
 				t.Fatalf("hardlink scenario %s: Extract must accept this archive, got: %v",
 					tc.name, err)
 			}
-			tc.validate(t, dir)
+			if tc.validate != nil {
+				tc.validate(t, dir)
+			}
 		})
 	}
 }

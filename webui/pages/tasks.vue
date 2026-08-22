@@ -131,7 +131,7 @@
     </div>
 
     <!-- Snapshot modal -->
-    <div v-if="snapModalTask" class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="snap-modal-title" @keydown.esc="snapModalTask = null">
+    <div v-if="snapModalTask" ref="snapModalBackdrop" class="modal-backdrop" tabindex="-1" role="dialog" aria-modal="true" aria-labelledby="snap-modal-title" @keydown.esc="snapModalTask = null">
       <div class="modal-box">
         <h3 id="snap-modal-title">Event Snapshots — {{ snapModalTask.id }}</h3>
         
@@ -181,7 +181,7 @@
 </template>
 
 <script setup>
-import { ref, computed } from 'vue'
+import { ref, computed, nextTick } from 'vue'
 import { apiFetch, usePoll } from '~/composables/useApi'
 
 const tasks = ref([])
@@ -289,10 +289,16 @@ const taskSnapshots = ref([])
 const snapEventId = ref('')
 const snapError = ref('')
 
+const snapModalBackdrop = ref(null)
+
 const openSnapshotModal = async (t) => {
   snapModalTask.value = t
   snapError.value = ''
   snapEventId.value = `step_${Date.now().toString().slice(-4)}`
+  await nextTick()
+  if (snapModalBackdrop.value) {
+    snapModalBackdrop.value.focus()
+  }
   await loadSnapshots(t.id)
 }
 

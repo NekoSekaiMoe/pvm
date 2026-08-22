@@ -28,12 +28,15 @@ echo "=== Starting E2B API server on port $PORT ==="
 "$TMP/agentpvm" api --port "$PORT" >"$TMP/srv.log" 2>&1 &
 SRV=$!
 
-for i in $(seq 1 30); do
+READY=0
+for _ in $(seq 1 30); do
     if curl -s "http://127.0.0.1:$PORT/api/containers" -H "Authorization: Bearer $SECRET" >/dev/null 2>&1; then
+        READY=1
         break
     fi
     sleep 0.1
 done
+[ "$READY" = "1" ] || fail "server failed to become ready on port $PORT"
 
 AUTH="Authorization: Bearer $SECRET"
 JSON_HDR="Content-Type: application/json"
@@ -68,9 +71,10 @@ SNAP_RESP=$(curl -s -X POST "http://127.0.0.1:$PORT/api/tasks/$TASK_ID/snapshots
     -H "$AUTH" -H "$JSON_HDR" \
     -d '{"event_id":"evt-step-101","audit_hash":"sha256:abc123456","metadata":{"tool":"bash_exec","cmd":"ls -la"}}')
 
-echo "$SNAP_RESP" | grep -q "snap-$TASK_ID" || fail "snapshot ID missing in response: $SNAP_RESP"
-echo "$SNAP_RESP" | grep -q "evt-step-101" || fail "event_id missing in response: $SNAP_RESP"
-SNAP_ID=$(echo "$SNAP_RESP" | grep -o '"id":"[^"]*' | cut -d'"' -f4)
+SNAP_ID=$(echo "$SNAP_RESP" | jq -r .id)
+[ -n "$SNAP_ID" ] && [ "$SNAP_ID" != "null" ] || fail "snapshot ID missing in response: $SNAP_RESP"
+EVENT_ID=$(echo "$SNAP_RESP" | jq -r .event_id)
+[ "$EVENT_ID" = "evt-step-101" ] || fail "event_id missing in response: $SNAP_RESP"
 echo "   Snapshot created: $SNAP_ID ✓"
 
 # 1.2 List snapshots
@@ -80,7 +84,7 @@ echo "   Snapshot listed in task snapshot index ✓"
 
 # 1.3 Get snapshot detail
 GET_RESP=$(curl -s "http://127.0.0.1:$PORT/api/tasks/$TASK_ID/snapshots/$SNAP_ID" -H "$AUTH")
-echo "$GET_RESP" | grep -q "evt-step-101" || fail "snapshot detail mismatch: $GET_RESP"
+[ "$(echo "$GET_RESP" | jq -r .event_id)" = "evt-step-101" ] || fail "snapshot detail mismatch: $GET_RESP"
 echo "   Snapshot detail verified ✓"
 
 # =========================================================================
@@ -93,14 +97,14 @@ CLONE_RESP=$(curl -s -X POST "http://127.0.0.1:$PORT/api/tasks/$TASK_ID/clone" \
     -H "$AUTH" -H "$JSON_HDR" \
     -d "{\"new_id\":\"$CLONE_TASK_ID\"}")
 
-echo "$CLONE_RESP" | grep -q '"status":"cloned"' || fail "clone failed: $CLONE_RESP"
-echo "$CLONE_RESP" | grep -q "$CLONE_TASK_ID" || fail "new_id missing: $CLONE_RESP"
+[ "$(echo "$CLONE_RESP" | jq -r .status)" = "cloned" ] || fail "clone failed: $CLONE_RESP"
+[ "$(echo "$CLONE_RESP" | jq -r .id)" = "$CLONE_TASK_ID" ] || fail "new_id missing: $CLONE_RESP"
 echo "   Task cloned instantly to $CLONE_TASK_ID ✓"
 
 # Verify cloned task state is isolated and ready
 CLONED_STATE=$(curl -s "http://127.0.0.1:$PORT/api/tasks/$CLONE_TASK_ID" -H "$AUTH")
-echo "$CLONED_STATE" | grep -q '"status":"ready"' || fail "cloned state not ready: $CLONED_STATE"
-echo "$CLONED_STATE" | grep -q '"pid":0' || fail "cloned pid should be 0: $CLONED_STATE"
+[ "$(echo "$CLONED_STATE" | jq -r .status)" = "ready" ] || fail "cloned state not ready: $CLONED_STATE"
+[ "$(echo "$CLONED_STATE" | jq -r .pid)" = "0" ] || fail "cloned pid should be 0: $CLONED_STATE"
 echo "   Cloned task state verified as ready and isolated ✓"
 
 # Verify duplicate clone returns 409 Conflict
@@ -114,7 +118,7 @@ echo "   Duplicate clone rejected with 409 Conflict ✓"
 CONT_CLONE_RESP=$(curl -s -X POST "http://127.0.0.1:$PORT/api/containers/$TASK_ID/clone" \
     -H "$AUTH" -H "$JSON_HDR" \
     -d '{"new_id":"cont-cloned-02"}')
-echo "$CONT_CLONE_RESP" | grep -q '"status":"cloned"' || fail "container clone failed: $CONT_CLONE_RESP"
+[ "$(echo "$CONT_CLONE_RESP" | jq -r .status)" = "cloned" ] || fail "container clone failed: $CONT_CLONE_RESP"
 echo "   Container clone endpoint verified ✓"
 
 # =========================================================================
@@ -128,13 +132,13 @@ curl -s -X POST "http://127.0.0.1:$PORT/api/tasks/$TASK_ID/transition" \
     -d '{"to":"failed","actor":"system","reason":"simulated error"}' >/dev/null
 
 STATE_BEFORE_RB=$(curl -s "http://127.0.0.1:$PORT/api/tasks/$TASK_ID" -H "$AUTH")
-echo "$STATE_BEFORE_RB" | grep -q '"status":"failed"' || fail "transition to failed failed"
+[ "$(echo "$STATE_BEFORE_RB" | jq -r .status)" = "failed" ] || fail "transition to failed failed"
 
 # Rollback to snapshot
 RB_RESP=$(curl -s -X POST "http://127.0.0.1:$PORT/api/tasks/$TASK_ID/rollback" \
     -H "$AUTH" -H "$JSON_HDR" \
     -d "{\"snapshot_id\":\"$SNAP_ID\"}")
-echo "$RB_RESP" | grep -q '"status":"rolled_back"' || fail "rollback failed: $RB_RESP"
+[ "$(echo "$RB_RESP" | jq -r .status)" = "rolled_back" ] || fail "rollback failed: $RB_RESP"
 
 STATE_AFTER_RB=$(curl -s "http://127.0.0.1:$PORT/api/tasks/$TASK_ID" -H "$AUTH")
 echo "$STATE_AFTER_RB" | grep -q '"status":"running"' || fail "state not restored to running: $STATE_AFTER_RB"
