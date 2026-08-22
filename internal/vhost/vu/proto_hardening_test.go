@@ -146,7 +146,7 @@ func TestReplyPayloadIndependentOfReceiveBuffer(t *testing.T) {
 		}
 		size := binary.LittleEndian.Uint32(buf[8:])
 		if int(size) != 8 {
-			done <- bytes.ErrTooLarge
+			done <- errReplySize
 			return
 		}
 		if !bytes.Equal(buf[12:], bytes.Repeat([]byte{0x42}, 8)) {
@@ -174,4 +174,7 @@ func TestReplyPayloadIndependentOfReceiveBuffer(t *testing.T) {
 	}
 }
 
-var errReplyMismatch = errors.New("reply payload mismatch")
+var (
+	errReplyMismatch = errors.New("reply payload mismatch")
+	errReplySize     = errors.New("reply payload size mismatch")
+)

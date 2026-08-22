@@ -30,11 +30,13 @@ var idRegex = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 // iproute2 or smuggle extra arguments into the invoked commands.
 var netNameRegex = regexp.MustCompile(`^[a-zA-Z0-9._-]{1,15}$`)
 
-// validNetName applies netNameRegex plus the two names the charset alone
+// validNetName applies netNameRegex plus the names the charset alone
 // accepts but must never reach iproute2 or state-path derivation: "." and
-// ".." (they resolve to the current/parent directory in derived paths).
+// ".." (they resolve to the current/parent directory in derived paths) and
+// leading "-" (iproute2 would parse it as a flag value).
 func validNetName(name string) bool {
-	return name != "." && name != ".." && netNameRegex.MatchString(name)
+	return name != "." && name != ".." &&
+		!strings.HasPrefix(name, "-") && netNameRegex.MatchString(name)
 }
 
 // loadLaunchConfig loads a TaskSpec TOML but returns only the launch-relevant

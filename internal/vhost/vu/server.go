@@ -33,13 +33,18 @@ func Serve(socketPath string, dev *BlkDev) (*Server, error) {
 	if err := os.Remove(socketPath); err != nil && !os.IsNotExist(err) {
 		return nil, err
 	}
+	// net.ListenUnix creates the socket with mode 0777 &^ process umask:
+	// a permissive umask would expose the control channel (memory-table fd
+	// passing) to other local users during the window before the Chmod
+	// below — permanently, if the Chmod failed. A private umask around the
+	// create closes that window; the Chmod still pins the enforced 0600
+	// mode, and only the guest frontend may talk to the socket.
+	oldUmask := unix.Umask(0o077)
 	ln, err := net.ListenUnix("unix", &net.UnixAddr{Name: socketPath, Net: "unix"})
+	unix.Umask(oldUmask)
 	if err != nil {
 		return nil, fmt.Errorf("vu: listen %s: %w", socketPath, err)
 	}
-	// ListenUnix applies the process umask; a permissive umask would expose
-	// the control channel (memory-table fd passing) to other local users.
-	// Only the guest frontend may talk to it.
 	if err := os.Chmod(socketPath, 0600); err != nil {
 		ln.Close()
 		os.Remove(socketPath)
@@ -422,38 +427,9 @@ func (s *session) pump() {
 			if len(batch) == 0 {
 				break
 			}
-			// Phase 2 (unlocked): pure device IO — read/write/fsync.
-			type result struct {
-				e       *elem
-				usedLen uint32
+			if s.runBatch(batch) {
+				return // session closed mid-batch; stop pumping
 			}
-			results := make([]result, 0, len(batch))
-			for _, e := range batch {
-				usedLen, err := s.dev.process(e)
-				if err != nil {
-					log.Printf("vu: blk request: %v", err)
-					continue
-				}
-				results = append(results, result{e: e, usedLen: usedLen})
-			}
-			// Phase 3 (locked): publish completions and interrupt the guest.
-			s.mu.Lock()
-			s.pumpBusy-- // batch left Phase 2; wake any SET_MEM_TABLE waiter
-			s.pumpIdle.Broadcast()
-			if s.closed {
-				s.mu.Unlock()
-				return
-			}
-			for _, r := range results {
-				if err := s.vq.push(r.e, r.usedLen); err != nil {
-					log.Printf("vu: push: %v", err)
-					break
-				}
-			}
-			if err := s.vq.notify(); err != nil {
-				log.Printf("vu: notify: %v", err)
-			}
-			s.mu.Unlock()
 			// A full batch means more work may be pending; otherwise the
 			// queue is drained and we go back to waiting for a kick.
 			if len(batch) < pumpMaxBatch {
@@ -461,6 +437,61 @@ func (s *session) pump() {
 			}
 		}
 	}
+}
+
+// runBatch drives one popped batch through Phase 2 (unlocked device IO)
+// and Phase 3 (locked publish/notify), then releases the pump-busy mark
+// popBatch took under s.mu. The release is registered as a defer at
+// pump-busy acquisition: if dev.process panics in Phase 2, the counter is
+// still decremented and pumpIdle still broadcast under s.mu, so a
+// SET_MEM_TABLE waiter can never hang on a counter that will not drop.
+// The normal Phase 3 path falls through the same defer — no double
+// decrement. It reports whether the session closed mid-batch.
+func (s *session) runBatch(batch []*elem) (sessionClosed bool) {
+	phase3Locked := false
+	defer func() {
+		if !phase3Locked { // panicked in Phase 2, before Phase 3 took s.mu
+			s.mu.Lock()
+		}
+		s.pumpBusy-- // batch left Phase 2; wake any SET_MEM_TABLE waiter
+		s.pumpIdle.Broadcast()
+		s.mu.Unlock()
+	}()
+
+	// Phase 2 (unlocked): pure device IO — read/write/fsync.
+	type result struct {
+		e       *elem
+		usedLen uint32
+	}
+	results := make([]result, 0, len(batch))
+	for _, e := range batch {
+		usedLen, err := s.dev.process(e)
+		if err != nil {
+			log.Printf("vu: blk request: %v", err)
+			continue
+		}
+		results = append(results, result{e: e, usedLen: usedLen})
+	}
+
+	// Phase 3 (locked): publish completions and interrupt the guest. The
+	// deferred release runs before s.mu is dropped, so the decrement and
+	// broadcast stay in the same lock hold as push/notify — exactly the
+	// semantics of the former inline Phase 3.
+	s.mu.Lock()
+	phase3Locked = true
+	if s.closed {
+		return true
+	}
+	for _, r := range results {
+		if err := s.vq.push(r.e, r.usedLen); err != nil {
+			log.Printf("vu: push: %v", err)
+			break
+		}
+	}
+	if err := s.vq.notify(); err != nil {
+		log.Printf("vu: notify: %v", err)
+	}
+	return false
 }
 
 // pumpMaxBatch bounds how many requests one locked pop phase extracts

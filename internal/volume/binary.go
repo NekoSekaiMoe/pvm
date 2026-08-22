@@ -109,7 +109,9 @@ func (p *BinaryPlugin) Init(_ context.Context, cfg PluginConfig) error {
 		p.legacyArgv = false
 	case "argv-v1":
 		p.legacyArgv = true
-		log.Printf("[warn] volume binary %q: protocol=argv-v1 puts credentials in argv (world-readable via /proc/<pid>/cmdline); use protocol=stdin if the plugin supports it", p.binaryPath)
+		log.Printf("[warn] volume binary %q: protocol=argv-v1 puts credentials in argv "+
+			"(world-readable via /proc/<pid>/cmdline); use protocol=stdin if the plugin supports it",
+			p.binaryPath)
 	default:
 		return fmt.Errorf("volume binary: unknown protocol %q (want %q or %q)",
 			cfg.Extra["protocol"], "stdin", "argv-v1")
