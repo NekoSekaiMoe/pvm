@@ -22,6 +22,7 @@ PORT=18091
 export PVM_API="http://127.0.0.1:$PORT"
 API="$PVM_API/api"
 AUTH="Authorization: Bearer secret"
+export API_SECRET="secret"
 
 fail() { echo "❌ $1"; exit 1; }
 

@@ -29,6 +29,9 @@ tenant = "qa"
 [runtime]
 name = "smoke-task"
 memory = "256M"
+[workspace]
+init = "/init.sh"
+base_image = "/nonexistent/rootfs.img"
 [kernel]
 path = "/nonexistent/linux"
 EOF

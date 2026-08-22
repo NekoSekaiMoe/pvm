@@ -32,6 +32,8 @@ This directory contains shell-based integration and end-to-end (E2E) suites vali
 | `22_test_docker_image_pull.sh`| No | Docker image pull error handling and safeName sanitization |
 | `23_test_container_api.sh` | No | Container REST: list shape, logs/delete/snapshot/restore id validation, `/containers/start` validation chain (name/CPU/rootfs injection/memory) |
 | `24_test_tasks_audit_api.sh`| No | Task read API (`GET /tasks`, detail 400/404), unknown-task transition 404, `load-spec` path mode + `PVM_SPEC_ROOT` traversal defense, audit ledger read + chain verify |
+| `25_test_e2b_api_full.sh` | No | Exhaustive sweep of ALL 34 API routes: success path where kernel-free, contract-correct error where kernel/root required |
+| `26_test_full_feature_e2e.sh`| No | One task's full cross-plane lifecycle: load-spec → FSM → tool gateway (allow/deny/approve) → approval → pause/resume → gate release → completed → destroy → audit chain |
 
 ---
 
@@ -40,7 +42,7 @@ This directory contains shell-based integration and end-to-end (E2E) suites vali
 ```bash
 # Run all unprivileged CI-safe suites (fails fast on first error)
 set -e
-for s in tests/{05,06,07,08,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24}_*.sh; do
+for s in tests/{05,06,07,08,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26}_*.sh; do
     echo "Running $s..."
     ./"$s"
 done
