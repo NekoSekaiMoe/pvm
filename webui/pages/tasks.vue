@@ -128,6 +128,8 @@
         </div>
         <div v-if="transError" class="callout err" style="margin-top:1rem;">{{ transError }}</div>
       </div>
+    </div>
+
     <!-- Snapshot modal -->
     <div v-if="snapModalTask" class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="snap-modal-title" @keydown.esc="snapModalTask = null">
       <div class="modal-box">
