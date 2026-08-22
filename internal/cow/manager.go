@@ -291,8 +291,14 @@ func registerOverlayBacking(overlayPath, baseDir string) {
 	backingRootsMu.Lock()
 	defer backingRootsMu.Unlock()
 	// Re-registering an overlay path (e.g. the file was deleted externally
-	// and is recreated) must not leak the previous base dir's refcount.
-	if old, ok := overlayBackingDirs[overlayPath]; ok && old != baseDir {
+	// and is recreated) must not leak the previous base dir's refcount —
+	// including the identical-dir case: skipping the decrement there would
+	// grow the count by one per re-registration. Drop the existing mapping's
+	// count first (deleting the entry at zero), then record the mapping and
+	// increment the new base dir exactly once. The transient zero is invisible
+	// to readers: the whole swap runs under backingRootsMu, which
+	// backingPathAllowed also holds while snapshotting the roots.
+	if old, ok := overlayBackingDirs[overlayPath]; ok {
 		if n := dynamicBackingRoots[old]; n <= 1 {
 			delete(dynamicBackingRoots, old)
 		} else {

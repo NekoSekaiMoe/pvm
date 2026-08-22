@@ -210,30 +210,144 @@ func TestOpen_RejectsOversizedVirtualSize(t *testing.T) {
 }
 
 func TestDivCeil(t *testing.T) {
-	// A zero divisor must be an error, never a panic.
-	if _, err := divCeil(10, 0); err == nil {
-		t.Fatal("divCeil(10, 0) should reject a zero divisor")
+	cases := []struct {
+		name    string
+		in, div uint64
+		want    uint64
+		wantErr bool
+	}{
+		{
+			// A zero divisor must be an error, never a panic.
+			name:    "zero divisor is rejected, not a panic",
+			in:      10,
+			div:     0,
+			wantErr: true,
+		},
+		{
+			// Non-exact ceiling division near the uint64 limit: the naive
+			// (a+b-1)/b wraps here; the overflow-safe path must return the
+			// exact ceiling 2^64/3.
+			name: "non-exact ceiling near uint64 limit is overflow-safe",
+			in:   ^uint64(0) - 1,
+			div:  3,
+			want: ^uint64(0) / 3,
+		},
+		{
+			// Exact division at the uint64 max succeeds (no spurious
+			// overflow).
+			name: "exact division at uint64 max",
+			in:   ^uint64(0),
+			div:  1,
+			want: ^uint64(0),
+		},
+		{
+			// Ordinary anchor: ceiling for inexact.
+			name: "ordinary inexact division rounds up",
+			in:   10,
+			div:  4,
+			want: 3,
+		},
+		{
+			// Ordinary anchor: identity for exact.
+			name: "ordinary exact division is identity",
+			in:   8,
+			div:  4,
+			want: 2,
+		},
 	}
-	// Non-exact ceiling division near the uint64 limit: the naive
-	// (a+b-1)/b wraps here; the overflow-safe path must return the exact
-	// ceiling 2^64/3.
-	got, err := divCeil(^uint64(0)-1, 3)
-	if err != nil {
-		t.Fatalf("divCeil(^uint64(0)-1, 3): %v", err)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := divCeil(tc.in, tc.div)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("divCeil(%d, %d) = %d, nil; want an error", tc.in, tc.div, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("divCeil(%d, %d): %v", tc.in, tc.div, err)
+			}
+			if got != tc.want {
+				t.Fatalf("divCeil(%d, %d) = %d, want %d", tc.in, tc.div, got, tc.want)
+			}
+		})
 	}
-	if want := ^uint64(0) / 3; got != want {
-		t.Fatalf("divCeil(^uint64(0)-1, 3) = %d, want %d", got, want)
+}
+
+// TestRegisterOverlayBacking_RefcountBalance drives the overlay-scoped
+// backing registry internals directly: re-registering an overlay with a
+// different base and back, and re-registering with the identical base, must
+// leave refcounts exactly where a single clean registration would have
+// them, and unregistering must drop every entry the overlay created —
+// nothing leaks into dynamicBackingRoots or overlayBackingDirs.
+func TestRegisterOverlayBacking_RefcountBalance(t *testing.T) {
+	baseA := t.TempDir()
+	baseB := t.TempDir()
+	overlay := filepath.Join(t.TempDir(), "ov.qcow2")
+
+	rootCount := func(dir string) (n int, ok bool) {
+		backingRootsMu.Lock()
+		defer backingRootsMu.Unlock()
+		n, ok = dynamicBackingRoots[dir]
+		return n, ok
 	}
-	// Exact division at the uint64 max succeeds (no spurious overflow).
-	if got, err = divCeil(^uint64(0), 1); err != nil || got != ^uint64(0) {
-		t.Fatalf("divCeil(^uint64(0), 1) = %d, %v; want %d, nil", got, err, ^uint64(0))
+	mappedBase := func(ov string) (dir string, ok bool) {
+		backingRootsMu.Lock()
+		defer backingRootsMu.Unlock()
+		dir, ok = overlayBackingDirs[ov]
+		return dir, ok
 	}
-	// Ordinary anchors: ceiling for inexact, identity for exact.
-	if got, err = divCeil(10, 4); err != nil || got != 3 {
-		t.Fatalf("divCeil(10, 4) = %d, %v; want 3, nil", got, err)
+
+	// Initial registration: exactly one live authorization of A.
+	registerOverlayBacking(overlay, baseA)
+	if n, ok := rootCount(baseA); !ok || n != 1 {
+		t.Fatalf("after first register: dynamicBackingRoots[%s] = %d,%v; want 1,true", baseA, n, ok)
 	}
-	if got, err = divCeil(8, 4); err != nil || got != 2 {
-		t.Fatalf("divCeil(8, 4) = %d, %v; want 2, nil", got, err)
+	if b, ok := mappedBase(overlay); !ok || b != baseA {
+		t.Fatalf("overlay mapping = %q,%v; want %q,true", b, ok, baseA)
+	}
+
+	// Re-register with a DIFFERENT base: A drops to zero (entry deleted),
+	// B is at exactly one.
+	registerOverlayBacking(overlay, baseB)
+	if _, ok := rootCount(baseA); ok {
+		t.Fatal("old base dir still refcounted after re-registering with a different base")
+	}
+	if n, ok := rootCount(baseB); !ok || n != 1 {
+		t.Fatalf("after switching bases: dynamicBackingRoots[%s] = %d,%v; want 1,true", baseB, n, ok)
+	}
+	if b, ok := mappedBase(overlay); !ok || b != baseB {
+		t.Fatalf("overlay mapping = %q,%v; want %q,true", b, ok, baseB)
+	}
+
+	// Switch BACK to A: B drops to zero, A returns to exactly one.
+	registerOverlayBacking(overlay, baseA)
+	if _, ok := rootCount(baseB); ok {
+		t.Fatal("base B still refcounted after switching back")
+	}
+	if n, ok := rootCount(baseA); !ok || n != 1 {
+		t.Fatalf("after switching back: dynamicBackingRoots[%s] = %d,%v; want 1,true", baseA, n, ok)
+	}
+
+	// IDENTICAL-dir re-registration, repeatedly: decrement-then-increment
+	// must net to exactly one — the count must never grow.
+	for i := 0; i < 3; i++ {
+		registerOverlayBacking(overlay, baseA)
+		if n, ok := rootCount(baseA); !ok || n != 1 {
+			t.Fatalf("identical-dir re-register #%d: dynamicBackingRoots[%s] = %d,%v; want 1,true", i+1, baseA, n, ok)
+		}
+		if b, ok := mappedBase(overlay); !ok || b != baseA {
+			t.Fatalf("identical-dir re-register #%d dropped the mapping: got %q,%v; want %q,true", i+1, b, ok, baseA)
+		}
+	}
+
+	// Teardown: the last authorization and the mapping itself both end.
+	unregisterOverlayBacking(overlay)
+	if _, ok := rootCount(baseA); ok {
+		t.Fatal("base dir leaked in dynamicBackingRoots after unregisterOverlayBacking")
+	}
+	if _, ok := mappedBase(overlay); ok {
+		t.Fatal("overlay entry leaked in overlayBackingDirs after unregisterOverlayBacking")
 	}
 }
 
