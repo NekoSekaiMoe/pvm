@@ -397,10 +397,15 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 			// a raw ext4 image here. Recorded as a constrained isolation level.
 			resolvedRootfs = s.Workspace.BaseImage
 			if s.Workspace.Ephemeral {
-				// Ephemeral on the ubd path: the cmdline "ro" (buildTaskArgs)
-				// is the write barrier — ubd has no host-side read-only backend,
-				// so this audit row records the weaker guarantee explicitly.
-				_ = ledger.Append(audit.Record{Phase: audit.PhaseExec, Subject: taskID, Action: "rootfs", Decision: audit.DecisionConstrain, Reason: "ephemeral mode: ubd backend mounts base with ro cmdline (no qcow2 CoW)"})
+				// Ephemeral on the ubd path: buildTaskArgs appends the ubd 'r'
+				// flag (ubd0r=), so the device itself is opened read-only on
+				// the host — device-level enforcement on par with the vhost
+				// path's read-only backend, on top of the cmdline "ro".
+				_ = ledger.Append(audit.Record{
+					Phase: audit.PhaseExec, Subject: taskID, Action: "rootfs",
+					Decision: audit.DecisionConstrain,
+					Reason:   "ephemeral mode: ubd0r boots the base device-read-only (no qcow2 CoW)",
+				})
 			} else {
 				_ = ledger.Append(audit.Record{Phase: audit.PhaseExec, Subject: taskID, Action: "rootfs", Decision: audit.DecisionConstrain, Reason: "ubd backend mounts base directly (no qcow2 CoW)"})
 			}
@@ -923,7 +928,17 @@ func buildLegacyArgs(ctx context.Context, cfg *config.ContainerConfig) ([]string
 			return nil, err
 		}
 		// Boot exactly the path that passed validation (symlinks resolved).
-		args = append(args, fmt.Sprintf("ubd0=%s", resolved))
+		// Ephemeral appends the ubd 'r' flag (ubd0r=): the host opens the
+		// backing file O_RDONLY and marks the disk read-only, so a guest
+		// that remounts the root rw — or writes the raw /dev/ubda — still
+		// cannot reach the file. The separate "ro" token below keeps the
+		// ROOT MOUNT read-only as well (belt-and-suspenders, mirroring the
+		// vhost path's read-only backend + cmdline ro pairing).
+		if cfg.Ephemeral {
+			args = append(args, fmt.Sprintf("ubd0r=%s", resolved))
+		} else {
+			args = append(args, fmt.Sprintf("ubd0=%s", resolved))
+		}
 		args = append(args, "root=/dev/ubda")
 	}
 	// Root mount mode: ephemeral sandboxes mount the rootfs read-only so
@@ -993,8 +1008,16 @@ func buildTaskArgs(s *spec.TaskSpec, vhostSock, resolvedRootfs, egressAddr strin
 		if err != nil {
 			return nil, err
 		}
-		// Boot exactly the validated (resolved, contained) path.
-		args = append(args, fmt.Sprintf("ubd0=%s", resolved))
+		// Boot exactly the validated (resolved, contained) path. Ephemeral
+		// uses the ubd 'r' flag (ubd0r=) for device-level read-only — the
+		// same guarantee as the legacy path: the host opens the backing
+		// file O_RDONLY, so guest writes cannot reach it even if the root
+		// is remounted rw.
+		if s.Workspace.Ephemeral {
+			args = append(args, fmt.Sprintf("ubd0r=%s", resolved))
+		} else {
+			args = append(args, fmt.Sprintf("ubd0=%s", resolved))
+		}
 		args = append(args, "root=/dev/ubda")
 	}
 	// resolvedRootfs empty: no block device was provisioned (BaseImage

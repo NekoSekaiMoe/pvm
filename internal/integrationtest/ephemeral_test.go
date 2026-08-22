@@ -1,7 +1,8 @@
 // ephemeral_test.go — cross-plane integration for workspace.ephemeral
 // (non-persistent sandboxes): spec → StartTask → FSM → audit, asserting the
 // ephemeral contract end to end:
-//   - the kernel cmdline boots "ro" (not "rw"),
+//   - the kernel cmdline boots "ro" (not "rw") and the ubd device is
+//     marked device-read-only (ubd0r=),
 //   - NO qcow2 overlay is ever created (the base is served read-only),
 //   - the audit trail records the constrained rootfs decision.
 package integrationtest
@@ -18,6 +19,30 @@ import (
 	"uml-container/internal/spec"
 	"uml-container/internal/state"
 )
+
+// hasArgToken reports whether args contains the exact standalone token
+// (e.g. "ro"). Substring matching against a joined command line is
+// meaningless here: root=/dev/ubda already contains "ro", so a broad
+// Contains would pass even if the real ro argument regressed away.
+func hasArgToken(args []string, token string) bool {
+	for _, a := range args {
+		if a == token {
+			return true
+		}
+	}
+	return false
+}
+
+// hasArgPrefix reports whether any argument starts with prefix (e.g.
+// "ubd0r=", the UBD device-level read-only marker).
+func hasArgPrefix(args []string, prefix string) bool {
+	for _, a := range args {
+		if strings.HasPrefix(a, prefix) {
+			return true
+		}
+	}
+	return false
+}
 
 // TestFlow_EphemeralVhostNoOverlay drives StartTask with an ephemeral spec on
 // the vhost path: the base image is validated and served read-only through a
@@ -51,15 +76,16 @@ func TestFlow_EphemeralVhostNoOverlay(t *testing.T) {
 		t.Fatalf("starttask: %v", err)
 	}
 
-	// 1. Kernel cmdline: read-only root, vhost device, no rw.
-	joined := strings.Join(l.args, " ")
-	if !strings.Contains(joined, "ro") || strings.Contains(joined, " rw") {
+	// 1. Kernel cmdline: read-only root, vhost device, no rw. Token-exact:
+	// "ro" must appear as a standalone argument; root=/dev/vda contains
+	// "ro" as a substring but proves nothing about the mount mode.
+	if !hasArgToken(l.args, "ro") || hasArgToken(l.args, "rw") {
 		t.Errorf("ephemeral cmdline not read-only: %v", l.args)
 	}
-	if !strings.Contains(joined, "root=/dev/vda") {
+	if !hasArgToken(l.args, "root=/dev/vda") {
 		t.Errorf("vhost root device missing: %v", l.args)
 	}
-	if !strings.Contains(joined, "virtio_uml.device=") {
+	if !hasArgPrefix(l.args, "virtio_uml.device=") {
 		t.Errorf("virtio_uml.device missing: %v", l.args)
 	}
 
@@ -138,12 +164,18 @@ func TestFlow_EphemeralUbdReadOnly(t *testing.T) {
 		t.Fatalf("starttask: %v", err)
 	}
 
-	joined := strings.Join(l.args, " ")
-	if !strings.Contains(joined, "ubd0=") || !strings.Contains(joined, "root=/dev/ubda") {
-		t.Errorf("ubd args missing: %v", l.args)
-	}
-	if !strings.Contains(joined, "ro") || strings.Contains(joined, " rw") {
+	// Token-exact read-only assertions plus the UBD device-level marker:
+	// ephemeral boots ubd0r= (host-side O_RDONLY device), never plain
+	// ubd0=, and "ro" must be a standalone argument (root=/dev/ubda
+	// contains "ro" as a substring but proves nothing about the mode).
+	if !hasArgToken(l.args, "ro") || hasArgToken(l.args, "rw") {
 		t.Errorf("ephemeral ubd cmdline not read-only: %v", l.args)
+	}
+	if !hasArgPrefix(l.args, "ubd0r=") || hasArgPrefix(l.args, "ubd0=") {
+		t.Errorf("ephemeral ubd device not read-only (want ubd0r=): %v", l.args)
+	}
+	if !hasArgToken(l.args, "root=/dev/ubda") {
+		t.Errorf("ubd root device missing: %v", l.args)
 	}
 
 	// No overlay on the ubd path either (it never creates one, but the

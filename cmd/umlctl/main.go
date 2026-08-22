@@ -131,7 +131,12 @@ func main() {
 					*ephemeral = true
 				}
 			} else {
-				fmt.Printf("Warning: -config %s load failed: %v\n", *configPath, err)
+				// A bad -config must not silently fall back to flag defaults:
+				// the caller asked for a specific launch shape and booting a
+				// different one (e.g. without the config's ephemeral setting)
+				// would be surprising. Fail fast with a non-zero exit.
+				fmt.Fprintf(os.Stderr, "Error: -config %s load failed: %v\n", *configPath, err)
+				os.Exit(1)
 			}
 		}
 
@@ -168,7 +173,8 @@ func main() {
 		// container boots its rootfs read-only, so copying the base into a
 		// private layer would be pure waste.
 		if *ephemeral && *overlay {
-			fmt.Println("Error: -ephemeral and -overlay are mutually exclusive (ephemeral boots the rootfs read-only, no layer is cloned)")
+			fmt.Println("Error: -ephemeral and -overlay are mutually exclusive " +
+				"(ephemeral boots the rootfs read-only, no layer is cloned)")
 			os.Exit(1)
 		}
 

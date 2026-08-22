@@ -405,35 +405,64 @@ func TestBuildTaskArgs_EphemeralReadOnly(t *testing.T) {
 }
 
 // TestBuildLegacyArgs_EphemeralReadOnly: the legacy path mirrors the spec
-// path — cfg.Ephemeral boots "ro".
+// path — cfg.Ephemeral boots "ro" and marks the ubd device read-only
+// (ubd0r=); persistent boots "rw" over a plain ubd0= device.
 func TestBuildLegacyArgs_EphemeralReadOnly(t *testing.T) {
-	root := t.TempDir()
-	rootfs := filepath.Join(root, "rootfs.img")
-	if err := os.WriteFile(rootfs, []byte("img"), 0o600); err != nil {
-		t.Fatal(err)
+	cases := []struct {
+		name      string
+		ephemeral bool
+		want      string
+	}{
+		{"persistent", false, "rw"},
+		{"ephemeral", true, "ro"},
 	}
-	cfg := &config.ContainerConfig{
-		Init:      "/init.sh",
-		Memory:    "512M",
-		Rootfs:    rootfs,
-		Ephemeral: true,
-	}
-	args, err := buildLegacyArgs(context.Background(), cfg)
-	if err != nil {
-		t.Fatalf("buildLegacyArgs: %v", err)
-	}
-	for _, a := range args {
-		if a == "rw" {
-			t.Fatalf("ephemeral legacy args contain rw: %v", args)
-		}
-	}
-	sawRO := false
-	for _, a := range args {
-		if a == "ro" {
-			sawRO = true
-		}
-	}
-	if !sawRO {
-		t.Fatalf("legacy args missing ro: %v", args)
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			root := t.TempDir()
+			rootfs := filepath.Join(root, "rootfs.img")
+			if err := os.WriteFile(rootfs, []byte("img"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cfg := &config.ContainerConfig{
+				Init:      "/init.sh",
+				Memory:    "512M",
+				Rootfs:    rootfs,
+				Ephemeral: c.ephemeral,
+			}
+			args, err := buildLegacyArgs(context.Background(), cfg)
+			if err != nil {
+				t.Fatalf("buildLegacyArgs: %v", err)
+			}
+			sawWant, sawOther := false, false
+			for _, a := range args {
+				switch a {
+				case c.want:
+					sawWant = true
+				case "ro", "rw":
+					sawOther = true
+				}
+			}
+			if !sawWant || sawOther {
+				t.Fatalf("root mount mode wrong (want token %q): %v", c.want, args)
+			}
+			// Device-level marker: ephemeral boots ubd0r= (host-side
+			// read-only device), persistent boots plain ubd0=.
+			wantPrefix, otherPrefix := "ubd0r=", "ubd0="
+			if !c.ephemeral {
+				wantPrefix, otherPrefix = otherPrefix, wantPrefix
+			}
+			sawWant, sawOther = false, false
+			for _, a := range args {
+				switch {
+				case strings.HasPrefix(a, wantPrefix):
+					sawWant = true
+				case strings.HasPrefix(a, otherPrefix):
+					sawOther = true
+				}
+			}
+			if !sawWant || sawOther {
+				t.Fatalf("ubd device marker wrong (want %s): %v", wantPrefix, args)
+			}
+		})
 	}
 }

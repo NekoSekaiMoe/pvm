@@ -36,7 +36,11 @@ compact_on_exit = true
 # mounted by an ephemeral-aware guest init (see uml/init-ephemeral.sh).
 # Declared [[volumes]] are STILL attached and preserved — explicit mounts
 # are user intent. Mutually exclusive with compact_on_exit and overlay
-# (there is no overlay to compact or place). CLI override: -ephemeral.
+# (there is no overlay to compact or place). CLI override: -ephemeral —
+# an explicit CLI flip to ephemeral also disables compact_on_exit (a
+# meaningless knob in ephemeral mode), so `agentpvm run -ephemeral` works
+# with this default config as-is; an explicit workspace.overlay still
+# conflicts and is rejected.
 # ephemeral = false
 
 [kernel]

@@ -444,10 +444,12 @@ func (s *TaskSpec) Validate() error {
 	// an overlay that will never exist is almost certainly a config error.
 	if s.Workspace.Ephemeral {
 		if s.Workspace.CompactOnExit {
-			errs = append(errs, errors.New("spec: workspace.compact_on_exit conflicts with workspace.ephemeral (ephemeral tasks create no overlay to compact)"))
+			errs = append(errs, errors.New("spec: workspace.compact_on_exit conflicts with "+
+				"workspace.ephemeral (ephemeral tasks create no overlay to compact)"))
 		}
 		if s.Workspace.Overlay != "" {
-			errs = append(errs, errors.New("spec: workspace.overlay conflicts with workspace.ephemeral (ephemeral tasks never create an overlay)"))
+			errs = append(errs, errors.New("spec: workspace.overlay conflicts with "+
+				"workspace.ephemeral (ephemeral tasks never create an overlay)"))
 		}
 	}
 	if s.Identity.TTL != "" {

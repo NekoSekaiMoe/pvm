@@ -36,16 +36,38 @@ for d in /var/log /var/cache; do
     mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs "$d" 2>/dev/null
 done
 
-# Attach declared hostfs volumes (host passes hostfs_volume=host:guest[:mode]).
-for vol in $(IFS=,; echo "${hostfs_volume:-}"); do
+# Attach declared hostfs volumes (host passes
+# hostfs_volume=host:guest[:mode], comma-separated for multiple volumes).
+# Split on the loop's own field separator (IFS=,) so every entry is
+# processed independently — `$(IFS=,; echo ...)` does NOT work: the
+# assignment lives in a subshell and never reaches the outer word
+# splitting, so the whole comma-joined string iterates as ONE entry.
+# The guest mount path must be absolute and pre-created in the image:
+# the rootfs is read-only, so a missing directory cannot be created here
+# — and a failed mkdir/mount terminates init instead of launching the
+# workload without its declared volumes.
+saved_ifs="$IFS"
+IFS=,
+for vol in ${hostfs_volume:-}; do
     host=$(echo "$vol" | cut -d: -f1)
     guest=$(echo "$vol" | cut -d: -f2)
     mode=$(echo "$vol" | cut -d: -f3)
     [ -z "$mode" ] && mode=rw
-    mkdir -p "$guest" 2>/dev/null || true
-    mount -t hostfs -o "$mode" none "$guest" -o "$host" 2>/dev/null || \
-        echo "init-ephemeral: warning: could not mount volume $host -> $guest"
+    case "$guest" in
+        /*) ;;
+        *) echo "init-ephemeral: fatal: volume guest path '$guest' is not absolute" > /dev/console
+           exit 1 ;;
+    esac
+    if ! mkdir -p "$guest"; then
+        echo "init-ephemeral: fatal: guest mount path '$guest' missing from image (rootfs is read-only; pre-create it)" > /dev/console
+        exit 1
+    fi
+    if ! mount -t hostfs -o "$mode" none "$guest" -o "$host"; then
+        echo "init-ephemeral: fatal: could not mount volume $host -> $guest" > /dev/console
+        exit 1
+    fi
 done
+IFS="$saved_ifs"
 
 echo "init-ephemeral: root ro, tmpfs scratch ready" > /dev/console
 

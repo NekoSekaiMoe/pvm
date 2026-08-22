@@ -4,8 +4,9 @@
     <p class="muted">
       Non-persistent task sandboxes (<span class="mono">workspace.ephemeral</span>): the rootfs boots
       read-only (kernel <span class="mono">ro</span> + read-only block backend), no qcow2 overlay is
-      ever created, and guest scratch lives on tmpfs — nothing the task writes reaches the host disk.
-      Declared persistent volumes are still attached and preserved.
+      ever created, and guest scratch lives on tmpfs — writes to the read-only rootfs or to tmpfs
+      scratch never reach the host disk. Exception: declared writable persistent volumes are
+      user-intent mounts whose writes DO reach host storage and are retained after the task exits.
     </p>
 
     <!-- Builder form -->
@@ -20,10 +21,13 @@
       </div>
 
       <div class="form-row">
-        <div class="input-group">
-          <input v-model="form.name" placeholder="task name (runtime.name)" />
-          <input v-model="form.memory" placeholder="memory, e.g. 512M" />
-          <input v-model="form.cpu" placeholder="cpu millicores, e.g. 1000" />
+        <div>
+          <div class="input-group">
+            <input v-model="form.name" placeholder="task name (runtime.name)" />
+            <input v-model="form.memory" placeholder="memory, e.g. 512M" />
+            <input v-model="form.cpu" placeholder="cpu millicores, e.g. 1000" />
+          </div>
+          <p v-if="cpuError" class="field-error">{{ cpuError }}</p>
         </div>
       </div>
 
@@ -127,6 +131,19 @@ const form = ref({
 const fingerprint = ref('')
 const specError = ref('')
 
+// cpu keeps the user's RAW input (no number coercion): "1000m", "1.5" or
+// "abc" stay visible and rejectable instead of being silently coerced by
+// parseInt ("1.5" -> 1, "abc" -> 0 = unlimited). Only a complete decimal
+// integer is valid; anything else shows a field error and is emitted
+// verbatim into the TOML so /api/tasks/load-spec rejects the spec.
+const cpuRaw = computed(() => (form.value.cpu || '').trim())
+const cpuError = computed(() => {
+  if (cpuRaw.value === '') return ''
+  return /^\d+$/.test(cpuRaw.value)
+    ? ''
+    : `cpu must be a whole number of millicores (e.g. 1000), got "${cpuRaw.value}"`
+})
+
 const toml = computed(() => {
   const f = form.value
   const lines = []
@@ -136,7 +153,10 @@ const toml = computed(() => {
   lines.push('')
   lines.push('[runtime]')
   lines.push(`name = ${JSON.stringify(f.name || 'ephemeral-task')}`)
-  if (f.cpu) lines.push(`cpu = ${parseInt(f.cpu) || 0}`)
+  // Raw emission (see cpuRaw): valid integers pass through unchanged;
+  // invalid values produce an invalid TOML integer so the server rejects
+  // the spec instead of the form silently rewriting it.
+  if (cpuRaw.value) lines.push(`cpu = ${cpuRaw.value}`)
   if (f.memory) lines.push(`memory = ${JSON.stringify(f.memory)}`)
   lines.push('')
   lines.push('[workspace]')
@@ -183,6 +203,11 @@ const copyToml = async () => {
 </script>
 
 <style scoped>
+.field-error {
+  margin: 0.35rem 0 0;
+  font-size: 0.8rem;
+  color: #ff8f8f;
+}
 .check {
   display: inline-flex;
   align-items: center;

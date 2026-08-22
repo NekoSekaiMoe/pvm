@@ -125,7 +125,8 @@ func runCmd(args []string) {
 	initCmd := fs.String("init", "", "Override workspace.init (in-guest init command)")
 	netEnabled := fs.Bool("net", false, "Enable guest networking (overrides network.enabled)")
 	netTap := fs.String("net-tap", "", "Host TAP device name (overrides network.tap)")
-	ephemeral := fs.Bool("ephemeral", false, "Non-persistent sandbox (overrides workspace.ephemeral): read-only rootfs, no qcow2 overlay")
+	ephemeral := fs.Bool("ephemeral", false,
+		"Non-persistent sandbox (overrides workspace.ephemeral): read-only rootfs, no qcow2 overlay")
 	fs.Parse(args)
 
 	if *debug {
@@ -179,11 +180,22 @@ func runCmd(args []string) {
 	}
 	if ephemeralGiven {
 		s.Workspace.Ephemeral = *ephemeral
+		// An explicit -ephemeral flip must stay compatible with configs that
+		// set compact_on_exit (the repo default uml/agentpvm.toml does):
+		// an ephemeral task creates no overlay, so there is nothing to
+		// compact and the meaningless knob is dropped instead of failing
+		// Validate. workspace.overlay is NOT auto-cleared: an explicit
+		// overlay path is placement intent, and silently discarding it
+		// would boot a differently-shaped sandbox than the one configured.
+		if *ephemeral {
+			s.Workspace.CompactOnExit = false
+		}
 	}
 	// Re-validate after the overrides: a CLI flip can introduce cross-field
-	// conflicts the config file alone would have caught (e.g. -ephemeral over
-	// a config with compact_on_exit=true — an ephemeral task has no overlay
-	// to compact, so the combination must fail here, not mid-boot).
+	// conflicts the config file alone would have caught (e.g. -ephemeral
+	// over a config with an explicit workspace.overlay — placement intent
+	// is not silently dropped, so the combination must fail here, not
+	// mid-boot).
 	if err := s.Validate(); err != nil {
 		fmt.Fprintf(os.Stderr, "config: overrides leave spec invalid: %v\n", err)
 		os.Exit(1)
