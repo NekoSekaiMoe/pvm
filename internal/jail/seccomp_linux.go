@@ -39,7 +39,16 @@ var BlockedDangerousSyscalls = []string{
 // UMLAllowedSyscalls contains the safe subset of host syscalls required by the
 // UML kernel process to manage guest tasks (ptrace/SKAS), emulate memory/pages (mmap/mprotect),
 // handle signals, communicate via vector TAP/vhost-user, and perform jailed I/O.
-var UMLAllowedSyscalls = []string{
+//
+// The filter is installed BEFORE execve (see helper_linux.go), so it also
+// constrains the dynamic loader and libc startup of the workload itself —
+// every entry ld.so / glibc init needs must be listed here, or the workload
+// dies before main() with errors like:
+//
+//	"error while loading shared libraries: libc.so.6: cannot stat shared
+//	 object: Operation not permitted"   (ld.so fstat of the library)
+//	"Fatal glibc error: Cannot allocate TLS block"  (arch_prctl ARCH_SET_FS)
+var UMLAllowedSyscalls = append([]string{
 	// Ptrace (UML SKAS guest syscall interception)
 	"ptrace",
 
@@ -72,13 +81,27 @@ var UMLAllowedSyscalls = []string{
 
 	// Jailed Filesystem / HostFS
 	"openat", "openat2", "newfstatat", "statx", "fstatfs", "statfs",
+	// fstat is the canonical "stat an open fd" syscall (x86_64 nr 5, arm64
+	// nr 80): glibc's fstat() goes straight here (it does NOT route through
+	// newfstatat/statx), and ld.so fstats every shared object it loads —
+	// without this entry a dynamic workload dies in the loader.
+	"fstat",
 	"faccessat", "faccessat2", "readlinkat", "getcwd", "chdir", "fchdir",
 	"mkdirat", "unlinkat", "renameat2", "linkat", "symlinkat", "fchmodat", "fchownat",
 	"ftruncate", "fallocate", "fsync", "fdatasync", "sync", "getdents64", "fcntl",
 	// ioctl passes a second-stage argument filter: only the request numbers
 	// in allowedIoctlRequests are allowed through (see buildIoctlArgFilter).
 	"ioctl",
-}
+
+	// Resource limits & process reaping. UML's main() calls
+	// getrlimit(RLIMIT_STACK) in set_stklim() and exits(1) with
+	// "getrlimit: Operation not permitted" if it fails (arch/um/os-Linux/
+	// main.c). glibc >= 2.36 implements getrlimit() via prlimit64, so both
+	// numbers must be allowed. wait4 backs waitpid() for guest-thread reaping
+	// (arch/um/os-Linux/skas/process.c). All are process-local reads/waits:
+	// they cannot touch the host outside this process tree.
+	"getrlimit", "prlimit64", "wait4",
+}, archSpecificAllowedSyscalls...)
 
 // IsSyscallAllowed reports whether the named syscall is in the UML allowed set.
 func IsSyscallAllowed(name string) bool {

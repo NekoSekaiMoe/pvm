@@ -84,6 +84,18 @@ func TestSeccomp_FilterBranchSemantics(t *testing.T) {
 		// The jail helper's final handoff to the workload: without this
 		// entry the helper dies with EPERM at exec time.
 		{"allowed execve", uint32(unix.SYS_EXECVE), unix.SECCOMP_RET_ALLOW},
+		// Loader/libc startup regressions (the filter is installed before
+		// execve, so it constrains ld.so too):
+		//  - fstat: ld.so stats every shared object it loads; without it a
+		//    dynamic workload dies with "cannot stat shared object:
+		//    Operation not permitted".
+		//  - getrlimit/prlimit64: UML main() -> set_stklim() exits(1) with
+		//    "getrlimit: Operation not permitted" when denied.
+		//  - wait4: waitpid() backing for guest-thread reaping.
+		{"allowed fstat", uint32(unix.SYS_FSTAT), unix.SECCOMP_RET_ALLOW},
+		{"allowed getrlimit", uint32(unix.SYS_GETRLIMIT), unix.SECCOMP_RET_ALLOW},
+		{"allowed prlimit64", uint32(unix.SYS_PRLIMIT64), unix.SECCOMP_RET_ALLOW},
+		{"allowed wait4", uint32(unix.SYS_WAIT4), unix.SECCOMP_RET_ALLOW},
 		{"blocked unshare", uint32(unix.SYS_UNSHARE), errnoEPERM},
 		{"blocked mount", uint32(unix.SYS_MOUNT), errnoEPERM},
 		{"blocked bpf", uint32(unix.SYS_BPF), errnoEPERM},

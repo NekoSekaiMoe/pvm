@@ -182,6 +182,8 @@ func getSyscallNumber(name string) (int, bool) {
 		return unix.SYS_NEWFSTATAT, true
 	case "statx":
 		return unix.SYS_STATX, true
+	case "fstat":
+		return unix.SYS_FSTAT, true
 	case "fstatfs":
 		return unix.SYS_FSTATFS, true
 	case "statfs":
@@ -194,6 +196,12 @@ func getSyscallNumber(name string) (int, bool) {
 		return unix.SYS_READLINKAT, true
 	case "getcwd":
 		return unix.SYS_GETCWD, true
+	case "getrlimit":
+		return unix.SYS_GETRLIMIT, true
+	case "prlimit64":
+		return unix.SYS_PRLIMIT64, true
+	case "wait4":
+		return unix.SYS_WAIT4, true
 	case "chdir":
 		return unix.SYS_CHDIR, true
 	case "fchdir":
@@ -229,6 +237,9 @@ func getSyscallNumber(name string) (int, bool) {
 	case "ioctl":
 		return unix.SYS_IOCTL, true
 	default:
-		return 0, false
+		// Architecture-specific numbers (e.g. arch_prctl exists only on
+		// x86_64). Defined in seccomp_<goarch>.go so this file compiles on
+		// every Linux target.
+		return getArchSyscallNumber(name)
 	}
 }
