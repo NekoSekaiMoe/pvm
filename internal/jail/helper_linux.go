@@ -54,6 +54,11 @@ func runJailHelper() error {
 		return err
 	}
 
+	// All host resources are bind-mounted now: close the hand-over fds so
+	// they do not leak into the workload (caller-owned ExtraFiles like the
+	// tap fd are untouched).
+	closeHelperFDs(&cfg)
+
 	// Landlock hardening runs after pivot_root so the allowed paths are the
 	// in-jail views. Any failure aborts the launch.
 	if err := ApplyLandlockLockdown(allowed); err != nil {
@@ -126,11 +131,31 @@ func runJailHelper() error {
 	return nil // unreachable
 }
 
+// closeHelperFDs closes the hand-over fds recorded in the helper config.
+func closeHelperFDs(cfg *jailHelperConfig) {
+	for _, fd := range append([]int{cfg.ExeFD, cfg.TargetFD, cfg.RootfsFD}, cfg.VolumeFDs...) {
+		if fd > 0 {
+			unix.Close(fd)
+		}
+	}
+}
+
 // setupJailFilesystem builds the jailed filesystem view from the helper
 // config and pivots into it. It returns the post-pivot paths Landlock should
 // keep accessible. Every mount / root-switch failure is fatal to the launch.
+//
+// Host-side sources are referenced ONLY through /proc/self/fd/N (see
+// jailHelperConfig): the mapped uid inside the user namespace cannot
+// necessarily traverse their ancestor directories.
 func setupJailFilesystem(cfg *jailHelperConfig) ([]string, error) {
 	rootfs := cfg.Rootfs
+	if cfg.RootfsFD > 0 {
+		rootfs = procFDPath(cfg.RootfsFD)
+	}
+	target := cfg.Target
+	if cfg.TargetFD > 0 {
+		target = procFDPath(cfg.TargetFD)
+	}
 
 	// Detach mount propagation from the host so none of the mounts below
 	// leak into the parent mount namespace.
@@ -147,7 +172,7 @@ func setupJailFilesystem(cfg *jailHelperConfig) ([]string, error) {
 	// The workload binary lives on the host filesystem; bind it into the
 	// jail together with the read-only system trees its dynamic loader and
 	// shared libraries live in, so execve still works after pivot_root.
-	if err := bindFile(cfg.Target, filepath.Join(rootfs, jailEntryPath), true); err != nil {
+	if err := bindFile(target, filepath.Join(rootfs, jailEntryPath), true); err != nil {
 		return nil, fmt.Errorf("bind workload binary %s: %w", cfg.Target, err)
 	}
 	allowed := []string{filepath.Dir(jailEntryPath)}
@@ -172,13 +197,18 @@ func setupJailFilesystem(cfg *jailHelperConfig) ([]string, error) {
 		}
 	}
 
-	// Configured volumes: host path -> guest path inside the rootfs.
-	for _, v := range cfg.Volumes {
+	// Configured volumes: host path -> guest path inside the rootfs. Sources
+	// are the inherited fds (procfd magic links), never the raw host paths.
+	for i, v := range cfg.Volumes {
 		if v.HostPath == "" || !filepath.IsAbs(v.GuestPath) {
 			return nil, fmt.Errorf("invalid volume mapping %+v: need host path and absolute guest path", v)
 		}
-		target := filepath.Join(rootfs, v.GuestPath)
-		if err := bindPath(v.HostPath, target, v.ReadOnly); err != nil {
+		src := v.HostPath
+		if i < len(cfg.VolumeFDs) && cfg.VolumeFDs[i] > 0 {
+			src = procFDPath(cfg.VolumeFDs[i])
+		}
+		dst := filepath.Join(rootfs, v.GuestPath)
+		if err := bindPath(src, dst, v.ReadOnly); err != nil {
 			return nil, fmt.Errorf("bind volume %s -> %s: %w", v.HostPath, v.GuestPath, err)
 		}
 		allowed = append(allowed, v.GuestPath)

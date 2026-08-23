@@ -27,6 +27,12 @@
 - **vhost-user / egress proxy**：两者本是 manager 进程内 goroutine（非子
   进程），随 manager 保持宿主侧 root；已处理的是 monitor 触达面的属主
   (vhost socket chown 进 uid 段、state 目录 o+x 遍历、overlay chown)
+- **fd 化（fd-only inside namespace）**:helper 接触的所有宿主路径——
+  re-exec 自身、jail rootfs、workload binary、volume bind 源——在 fork 前
+  由 manager 以 O_RDONLY 打开并继承，namespace 内只走 /proc/self/fd/N
+  （magic link 直解 dentry，绕过祖先目录穿越权限；修复 CI 上
+  /home/runner/work 0750 导致的 fork/exec EACCES)。launcher 在 Start 后
+  关闭全部 ExtraFiles 宿主侧副本
 - **seccomp**：黑名单保持不动（fail-open 为既有定论，见
   `internal/jail/seccomp_linux.go` 头部历史注释），降级为纵深防御
 - **对抗测试**:`internal/securitytest` 新增

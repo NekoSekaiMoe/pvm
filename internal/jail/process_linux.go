@@ -30,6 +30,20 @@ type jailHelperConfig struct {
 	Volumes []VolumeMapping `json:"volumes"`
 	Target  string          `json:"target"`
 	Args    []string        `json:"args"`
+	// Inside the user namespace the mapped uid cannot necessarily even
+	// TRAVERSE the ancestor directories of host paths (CI workspaces under
+	// /home/runner/work are 0750, breaking both the re-exec of this binary
+	// and every bind-mount source). So all host paths are opened by the
+	// manager before the namespace clone and handed over as inherited fds;
+	// the helper references them exclusively through /proc/self/fd/N, whose
+	// magic-link resolution jumps straight to the dentry without an ancestor
+	// walk. This is the "namespace 内只留 fd 操作" rule from the TODO design
+	// sketch. A zero fd means "fall back to the path field" (used only by
+	// tests that inject the helper config directly).
+	ExeFD     int   `json:"exe_fd,omitempty"`
+	TargetFD  int   `json:"target_fd,omitempty"`
+	RootfsFD  int   `json:"rootfs_fd,omitempty"`
+	VolumeFDs []int `json:"volume_fds,omitempty"` // parallel to Volumes
 	// MountProc tells the helper to mount a private procfs at /proc after
 	// pivot_root. It is set exactly when the child got CLONE_NEWPID, so the
 	// procfs exposes only the jail's own process tree — safe to mount, and
@@ -140,25 +154,100 @@ func ConfigureProcessIsolation(cmd *exec.Cmd, j *JailEnvironment) error {
 	return nil
 }
 
+// firstExtraFD is the fd number of ExtraFiles[0] in the child (os/exec
+// contract: entry i becomes fd 3+i).
+const firstExtraFD = 3
+
+// procFDPath returns the /proc/self/fd/N path for an inherited fd. Magic
+// links resolve straight to the open file description, so referencing host
+// resources this way bypasses ancestor-directory permission checks that the
+// mapped uid inside the user namespace might not pass.
+func procFDPath(fd int) string {
+	return fmt.Sprintf("/proc/self/fd/%d", fd)
+}
+
+// openBindSource opens a host path for hand-over into the jail. Files need
+// O_RDONLY (an O_PATH fd cannot be exec'd and is weaker for mount sources);
+// directories get O_DIRECTORY. The fd is what the helper bind-mounts
+// through /proc/self/fd/N, bypassing ancestor-directory permission checks
+// inside the user namespace.
+func openBindSource(path string) (*os.File, error) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	flag := os.O_RDONLY
+	if fi.IsDir() {
+		flag |= unix.O_DIRECTORY
+	}
+	return os.OpenFile(path, flag, 0)
+}
+
 // wrapWithJailHelper rewrites cmd so that, instead of the target binary, the
 // current executable is re-exec'd with the jail-helper marker set. The helper
 // branch (helper_linux.go) performs the actual filesystem isolation and then
 // execs the original target. Any isolation failure makes the child exit
 // non-zero before the workload starts, so the error propagates to the caller
 // waiting on the process.
+//
+// ExtraFiles contract: fds the CALLER attached (tap fd via uml.KeyExtraFiles)
+// keep their numbers (3..3+n-1); the jail appends its own hand-over fds
+// (exe, target, rootfs, volumes) right after. All ExtraFiles are closed by
+// the launcher after cmd.Start — the child holds its own duplicates.
 func wrapWithJailHelper(cmd *exec.Cmd, j *JailEnvironment, mountProc bool) error {
 	exe, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("jail: locate executable for re-exec helper: %w", err)
 	}
+
+	// Open every host path BEFORE the namespace clone (see jailHelperConfig).
+	base := firstExtraFD + len(cmd.ExtraFiles)
+	exeF, err := os.Open(exe) // O_RDONLY: O_PATH fds cannot be execve'd
+	if err != nil {
+		return fmt.Errorf("jail: open executable for re-exec: %w", err)
+	}
+	tgtF, err := openBindSource(cmd.Path)
+	if err != nil {
+		exeF.Close()
+		return fmt.Errorf("jail: open workload %s: %w", cmd.Path, err)
+	}
+	rootF, err := openBindSource(j.Rootfs)
+	if err != nil {
+		exeF.Close()
+		tgtF.Close()
+		return fmt.Errorf("jail: open jail rootfs %s: %w", j.Rootfs, err)
+	}
+	volFs := make([]*os.File, 0, len(j.Config.Volumes))
+	for _, v := range j.Config.Volumes {
+		vf, err := openBindSource(v.HostPath)
+		if err != nil {
+			exeF.Close()
+			tgtF.Close()
+			rootF.Close()
+			for _, f := range volFs {
+				f.Close()
+			}
+			return fmt.Errorf("jail: open volume %s: %w", v.HostPath, err)
+		}
+		volFs = append(volFs, vf)
+	}
+
 	cfg := jailHelperConfig{
 		Rootfs:             j.Rootfs,
 		JailDir:            j.JailDir,
 		Volumes:            j.Config.Volumes,
 		Target:             cmd.Path,
 		Args:               cmd.Args,
+		ExeFD:              base,
+		TargetFD:           base + 1,
+		RootfsFD:           base + 2,
 		MountProc:          mountProc,
 		EnforceHostSeccomp: j.Config.EnforceHostSeccomp,
+	}
+	cmd.ExtraFiles = append(cmd.ExtraFiles, exeF, tgtF, rootF)
+	for i, vf := range volFs {
+		cfg.VolumeFDs = append(cfg.VolumeFDs, base+3+i)
+		cmd.ExtraFiles = append(cmd.ExtraFiles, vf)
 	}
 	blob, err := json.Marshal(cfg)
 	if err != nil {
@@ -175,7 +264,11 @@ func wrapWithJailHelper(cmd *exec.Cmd, j *JailEnvironment, mountProc bool) error
 		jailHelperEnvMarker+"=1",
 		jailHelperEnvConfig+"="+string(blob),
 	)
-	cmd.Path = exe
+	// Re-exec through the inherited fd, not the path: inside the new user
+	// namespace the mapped uid may be unable to traverse the binary's
+	// ancestor directories (CI workspaces are 0750). /proc/self/fd/N magic
+	// links resolve straight to the file.
+	cmd.Path = procFDPath(cfg.ExeFD)
 	if len(cmd.Args) == 0 {
 		cmd.Args = []string{exe}
 	} else {

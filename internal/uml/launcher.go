@@ -19,7 +19,9 @@ const (
 	// direct child (os/exec.ExtraFiles contract) and survives the jail
 	// helper's exec into the workload, so kernel args can reference fd=3+i.
 	// This is the rootless-jail mechanism for moving privileged opens
-	// (TUNSETIFF) host-side (TODO.md "[P1] Jail rootless 化").
+	// (TUNSETIFF) host-side (TODO.md "[P1] Jail rootless 化"). Ownership
+	// transfers to the launcher: all ExtraFiles are closed after Start
+	// (the child holds its own duplicates) — do not use them afterwards.
 	KeyExtraFiles ContextKey = "extra_files"
 )
 
@@ -87,9 +89,21 @@ func (l *DefaultLauncher) Start(ctx context.Context, kernel string, args []strin
 		// Pipes were created; mark the goroutines we won't start as done so a
 		// later Wait doesn't block forever.
 		p.wg.Wait()
+		closeExtraFiles(cmd)
 		return 0, nil, err
 	}
+	// The child holds its own duplicates of every ExtraFiles entry (tap fd,
+	// jail hand-over fds); close the manager-side copies so they don't leak
+	// across many launches. Callers must not use their copies after Start.
+	closeExtraFiles(cmd)
 	return cmd.Process.Pid, p, nil
+}
+
+// closeExtraFiles releases the parent-side copies of cmd.ExtraFiles.
+func closeExtraFiles(cmd *exec.Cmd) {
+	for _, f := range cmd.ExtraFiles {
+		_ = f.Close()
+	}
 }
 
 // (buildCmd was previously used to optionally wrap UML under strace for hang

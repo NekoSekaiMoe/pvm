@@ -5,6 +5,8 @@ package jail
 import (
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 )
@@ -23,8 +25,8 @@ func TestConfigureProcessIsolation_FlagPolicy(t *testing.T) {
 	})
 	t.Cleanup(func() { ResetHostCapabilitiesForTest(nil) })
 
-	cmd := exec.Command("true")
-	if err := ConfigureProcessIsolation(cmd, &JailEnvironment{}); err != nil {
+	cmd := exec.Command("/bin/true")
+	if err := ConfigureProcessIsolation(cmd, &JailEnvironment{Rootfs: t.TempDir()}); err != nil {
 		t.Fatalf("ConfigureProcessIsolation failed: %v", err)
 	}
 	if cmd.SysProcAttr == nil {
@@ -84,9 +86,10 @@ func TestConfigureProcessIsolation_RootlessHardBoundary(t *testing.T) {
 	})
 	t.Cleanup(func() { ResetHostCapabilitiesForTest(nil) })
 
-	cmd := exec.Command("true")
+	cmd := exec.Command("/bin/true")
 	env := &JailEnvironment{
 		Config: Config{UIDBase: 100000, UIDRangeSize: 65536},
+		Rootfs: t.TempDir(),
 	}
 	if err := ConfigureProcessIsolation(cmd, env); err != nil {
 		t.Fatalf("ConfigureProcessIsolation failed: %v", err)
@@ -105,5 +108,49 @@ func TestConfigureProcessIsolation_RootlessHardBoundary(t *testing.T) {
 	}
 	if len(cmd.SysProcAttr.GidMappings) != 1 || cmd.SysProcAttr.GidMappings[0] != want[0] {
 		t.Errorf("gid mappings = %v, want %v", cmd.SysProcAttr.GidMappings, want)
+	}
+}
+
+// TestRootlessJail_Execution runs the FULL jail path (namespace clone with
+// NEWUSER+NEWPID, fd hand-over, helper pivot_root, private /proc mount,
+// Landlock, capability drop, seccomp, workload exec) as root, exactly the
+// way the manager launches UML in production. It exists because flag-only
+// tests cannot see helper-time failures (bind sources, /proc mount,
+// Landlock rules on procfs): the CI privileged leg (sudo go test
+// ./internal/jail/) executes this on every run.
+func TestRootlessJail_Execution(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("privileged-only execution leg")
+	}
+	caps := DetectHostCapabilities()
+	if !caps.HasUserNS || !caps.HasMountNS {
+		t.Skip("host lacks user/mount namespaces")
+	}
+
+	env, err := SetupJail(Config{
+		TaskID:       "rootless-exec-test",
+		BaseDir:      filepath.Join(t.TempDir(), "jail"),
+		UIDBase:      100000,
+		UIDRangeSize: 65536,
+	})
+	if err != nil {
+		t.Fatalf("SetupJail: %v", err)
+	}
+	t.Cleanup(func() { env.Cleanup() })
+
+	cmd := exec.Command("/bin/sh", "-c",
+		`echo JAIL_OK; echo NS_PID=$$; [ -d /proc/self ] && echo PROC_OK || echo PROC_MISSING; `+
+			`kill -TERM 2 2>/dev/null || echo HOST_PID2_UNREACHABLE`)
+	if err := ConfigureProcessIsolation(cmd, env); err != nil {
+		t.Fatalf("ConfigureProcessIsolation: %v", err)
+	}
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("rootless jailed execution failed: %v, output: %s", err, out)
+	}
+	for _, want := range []string{"JAIL_OK", "NS_PID=1", "PROC_OK", "HOST_PID2_UNREACHABLE"} {
+		if !strings.Contains(string(out), want) {
+			t.Errorf("expected %q in jailed workload output, got:\n%s", want, out)
+		}
 	}
 }

@@ -66,6 +66,15 @@ chmod +x "$TMP/fake_kernel"
 
 console_log() { echo "$PVM_STATE_ROOT/$1/logs/console.log"; }
 
+# dump_run <task-id>: full failure diagnostics — manager stdout/stderr plus
+# the in-jail console log (jail helper errors go there, not to the manager's
+# own log).
+dump_run() {
+    local id=$1
+    echo "----- console log ($id) -----"
+    cat "$(console_log "$id")" 2>/dev/null || echo "(no console log)"
+}
+
 # assert_markers <task-id> <userns-expected 0|1>
 assert_markers() {
     local id=$1 want_ns=$2 log
@@ -99,7 +108,7 @@ EOF
 # --- 1. agentpvm run: jailed fake kernel, markers from inside ---------------
 echo "==> 1. agentpvm run with fake kernel"
 "$TMP/agentpvm" run -config "$SPEC" -kernel "$TMP/fake_kernel" > "$TMP/run1.log" 2>&1 \
-    || fail "agentpvm run failed: $(cat "$TMP/run1.log")"
+    || { cat "$TMP/run1.log"; dump_run rl31-task; fail "agentpvm run failed"; }
 assert_markers rl31-task "$HAS_USERNS"
 echo "   fake kernel markers verified (userns=$HAS_USERNS) ✓"
 
@@ -149,7 +158,7 @@ sed 's/allow_insecure_degraded = true/allow_insecure_degraded = false/; s/rl31-t
 if [ "$HAS_USERNS" -eq 1 ]; then
     # Full boundary: strict spec must boot WITHOUT any degraded bypass.
     $SUDO_CMD "$TMP/agentpvm" run -config "$SPEC_STRICT" -kernel "$TMP/fake_kernel" > "$TMP/strict.log" 2>&1 \
-        || fail "strict run failed on a userns-capable host: $(cat "$TMP/strict.log")"
+        || { cat "$TMP/strict.log"; dump_run rl31-strict; fail "strict run failed on a userns-capable host"; }
     assert_markers rl31-strict 1
     echo "   strict spec boots under NEWUSER+NEWPID, no bypass ✓"
 else
@@ -169,7 +178,7 @@ if [ "$HAS_USERNS" -eq 1 ] && [ -e /dev/net/tun ] && command -v ip >/dev/null; t
     $SUDO_CMD ip link set "$TAP" up 2>/dev/null || true
     $SUDO_CMD "$TMP/umlctl" start -name "rl31-tap" -kernel "$TMP/fake_kernel" \
         -rootfs "$PVM_IMAGE_ROOT/rootfs.img" -net-tap "$TAP" > "$TMP/tap_run.log" 2>&1 \
-        || fail "rootless tap run failed: $(cat "$TMP/tap_run.log")"
+        || { cat "$TMP/tap_run.log"; dump_run rl31-tap; fail "rootless tap run failed"; }
     TAP_LOG="$(console_log rl31-tap)"
     grep -q FAKE_KERNEL_DONE "$TAP_LOG" || fail "tap run: fake kernel incomplete: $(cat "$TAP_LOG")"
     # fd transport: /dev/net/tun must NOT be bound into the jail anymore.
