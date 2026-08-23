@@ -169,21 +169,30 @@ func setupJailFilesystem(cfg *jailHelperConfig) ([]string, error) {
 		return nil, fmt.Errorf("bind rootfs %s onto itself: %w", rootfs, err)
 	}
 
+	// roTargets collects the POST-PIVOT in-jail paths that must become
+	// read-only. The remount runs after pivot_root on plain absolute paths:
+	// inside a user namespace, remounting through a /proc/self/fd magic
+	// link fails EINVAL (privileged CI leg), and MS_RDONLY on the initial
+	// bind is silently ignored — hence the two-phase approach.
+	var roTargets []string
+
 	// The workload binary lives on the host filesystem; bind it into the
 	// jail together with the read-only system trees its dynamic loader and
 	// shared libraries live in, so execve still works after pivot_root.
-	if err := bindFile(target, filepath.Join(rootfs, jailEntryPath), true); err != nil {
+	if err := bindFile(target, filepath.Join(rootfs, jailEntryPath)); err != nil {
 		return nil, fmt.Errorf("bind workload binary %s: %w", cfg.Target, err)
 	}
+	roTargets = append(roTargets, jailEntryPath)
 	allowed := []string{filepath.Dir(jailEntryPath)}
 	for _, dir := range []string{"/lib", "/lib64", "/usr/lib", "/usr/lib64", "/bin", "/sbin", "/usr/bin", "/usr/sbin"} {
 		if fi, err := os.Stat(dir); err != nil || !fi.IsDir() {
 			continue
 		}
-		if err := bindDir(dir, filepath.Join(rootfs, dir), true); err != nil {
+		if err := bindDir(dir, filepath.Join(rootfs, dir)); err != nil {
 			return nil, fmt.Errorf("bind system directory %s: %w", dir, err)
 		}
 		allowed = append(allowed, dir)
+		roTargets = append(roTargets, dir)
 	}
 
 	// Minimal device nodes a workload cannot function without.
@@ -192,7 +201,7 @@ func setupJailFilesystem(cfg *jailHelperConfig) ([]string, error) {
 		if fi, err := os.Stat(host); err != nil || fi.IsDir() {
 			continue
 		}
-		if err := bindFile(host, filepath.Join(rootfs, "dev", dev), false); err != nil {
+		if err := bindFile(host, filepath.Join(rootfs, "dev", dev)); err != nil {
 			return nil, fmt.Errorf("bind device %s: %w", host, err)
 		}
 	}
@@ -208,10 +217,13 @@ func setupJailFilesystem(cfg *jailHelperConfig) ([]string, error) {
 			src = procFDPath(cfg.VolumeFDs[i])
 		}
 		dst := filepath.Join(rootfs, v.GuestPath)
-		if err := bindPath(src, dst, v.ReadOnly); err != nil {
+		if err := bindPath(src, dst); err != nil {
 			return nil, fmt.Errorf("bind volume %s -> %s: %w", v.HostPath, v.GuestPath, err)
 		}
 		allowed = append(allowed, v.GuestPath)
+		if v.ReadOnly {
+			roTargets = append(roTargets, v.GuestPath)
+		}
 	}
 
 	// Jail working directories created by SetupJail. Only allowlist the
@@ -258,29 +270,50 @@ func setupJailFilesystem(cfg *jailHelperConfig) ([]string, error) {
 		allowed = append(allowed, "/proc")
 	}
 
+	// Apply the read-only remounts on plain post-pivot paths (see roTargets).
+	for _, t := range roTargets {
+		if err := remountReadOnly(t); err != nil {
+			return nil, fmt.Errorf("make %s read-only: %w", t, err)
+		}
+	}
+
 	return allowed, nil
 }
 
 // bindPath bind-mounts a host file or directory onto target inside the rootfs.
-func bindPath(host, target string, readOnly bool) error {
+// Read-only is NOT applied here: see roTargets/remountReadOnly.
+func bindPath(host, target string) error {
 	fi, err := os.Stat(host)
 	if err != nil {
 		return err
 	}
 	if fi.IsDir() {
-		return bindDir(host, target, readOnly)
+		return bindDir(host, target)
 	}
-	return bindFile(host, target, readOnly)
+	return bindFile(host, target)
 }
 
-func bindDir(host, target string, readOnly bool) error {
+// remountReadOnly switches a bind mount to read-only. It must be called with
+// the POST-PIVOT in-jail path, never with a pre-pivot /proc/self/fd/-prefixed
+// path: inside a user namespace, remounting through a procfs magic link fails
+// with EINVAL (privileged CI leg, TestConfigureProcessIsolation_Execution).
+func remountReadOnly(target string) error {
+	// A read-only bind requires a separate remount pass; MS_RDONLY on the
+	// initial bind is silently ignored.
+	if err := unix.Mount("", target, "", unix.MS_BIND|unix.MS_REMOUNT|unix.MS_RDONLY, ""); err != nil {
+		return fmt.Errorf("remount read-only: %w", err)
+	}
+	return nil
+}
+
+func bindDir(host, target string) error {
 	if err := os.MkdirAll(target, 0755); err != nil {
 		return err
 	}
-	return bindMount(host, target, readOnly)
+	return bindMount(host, target)
 }
 
-func bindFile(host, target string, readOnly bool) error {
+func bindFile(host, target string) error {
 	if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
 		return err
 	}
@@ -291,19 +324,12 @@ func bindFile(host, target string, readOnly bool) error {
 	if err := f.Close(); err != nil {
 		return err
 	}
-	return bindMount(host, target, readOnly)
+	return bindMount(host, target)
 }
 
-func bindMount(host, target string, readOnly bool) error {
-	if err := unix.Mount(host, target, "", unix.MS_BIND|unix.MS_REC, ""); err != nil {
-		return err
-	}
-	if readOnly {
-		// A read-only bind requires a separate remount pass; MS_RDONLY on
-		// the initial bind is silently ignored.
-		if err := unix.Mount("", target, "", unix.MS_BIND|unix.MS_REMOUNT|unix.MS_RDONLY, ""); err != nil {
-			return fmt.Errorf("remount read-only: %w", err)
-		}
-	}
-	return nil
+func bindMount(host, target string) error {
+	// The bind itself is always created read-WRITE; read-only is applied
+	// after pivot_root via remountReadOnly on the plain in-jail path (see
+	// there for why the remount must not go through procfs magic links).
+	return unix.Mount(host, target, "", unix.MS_BIND|unix.MS_REC, "")
 }
