@@ -128,7 +128,11 @@ jobs:
         fi
 
     - name: Dump logs on failure
-      if: failure()
+      # !success() — NOT failure() — so a step CANCELLED by timeout-minutes
+      # also dumps. A cancel does not register as failure(), and the 15-minute
+      # integration timeout used to take the logs with it: zero evidence for
+      # post-mortem (exactly what happened on the 1090982 run).
+      if: ${{ !success() }}
       run: |
         set +e
         echo "===== umlctl output (uml.log) ====="
@@ -151,7 +155,7 @@ jobs:
         echo "===== end of logs ====="
 
     - name: Dump cgroup state on failure
-      if: failure()
+      if: ${{ !success() }}
       run: |
         set +e
         echo "===== whoami / id ====="
