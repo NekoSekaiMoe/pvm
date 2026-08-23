@@ -3,11 +3,34 @@
 package jail
 
 import (
+	"encoding/json"
+	"fmt"
+	"os"
 	"os/exec"
 	"syscall"
 
 	"golang.org/x/sys/unix"
 )
+
+// Environment markers used to hand the mount/pivot_root plan to the re-exec'd
+// jail helper (helper_linux.go). Go cannot run code between fork(2) and
+// execve(2), so filesystem isolation inside the child's fresh mount namespace
+// is performed by re-executing this same binary with the marker set; the
+// helper branch then mounts, pivots into the rootfs, applies Landlock and
+// finally execs the real workload.
+const (
+	jailHelperEnvMarker = "PVM_JAIL_HELPER"
+	jailHelperEnvConfig = "PVM_JAIL_HELPER_CONFIG"
+)
+
+// jailHelperConfig is the JSON-serialized plan passed to the re-exec'd helper.
+type jailHelperConfig struct {
+	Rootfs  string          `json:"rootfs"`
+	JailDir string          `json:"jail_dir"`
+	Volumes []VolumeMapping `json:"volumes"`
+	Target  string          `json:"target"`
+	Args    []string        `json:"args"`
+}
 
 // ConfigureProcessIsolation decorates the exec.Cmd with death-signals and isolation attributes.
 //
@@ -46,7 +69,7 @@ func ConfigureProcessIsolation(cmd *exec.Cmd, j *JailEnvironment) error {
 	// Always send SIGKILL to the UML child if the parent manager exits
 	cmd.SysProcAttr.Pdeathsig = unix.SIGKILL
 
-	privileged := unix.Getuid() == 0
+	privileged := unix.Geteuid() == 0
 	caps := DetectHostCapabilities()
 	// The isolation set applies when it can actually succeed at fork time:
 	// privileged callers always may unshare; unprivileged callers need a
@@ -65,7 +88,55 @@ func ConfigureProcessIsolation(cmd *exec.Cmd, j *JailEnvironment) error {
 				{ContainerID: 0, HostID: unix.Getgid(), Size: 1},
 			}
 		}
+		// Route the launch through the re-exec helper so the mounts,
+		// pivot_root and Landlock hardening run inside the child's new
+		// mount namespace before the real workload is exec'd.
+		if err := wrapWithJailHelper(cmd, j); err != nil {
+			return err
+		}
 	}
 
+	return nil
+}
+
+// wrapWithJailHelper rewrites cmd so that, instead of the target binary, the
+// current executable is re-exec'd with the jail-helper marker set. The helper
+// branch (helper_linux.go) performs the actual filesystem isolation and then
+// execs the original target. Any isolation failure makes the child exit
+// non-zero before the workload starts, so the error propagates to the caller
+// waiting on the process.
+func wrapWithJailHelper(cmd *exec.Cmd, j *JailEnvironment) error {
+	exe, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("jail: locate executable for re-exec helper: %w", err)
+	}
+	cfg := jailHelperConfig{
+		Rootfs:  j.Rootfs,
+		JailDir: j.JailDir,
+		Volumes: j.Config.Volumes,
+		Target:  cmd.Path,
+		Args:    cmd.Args,
+	}
+	blob, err := json.Marshal(cfg)
+	if err != nil {
+		return fmt.Errorf("jail: encode helper config: %w", err)
+	}
+
+	// Preserve the inherited environment: exec.Cmd falls back to os.Environ()
+	// only while Env is nil, and the helper forwards cmd.Env to the workload.
+	env := cmd.Env
+	if env == nil {
+		env = os.Environ()
+	}
+	cmd.Env = append(env,
+		jailHelperEnvMarker+"=1",
+		jailHelperEnvConfig+"="+string(blob),
+	)
+	cmd.Path = exe
+	if len(cmd.Args) == 0 {
+		cmd.Args = []string{exe}
+	} else {
+		cmd.Args = append([]string{exe}, cmd.Args...)
+	}
 	return nil
 }

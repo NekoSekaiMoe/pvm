@@ -25,6 +25,7 @@ type HostCapabilities struct {
 }
 
 var (
+	capMu      sync.RWMutex // guards cachedCaps against concurrent test injection
 	capOnce    sync.Once
 	cachedCaps HostCapabilities
 )
@@ -32,14 +33,25 @@ var (
 // DetectHostCapabilities probes the host kernel and environment for security primitives.
 func DetectHostCapabilities() HostCapabilities {
 	capOnce.Do(func() {
+		capMu.Lock()
+		defer capMu.Unlock()
 		cachedCaps = probeHostCapabilities()
 	})
+	capMu.RLock()
+	defer capMu.RUnlock()
 	return cachedCaps
 }
 
 // ResetHostCapabilitiesForTest allows unit tests to inject simulated capability states.
+//
+// This is a test hook that intentionally remains part of the production API:
+// cross-package tests (internal/container, internal/integrationtest,
+// internal/securitytest) import the jail package and therefore cannot see a
+// jail-internal export_test.go helper. It must not be called by production code.
 func ResetHostCapabilitiesForTest(caps *HostCapabilities) {
 	capOnce.Do(func() {}) // Disarm capOnce so DetectHostCapabilities will not overwrite cachedCaps
+	capMu.Lock()
+	defer capMu.Unlock()
 	if caps == nil {
 		cachedCaps = probeHostCapabilities()
 	} else {
@@ -61,7 +73,12 @@ func CheckSecurity(allowDegraded bool, enforceSeccomp, enforceLandlock bool) (*S
 	if enforceLandlock && !caps.HasLandlock {
 		bypassed = append(bypassed, "landlock-lsm")
 	}
-	if !caps.HasUserNS && !caps.HasMountNS {
+	// The namespace-isolation baseline must mirror what
+	// ConfigureProcessIsolation actually requires (process_linux.go): a
+	// usable mount namespace plus either a privileged caller or user
+	// namespaces to unshare rootless.
+	privileged := os.Geteuid() == 0
+	if !caps.HasMountNS || (!privileged && !caps.HasUserNS) {
 		bypassed = append(bypassed, "namespace-isolation")
 	}
 
@@ -118,6 +135,12 @@ type JailEnvironment struct {
 func SetupJail(cfg Config) (*JailEnvironment, error) {
 	if cfg.TaskID == "" {
 		return nil, fmt.Errorf("jail: task ID is required")
+	}
+	// The task ID becomes a path component of the default BaseDir; reject
+	// path separators and traversal components so an attacker-controlled ID
+	// cannot escape the jail root.
+	if strings.ContainsAny(cfg.TaskID, "/\\") || strings.Contains(cfg.TaskID, "..") {
+		return nil, fmt.Errorf("jail: invalid task ID %q: must not contain path separators or '..' traversal components", cfg.TaskID)
 	}
 	if cfg.BaseDir == "" {
 		cfg.BaseDir = filepath.Join(os.TempDir(), "pvm-jails", cfg.TaskID)

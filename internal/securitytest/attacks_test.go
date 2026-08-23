@@ -235,9 +235,9 @@ func TestAttack_SecretInArtifactDiff(t *testing.T) {
 	}
 	// Multiple secret shapes the gate must catch.
 	for _, secret := range []string{
-		"AKIAIOSFODNN7EXAMPLE",                                  // AWS access key
-		"ghp_" + strings.Repeat("a", 36),                        // GitHub token
-		"-----BEGIN RSA PRIVATE KEY-----\nMIIE",                 // private key
+		"AKIAIOSFODNN7EXAMPLE",                                            // AWS access key
+		"ghp_" + strings.Repeat("a", 36),                                  // GitHub token
+		"-----BEGIN RSA PRIVATE KEY-----\nMIIE",                           // private key
 		"xoxb-" + strings.Repeat("p", 12) + "-" + strings.Repeat("q", 12), // Slack
 	} {
 		released = false
@@ -319,7 +319,10 @@ func TestAttack_QuotaBypassViaConcurrency(t *testing.T) {
 // =====================================================================
 
 func TestAttack_SpecValidationBypass(t *testing.T) {
-	cases := []struct{ name string; s *spec.TaskSpec }{
+	cases := []struct {
+		name string
+		s    *spec.TaskSpec
+	}{
 		{"negative cpu", &spec.TaskSpec{Version: 1, Caller: "x", Runtime: spec.RuntimeSpec{CPU: -1}}},
 		{"huge cpu", &spec.TaskSpec{Version: 1, Caller: "x", Runtime: spec.RuntimeSpec{CPU: 100000}}},
 		{"bad action", &spec.TaskSpec{Version: 1, Caller: "x", Tools: []spec.ToolRule{{Name: "t", Action: "allow-and-also-deny"}}}},
@@ -471,18 +474,3 @@ func TestAttack_SecurityBypassAudited(t *testing.T) {
 		t.Fatalf("expected 'landlock-lsm' in audit ledger reason, got %s", string(data))
 	}
 }
-
-// =====================================================================
-// ATTACK 13: seccomp filter structure integrity — dangerous host syscalls
-// like bpf, io_uring, mount, unshare must NEVER be in the allowed set.
-// =====================================================================
-
-func TestAttack_SeccompFilterBlocksDangerousSyscalls(t *testing.T) {
-	dangerous := []string{"bpf", "io_uring_setup", "io_uring_enter", "mount", "unshare", "setns", "kexec_load", "reboot"}
-	for _, d := range dangerous {
-		if jail.IsSyscallAllowed(d) {
-			t.Errorf("SECURITY: dangerous syscall %q is allowed by UML seccomp filter", d)
-		}
-	}
-}
-

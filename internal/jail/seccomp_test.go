@@ -18,17 +18,22 @@ func TestSeccompHelperProcess(t *testing.T) {
 }
 
 func TestSeccomp_AllowedSyscallsIntegrity(t *testing.T) {
-	// Must allow ptrace for UML SKAS execution
-	if !IsSyscallAllowed("ptrace") {
-		t.Errorf("expected 'ptrace' to be allowed for UML")
+	cases := []struct {
+		name   string
+		reason string
+	}{
+		{"ptrace", "UML SKAS execution"},
+		{"mmap", "UML page handling"},
+		{"mprotect", "UML page handling"},
+		{"rt_sigaction", "signal handling"},
+		{"rt_sigprocmask", "signal handling"},
 	}
-	// Must allow mmap and mprotect for UML page handling
-	if !IsSyscallAllowed("mmap") || !IsSyscallAllowed("mprotect") {
-		t.Errorf("expected 'mmap' and 'mprotect' to be allowed for UML")
-	}
-	// Must allow signal handling
-	if !IsSyscallAllowed("rt_sigaction") || !IsSyscallAllowed("rt_sigprocmask") {
-		t.Errorf("expected signal syscalls to be allowed for UML")
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if !IsSyscallAllowed(tc.name) {
+				t.Errorf("expected %q to be allowed for UML (%s)", tc.name, tc.reason)
+			}
+		})
 	}
 }
 
@@ -44,19 +49,30 @@ func TestSeccomp_BlockedDangerousSyscalls(t *testing.T) {
 	}
 
 	for _, d := range dangerous {
-		if !IsSyscallDangerous(d) {
-			t.Errorf("expected syscall %s to be flagged as dangerous", d)
-		}
-		if IsSyscallAllowed(d) {
-			t.Errorf("dangerous syscall %s MUST NOT be in UML allowed set", d)
-		}
+		t.Run(d, func(t *testing.T) {
+			if !IsSyscallDangerous(d) {
+				t.Errorf("expected syscall %s to be flagged as dangerous", d)
+			}
+			if IsSyscallAllowed(d) {
+				t.Errorf("dangerous syscall %s MUST NOT be in UML allowed set", d)
+			}
+		})
 	}
 }
 
 func TestSeccomp_FilterGeneration(t *testing.T) {
-	filter := BuildUMLSeccompFilter()
-	if len(filter) == 0 {
-		t.Fatalf("expected non-empty BPF filter")
+	cases := []struct {
+		name string
+	}{
+		{"non-empty filter"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			filter := BuildUMLSeccompFilter()
+			if len(filter) == 0 {
+				t.Fatalf("expected non-empty BPF filter")
+			}
+		})
 	}
 }
 

@@ -1,9 +1,11 @@
 package jail
 
 import (
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"syscall"
 	"testing"
 )
 
@@ -14,13 +16,25 @@ func TestLandlockHelperProcess(t *testing.T) {
 		return
 	}
 	allowed := os.Getenv("LANDLOCK_ALLOWED_DIR")
+	denied := os.Getenv("LANDLOCK_DENIED_DIR")
 	if err := ApplyLandlockLockdown([]string{allowed}); err != nil {
 		os.Exit(2)
 	}
-	// Try writing to allowed path
+	// Writing inside the allowed directory must succeed.
 	testFile := filepath.Join(allowed, "test.txt")
 	if err := os.WriteFile(testFile, []byte("ok"), 0644); err != nil {
 		os.Exit(3)
+	}
+	// Writing inside the denied directory must fail with EACCES.
+	if denied != "" {
+		deniedFile := filepath.Join(denied, "test.txt")
+		err := os.WriteFile(deniedFile, []byte("nope"), 0644)
+		if err == nil {
+			os.Exit(4) // write unexpectedly succeeded
+		}
+		if !errors.Is(err, syscall.EACCES) {
+			os.Exit(5) // write failed, but not with EACCES
+		}
 	}
 	os.Exit(0)
 }
@@ -36,11 +50,16 @@ func TestLandlock_ApplyAllowedPaths(t *testing.T) {
 	if err := os.MkdirAll(p1, 0755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
+	denied := filepath.Join(tmp, "denied")
+	if err := os.MkdirAll(denied, 0755); err != nil {
+		t.Fatalf("mkdir denied: %v", err)
+	}
 
-	cmd := exec.Command(os.Args[0], "-test.run=TestLandlockHelperProcess")
+	cmd := exec.Command(os.Args[0], "-test.run=^TestLandlockHelperProcess$")
 	cmd.Env = append(os.Environ(),
 		"GO_WANT_LANDLOCK_HELPER=1",
 		"LANDLOCK_ALLOWED_DIR="+p1,
+		"LANDLOCK_DENIED_DIR="+denied,
 	)
 	out, err := cmd.CombinedOutput()
 	if err != nil {

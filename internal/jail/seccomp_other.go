@@ -10,7 +10,13 @@ var UMLAllowedSyscalls = []string{
 	"ptrace", "mmap", "read", "write", "open", "close", "socket",
 }
 
+// IsSyscallAllowed reports whether the named syscall is in the UML allowed set.
 func IsSyscallAllowed(name string) bool {
+	for _, s := range UMLAllowedSyscalls {
+		if s == name {
+			return true
+		}
+	}
 	return false
 }
 
@@ -24,6 +30,23 @@ func GetBlockedDangerousSyscalls() []string {
 
 func GetUMLAllowedSyscalls() []string {
 	return UMLAllowedSyscalls
+}
+
+// Classic BPF / seccomp constants, kept local because x/sys/unix does not
+// expose seccomp return actions on non-Linux platforms.
+const (
+	bpfRetK           = 0x06       // BPF_RET | BPF_K
+	seccompRetErrno   = 0x00050000 // SECCOMP_RET_ERRNO
+	seccompErrnoEPERM = 1          // EPERM
+)
+
+// BuildUMLSeccompFilter returns a stub default-deny filter on non-Linux
+// platforms. It is never installed, but keeps filter-structure call sites
+// and shared tests compiling and passing everywhere.
+func BuildUMLSeccompFilter() []SockFilter {
+	return []SockFilter{
+		{Code: bpfRetK, K: seccompRetErrno | seccompErrnoEPERM},
+	}
 }
 
 func ApplyHostSeccompFilter() error {

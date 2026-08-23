@@ -12,11 +12,6 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// sysLandlockCreateRuleset is the syscall number for landlock_create_ruleset
-const (
-	sysLandlockCreateRuleset = 444 // on x86_64 and arm64 Linux
-)
-
 func probeHostCapabilities() HostCapabilities {
 	caps := HostCapabilities{
 		HasSeccomp:  true, // Linux kernels >= 3.5 support seccomp-bpf
@@ -26,7 +21,7 @@ func probeHostCapabilities() HostCapabilities {
 	}
 
 	// 1. Probe Seccomp / PR_SET_NO_NEW_PRIVS
-	if err := unix.Prctl(unix.PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0); err != nil && err != unix.EINVAL {
+	if err := unix.Prctl(unix.PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0); err != nil {
 		caps.HasSeccomp = false
 	}
 
@@ -48,19 +43,15 @@ func probeHostCapabilities() HostCapabilities {
 	// landlock_create_ruleset(NULL, 0, LANDLOCK_CREATE_RULESET_VERSION)
 	const landlockCreateRulesetVersion = 1 << 0
 	res, _, err := unix.Syscall(
-		sysLandlockCreateRuleset,
+		unix.SYS_LANDLOCK_CREATE_RULESET,
 		0,
 		0,
 		uintptr(landlockCreateRulesetVersion),
 	)
-	if err == 0 && int(res) > 0 {
-		caps.HasLandlock = true
-	} else if err == unix.EOPNOTSUPP || err == unix.ENOSYS {
-		caps.HasLandlock = false
-	} else {
-		// Kernel might support landlock ABI but ruleset query differed
-		caps.HasLandlock = (err != unix.ENOSYS)
-	}
+	// Conservative policy: only a successful version query proves Landlock
+	// is usable. ENOSYS, EOPNOTSUPP, EPERM, EINVAL or any other error all
+	// mean Landlock is unavailable on this host.
+	caps.HasLandlock = err == 0 && int(res) > 0
 
 	caps.Details = fmt.Sprintf("linux [seccomp:%v, mountns:%v, userns:%v, landlock:%v]",
 		caps.HasSeccomp, caps.HasMountNS, caps.HasUserNS, caps.HasLandlock)

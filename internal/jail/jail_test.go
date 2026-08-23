@@ -15,60 +15,127 @@ func TestDetectHostCapabilities(t *testing.T) {
 	}
 }
 
-func TestCheckSecurity_FailClosedByDefault(t *testing.T) {
-	// Simulate environment missing Landlock and Seccomp
-	simulated := &HostCapabilities{
-		HasSeccomp:  false,
-		HasLandlock: false,
-		HasMountNS:  false,
-		HasUserNS:   false,
-		Details:     "simulated-insecure",
-	}
-	ResetHostCapabilitiesForTest(simulated)
-	defer ResetHostCapabilitiesForTest(nil)
-
-	// allowDegraded = false => must FAIL-CLOSED
-	rep, err := CheckSecurity(false, true, true)
-	if err == nil {
-		t.Fatalf("expected fail-closed error, got report: %+v", rep)
-	}
-	if !strings.Contains(err.Error(), "fail-closed") {
-		t.Errorf("expected 'fail-closed' in error, got %v", err)
-	}
-	if !strings.Contains(err.Error(), "--insecure-allow-degraded") {
-		t.Errorf("expected bypass hint in error, got %v", err)
-	}
-}
-
-func TestCheckSecurity_AllowDegraded(t *testing.T) {
-	// Simulate environment missing Landlock
-	simulated := &HostCapabilities{
-		HasSeccomp:  true,
-		HasLandlock: false,
-		HasMountNS:  true,
-		HasUserNS:   true,
-		Details:     "simulated-no-landlock",
-	}
-	ResetHostCapabilitiesForTest(simulated)
-	defer ResetHostCapabilitiesForTest(nil)
-
-	// allowDegraded = true => must return degraded report without error
-	rep, err := CheckSecurity(true, true, true)
-	if err != nil {
-		t.Fatalf("unexpected error with allowDegraded=true: %v", err)
-	}
-	if !rep.Degraded {
-		t.Errorf("expected report.Degraded to be true")
-	}
-	found := false
-	for _, l := range rep.BypassedLayers {
-		if l == "landlock-lsm" {
-			found = true
-			break
+func TestCheckSecurity(t *testing.T) {
+	contains := func(haystack []string, needle string) bool {
+		for _, s := range haystack {
+			if s == needle {
+				return true
+			}
 		}
+		return false
 	}
-	if !found {
-		t.Errorf("expected 'landlock-lsm' in bypassed layers, got %v", rep.BypassedLayers)
+
+	cases := []struct {
+		name           string
+		caps           HostCapabilities
+		allowDegraded  bool
+		enforceSeccomp bool
+		enforceLand    bool
+		wantErr        bool
+		wantBypassed   []string // layers that MUST be reported
+		forbidBypassed []string // layers that MUST NOT be reported
+	}{
+		{
+			name: "fail closed by default",
+			caps: HostCapabilities{
+				HasSeccomp: false, HasLandlock: false, HasMountNS: false, HasUserNS: false,
+				Details: "simulated-insecure",
+			},
+			allowDegraded:  false,
+			enforceSeccomp: true,
+			enforceLand:    true,
+			wantErr:        true,
+		},
+		{
+			name: "allow degraded missing landlock",
+			caps: HostCapabilities{
+				HasSeccomp: true, HasLandlock: false, HasMountNS: true, HasUserNS: true,
+				Details: "simulated-no-landlock",
+			},
+			allowDegraded:  true,
+			enforceSeccomp: true,
+			enforceLand:    true,
+			wantBypassed:   []string{"landlock-lsm"},
+			forbidBypassed: []string{"seccomp-bpf", "namespace-isolation"},
+		},
+		{
+			name: "only missing seccomp",
+			caps: HostCapabilities{
+				HasSeccomp: false, HasLandlock: true, HasMountNS: true, HasUserNS: true,
+				Details: "simulated-no-seccomp",
+			},
+			allowDegraded:  true,
+			enforceSeccomp: true,
+			enforceLand:    true,
+			wantBypassed:   []string{"seccomp-bpf"},
+			forbidBypassed: []string{"landlock-lsm", "namespace-isolation"},
+		},
+		{
+			// HasMountNS=false makes the namespace baseline unmet regardless of
+			// the caller's euid, so this case is hermetic under root and rootless CI.
+			name: "only missing namespace isolation",
+			caps: HostCapabilities{
+				HasSeccomp: true, HasLandlock: true, HasMountNS: false, HasUserNS: false,
+				Details: "simulated-no-namespace",
+			},
+			allowDegraded:  true,
+			enforceSeccomp: true,
+			enforceLand:    true,
+			wantBypassed:   []string{"namespace-isolation"},
+			forbidBypassed: []string{"seccomp-bpf", "landlock-lsm"},
+		},
+		{
+			name: "seccomp not enforced is not reported",
+			caps: HostCapabilities{
+				HasSeccomp: false, HasLandlock: true, HasMountNS: true, HasUserNS: true,
+				Details: "simulated-no-seccomp-unenforced",
+			},
+			allowDegraded:  true,
+			enforceSeccomp: false,
+			enforceLand:    true,
+			forbidBypassed: []string{"seccomp-bpf", "landlock-lsm", "namespace-isolation"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			caps := tc.caps
+			ResetHostCapabilitiesForTest(&caps)
+			t.Cleanup(func() { ResetHostCapabilitiesForTest(nil) })
+
+			rep, err := CheckSecurity(tc.allowDegraded, tc.enforceSeccomp, tc.enforceLand)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected fail-closed error, got report: %+v", rep)
+				}
+				if !strings.Contains(err.Error(), "fail-closed") {
+					t.Errorf("expected 'fail-closed' in error, got %v", err)
+				}
+				if !strings.Contains(err.Error(), "--insecure-allow-degraded") {
+					t.Errorf("expected bypass hint in error, got %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error with allowDegraded=true: %v", err)
+			}
+			if len(tc.wantBypassed) > 0 && !rep.Degraded {
+				t.Errorf("expected report.Degraded to be true, bypassed=%v", rep.BypassedLayers)
+			}
+			if len(tc.wantBypassed) == 0 && rep.Degraded {
+				t.Errorf("expected no bypassed layers, got %v", rep.BypassedLayers)
+			}
+			for _, want := range tc.wantBypassed {
+				if !contains(rep.BypassedLayers, want) {
+					t.Errorf("expected %q in bypassed layers, got %v", want, rep.BypassedLayers)
+				}
+			}
+			for _, forbid := range tc.forbidBypassed {
+				if contains(rep.BypassedLayers, forbid) {
+					t.Errorf("did not expect %q in bypassed layers, got %v", forbid, rep.BypassedLayers)
+				}
+			}
+		})
 	}
 }
 

@@ -12,7 +12,6 @@ import (
 
 // Landlock access flags
 const (
-	landlockAccessFSRx = 0x01 | 0x02 // EXECUTE | WRITE_FILE
 	landlockAccessFSRw = 0x01 | 0x02 | 0x04 | 0x08 | 0x10 | 0x20 | 0x40 | 0x80 | 0x100 | 0x200 | 0x400 | 0x800 | 0x1000
 )
 
@@ -37,7 +36,7 @@ func ApplyLandlockLockdown(allowedPaths []string) error {
 	}
 
 	fd, _, err := unix.Syscall(
-		sysLandlockCreateRuleset,
+		unix.SYS_LANDLOCK_CREATE_RULESET,
 		uintptr(unsafe.Pointer(&attr)),
 		unsafe.Sizeof(attr),
 		0,
@@ -52,20 +51,19 @@ func ApplyLandlockLockdown(allowedPaths []string) error {
 	defer unix.Close(rulesetFd)
 
 	// 2. Add path beneath rules
-	const sysLandlockAddRule = 445
 	const landlockRulePathBeneath = 1
 
 	for _, p := range allowedPaths {
 		f, openErr := os.Open(p)
 		if openErr != nil {
-			continue
+			return fmt.Errorf("landlock: open allowed path %s: %w", p, openErr)
 		}
 		pathAttr := landlockPathBeneathAttr{
 			allowedAccess: landlockAccessFSRw,
 			parentFd:      int32(f.Fd()),
 		}
 		_, _, addErr := unix.Syscall6(
-			sysLandlockAddRule,
+			unix.SYS_LANDLOCK_ADD_RULE,
 			uintptr(rulesetFd),
 			uintptr(landlockRulePathBeneath),
 			uintptr(unsafe.Pointer(&pathAttr)),
@@ -78,13 +76,12 @@ func ApplyLandlockLockdown(allowedPaths []string) error {
 	}
 
 	// 3. Enforce self restriction
-	const sysLandlockRestrictSelf = 446
 	if err := unix.Prctl(unix.PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0); err != nil {
 		return fmt.Errorf("landlock: set no_new_privs: %w", err)
 	}
 
 	_, _, resErr := unix.Syscall(
-		sysLandlockRestrictSelf,
+		unix.SYS_LANDLOCK_RESTRICT_SELF,
 		uintptr(rulesetFd),
 		0,
 		0,

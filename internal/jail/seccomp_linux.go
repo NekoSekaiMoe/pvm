@@ -108,7 +108,9 @@ func GetUMLAllowedSyscalls() []string {
 }
 
 // BuildUMLSeccompFilter compiles a Classic BPF filter for the host UML process.
-func BuildUMLSeccompFilter() []unix.SockFilter {
+// It returns the package-local SockFilter type (a mirror of unix.SockFilter)
+// so the filter structure can be built and tested on non-Linux platforms.
+func BuildUMLSeccompFilter() []SockFilter {
 	// Standard BPF Seccomp filter layout:
 	// 1. Validate Architecture (AUDIT_ARCH_X86_64 or AUDIT_ARCH_AARCH64)
 	// 2. Load Syscall Number: BPF_LD | BPF_W | BPF_ABS, offset 0
@@ -124,7 +126,7 @@ func BuildUMLSeccompFilter() []unix.SockFilter {
 		arch = 0
 	}
 
-	filter := []unix.SockFilter{
+	filter := []SockFilter{
 		// [0] Load architecture: [4]
 		{Code: unix.BPF_LD | unix.BPF_W | unix.BPF_ABS, K: 4},
 		// [1] If arch != expected, kill process or deny
@@ -135,21 +137,22 @@ func BuildUMLSeccompFilter() []unix.SockFilter {
 		{Code: unix.BPF_LD | unix.BPF_W | unix.BPF_ABS, K: 0},
 	}
 
-	// For all allowed syscalls, if matched -> ALLOW
+	// For each allowed syscall emit a JEQ/ALLOW pair: on a match fall
+	// through (Jt=0) to the SECCOMP_RET_ALLOW immediately below; on a
+	// mismatch skip it (Jf=1) and keep checking the remaining rules.
 	for _, name := range UMLAllowedSyscalls {
 		nr, ok := getSyscallNumber(name)
 		if !ok || nr < 0 {
 			continue
 		}
-		// If syscall == nr -> return ALLOW (jump 1 to allow instruction)
 		filter = append(filter,
-			unix.SockFilter{
+			SockFilter{
 				Code: unix.BPF_JMP | unix.BPF_JEQ | unix.BPF_K,
 				K:    uint32(nr),
-				Jt:   1, // jump over next instruction to ALLOW
-				Jf:   0, // continue check
+				Jt:   0, // match: execute the ALLOW instruction directly below
+				Jf:   1, // mismatch: skip ALLOW, continue with the next rule
 			},
-			unix.SockFilter{
+			SockFilter{
 				Code: unix.BPF_RET | unix.BPF_K,
 				K:    unix.SECCOMP_RET_ALLOW,
 			},
@@ -157,7 +160,7 @@ func BuildUMLSeccompFilter() []unix.SockFilter {
 	}
 
 	// Default fallback: return ERRNO(EPERM)
-	filter = append(filter, unix.SockFilter{
+	filter = append(filter, SockFilter{
 		Code: unix.BPF_RET | unix.BPF_K,
 		K:    unix.SECCOMP_RET_ERRNO | (uint32(unix.EPERM) & unix.SECCOMP_RET_DATA),
 	})
@@ -173,9 +176,16 @@ func ApplyHostSeccompFilter() error {
 	}
 
 	filter := BuildUMLSeccompFilter()
+	if len(filter) == 0 {
+		return fmt.Errorf("seccomp: empty filter")
+	}
+	raw := make([]unix.SockFilter, len(filter))
+	for i, f := range filter {
+		raw[i] = unix.SockFilter{Code: f.Code, Jt: f.Jt, Jf: f.Jf, K: f.K}
+	}
 	prog := unix.SockFprog{
-		Len:    uint16(len(filter)),
-		Filter: (*unix.SockFilter)(unsafe.Pointer(&filter[0])),
+		Len:    uint16(len(raw)),
+		Filter: (*unix.SockFilter)(unsafe.Pointer(&raw[0])),
 	}
 
 	// SECCOMP_SET_MODE_FILTER = 1

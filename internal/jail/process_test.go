@@ -1,9 +1,13 @@
+//go:build linux
+
 package jail
 
 import (
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -48,18 +52,66 @@ func TestConfigureProcessIsolation_Execution(t *testing.T) {
 		Rootfs:  tmp,
 	}
 
-	testFile := filepath.Join(tmp, "subtest")
-	cmd := exec.Command("touch", testFile)
+	// The jail helper pivots into Rootfs, so the workload sees the volume at
+	// its guest path; writes there must land back on the host path.
+	cmd := exec.Command("touch", "/workspace/subtest")
 	if err := ConfigureProcessIsolation(cmd, env); err != nil {
 		t.Fatalf("ConfigureProcessIsolation failed: %v", err)
 	}
 
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		// In unprivileged CI containers where CLONE_NEWUSER / CLONE_NEWNS fails at runtime
-		t.Logf("Namespace execution returned (unprivileged container): %v, output: %s", err, string(out))
 		if os.Geteuid() != 0 {
-			t.Skip("skipping unprivileged namespace execution error on container without user namespace permissions")
+			// Known case: unprivileged CI containers without user-namespace
+			// permissions cannot create CLONE_NEWUSER/CLONE_NEWNS at runtime.
+			t.Skipf("skipping unprivileged namespace execution (container without user namespace permissions): %v, output: %s", err, string(out))
 		}
+		// Privileged callers always may unshare; a failure here means the
+		// isolation setup itself is broken and must not be waved through.
+		t.Fatalf("privileged namespace execution failed: %v, output: %s", err, string(out))
+	}
+
+	testFile := filepath.Join(tmp, "subtest")
+	if _, err := os.Stat(testFile); err != nil {
+		t.Fatalf("expected jailed write to land on host volume path %s: %v", testFile, err)
+	}
+}
+
+// TestJailHelper_FailsClosedWithoutPrivileges pins the error-propagation
+// contract of the re-exec helper: when the mounts cannot be set up (here:
+// no CAP_SYS_ADMIN and no user namespace), the helper must exit non-zero
+// with a clear diagnostic BEFORE the workload binary is exec'd.
+func TestJailHelper_FailsClosedWithoutPrivileges(t *testing.T) {
+	if os.Geteuid() == 0 {
+		// As root the first mount would succeed and — without CLONE_NEWNS —
+		// mutate the mount namespace shared with the test runner. The real
+		// launch path always pairs the helper with CLONE_NEWNS, so only
+		// exercise the failure leg unprivileged.
+		t.Skip("helper fail-closed leg is only safe to probe unprivileged")
+	}
+
+	cfg := jailHelperConfig{
+		Rootfs: t.TempDir(),
+		Target: "/bin/true",
+		Args:   []string{"true"},
+	}
+	blob, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("marshal helper config: %v", err)
+	}
+
+	// The helper branch runs from init() in the re-exec'd binary, so it fires
+	// before the test framework regardless of -test.run.
+	cmd := exec.Command(os.Args[0], "-test.run=TestJailHelperSentinel")
+	cmd.Env = append(os.Environ(),
+		jailHelperEnvMarker+"=1",
+		jailHelperEnvConfig+"="+string(blob),
+	)
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("helper must fail without mount privileges; it ran the workload. output: %s", string(out))
+	}
+	if !strings.Contains(string(out), "jail helper:") {
+		t.Errorf("expected a clear 'jail helper:' diagnostic, got: %s", string(out))
 	}
 }

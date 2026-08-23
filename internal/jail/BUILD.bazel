@@ -10,6 +10,7 @@ go_library(
         "probe_other.go",
         "process_linux.go",
         "process_other.go",
+        "seccomp_filter.go",
         "seccomp_linux.go",
         "seccomp_other.go",
         "syscall_table_linux.go",
@@ -26,7 +27,9 @@ go_test(
         "landlock_test.go",
         "process_flags_test.go",
         "process_test.go",
+        "seccomp_linux_test.go",
         "seccomp_test.go",
     ],
     embed = [":jail"],
+    deps = ["@org_golang_x_sys//unix"],
 )
