@@ -2,6 +2,7 @@ package uml
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -36,7 +37,13 @@ type DefaultLauncher struct{}
 func (l *DefaultLauncher) Start(ctx context.Context, kernel string, args []string, logFile *os.File) (int, *Process, error) {
 	cmd := exec.CommandContext(ctx, kernel, args...)
 	if jEnv, ok := ctx.Value(KeyJailEnv).(*jail.JailEnvironment); ok && jEnv != nil {
-		_ = jail.ConfigureProcessIsolation(cmd, jEnv)
+		// A failed isolation setup must abort BEFORE cmd.Start: running the
+		// kernel without the promised sandbox would silently violate the
+		// jail contract. Returning the error lets the caller (container
+		// Manager) flip the task state to Failed instead of Running.
+		if err := jail.ConfigureProcessIsolation(cmd, jEnv); err != nil {
+			return 0, nil, fmt.Errorf("uml: configure process isolation: %w", err)
+		}
 	}
 	// Use pipes for stdout/stderr to prevent UML epoll_ctl errors on regular files
 	stdout, err := cmd.StdoutPipe()

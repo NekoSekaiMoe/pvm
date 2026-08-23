@@ -48,18 +48,26 @@ func loadLaunchConfig(path string) (*spec.TaskSpec, error) {
 	return spec.LoadFile(path)
 }
 
-// ephemeralFalseExplicit reports whether the caller explicitly passed
-// -ephemeral=false on this FlagSet. The -config merge only flips ephemeral
-// ON from the spec, so an explicit CLI opt-out must win over the file
-// (same flag-beats-file rule as every other boolean override).
-func ephemeralFalseExplicit(fs *flag.FlagSet) bool {
+// boolFalseExplicit reports whether the caller explicitly passed -name=false
+// on this FlagSet. flag.Visit only reports flags that were SET on the command
+// line, so an explicit "false" is distinguishable from the untouched default
+// only by inspecting the visited flag values. The -config merge below only
+// flips booleans ON from the spec, so an explicit CLI opt-out must win over
+// the file (same flag-beats-file rule as every other boolean override).
+func boolFalseExplicit(fs *flag.FlagSet, name string) bool {
 	explicitFalse := false
 	fs.Visit(func(f *flag.Flag) {
-		if f.Name == "ephemeral" && f.Value.String() == "false" {
+		if f.Name == name && f.Value.String() == "false" {
 			explicitFalse = true
 		}
 	})
 	return explicitFalse
+}
+
+// ephemeralFalseExplicit reports whether the caller explicitly passed
+// -ephemeral=false on this FlagSet (see boolFalseExplicit).
+func ephemeralFalseExplicit(fs *flag.FlagSet) bool {
+	return boolFalseExplicit(fs, "ephemeral")
 }
 
 func main() {
@@ -131,7 +139,12 @@ func main() {
 				if s.Workspace.Ephemeral && !ephemeralFalseExplicit(startCmd) {
 					*ephemeral = true
 				}
-				if s.Security.AllowInsecureDegraded {
+				// Same flip-on rule for insecure-allow-degraded: the config's
+				// true must not override an explicit -insecure-allow-degraded=false
+				// on the command line. Allowing the file to silently re-enable
+				// degraded mode after the caller opted out would weaken the
+				// security posture the user explicitly requested.
+				if s.Security.AllowInsecureDegraded && !boolFalseExplicit(startCmd, "insecure-allow-degraded") {
 					*insecureDegraded = true
 				}
 			} else {

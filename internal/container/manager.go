@@ -112,12 +112,21 @@ func (m *Manager) Start(ctx context.Context, cfg *config.ContainerConfig) error 
 	}
 	_ = secRep
 
-	jailEnv, _ := jail.SetupJail(jail.Config{
+	// A SetupJail failure must abort the boot BEFORE Launcher.Start:
+	// continuing without the jail environment would run the kernel
+	// un-isolated while the state file claims the task started normally.
+	// Same status-save-then-return shape as the secErr branch above.
+	jailEnv, jailErr := jail.SetupJail(jail.Config{
 		TaskID:                cfg.ID,
 		AllowInsecureDegraded: cfg.AllowInsecureDegraded,
 		EnforceHostSeccomp:    true,
 		EnforceLandlock:       true,
 	})
+	if jailErr != nil {
+		st.Status = state.StatusExited
+		state.SaveState(cfg.ID, st)
+		return jailErr
+	}
 	if jailEnv != nil {
 		defer jailEnv.Cleanup()
 		ctx = context.WithValue(ctx, uml.KeyJailEnv, jailEnv)
@@ -264,13 +273,22 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 		return secErr
 	}
 	if secRep != nil && secRep.Degraded {
-		_ = ledger.Append(audit.Record{
+		// The degraded warning is the ONLY auditable trace that this task ran
+		// below the full security baseline. Silently dropping a failed append
+		// would let a downgraded sandbox boot with no evidence of the
+		// downgrade, so fail closed (Failed transition + no Provisioning),
+		// matching the spec-evidence append above.
+		if err := ledger.Append(audit.Record{
 			Phase:    audit.PhaseExec,
 			Subject:  s.Caller,
 			Action:   "security:degraded_warning",
 			Decision: audit.DecisionAllow,
 			Reason:   secRep.Details,
-		})
+		}); err != nil {
+			_ = st.Transition(state.StatusFailed, state.ActorController, "audit degraded-warning append failed: "+err.Error())
+			state.SaveState(taskID, st)
+			return fmt.Errorf("container: audit degraded warning for %s: %w", taskID, err)
+		}
 	}
 
 	// Provisioning: create overlay, start vhost daemon, set up network+policy.
