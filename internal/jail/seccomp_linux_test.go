@@ -80,6 +80,9 @@ func TestSeccomp_FilterBranchSemantics(t *testing.T) {
 		{"allowed write", uint32(unix.SYS_WRITE), unix.SECCOMP_RET_ALLOW},
 		{"allowed getpid", uint32(unix.SYS_GETPID), unix.SECCOMP_RET_ALLOW},
 		{"allowed ptrace", uint32(unix.SYS_PTRACE), unix.SECCOMP_RET_ALLOW},
+		// The jail helper's final handoff to the workload: without this
+		// entry the helper dies with EPERM at exec time.
+		{"allowed execve", uint32(unix.SYS_EXECVE), unix.SECCOMP_RET_ALLOW},
 		{"blocked unshare", uint32(unix.SYS_UNSHARE), errnoEPERM},
 		{"blocked mount", uint32(unix.SYS_MOUNT), errnoEPERM},
 		{"blocked bpf", uint32(unix.SYS_BPF), errnoEPERM},
@@ -101,6 +104,23 @@ func TestSeccomp_FilterBranchSemantics(t *testing.T) {
 			t.Errorf("wrong arch: got action %#x, want %#x", got, errnoEPERM)
 		}
 	})
+}
+
+// TestSeccomp_AllowedSyscallsResolvable pins the contract that every name
+// in UMLAllowedSyscalls resolves to a real syscall number via
+// getSyscallNumber. BuildUMLSeccompFilter silently skips unresolvable
+// names, so a missing table entry would quietly drop the syscall from the
+// installed filter — this is exactly how execve once fell to the default
+// EPERM and killed the jail helper's workload handoff.
+func TestSeccomp_AllowedSyscallsResolvable(t *testing.T) {
+	for _, name := range UMLAllowedSyscalls {
+		t.Run(name, func(t *testing.T) {
+			nr, ok := getSyscallNumber(name)
+			if !ok || nr < 0 {
+				t.Errorf("allowed syscall %q has no syscall-table entry; it will be silently denied (EPERM) by the installed filter", name)
+			}
+		})
+	}
 }
 
 // TestSeccomp_IoctlArgFiltering verifies the second-stage argument check on

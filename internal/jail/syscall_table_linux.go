@@ -88,6 +88,8 @@ func getSyscallNumber(name string) (int, bool) {
 		return unix.SYS_SCHED_GETAFFINITY, true
 	case "sched_setaffinity":
 		return unix.SYS_SCHED_SETAFFINITY, true
+	case "execve":
+		return unix.SYS_EXECVE, true
 	case "clock_gettime":
 		return unix.SYS_CLOCK_GETTIME, true
 	case "clock_getres":
