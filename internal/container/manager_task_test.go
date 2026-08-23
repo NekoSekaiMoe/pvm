@@ -155,15 +155,17 @@ func TestStartTask(t *testing.T) {
 				return minimalSpec(base)
 			},
 			assert: func(t *testing.T, tl *trackingLauncher, s *spec.TaskSpec, _ string, _ error) {
-				resolved, rerr := filepath.EvalSymlinks(s.Workspace.BaseImage)
-				if rerr != nil {
+				if _, rerr := filepath.EvalSymlinks(s.Workspace.BaseImage); rerr != nil {
 					t.Fatalf("resolve base: %v", rerr)
 				}
-				// The kernel cmdline must carry ubd0=<resolved base>
-				// directly (no overlay created).
+				// The jail is active in tests (TestMain pins capabilities), so
+				// the kernel cmdline carries the IN-JAIL bind-mount path; the
+				// resolved base path moves into the jail volume mapping. The
+				// point of this case — no overlay, base mounted directly via
+				// ubd0 — is preserved: ubd0= (not ubd0r=) is present.
 				found := false
 				for _, a := range tl.args {
-					if a == "ubd0="+resolved {
+					if a == "ubd0="+jailGuestRootfs {
 						found = true
 						break
 					}

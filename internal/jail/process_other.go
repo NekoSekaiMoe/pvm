@@ -15,3 +15,8 @@ import (
 func ConfigureProcessIsolation(cmd *exec.Cmd, j *JailEnvironment) error {
 	return fmt.Errorf("jail: process isolation requires Linux; refusing to start an un-isolated process on this platform")
 }
+
+// IsolationActive is always false on non-Linux platforms: no launch ever
+// enters a jail here (ConfigureProcessIsolation fails closed), so callers
+// must never rewrite host paths into in-jail bind-mount paths.
+func (j *JailEnvironment) IsolationActive() bool { return false }

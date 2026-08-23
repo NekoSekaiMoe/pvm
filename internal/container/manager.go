@@ -160,6 +160,15 @@ func (m *Manager) Boot(ctx context.Context, cfg *config.ContainerConfig) (*Boote
 		return nil, jailErr
 	}
 	if jailEnv != nil {
+		if jailEnv.IsolationActive() {
+			// The kernel will pivot_root into the jail: rewrite every host
+			// path on its command line (ubd image, vhost socket, hostfs
+			// volumes) to the in-jail bind mount and make the tap device
+			// node visible.
+			var vols []jail.VolumeMapping
+			args, vols = routeLaunchThroughJail(args, cfg.NetworkTap)
+			jailEnv.Config.Volumes = vols
+		}
 		ctx = context.WithValue(ctx, uml.KeyJailEnv, jailEnv)
 	}
 
@@ -712,6 +721,17 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 	}
 	if jailEnv != nil {
 		defer jailEnv.Cleanup()
+		if jailEnv.IsolationActive() {
+			// Same jail path-rewrite as the legacy Boot path: the kernel
+			// must open the overlay/vhost socket/tun through in-jail binds.
+			tap := ""
+			if s.Network.Enabled {
+				tap = s.Network.TAP
+			}
+			var vols []jail.VolumeMapping
+			args, vols = routeLaunchThroughJail(args, tap)
+			jailEnv.Config.Volumes = vols
+		}
 		ctx = context.WithValue(ctx, uml.KeyJailEnv, jailEnv)
 	}
 

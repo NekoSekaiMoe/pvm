@@ -37,6 +37,20 @@ type jailHelperConfig struct {
 	EnforceHostSeccomp bool `json:"enforce_host_seccomp"`
 }
 
+// IsolationActive reports whether a launch through this environment would
+// actually enter the jail (fresh mount namespace + pivot_root): it is the
+// same predicate ConfigureProcessIsolation applies. Callers that rewrite
+// host paths into in-jail bind-mount paths (rootfs image, /dev/net/tun,
+// vhost-user socket) must consult this FIRST — when false, the workload
+// keeps the host filesystem view and host paths must be left untouched.
+func (j *JailEnvironment) IsolationActive() bool {
+	if j == nil {
+		return false
+	}
+	caps := DetectHostCapabilities()
+	return caps.HasMountNS && (unix.Geteuid() == 0 || caps.HasUserNS)
+}
+
 // ConfigureProcessIsolation decorates the exec.Cmd with death-signals and isolation attributes.
 //
 // The UML monitor is a host-side process-tree supervisor, not a leaf workload:
@@ -79,7 +93,7 @@ func ConfigureProcessIsolation(cmd *exec.Cmd, j *JailEnvironment) error {
 	// The isolation set applies when it can actually succeed at fork time:
 	// privileged callers always may unshare; unprivileged callers need a
 	// user namespace (CLONE_NEWNS without CAP_SYS_ADMIN would fail EPERM).
-	if j != nil && caps.HasMountNS && (privileged || caps.HasUserNS) {
+	if j.IsolationActive() {
 		cmd.SysProcAttr.Cloneflags |= syscall.CLONE_NEWNS | syscall.CLONE_NEWIPC | syscall.CLONE_NEWUTS
 		// Rootless only: map the unprivileged caller to uid/gid 0 inside
 		// the sandbox. See the policy comment above for why a privileged

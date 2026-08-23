@@ -2,7 +2,10 @@ load("@rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
     name = "container",
-    srcs = ["manager.go"],
+    srcs = [
+        "manager.go",
+        "manager_jail.go",
+    ],
     importpath = "uml-container/internal/container",
     visibility = ["//:__subpackages__"],
     deps = [
@@ -27,6 +30,7 @@ go_test(
     name = "container_test",
     srcs = [
         "manager_args_test.go",
+        "manager_jail_test.go",
         "manager_task_test.go",
         "manager_test.go",
     ],

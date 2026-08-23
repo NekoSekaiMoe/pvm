@@ -75,13 +75,12 @@ func TestManager_Start(t *testing.T) {
 	defer os.Unsetenv("PVM_CGROUP_ROOT")
 
 	// validateRootfs resolves symlinks and requires a regular file: boot a
-	// real image and assert the RESOLVED path on the kernel command line.
+	// real image; with the jail active the cmdline carries the in-jail path.
 	rootfs := filepath.Join(tempDir, "rootfs.img")
 	if err := os.WriteFile(rootfs, []byte("img"), 0600); err != nil {
 		t.Fatalf("write rootfs: %v", err)
 	}
-	resolvedRootfs, err := filepath.EvalSymlinks(rootfs)
-	if err != nil {
+	if _, err := filepath.EvalSymlinks(rootfs); err != nil {
 		t.Fatalf("resolve rootfs: %v", err)
 	}
 
@@ -101,7 +100,11 @@ func TestManager_Start(t *testing.T) {
 		t.Fatalf("Start failed: %v", err)
 	}
 
-	expectedArgs := []string{"ubd0=" + resolvedRootfs, "root=/dev/ubda", "init=/sbin/init", "mem=512M", "vec0:transport=tap,ifname=tap0,depth=128,gro=1"}
+	// TestMain pins full host capabilities, so the jail is active and the
+	// kernel cmdline carries the IN-JAIL bind-mount path for the rootfs;
+	// the resolved host path moves into the jail volume mapping (covered by
+	// manager_jail_test.go).
+	expectedArgs := []string{"ubd0=" + jailGuestRootfs, "root=/dev/ubda", "init=/sbin/init", "mem=512M", "vec0:transport=tap,ifname=tap0,depth=128,gro=1"}
 	for _, arg := range expectedArgs {
 		if !contains(mock.lastArgs, arg) {
 			t.Errorf("expected arg %s, but missing", arg)
@@ -132,8 +135,7 @@ func TestManager_Start_Virtio(t *testing.T) {
 	if err := os.WriteFile(rootfs, []byte("img"), 0600); err != nil {
 		t.Fatalf("write rootfs: %v", err)
 	}
-	resolvedRootfs, err := filepath.EvalSymlinks(rootfs)
-	if err != nil {
+	if _, err := filepath.EvalSymlinks(rootfs); err != nil {
 		t.Fatalf("resolve rootfs: %v", err)
 	}
 
@@ -153,7 +155,8 @@ func TestManager_Start_Virtio(t *testing.T) {
 		t.Fatalf("Start failed: %v", err)
 	}
 
-	expectedArgs := []string{"ubd0=" + resolvedRootfs, "root=/dev/ubda", "init=/sbin/init", "mem=512M", "vec0:transport=tap,ifname=tap0,depth=128,gro=1"}
+	// Jail active (TestMain pins capabilities): rootfs arg uses the in-jail path.
+	expectedArgs := []string{"ubd0=" + jailGuestRootfs, "root=/dev/ubda", "init=/sbin/init", "mem=512M", "vec0:transport=tap,ifname=tap0,depth=128,gro=1"}
 	for _, arg := range expectedArgs {
 		if !contains(mock.lastArgs, arg) {
 			t.Errorf("expected arg %s, but missing", arg)

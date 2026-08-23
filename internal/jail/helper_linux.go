@@ -68,6 +68,14 @@ func runJailHelper() error {
 		}
 		env = append(env, e)
 	}
+	// Repoint HOME at a directory that exists inside the jail: UML's
+	// make_umid() crashes the whole kernel on a missing $HOME (see
+	// jailHomeEnv). This runs after pivot_root, so the existence check
+	// sees the jail view, not the host's.
+	env = jailHomeEnv(env, func(p string) bool {
+		fi, err := os.Stat(p)
+		return err == nil && fi.IsDir()
+	})
 	argv := cfg.Args
 	if len(argv) == 0 {
 		argv = []string{cfg.Target}
