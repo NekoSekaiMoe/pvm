@@ -74,7 +74,10 @@ var UMLAllowedSyscalls = []string{
 	"openat", "openat2", "newfstatat", "statx", "fstatfs", "statfs",
 	"faccessat", "faccessat2", "readlinkat", "getcwd", "chdir", "fchdir",
 	"mkdirat", "unlinkat", "renameat2", "linkat", "symlinkat", "fchmodat", "fchownat",
-	"ftruncate", "fallocate", "fsync", "fdatasync", "sync", "getdents64", "fcntl", "ioctl",
+	"ftruncate", "fallocate", "fsync", "fdatasync", "sync", "getdents64", "fcntl",
+	// ioctl passes a second-stage argument filter: only the request numbers
+	// in allowedIoctlRequests are allowed through (see buildIoctlArgFilter).
+	"ioctl",
 }
 
 // IsSyscallAllowed reports whether the named syscall is in the UML allowed set.
@@ -154,6 +157,10 @@ func BuildUMLSeccompFilter() []SockFilter {
 		if !ok || nr < 0 {
 			continue
 		}
+		if name == "ioctl" {
+			filter = append(filter, buildIoctlArgFilter(uint32(nr))...)
+			continue
+		}
 		filter = append(filter,
 			SockFilter{
 				Code: unix.BPF_JMP | unix.BPF_JEQ | unix.BPF_K,
@@ -175,6 +182,46 @@ func BuildUMLSeccompFilter() []SockFilter {
 	})
 
 	return filter
+}
+
+// seccompArg1LowOffset is the byte offset of the low 32 bits of args[1]
+// (the ioctl request) in struct seccomp_data {nr@0, arch@4, ip@8, args@16}.
+// Both supported architectures (x86_64, aarch64) are little-endian, so the
+// low word of the 64-bit argument sits at offset 24.
+const seccompArg1LowOffset = 24
+
+// buildIoctlArgFilter emits the two-stage rule for ioctl: on a syscall-number
+// match, load the request argument and compare it against
+// allowedIoctlRequests; a request outside the allowlist returns
+// ERRNO(EPERM) — the same action as a blocked syscall number. The classic
+// BPF jump offsets are relative: the initial JEQ's Jf skips the whole
+// argument block (1 LD + 2 per request + 1 EPERM).
+func buildIoctlArgFilter(nr uint32) []SockFilter {
+	eperm := SockFilter{
+		Code: unix.BPF_RET | unix.BPF_K,
+		K:    unix.SECCOMP_RET_ERRNO | (uint32(unix.EPERM) & unix.SECCOMP_RET_DATA),
+	}
+	block := []SockFilter{
+		{
+			Code: unix.BPF_JMP | unix.BPF_JEQ | unix.BPF_K,
+			K:    nr,
+			Jt:   0,                                      // match: fall through to the argument check
+			Jf:   uint8(2 + 2*len(allowedIoctlRequests)), // mismatch: skip the block
+		},
+		{Code: unix.BPF_LD | unix.BPF_W | unix.BPF_ABS, K: seccompArg1LowOffset},
+	}
+	for _, req := range allowedIoctlRequests {
+		block = append(block,
+			SockFilter{
+				Code: unix.BPF_JMP | unix.BPF_JEQ | unix.BPF_K,
+				K:    req,
+				Jt:   0, // match: execute the ALLOW instruction directly below
+				Jf:   1, // mismatch: skip ALLOW, check the next request
+			},
+			SockFilter{Code: unix.BPF_RET | unix.BPF_K, K: unix.SECCOMP_RET_ALLOW},
+		)
+	}
+	return append(block, eperm)
 }
 
 // ApplyHostSeccompFilter installs the tailored BPF seccomp filter on the current thread/process.

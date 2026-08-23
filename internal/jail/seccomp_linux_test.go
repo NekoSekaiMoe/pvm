@@ -13,8 +13,9 @@ import (
 
 // simulateSeccompFilter interprets the classic BPF filter produced by
 // BuildUMLSeccompFilter against a synthetic seccomp_data record
-// {nr @ offset 0, arch @ offset 4} and returns the SECCOMP_RET_* action.
-func simulateSeccompFilter(t *testing.T, filter []SockFilter, nr, arch uint32) uint32 {
+// {nr @ offset 0, arch @ offset 4, args[1] low word @ offset 24} and
+// returns the SECCOMP_RET_* action.
+func simulateSeccompFilter(t *testing.T, filter []SockFilter, nr, arch, arg1Low uint32) uint32 {
 	t.Helper()
 	var a uint32
 	pc := 0
@@ -30,6 +31,8 @@ func simulateSeccompFilter(t *testing.T, filter []SockFilter, nr, arch uint32) u
 				a = nr
 			case 4:
 				a = arch
+			case seccompArg1LowOffset:
+				a = arg1Low
 			default:
 				t.Fatalf("unexpected BPF_ABS offset %d", ins.K)
 			}
@@ -83,7 +86,7 @@ func TestSeccomp_FilterBranchSemantics(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := simulateSeccompFilter(t, filter, tc.nr, arch); got != tc.want {
+			if got := simulateSeccompFilter(t, filter, tc.nr, arch, 0); got != tc.want {
 				t.Errorf("syscall nr=%d: got action %#x, want %#x", tc.nr, got, tc.want)
 			}
 		})
@@ -94,10 +97,51 @@ func TestSeccomp_FilterBranchSemantics(t *testing.T) {
 		if arch == badArch {
 			badArch = unix.AUDIT_ARCH_AARCH64
 		}
-		if got := simulateSeccompFilter(t, filter, uint32(unix.SYS_WRITE), badArch); got != errnoEPERM {
+		if got := simulateSeccompFilter(t, filter, uint32(unix.SYS_WRITE), badArch, 0); got != errnoEPERM {
 			t.Errorf("wrong arch: got action %#x, want %#x", got, errnoEPERM)
 		}
 	})
+}
+
+// TestSeccomp_IoctlArgFiltering verifies the second-stage argument check on
+// ioctl: every allowlisted request number reaches SECCOMP_RET_ALLOW while
+// any other request — including harmless-looking setters — falls to
+// ERRNO(EPERM), the same action as a blocked syscall number.
+func TestSeccomp_IoctlArgFiltering(t *testing.T) {
+	arch := hostAuditArch()
+	if arch == 0 {
+		t.Skip("unsupported architecture for audit arch check")
+	}
+	filter := BuildUMLSeccompFilter()
+	errnoEPERM := uint32(unix.SECCOMP_RET_ERRNO | (uint32(unix.EPERM) & unix.SECCOMP_RET_DATA))
+
+	t.Run("every allowlisted request allowed", func(t *testing.T) {
+		if len(allowedIoctlRequests) == 0 {
+			t.Fatal("allowedIoctlRequests must not be empty (ioctl would be fully blocked)")
+		}
+		for _, req := range allowedIoctlRequests {
+			if got := simulateSeccompFilter(t, filter, uint32(unix.SYS_IOCTL), arch, req); got != unix.SECCOMP_RET_ALLOW {
+				t.Errorf("ioctl request %#x: got action %#x, want ALLOW", req, got)
+			}
+		}
+	})
+
+	denied := []struct {
+		name string
+		req  uint32
+	}{
+		{"interface setter SIOCSIFFLAGS", 0x8914},
+		{"TAP sndbuf setter TUNSETSNDBUF", 0x400454D4},
+		{"unlisted device command", 0xDEAD},
+		{"zero", 0},
+	}
+	for _, tc := range denied {
+		t.Run("denied "+tc.name, func(t *testing.T) {
+			if got := simulateSeccompFilter(t, filter, uint32(unix.SYS_IOCTL), arch, tc.req); got != errnoEPERM {
+				t.Errorf("ioctl request %#x: got action %#x, want %#x", tc.req, got, errnoEPERM)
+			}
+		})
+	}
 }
 
 // TestSeccompSyscallHelperProcess applies the real filter in a subprocess and
@@ -121,6 +165,16 @@ func TestSeccompSyscallHelperProcess(t *testing.T) {
 	// Blocked branch: unshare must fail with EPERM.
 	if _, _, errno := unix.Syscall(unix.SYS_UNSHARE, 0, 0, 0); errno != unix.EPERM {
 		os.Exit(5)
+	}
+	// ioctl argument filter: an allowlisted request must reach the kernel
+	// (fd 1 is a pipe here, so TCGETS fails with ENOTTY — anything but
+	// EPERM proves the filter let it through), while an unlisted request
+	// must be blocked with EPERM.
+	if _, _, errno := unix.Syscall(unix.SYS_IOCTL, 1, ioctlTCGETS, 0); errno == unix.EPERM {
+		os.Exit(6)
+	}
+	if _, _, errno := unix.Syscall(unix.SYS_IOCTL, 1, 0xDEAD, 0); errno != unix.EPERM {
+		os.Exit(7)
 	}
 	os.Exit(0)
 }
