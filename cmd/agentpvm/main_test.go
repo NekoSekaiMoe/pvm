@@ -140,6 +140,18 @@ func TestSafeDefaultSpec(t *testing.T) {
 	if s.Runtime.Name == "" || s.Runtime.Memory == "" || s.Kernel.Path == "" {
 		t.Errorf("safe default must still be launch-shaped, got %+v", s)
 	}
+	// The failsafe spec skips TOML decoding (and thus the loader's
+	// default-true materialization), so the secure baseline must be pinned
+	// explicitly: enforce host seccomp/Landlock, fail closed on degraded hosts.
+	if !s.Security.EnforceHostSeccomp {
+		t.Error("safe default must enforce host seccomp")
+	}
+	if !s.Security.EnforceLandlock {
+		t.Error("safe default must enforce Landlock")
+	}
+	if s.Security.AllowInsecureDegraded {
+		t.Error("safe default must not allow insecure degraded launch")
+	}
 	fp := s.Fingerprint()
 	if len(fp) != 64 {
 		t.Errorf("fingerprint = %q (len %d), want 64 hex chars", fp, len(fp))

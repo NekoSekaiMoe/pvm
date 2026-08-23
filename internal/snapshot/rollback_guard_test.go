@@ -70,6 +70,17 @@ func writeSnapshot(t *testing.T, dir, snapID, backingPath string) string {
 	if err := os.WriteFile(filepath.Join(snapDir, "snapshot.json"), meta, 0644); err != nil {
 		t.Fatal(err)
 	}
+	// Legacy-shaped state copy (parses cleanly, no SpecFP): CreateEventSnapshot
+	// always snapshots state.json, and the spec guard now fails closed when
+	// the copy is missing/unreadable — these tests exercise the overlay
+	// mechanics, so give them the legacy state that skips the guard.
+	legacyState, err := json.Marshal(state.ContainerState{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(snapDir, "state.json"), legacyState, 0644); err != nil {
+		t.Fatal(err)
+	}
 	return snapOv
 }
 

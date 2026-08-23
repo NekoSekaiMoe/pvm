@@ -350,6 +350,15 @@ func safeDefaultSpec() *spec.TaskSpec {
 		Kernel:    spec.KernelSpec{Path: "./bin/linux", UseVhostBlk: true},
 		Network:   spec.NetworkSpec{Enabled: false}, // default deny
 		Lifecycle: spec.LifecycleSpec{OnAnomaly: "pause", TTL: "1h"},
+		// The failsafe spec never passes through TOML decoding, so the
+		// loader's "absent key => true" materialization does not run here.
+		// Pin the secure defaults explicitly: enforce host seccomp/Landlock,
+		// never allow insecure degraded launch (fail-closed).
+		Security: spec.SecuritySpec{
+			AllowInsecureDegraded: false,
+			EnforceHostSeccomp:    true,
+			EnforceLandlock:       true,
+		},
 	}
 	_ = s.Validate()
 	return s

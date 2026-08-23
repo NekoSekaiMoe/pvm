@@ -218,3 +218,60 @@ func TestFingerprint_CoversControlFields(t *testing.T) {
 		})
 	}
 }
+
+// TestSecurityDefaultsMaterialized covers the toml.MetaData-based defaulting:
+// host-enforcement toggles default to true ONLY when the key is absent — a
+// plain bool zero value cannot distinguish "unset" from "explicit false", so
+// without this a spec omitting [security] would silently launch without
+// seccomp/Landlock enforcement (container.StartTask consumes these fields
+// verbatim for jail.CheckSecurity / SetupJail).
+func TestSecurityDefaultsMaterialized(t *testing.T) {
+	const secExplicitFalse = `
+[security]
+enforce_host_seccomp = false
+enforce_landlock     = false
+`
+	const secExplicitTrue = `
+[security]
+enforce_host_seccomp = true
+enforce_landlock     = true
+`
+	cases := []struct {
+		name           string
+		extra          string
+		wantSeccomp    bool
+		wantLandlock   bool
+		wantInsecureDg bool
+	}{
+		{"absent keys default true", "", true, true, false},
+		{"explicit false honored", secExplicitFalse, false, false, false},
+		{"explicit true honored", secExplicitTrue, true, true, false},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			// Cover both entry points: the file loader and the /api/tasks/load-spec
+			// in-memory loader must agree.
+			viaStr, err := LoadString(minimalValid + tc.extra)
+			if err != nil {
+				t.Fatalf("LoadString: %v", err)
+			}
+			viaFile, err := LoadFile(writeTemp(t, minimalValid+tc.extra))
+			if err != nil {
+				t.Fatalf("LoadFile: %v", err)
+			}
+			for _, s := range []*TaskSpec{viaStr, viaFile} {
+				if s.Security.EnforceHostSeccomp != tc.wantSeccomp {
+					t.Errorf("EnforceHostSeccomp = %v, want %v", s.Security.EnforceHostSeccomp, tc.wantSeccomp)
+				}
+				if s.Security.EnforceLandlock != tc.wantLandlock {
+					t.Errorf("EnforceLandlock = %v, want %v", s.Security.EnforceLandlock, tc.wantLandlock)
+				}
+				if s.Security.AllowInsecureDegraded != tc.wantInsecureDg {
+					t.Errorf("AllowInsecureDegraded = %v, want %v (fail-closed default)",
+						s.Security.AllowInsecureDegraded, tc.wantInsecureDg)
+				}
+			}
+		})
+	}
+}

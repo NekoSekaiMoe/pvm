@@ -71,12 +71,29 @@ func RollbackWithForce(taskID, snapshotID string, force bool) error {
 	// to roll a task whose current spec fingerprint differs from the one
 	// recorded in the snapshot's state copy — "old snapshot + new config"
 	// silently misconfigures the restored task. Runs BEFORE any mutation, so
-	// a refusal leaves both disk and state untouched. Legacy containers with
-	// no fingerprint on either side skip the check.
+	// a refusal leaves both disk and state untouched. Legacy containers whose
+	// state copy parses cleanly but records no fingerprint skip the check.
+	//
+	// A state copy that cannot be READ or PARSED is NOT legacy: silently
+	// treating it as "no fingerprint" would let a corrupt snapshot bypass the
+	// guard and roll the disk back underneath a mismatched spec. Fail closed
+	// unless the caller explicitly forces the rollback.
+	snapStateBytes, snapStateErr := os.ReadFile(filepath.Join(targetSnapDir, "state.json"))
 	snapSpecFP := ""
-	if stateBytes, err := os.ReadFile(filepath.Join(targetSnapDir, "state.json")); err == nil {
+	switch {
+	case snapStateErr != nil:
+		if !force {
+			return fmt.Errorf("snapshot: failed to read snapshot state copy: %w (retry with force)", snapStateErr)
+		}
+	default:
 		var probe state.ContainerState
-		if json.Unmarshal(stateBytes, &probe) == nil {
+		if err := json.Unmarshal(snapStateBytes, &probe); err != nil {
+			if !force {
+				return fmt.Errorf("snapshot: failed to parse snapshot state copy: %w (retry with force)", err)
+			}
+		} else {
+			// Legacy snapshots (predating SpecFP) parse fine but record an
+			// empty fingerprint — only this case skips the guard below.
 			snapSpecFP = probe.SpecFP
 		}
 	}

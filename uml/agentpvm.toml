@@ -170,7 +170,7 @@ auto_resume  = false     # when true, next API activity thaws Suspended -> Runni
 
 # --- security & host isolation baseline (gVisor Gofer jail & seccomp-bpf) ---
 [security]
-allow_insecure_degraded = true
+allow_insecure_degraded = false
 enforce_host_seccomp    = true
 enforce_landlock        = true
 

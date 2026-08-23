@@ -289,10 +289,13 @@ type SecuritySpec struct {
 	// the host kernel or environment. Defaults to false (fail-closed).
 	AllowInsecureDegraded bool `toml:"allow_insecure_degraded" json:"allow_insecure_degraded"`
 	// EnforceHostSeccomp enables host-level seccomp-bpf filtering for the UML process.
-	// Defaults to true when supported.
+	// Defaults to true when the key is absent from the TOML: LoadFile/LoadString
+	// materialize the default via toml.MetaData (a plain bool cannot tell "unset"
+	// apart from an explicit false). An explicit `enforce_host_seccomp = false`
+	// is honored. TaskSpecs built programmatically (no TOML decode) must set it.
 	EnforceHostSeccomp bool `toml:"enforce_host_seccomp" json:"enforce_host_seccomp"`
 	// EnforceLandlock enables Landlock LSM path lockdown for hostfs volumes.
-	// Defaults to true when supported.
+	// Same defaulting rule as EnforceHostSeccomp: true unless explicitly set.
 	EnforceLandlock bool `toml:"enforce_landlock" json:"enforce_landlock"`
 }
 
@@ -377,6 +380,7 @@ func LoadFile(path string) (*TaskSpec, error) {
 	if err != nil {
 		return nil, fmt.Errorf("spec: parse %s: %w", path, err)
 	}
+	applySecurityDefaults(&s, md)
 	if undecoded := md.Undecoded(); len(undecoded) > 0 {
 		// Unknown keys are a config-error signal (typo, stale field). Surface them.
 		return nil, fmt.Errorf("spec: unknown keys in %s: %v", path, undecoded)
@@ -387,6 +391,22 @@ func LoadFile(path string) (*TaskSpec, error) {
 	return &s, nil
 }
 
+// applySecurityDefaults materializes the documented "default true" for the
+// host-enforcement toggles ONLY when the key was absent from the TOML — a
+// plain bool zero value cannot distinguish "unset" from "explicit false"
+// after decode, so without this a config that simply omits the [security]
+// keys would silently launch WITHOUT seccomp/Landlock enforcement.
+// container.StartTask consumes these fields verbatim (jail.CheckSecurity and
+// SetupJail), so they must be correct coming out of the loader.
+func applySecurityDefaults(s *TaskSpec, md toml.MetaData) {
+	if !md.IsDefined("security", "enforce_host_seccomp") {
+		s.Security.EnforceHostSeccomp = true
+	}
+	if !md.IsDefined("security", "enforce_landlock") {
+		s.Security.EnforceLandlock = true
+	}
+}
+
 // LoadString parses and validates a TaskSpec from an in-memory TOML string.
 // Used by the /api/tasks/load-spec endpoint when the UI submits content directly.
 func LoadString(content string) (*TaskSpec, error) {
@@ -395,6 +415,7 @@ func LoadString(content string) (*TaskSpec, error) {
 	if err != nil {
 		return nil, fmt.Errorf("spec: parse: %w", err)
 	}
+	applySecurityDefaults(&s, md)
 	if undecoded := md.Undecoded(); len(undecoded) > 0 {
 		return nil, fmt.Errorf("spec: unknown keys: %v", undecoded)
 	}
