@@ -53,25 +53,29 @@ const displayedLogs = computed(() => {
 })
 
 // Tail the logs through the shared usePoll helper (in-flight dedup,
-// hidden-tab pause). Fetch errors stay in-page like before: rawLogs carries
-// the message, so fn deliberately never rejects.
+// hidden-tab pause, error backoff). Fetch errors still surface in-page via
+// rawLogs, but the callback MUST rethrow: usePoll only engages its shared
+// failure backoff (fails/retryAt doubling) when fn rejects — swallowing the
+// error would poll a dead container at full rate forever.
 const { refresh: fetchLogs } = usePoll(async () => {
+  let res
   try {
-    const res = await fetch(`/api/containers/${route.params.id}/logs`)
-    if (res.ok) {
-      rawLogs.value = await res.text()
-      if (autoScroll.value) {
-        nextTick(() => {
-          if (logContainer.value) {
-            logContainer.value.scrollTop = logContainer.value.scrollHeight
-          }
-        })
-      }
-    } else {
-      rawLogs.value = "No logs available or container is dead."
-    }
+    res = await fetch(`/api/containers/${route.params.id}/logs`)
   } catch (e) {
     rawLogs.value = "Error fetching logs."
+    throw e // let usePoll record the failure and back off
+  }
+  if (!res.ok) {
+    rawLogs.value = "No logs available or container is dead."
+    throw new Error(`log fetch failed: HTTP ${res.status}`) // same backoff path
+  }
+  rawLogs.value = await res.text()
+  if (autoScroll.value) {
+    nextTick(() => {
+      if (logContainer.value) {
+        logContainer.value.scrollTop = logContainer.value.scrollHeight
+      }
+    })
   }
 }, 2000)
 

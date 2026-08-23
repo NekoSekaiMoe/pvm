@@ -147,9 +147,14 @@ EOF
 cat "$TMP/agentpvm_run.log" | grep -q "Loaded TaskSpec" || fail "TaskSpec not loaded"
 
 # Verify Audit Ledger recorded the security degraded warning
+# The ledger dir name IS the task id (audit.Open(<root>/<task>/ledger.jsonl)),
+# so this file is already task-scoped; still assert the Record fields
+# explicitly: Action=security:degraded_warning on a line tied to this task.
 LEDGER_FILE="$PVM_AUDIT_ROOT/audit-task-degraded/ledger.jsonl"
 [ -f "$LEDGER_FILE" ] || fail "audit ledger not found at $LEDGER_FILE"
 grep -q "taskspec loaded" "$LEDGER_FILE" || fail "ledger missing taskspec record"
+grep -q '"action":"security:degraded_warning"' "$LEDGER_FILE" || fail "ledger missing security:degraded_warning record"
+grep '"action":"security:degraded_warning"' "$LEDGER_FILE" | grep -q '"task":"audit-task-degraded"' || fail "degraded_warning record not attributed to audit-task-degraded"
 
 # Verify umlctl start with -insecure-allow-degraded
 "$TMP/umlctl" start -name "umlctl-sec-test" -kernel "$TMP/fake_kernel" -rootfs "$PVM_IMAGE_ROOT/rootfs.img" -insecure-allow-degraded > "$TMP/umlctl_run.log" 2>&1 || fail "umlctl start failed: $(cat "$TMP/umlctl_run.log")"

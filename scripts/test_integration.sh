@@ -66,7 +66,7 @@ if [ "$START_RC" -ne 0 ]; then
         echo "FAILED: umlctl start still alive after ${BOOT_TIMEOUT}s — HANG, not a clean failure."
     fi
     echo "FAILED: umlctl start exited $START_RC — $UMLCTL_LOG contents:"
-    cat "$UMLCTL_LOG"
+    cat "$UMLCTL_LOG" 2>/dev/null || echo "(no umlctl log)"
     echo "---- UML console ($CONSOLE_LOG) ----"
     sudo cat "$CONSOLE_LOG" 2>/dev/null || echo "(no console.log found)"
     echo "---- container state.json ----"
@@ -75,12 +75,33 @@ if [ "$START_RC" -ne 0 ]; then
     sudo ps -eo pid,ppid,stat,wchan:32,cmd | grep -E 'bin/linux|umlctl' | grep -v grep || echo "(none)"
     # Kill leftovers (the SIGTERM above may have orphaned guest host-side
     # processes — they survive Pdeathsig, which only binds monitor->umlctl).
-    sudo pkill -9 -x linux 2>/dev/null || true
+    # SCOPED cleanup: only the UML kernel process THIS test launched. The
+    # kernel's host PID is recorded in the container's state.json ("pid"
+    # field, written by internal/container Start after Launcher.Start).
+    # Never pkill by the global process name "linux" — that would SIGKILL
+    # unrelated UML instances from other jobs sharing this host.
+    STATE_JSON=/var/lib/uml-container/containers/integration-test/state.json
+    UML_PID=$(sudo grep -o '"pid"[[:space:]]*:[[:space:]]*[0-9]\+' "$STATE_JSON" 2>/dev/null | grep -o '[0-9]\+$' || true)
+    if [ -n "$UML_PID" ] && [ "$UML_PID" -gt 0 ] 2>/dev/null; then
+        # Guard against stale state.json / PID reuse: only kill if the live
+        # process really is our UML kernel (bin/linux on its cmdline).
+        if sudo grep -qaz "bin/linux" "/proc/$UML_PID/cmdline" 2>/dev/null; then
+            for CHILD in $(sudo pgrep -P "$UML_PID" 2>/dev/null); do
+                sudo kill -9 "$CHILD" 2>/dev/null || true
+            done
+            sudo kill -9 "$UML_PID" 2>/dev/null || true
+            echo "killed leftover UML kernel pid $UML_PID (integration-test only)"
+        else
+            echo "(pid $UML_PID from state.json is not our UML kernel; skipping kill)"
+        fi
+    else
+        echo "(no UML pid recorded in state.json; nothing to kill)"
+    fi
     exit 1
 fi
 
 echo "---- umlctl output ($UMLCTL_LOG) ----"
-cat "$UMLCTL_LOG"
+cat "$UMLCTL_LOG" 2>/dev/null || echo "(no umlctl log)"
 echo "---- UML console ($CONSOLE_LOG) ----"
 sudo cat "$CONSOLE_LOG" 2>/dev/null || echo "(no console.log found)"
 
