@@ -24,6 +24,7 @@ go_test(
     srcs = [
         "jail_test.go",
         "landlock_test.go",
+        "process_flags_test.go",
         "process_test.go",
         "seccomp_test.go",
     ],
