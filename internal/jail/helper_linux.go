@@ -72,6 +72,22 @@ func runJailHelper() error {
 	if len(argv) == 0 {
 		argv = []string{cfg.Target}
 	}
+	// The UML kernel's main() (arch/um/os-Linux/main.c) calls
+	// personality(PER_LINUX | ADDR_NO_RANDOMIZE) and, when that CHANGES the
+	// persona, re-execs itself via readlink("/proc/self/exe") + execve. The
+	// jail has no /proc mounted (by design: no CLONE_NEWPID, so a mounted
+	// procfs would expose host processes), so that readlink gets ENOENT and
+	// the kernel dies instantly with "readlink failure: No such file or
+	// directory" before printing a single boot line. Pre-setting the exact
+	// persona the kernel asks for makes it skip the re-exec entirely
+	// (personality is inherited across execve, which is the mechanism UML
+	// itself relies on). This is fail-closed: without it the workload is
+	// guaranteed to die in the jail with a cryptic error.
+	//   PER_LINUX = 0x0000, ADDR_NO_RANDOMIZE = 0x0040000 (linux/personality.h)
+	if _, _, errno := unix.Syscall(unix.SYS_PERSONALITY, 0x0040000, 0, 0); errno != 0 {
+		return fmt.Errorf("disable ASLR for jailed workload (personality ADDR_NO_RANDOMIZE): %w", errno)
+	}
+
 	if err := syscall.Exec(jailEntryPath, argv, env); err != nil {
 		return fmt.Errorf("exec workload %s (in-jail %s): %w", cfg.Target, jailEntryPath, err)
 	}

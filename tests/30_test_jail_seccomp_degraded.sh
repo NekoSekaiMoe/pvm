@@ -116,8 +116,10 @@ enforce_landlock = true
 EOF
 
 # In unprivileged environment where landlock/mountns is not enabled, running strict must fail-closed
+HOST_DEGRADED=0
 if ! "$TMP/agentpvm" run -config "$SPEC_STRICT" -kernel "$TMP/fake_kernel" > "$TMP/strict_run.log" 2>&1; then
     grep -q "fail-closed" "$TMP/strict_run.log" || fail "expected fail-closed error in strict mode: $(cat "$TMP/strict_run.log")"
+    HOST_DEGRADED=1
     echo "   non-root strict fail-closed verified ✓"
 else
     echo "   host has full security capabilities (strict mode succeeded) ✓"
@@ -153,8 +155,17 @@ cat "$TMP/agentpvm_run.log" | grep -q "Loaded TaskSpec" || fail "TaskSpec not lo
 LEDGER_FILE="$PVM_AUDIT_ROOT/audit-task-degraded/ledger.jsonl"
 [ -f "$LEDGER_FILE" ] || fail "audit ledger not found at $LEDGER_FILE"
 grep -q "taskspec loaded" "$LEDGER_FILE" || fail "ledger missing taskspec record"
-grep -q '"action":"security:degraded_warning"' "$LEDGER_FILE" || fail "ledger missing security:degraded_warning record"
-grep '"action":"security:degraded_warning"' "$LEDGER_FILE" | grep -q '"task":"audit-task-degraded"' || fail "degraded_warning record not attributed to audit-task-degraded"
+# The degraded_warning record is only emitted when the host actually missed a
+# baseline (secRep.Degraded). On a fully capable host (CI runners have
+# seccomp+landlock+namespaces) the degraded spec boots with nothing bypassed,
+# so the warning is correctly absent — assert it only when 3a failed closed.
+if [ "$HOST_DEGRADED" -eq 1 ]; then
+    grep -q '"action":"security:degraded_warning"' "$LEDGER_FILE" || fail "ledger missing security:degraded_warning record"
+    grep '"action":"security:degraded_warning"' "$LEDGER_FILE" | grep -q '"task":"audit-task-degraded"' || fail "degraded_warning record not attributed to audit-task-degraded"
+    echo "   degraded host: security:degraded_warning ledger record verified ✓"
+else
+    echo "   full-capability host: no degraded_warning expected (nothing bypassed) ✓"
+fi
 
 # Verify umlctl start with -insecure-allow-degraded
 "$TMP/umlctl" start -name "umlctl-sec-test" -kernel "$TMP/fake_kernel" -rootfs "$PVM_IMAGE_ROOT/rootfs.img" -insecure-allow-degraded > "$TMP/umlctl_run.log" 2>&1 || fail "umlctl start failed: $(cat "$TMP/umlctl_run.log")"
