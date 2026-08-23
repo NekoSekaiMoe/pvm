@@ -113,14 +113,13 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted, onUnmounted } from 'vue'
-import { apiFetch } from '~/composables/useApi'
+import { ref, computed } from 'vue'
+import { apiFetch, usePoll } from '~/composables/useApi'
 
 const containers = ref([])
 const searchQuery = ref('')
 const newContainer = ref({ name: '', rootfs: 'alpine', mem: '512M', cpu: 0 })
 const snapshottingIds = ref(new Set())
-let timer
 
 const snapshotInFlight = (id) => snapshottingIds.value.has(id)
 
@@ -133,15 +132,14 @@ const filteredContainers = computed(() => {
   return containers.value.filter(c => c.id && c.id.toLowerCase().includes(q))
 })
 
-const fetchContainers = async () => {
-  try {
-    // API guarantees [] (never null) for empty lists — regression-locked by
-    // TestAPI_EmptyListsAreArraysNotNull; assign directly like approvals.vue.
-    containers.value = await apiFetch('/api/containers')
-  } catch (e) {
-    console.error(e)
-  }
-}
+// Poll the container list through the shared usePoll helper (in-flight
+// dedup, hidden-tab pause, error backoff); refresh doubles as the
+// imperative fetch used after mutations.
+// API guarantees [] (never null) for empty lists — regression-locked by
+// TestAPI_EmptyListsAreArraysNotNull; assign directly like approvals.vue.
+const { refresh: fetchContainers } = usePoll(async () => {
+  containers.value = await apiFetch('/api/containers')
+}, 2000)
 
 const startContainer = async () => {
   if (!newContainer.value.name) return
@@ -217,12 +215,4 @@ const snapshotContainer = async (id) => {
   }
 }
 
-onMounted(() => {
-  fetchContainers()
-  timer = setInterval(fetchContainers, 2000)
-})
-
-onUnmounted(() => {
-  clearInterval(timer)
-})
 </script>

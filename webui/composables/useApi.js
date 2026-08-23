@@ -38,16 +38,46 @@ export async function apiFetch(path, opts = {}) {
 }
 
 // Polling helper: returns a reactive ref + starts/stops a timer.
+// Three guards keep a slow or unreachable API from wasting requests:
+//   - in-flight dedup: ticks are skipped while a fetch is pending, so an
+//     endpoint slower than the interval never piles up concurrent requests.
+//   - hidden-tab pause: ticks are skipped while the tab is backgrounded.
+//   - error backoff: each consecutive failure doubles the effective interval
+//     (capped at 8x) until a fetch succeeds again.
+// refresh() shares the in-flight guard: a refresh issued while a poll fetch
+// is still pending is dropped and the data converges on the next tick.
 import { ref, onMounted, onUnmounted } from 'vue'
 export function usePoll(fn, ms = 2000) {
   const data = ref(null)
   const error = ref(null)
   let timer
+  let inflight = false
+  let fails = 0
+  let retryAt = 0
   const run = async () => {
-    try { data.value = await fn(); error.value = null }
-    catch (e) { error.value = e.message }
+    if (inflight) return
+    inflight = true
+    try {
+      data.value = await fn()
+      error.value = null
+      fails = 0
+      retryAt = 0
+    } catch (e) {
+      error.value = e.message
+      fails = Math.min(fails + 1, 3)
+      retryAt = Date.now() + ms * Math.min(2 ** fails, 8)
+    } finally {
+      inflight = false
+    }
   }
-  onMounted(() => { run(); timer = setInterval(run, ms) })
+  onMounted(() => {
+    run()
+    timer = setInterval(() => {
+      if (typeof document !== 'undefined' && document.hidden) return
+      if (Date.now() < retryAt) return
+      run()
+    }, ms)
+  })
   onUnmounted(() => clearInterval(timer))
   return { data, error, refresh: run }
 }

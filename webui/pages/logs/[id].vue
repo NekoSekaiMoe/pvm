@@ -30,15 +30,15 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted, onUnmounted, nextTick } from 'vue'
+import { ref, computed, nextTick } from 'vue'
 import { useRoute } from 'vue-router'
+import { usePoll } from '~/composables/useApi'
 
 const route = useRoute()
 const rawLogs = ref('Loading logs...')
 const filterKeyword = ref('')
 const autoScroll = ref(true)
 const logContainer = ref(null)
-let timer
 
 const lineCount = computed(() => rawLogs.value ? rawLogs.value.split('\n').length : 0)
 const logSizeKB = computed(() => rawLogs.value ? (rawLogs.value.length / 1024).toFixed(1) : 0)
@@ -52,7 +52,10 @@ const displayedLogs = computed(() => {
     .join('\n')
 })
 
-const fetchLogs = async () => {
+// Tail the logs through the shared usePoll helper (in-flight dedup,
+// hidden-tab pause). Fetch errors stay in-page like before: rawLogs carries
+// the message, so fn deliberately never rejects.
+const { refresh: fetchLogs } = usePoll(async () => {
   try {
     const res = await fetch(`/api/containers/${route.params.id}/logs`)
     if (res.ok) {
@@ -70,7 +73,7 @@ const fetchLogs = async () => {
   } catch (e) {
     rawLogs.value = "Error fetching logs."
   }
-}
+}, 2000)
 
 const copyLogs = async () => {
   try {
@@ -91,14 +94,6 @@ const downloadLogs = () => {
   URL.revokeObjectURL(url)
 }
 
-onMounted(() => {
-  fetchLogs()
-  timer = setInterval(fetchLogs, 2000)
-})
-
-onUnmounted(() => {
-  clearInterval(timer)
-})
 </script>
 
 <style scoped>
