@@ -5,6 +5,7 @@ go_library(
     srcs = ["launcher.go"],
     importpath = "uml-container/internal/uml",
     visibility = ["//:__subpackages__"],
+    deps = ["//internal/jail"],
 )
 
 go_test(

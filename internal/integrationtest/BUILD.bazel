@@ -17,6 +17,7 @@ go_test(
         "//internal/container",
         "//internal/identity",
         "//internal/incident",
+        "//internal/jail",
         "//internal/network/egress",
         "//internal/policy",
         "//internal/pool",

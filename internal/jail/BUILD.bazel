@@ -1,0 +1,30 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "jail",
+    srcs = [
+        "jail.go",
+        "landlock_linux.go",
+        "landlock_other.go",
+        "probe_linux.go",
+        "probe_other.go",
+        "process_linux.go",
+        "process_other.go",
+        "seccomp_linux.go",
+        "seccomp_other.go",
+        "syscall_table_linux.go",
+    ],
+    importpath = "uml-container/internal/jail",
+    visibility = ["//:__subpackages__"],
+    deps = ["@org_golang_x_sys//unix"],
+)
+
+go_test(
+    name = "jail_test",
+    srcs = [
+        "jail_test.go",
+        "landlock_test.go",
+        "seccomp_test.go",
+    ],
+    embed = [":jail"],
+)
