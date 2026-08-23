@@ -547,11 +547,12 @@ func snapshotCmd(args []string) {
 		fmt.Printf("Cloned %s -> %s successfully\n", srcID, dstID)
 	case "rollback":
 		if len(args) < 3 {
-			fmt.Println("Usage: agentpvm snapshot rollback <id> <snap_id>")
+			fmt.Println("Usage: agentpvm snapshot rollback <id> <snap_id> [force]")
 			os.Exit(1)
 		}
 		id, snapID := args[1], args[2]
-		if err := snapshot.Rollback(id, snapID); err != nil {
+		force := len(args) >= 4 && args[3] == "force"
+		if err := snapshot.RollbackWithForce(id, snapID, force); err != nil {
 			fmt.Printf("Rollback failed: %v\n", err)
 			os.Exit(1)
 		}

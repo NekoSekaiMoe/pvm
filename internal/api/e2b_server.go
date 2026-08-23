@@ -304,6 +304,7 @@ func NewE2BServer() (*echo.Echo, error) {
 		}
 		var req struct {
 			SnapshotID string `json:"snapshot_id"`
+			Force      bool   `json:"force"`
 		}
 		if err := c.Bind(&req); err != nil || req.SnapshotID == "" {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": "snapshot_id is required"})
@@ -313,7 +314,10 @@ func NewE2BServer() (*echo.Echo, error) {
 		}
 		release := taskLock(id)
 		defer release()
-		if err := snapshot.Rollback(id, req.SnapshotID); err != nil {
+		if err := snapshot.RollbackWithForce(id, req.SnapshotID, req.Force); err != nil {
+			if errors.Is(err, snapshot.ErrSpecMismatch) {
+				return c.JSON(http.StatusConflict, map[string]string{"error": err.Error()})
+			}
 			if strings.Contains(err.Error(), "not found") {
 				return c.JSON(http.StatusNotFound, map[string]string{"error": err.Error()})
 			}
@@ -626,6 +630,7 @@ func NewE2BServer() (*echo.Echo, error) {
 		}
 		var req struct {
 			SnapshotID string `json:"snapshot_id"`
+			Force      bool   `json:"force"`
 		}
 		if err := c.Bind(&req); err != nil || req.SnapshotID == "" {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": "snapshot_id is required"})
@@ -635,7 +640,10 @@ func NewE2BServer() (*echo.Echo, error) {
 		}
 		release := taskLock(id)
 		defer release()
-		if err := snapshot.Rollback(id, req.SnapshotID); err != nil {
+		if err := snapshot.RollbackWithForce(id, req.SnapshotID, req.Force); err != nil {
+			if errors.Is(err, snapshot.ErrSpecMismatch) {
+				return c.JSON(http.StatusConflict, map[string]string{"error": err.Error()})
+			}
 			if strings.Contains(err.Error(), "not found") {
 				return c.JSON(http.StatusNotFound, map[string]string{"error": err.Error()})
 			}

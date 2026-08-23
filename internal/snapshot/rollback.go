@@ -3,6 +3,7 @@ package snapshot
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -15,9 +16,22 @@ import (
 
 var rollbackMu sync.Mutex
 
+// ErrSpecMismatch is returned by Rollback when the task's CURRENT TaskSpec
+// fingerprint differs from the one recorded alongside the snapshot. Rolling
+// back would pair an old disk with a new configuration — the disk-edition
+// analog of CubeShim's start_vm config guard. Callers may bypass it only by
+// passing force=true.
+var ErrSpecMismatch = errors.New("snapshot: spec fingerprint mismatch")
+
 // Rollback restores a container's filesystem state and FSM state back to a
-// specified historical EventSnapshot.
+// specified historical EventSnapshot, refusing on spec mismatch.
 func Rollback(taskID, snapshotID string) error {
+	return RollbackWithForce(taskID, snapshotID, false)
+}
+
+// RollbackWithForce is Rollback with an explicit override for the spec
+// alignment guard.
+func RollbackWithForce(taskID, snapshotID string, force bool) error {
 	if !validContainerID.MatchString(taskID) {
 		return fmt.Errorf("snapshot: invalid task id %q", taskID)
 	}
@@ -53,6 +67,24 @@ func Rollback(taskID, snapshotID string) error {
 		return fmt.Errorf("snapshot: failed to parse snapshot metadata: %w", err)
 	}
 
+	// Spec alignment guard (CubeShim start_vm pattern, disk edition): refuse
+	// to roll a task whose current spec fingerprint differs from the one
+	// recorded in the snapshot's state copy — "old snapshot + new config"
+	// silently misconfigures the restored task. Runs BEFORE any mutation, so
+	// a refusal leaves both disk and state untouched. Legacy containers with
+	// no fingerprint on either side skip the check.
+	snapSpecFP := ""
+	if stateBytes, err := os.ReadFile(filepath.Join(targetSnapDir, "state.json")); err == nil {
+		var probe state.ContainerState
+		if json.Unmarshal(stateBytes, &probe) == nil {
+			snapSpecFP = probe.SpecFP
+		}
+	}
+	currentState, _ := state.LoadState(taskID)
+	if !force && snapSpecFP != "" && currentState != nil && currentState.SpecFP != "" && snapSpecFP != currentState.SpecFP {
+		return fmt.Errorf("%w: snapshot spec %q != current spec %q (retry with force)", ErrSpecMismatch, snapSpecFP, currentState.SpecFP)
+	}
+
 	// 2. Restore disk overlay if present in snapshot
 	snapOverlay := filepath.Join(targetSnapDir, "overlay.qcow2")
 	currOverlay := filepath.Join(dir, "overlay.qcow2")
@@ -80,8 +112,8 @@ func Rollback(taskID, snapshotID string) error {
 		}
 	}
 
-	// 3. Restore state machine
-	currentState, _ := state.LoadState(taskID)
+	// 3. Restore state machine (currentState was loaded pre-mutation by the
+	// spec guard; the overlay restore above does not touch state.json).
 	fromStatus := state.StatusRunning
 	if currentState != nil {
 		fromStatus = currentState.Status
