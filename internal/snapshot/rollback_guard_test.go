@@ -109,6 +109,12 @@ func TestRollback_MakesOverlayStandalone(t *testing.T) {
 	task := "rb-task"
 	dir := filepath.Join(root, task)
 	buildOverlayChain(t, dir)
+	// Rollback fails closed when the CURRENT state is missing; give the
+	// task a legacy-shaped state (parses cleanly, no SpecFP) so this
+	// overlay-mechanics test reaches the restore path.
+	if err := state.SaveState(task, &state.ContainerState{ID: task, Name: task, Status: state.StatusRunning}); err != nil {
+		t.Fatal(err)
+	}
 	snapOv := writeSnapshot(t, dir, "snap-rb-1", filepath.Join(dir, "overlay.qcow2"))
 
 	if err := Rollback(task, "snap-rb-1"); err != nil {

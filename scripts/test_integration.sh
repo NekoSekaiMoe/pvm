@@ -57,6 +57,11 @@ CONSOLE_LOG=/var/lib/uml-container/containers/integration-test/logs/console.log
 # timed out). BOOT_TIMEOUT must stay comfortably below the workflow step's
 # timeout-minutes budget so the dumps below actually get emitted.
 BOOT_TIMEOUT=480
+# Canonical path of the kernel binary THIS test launches; the failure
+# cleanup below compares /proc/<pid>/exe against it to verify process
+# identity before killing (a cmdline substring match is spoofable by any
+# process merely mentioning "bin/linux" in its argv).
+KERNEL_REAL=$(realpath ./bin/linux)
 set +e
 sudo timeout -k 15 "${BOOT_TIMEOUT}" ./bin/umlctl start --name integration-test --kernel ./bin/linux --rootfs "$(pwd)/rootfs.img" --init /init.sh > "$UMLCTL_LOG" 2>&1
 START_RC=$?
@@ -83,16 +88,35 @@ if [ "$START_RC" -ne 0 ]; then
     STATE_JSON=/var/lib/uml-container/containers/integration-test/state.json
     UML_PID=$(sudo grep -o '"pid"[[:space:]]*:[[:space:]]*[0-9]\+' "$STATE_JSON" 2>/dev/null | grep -o '[0-9]\+$' || true)
     if [ -n "$UML_PID" ] && [ "$UML_PID" -gt 0 ] 2>/dev/null; then
-        # Guard against stale state.json / PID reuse: only kill if the live
-        # process really is our UML kernel (bin/linux on its cmdline).
-        if sudo grep -qaz "bin/linux" "/proc/$UML_PID/cmdline" 2>/dev/null; then
+        # Guard against stale state.json / PID reuse: only kill once the
+        # live process's identity is verified — never by a loose cmdline
+        # substring (any process mentioning "bin/linux" in argv would
+        # match). Two constrained checks, either suffices:
+        #   1. canonical /proc/<pid>/exe equals THIS test's kernel binary
+        #      (or the jail re-exec entry that bind-mounts it);
+        #   2. a strict argv contract: argv[0] is exactly the expected
+        #      kernel invocation AND argv carries THIS test's rootfs path.
+        PROC_EXE=$(sudo readlink -f "/proc/$UML_PID/exe" 2>/dev/null || true)
+        JAIL_ENTRY=/tmp/pvm-jails/integration-test/root/pvm/entry
+        ARGV0=$(sudo sh -c 'tr "\0" "\n" < "$1" | head -n1' _ "/proc/$UML_PID/cmdline" 2>/dev/null || true)
+        ROOTFS_REAL=$(realpath ./rootfs.img)
+        IS_OURS=0
+        case "$PROC_EXE" in
+            "$KERNEL_REAL"|"$JAIL_ENTRY") IS_OURS=1 ;;
+        esac
+        if [ "$IS_OURS" -eq 0 ] && [ -n "$ARGV0" ] \
+            && { [ "$ARGV0" = "./bin/linux" ] || [ "$ARGV0" = "$JAIL_ENTRY" ]; } \
+            && sudo grep -qazF "$ROOTFS_REAL" "/proc/$UML_PID/cmdline" 2>/dev/null; then
+            IS_OURS=1
+        fi
+        if [ "$IS_OURS" -eq 1 ]; then
             for CHILD in $(sudo pgrep -P "$UML_PID" 2>/dev/null); do
                 sudo kill -9 "$CHILD" 2>/dev/null || true
             done
             sudo kill -9 "$UML_PID" 2>/dev/null || true
             echo "killed leftover UML kernel pid $UML_PID (integration-test only)"
         else
-            echo "(pid $UML_PID from state.json is not our UML kernel; skipping kill)"
+            echo "(pid $UML_PID from state.json failed identity check (exe='${PROC_EXE:-unknown}'); skipping kill)"
         fi
     else
         echo "(no UML pid recorded in state.json; nothing to kill)"

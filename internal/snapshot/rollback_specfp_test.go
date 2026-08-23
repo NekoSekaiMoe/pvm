@@ -183,6 +183,64 @@ func TestRollbackSpecGuard(t *testing.T) {
 	}
 }
 
+// TestRollbackCurrentStateFailClosed pins the current-state side of the
+// guard: a missing or corrupt CURRENT state.json must abort a non-forced
+// rollback before any mutation (the load error was previously discarded,
+// silently skipping the spec guard), while force mode still recovers.
+func TestRollbackCurrentStateFailClosed(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(t *testing.T, statePath string)
+	}{
+		{
+			name: "missing current state",
+			mutate: func(t *testing.T, statePath string) {
+				t.Helper()
+				if err := os.Remove(statePath); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "corrupt current state",
+			mutate: func(t *testing.T, statePath string) {
+				t.Helper()
+				if err := os.WriteFile(statePath, []byte("{not json"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			newRollbackTask(t, "fp-A")
+			snap, err := CreateEventSnapshot("rbguard1", "evt1", "hash", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			dir, err := state.ContainerDir("rbguard1")
+			if err != nil {
+				t.Fatal(err)
+			}
+			tc.mutate(t, filepath.Join(dir, "state.json"))
+
+			err = RollbackWithForce("rbguard1", snap.ID, false)
+			if err == nil {
+				t.Fatal("expected non-forced rollback to fail on unloadable current state")
+			}
+			if !strings.Contains(err.Error(), "failed to load current state") {
+				t.Fatalf("expected 'failed to load current state', got %v", err)
+			}
+
+			// Force mode must still recover from the same broken state.
+			if err := RollbackWithForce("rbguard1", snap.ID, true); err != nil {
+				t.Fatalf("forced rollback should tolerate unloadable current state: %v", err)
+			}
+		})
+	}
+}
+
 // TestRollbackLegacyNoFingerprintSkipsGuard covers the legacy compatibility
 // path: snapshots whose state copy parses cleanly but predates SpecFP must
 // skip the guard rather than lock the task out of rollback.

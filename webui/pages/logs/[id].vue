@@ -6,6 +6,7 @@
         <p class="muted" style="font-size:0.875rem;">Lines: {{ lineCount }} | Size: {{ logSizeKB }} KB</p>
       </div>
       <div style="display:flex;gap:0.5rem;align-items:center;">
+        <button class="btn btn-primary" @click="fetchLogs" style="font-size:0.85rem;">Refresh</button>
         <button class="btn btn-primary" @click="copyLogs" style="font-size:0.85rem;">Copy Logs</button>
         <button class="btn btn-primary" @click="downloadLogs" style="font-size:0.85rem;background:var(--success);">Download</button>
         <NuxtLink to="/" class="btn btn-primary" style="text-decoration:none;font-size:0.85rem;">&larr; Back</NuxtLink>

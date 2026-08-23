@@ -11,6 +11,8 @@ import (
 
 // TestLandlockHelperProcess is invoked as a subprocess so that Landlock lockdown
 // is applied ONLY to the child process and does NOT contaminate the parent test runner process.
+// LANDLOCK_SCENARIO selects which assertion this run performs so each
+// scenario gets its own subtest (and its own exit code to diagnose).
 func TestLandlockHelperProcess(t *testing.T) {
 	if os.Getenv("GO_WANT_LANDLOCK_HELPER") != "1" {
 		return
@@ -20,13 +22,9 @@ func TestLandlockHelperProcess(t *testing.T) {
 	if err := ApplyLandlockLockdown([]string{allowed}); err != nil {
 		os.Exit(2)
 	}
-	// Writing inside the allowed directory must succeed.
-	testFile := filepath.Join(allowed, "test.txt")
-	if err := os.WriteFile(testFile, []byte("ok"), 0644); err != nil {
-		os.Exit(3)
-	}
-	// Writing inside the denied directory must fail with EACCES.
-	if denied != "" {
+	switch os.Getenv("LANDLOCK_SCENARIO") {
+	case "denied":
+		// Writing inside the denied directory must fail with EACCES.
 		deniedFile := filepath.Join(denied, "test.txt")
 		err := os.WriteFile(deniedFile, []byte("nope"), 0644)
 		if err == nil {
@@ -34,6 +32,12 @@ func TestLandlockHelperProcess(t *testing.T) {
 		}
 		if !errors.Is(err, syscall.EACCES) {
 			os.Exit(5) // write failed, but not with EACCES
+		}
+	default: // "allowed"
+		// Writing inside the allowed directory must succeed.
+		testFile := filepath.Join(allowed, "test.txt")
+		if err := os.WriteFile(testFile, []byte("ok"), 0644); err != nil {
+			os.Exit(3)
 		}
 	}
 	os.Exit(0)
@@ -55,14 +59,29 @@ func TestLandlock_ApplyAllowedPaths(t *testing.T) {
 		t.Fatalf("mkdir denied: %v", err)
 	}
 
-	cmd := exec.Command(os.Args[0], "-test.run=^TestLandlockHelperProcess$")
-	cmd.Env = append(os.Environ(),
-		"GO_WANT_LANDLOCK_HELPER=1",
-		"LANDLOCK_ALLOWED_DIR="+p1,
-		"LANDLOCK_DENIED_DIR="+denied,
-	)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("Landlock helper process failed: %v, output: %s", err, string(out))
+	cases := []struct {
+		name     string
+		scenario string
+	}{
+		{name: "write inside allowed dir succeeds", scenario: "allowed"},
+		{name: "write inside denied dir fails with EACCES", scenario: "denied"},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			// One helper subprocess per scenario so the allowed and denied
+			// paths can be diagnosed independently.
+			cmd := exec.Command(os.Args[0], "-test.run=^TestLandlockHelperProcess$")
+			cmd.Env = append(os.Environ(),
+				"GO_WANT_LANDLOCK_HELPER=1",
+				"LANDLOCK_SCENARIO="+tc.scenario,
+				"LANDLOCK_ALLOWED_DIR="+p1,
+				"LANDLOCK_DENIED_DIR="+denied,
+			)
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("Landlock helper process failed: %v, output: %s", err, string(out))
+			}
+		})
 	}
 }

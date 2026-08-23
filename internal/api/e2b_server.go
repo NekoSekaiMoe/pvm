@@ -323,19 +323,27 @@ func NewE2BServer() (*echo.Echo, error) {
 			}
 			return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		}
-		if l, lerr := audit.Open(id); lerr == nil {
-			reason := "rollback to " + req.SnapshotID
-			if req.Force {
-				reason = "forced rollback bypassing spec fingerprint guard to " + req.SnapshotID
-			}
-			_ = l.Append(audit.Record{
-				Phase:    audit.PhaseExec,
-				Subject:  "human",
-				Action:   "rollback",
-				Params:   map[string]string{"snapshot_id": req.SnapshotID, "force": strconv.FormatBool(req.Force)},
-				Decision: audit.DecisionAllow,
-				Reason:   reason,
-			})
+		// The rollback mutated disk and FSM state; the audit record is the
+		// only evidence of WHO forced it and WHY. If the ledger cannot be
+		// opened or appended, the rollback must NOT surface as a clean
+		// success — return the anomaly so the caller can reconcile.
+		l, lerr := audit.Open(id)
+		if lerr != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": fmt.Sprintf("rollback succeeded but audit ledger open failed: %v", lerr)})
+		}
+		reason := "rollback to " + req.SnapshotID
+		if req.Force {
+			reason = "forced rollback bypassing spec fingerprint guard to " + req.SnapshotID
+		}
+		if aerr := l.Append(audit.Record{
+			Phase:    audit.PhaseExec,
+			Subject:  "human",
+			Action:   "rollback",
+			Params:   map[string]string{"snapshot_id": req.SnapshotID, "force": strconv.FormatBool(req.Force)},
+			Decision: audit.DecisionAllow,
+			Reason:   reason,
+		}); aerr != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": fmt.Sprintf("rollback succeeded but audit append failed: %v", aerr)})
 		}
 		return c.JSON(http.StatusOK, map[string]string{"status": "rolled_back", "id": id, "snapshot_id": req.SnapshotID})
 	})
@@ -663,19 +671,23 @@ func NewE2BServer() (*echo.Echo, error) {
 			}
 			return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		}
-		if l, lerr := audit.Open(id); lerr == nil {
-			reason := "historical rollback to " + req.SnapshotID
-			if req.Force {
-				reason = "forced rollback bypassing spec fingerprint guard to " + req.SnapshotID
-			}
-			_ = l.Append(audit.Record{
-				Phase:    audit.PhaseExec,
-				Subject:  "human",
-				Action:   "rollback",
-				Params:   map[string]string{"snapshot_id": req.SnapshotID, "force": strconv.FormatBool(req.Force)},
-				Decision: audit.DecisionAllow,
-				Reason:   reason,
-			})
+		l, lerr := audit.Open(id)
+		if lerr != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": fmt.Sprintf("rollback succeeded but audit ledger open failed: %v", lerr)})
+		}
+		reason := "historical rollback to " + req.SnapshotID
+		if req.Force {
+			reason = "forced rollback bypassing spec fingerprint guard to " + req.SnapshotID
+		}
+		if aerr := l.Append(audit.Record{
+			Phase:    audit.PhaseExec,
+			Subject:  "human",
+			Action:   "rollback",
+			Params:   map[string]string{"snapshot_id": req.SnapshotID, "force": strconv.FormatBool(req.Force)},
+			Decision: audit.DecisionAllow,
+			Reason:   reason,
+		}); aerr != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": fmt.Sprintf("rollback succeeded but audit append failed: %v", aerr)})
 		}
 		st, err := state.LoadState(id)
 		if err != nil {

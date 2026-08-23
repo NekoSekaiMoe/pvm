@@ -22,6 +22,7 @@
 package api
 
 import (
+	"context"
 	"crypto/subtle"
 	"errors"
 	"fmt"
@@ -89,7 +90,13 @@ func resolveSandboxID(shortID string) (string, error) {
 	}
 	var matches []string
 	for _, st := range all {
-		if st.ID == shortID || strings.HasPrefix(st.ID, shortID) {
+		// An exact ID always wins, even when it is also a prefix of other
+		// task IDs — otherwise killing "web" would 409 just because
+		// "web-container" exists.
+		if st.ID == shortID {
+			return st.ID, nil
+		}
+		if strings.HasPrefix(st.ID, shortID) {
 			matches = append(matches, st.ID)
 		}
 	}
@@ -163,19 +170,39 @@ func registerE2BCompat(e *echo.Echo, apiSecretBytes []byte, autoMgr *lifecycle.M
 			Memory:      strconv.FormatInt(memBytes, 10),
 			MemoryBytes: memBytes,
 		}
-		if err := mgr.Start(c.Request().Context(), cfg); err != nil {
+		// Boot — not Start: Start blocks in Launcher.Wait until the UML
+		// process exits, which would hang the create call for the sandbox's
+		// whole lifetime. Use a background context: the request context is
+		// cancelled as soon as this handler returns, and exec.CommandContext
+		// would kill the just-booted kernel.
+		b, err := mgr.Boot(context.Background(), cfg)
+		if err != nil {
 			return c.JSON(http.StatusInternalServerError, map[string]string{"message": err.Error()})
 		}
 		// Persist SDK metadata into the task state so GET /sandboxes can
 		// reflect it back (E2B metadata is a create-time label set).
 		if len(req.Metadata) > 0 {
-			if st, lerr := state.LoadState(name); lerr == nil {
-				st.Metadata = req.Metadata
-				if serr := state.SaveState(name, st); serr != nil {
-					return c.JSON(http.StatusInternalServerError, map[string]string{"message": serr.Error()})
-				}
+			st, lerr := state.LoadState(name)
+			if lerr != nil {
+				// Boot persisted state moments ago; failing to reload it
+				// means the state dir is broken. Do not report create
+				// success for a sandbox whose metadata cannot be persisted:
+				// tear it down (kill + synchronous reap + remove) instead
+				// of leaving an orphaned VM behind.
+				teardownBootedSandbox(mgr, name, b)
+				return c.JSON(http.StatusInternalServerError, map[string]string{
+					"message": fmt.Sprintf("sandbox started but state reload failed; sandbox rolled back: %v", lerr),
+				})
+			}
+			st.Metadata = req.Metadata
+			if serr := state.SaveState(name, st); serr != nil {
+				go func() { _ = mgr.WaitExit(name, b) }()
+				return c.JSON(http.StatusInternalServerError, map[string]string{"message": serr.Error()})
 			}
 		}
+		// Reap the process and record the terminal status in the background
+		// so the create response can return immediately after startup.
+		go func() { _ = mgr.WaitExit(name, b) }()
 		return c.JSON(http.StatusOK, map[string]string{
 			"sandboxID":  name,
 			"clientID":   "",
@@ -198,6 +225,12 @@ func registerE2BCompat(e *echo.Echo, apiSecretBytes []byte, autoMgr *lifecycle.M
 		if err != nil {
 			return c.JSON(http.StatusConflict, map[string]string{"message": err.Error()})
 		}
+
+		// Serialize against a concurrent refresh of the same sandbox: the
+		// refresh handler rewrites state.json, so a delete racing it would
+		// resurrect a just-killed sandbox on disk.
+		release := taskLock(id)
+		defer release()
 
 		// Kill the process if it is really still ours (PID may be reused).
 		st, err := state.LoadState(id)
@@ -255,6 +288,10 @@ func registerE2BCompat(e *echo.Echo, apiSecretBytes []byte, autoMgr *lifecycle.M
 		if err != nil {
 			return c.JSON(http.StatusConflict, map[string]string{"message": err.Error()})
 		}
+		// Same per-sandbox lock as DELETE: the LoadState/SaveState pair below
+		// must not interleave with a concurrent delete of this sandbox.
+		release := taskLock(id)
+		defer release()
 		st, err := state.LoadState(id)
 		if err != nil {
 			return c.JSON(http.StatusInternalServerError, map[string]string{"message": err.Error()})
@@ -265,4 +302,17 @@ func registerE2BCompat(e *echo.Echo, apiSecretBytes []byte, autoMgr *lifecycle.M
 		}
 		return c.JSON(http.StatusOK, map[string]string{"message": "ok"})
 	})
+}
+
+// teardownBootedSandbox kills a just-booted sandbox whose create must fail,
+// reaps it synchronously (no background reaper owns the process yet), and
+// removes its state directory. Best-effort: the create is already failing.
+func teardownBootedSandbox(mgr *container.Manager, id string, b *container.Booted) {
+	if b != nil && b.Process != nil && b.Process.Cmd != nil && b.Process.Cmd.Process != nil {
+		_ = b.Process.Cmd.Process.Kill()
+	}
+	_ = mgr.WaitExit(id, b)
+	if dir, err := state.ContainerDir(id); err == nil {
+		_ = os.RemoveAll(dir)
+	}
 }

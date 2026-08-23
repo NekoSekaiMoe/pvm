@@ -72,20 +72,42 @@ func NewManager(launcher uml.Launcher) *Manager {
 	return &Manager{Launcher: launcher}
 }
 
+// Booted is a started legacy container: the process handle plus the jail
+// environment that must OUTLIVE it (the kernel pivot_roots into the jail
+// directory, so Cleanup may only run after the process exits — see WaitExit).
+type Booted struct {
+	Process *uml.Process
+	jail    *jail.JailEnvironment
+}
+
 // Start is the legacy entry point used by umlctl. It boots a UML kernel with
 // the given flat config, sets up cgroup limits, and records legacy status
 // (running/stopped/exited) in state.json. It does NOT engage the control planes.
+// Start blocks until the UML process exits; callers that must report "started"
+// immediately use Boot + WaitExit instead.
 func (m *Manager) Start(ctx context.Context, cfg *config.ContainerConfig) error {
-	args, err := buildLegacyArgs(ctx, cfg)
+	b, err := m.Boot(ctx, cfg)
 	if err != nil {
 		return err
+	}
+	return m.WaitExit(cfg.ID, b)
+}
+
+// Boot performs everything Start does up to and including Launcher.Start,
+// cgroup setup, and the Running state transition, then RETURNS as soon as
+// the process has started. The caller MUST eventually call WaitExit to reap
+// the process, record the terminal status, and release the jail directory.
+func (m *Manager) Boot(ctx context.Context, cfg *config.ContainerConfig) (*Booted, error) {
+	args, err := buildLegacyArgs(ctx, cfg)
+	if err != nil {
+		return nil, err
 	}
 
 	var logFile *os.File
 	if interactive, _ := ctx.Value(KeyInteractive).(bool); !interactive {
 		e := setupConsoleFile(cfg.ID, &logFile)
 		if e != nil {
-			return e
+			return nil, e
 		}
 	}
 
@@ -108,7 +130,7 @@ func (m *Manager) Start(ctx context.Context, cfg *config.ContainerConfig) error 
 	if secErr != nil {
 		st.Status = state.StatusExited
 		state.SaveState(cfg.ID, st)
-		return secErr
+		return nil, secErr
 	}
 	_ = secRep
 
@@ -125,19 +147,23 @@ func (m *Manager) Start(ctx context.Context, cfg *config.ContainerConfig) error 
 	if jailErr != nil {
 		st.Status = state.StatusExited
 		state.SaveState(cfg.ID, st)
-		return jailErr
+		return nil, jailErr
 	}
 	if jailEnv != nil {
-		defer jailEnv.Cleanup()
 		ctx = context.WithValue(ctx, uml.KeyJailEnv, jailEnv)
 	}
 
 	pid, p, err := m.Launcher.Start(ctx, cfg.Kernel, args, logFile)
 	st.PID = pid
 	if err != nil {
+		// The process never started, so nothing pivot_rooted into the jail:
+		// release it here (on success WaitExit owns the cleanup).
+		if jailEnv != nil {
+			_ = jailEnv.Cleanup()
+		}
 		st.Status = state.StatusExited
 		state.SaveState(cfg.ID, st)
-		return err
+		return nil, err
 	}
 
 	cg := cgroup.NewManager()
@@ -152,13 +178,29 @@ func (m *Manager) Start(ctx context.Context, cfg *config.ContainerConfig) error 
 		m.OnProvisioned(cfg.ID, pid, "")
 	}
 
-	err = m.Launcher.Wait(p)
-	if err != nil {
-		st.Status = state.StatusExited
-	} else {
-		st.Status = state.StatusStopped
+	return &Booted{Process: p, jail: jailEnv}, nil
+}
+
+// WaitExit blocks until a Booted process exits, records the terminal legacy
+// status, and releases the jail directory (which the running kernel used as
+// its pivot_root target, so it cannot be removed earlier). It returns the
+// process wait error. When the state directory is gone (e.g. the create
+// path tore the sandbox down), the terminal status is skipped rather than
+// recreating a phantom state.json.
+func (m *Manager) WaitExit(id string, b *Booted) error {
+	if b.jail != nil {
+		defer b.jail.Cleanup()
 	}
-	state.SaveState(cfg.ID, st)
+	err := m.Launcher.Wait(b.Process)
+	st, lerr := state.LoadState(id)
+	if lerr == nil {
+		if err != nil {
+			st.Status = state.StatusExited
+		} else {
+			st.Status = state.StatusStopped
+		}
+		state.SaveState(id, st)
+	}
 	return err
 }
 

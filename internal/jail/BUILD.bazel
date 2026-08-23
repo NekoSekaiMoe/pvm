@@ -3,6 +3,7 @@ load("@rules_go//go:def.bzl", "go_library", "go_test")
 go_library(
     name = "jail",
     srcs = [
+        "helper_linux.go",
         "jail.go",
         "landlock_linux.go",
         "landlock_other.go",

@@ -123,7 +123,12 @@ func BuildUMLSeccompFilter() []SockFilter {
 	case "arm64":
 		arch = unix.AUDIT_ARCH_AARCH64
 	default:
-		arch = 0
+		// Unsupported architecture: no AUDIT_ARCH_* constant to pin the
+		// filter to. Building anyway with arch=0 would produce a DENY-ALL
+		// filter (no real arch value equals 0, so every syscall falls into
+		// the ERRNO branch). Return an empty filter instead: the emptiness
+		// guard in ApplyHostSeccompFilter then refuses to install anything.
+		return nil
 	}
 
 	filter := []SockFilter{

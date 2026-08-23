@@ -6,8 +6,12 @@ var BlockedDangerousSyscalls = []string{
 	"bpf", "io_uring_setup", "kexec_load", "reboot", "sys_chroot", "pivot_root", "mount", "unshare", "setns",
 }
 
+// Keep this in sync with the set TestSeccomp_AllowedSyscallsIntegrity
+// (shared, no build tag) requires on EVERY platform: ptrace/mmap/mprotect
+// plus the two rt_sig* entries.
 var UMLAllowedSyscalls = []string{
-	"ptrace", "mmap", "read", "write", "open", "close", "socket",
+	"ptrace", "mmap", "mprotect", "rt_sigaction", "rt_sigprocmask",
+	"read", "write", "open", "close", "socket",
 }
 
 // IsSyscallAllowed reports whether the named syscall is in the UML allowed set.

@@ -212,62 +212,107 @@ func TestE2BCompatRefreshAndKill(t *testing.T) {
 }
 
 func TestE2BCompatMetadataRoundTrip(t *testing.T) {
-	e := newCompatEcho(t)
-
 	// The create handler itself needs a UML kernel (unavailable in CI), so
 	// persistence is exercised at the state layer: metadata written at
 	// create time must survive Save/Load and surface in the list view.
-	meta := map[string]string{"env": "prod", "team": "agent"}
-	if err := state.SaveState("sbxmeta1", &state.ContainerState{
-		ID:        "sbxmeta1",
-		Name:      "sbxmeta1",
-		Status:    state.StatusReady,
-		StartedAt: time.Now().UTC(),
-		Metadata:  meta,
-	}); err != nil {
-		t.Fatal(err)
+	cases := []struct {
+		name     string
+		id       string
+		metadata map[string]string // nil = sandbox without metadata
+	}{
+		{name: "with metadata", id: "sbxmeta1", metadata: map[string]string{"env": "prod", "team": "agent"}},
+		{name: "without metadata omits field", id: "sbxmeta2", metadata: nil},
 	}
-	st, err := state.LoadState("sbxmeta1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(st.Metadata) != len(meta) || st.Metadata["env"] != "prod" || st.Metadata["team"] != "agent" {
-		t.Fatalf("metadata not persisted: %v", st.Metadata)
-	}
-
-	rec := doCompat(t, e, http.MethodGet, "/sandboxes", "secret", "", false)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("list: expected 200, got %d: %s", rec.Code, rec.Body.String())
-	}
-	var views []map[string]any
-	if err := json.Unmarshal(rec.Body.Bytes(), &views); err != nil {
-		t.Fatalf("list body: %v", err)
-	}
-	if len(views) != 1 {
-		t.Fatalf("expected 1 view, got %d: %s", len(views), rec.Body.String())
-	}
-	got, ok := views[0]["metadata"].(map[string]any)
-	if !ok {
-		t.Fatalf("metadata missing from view: %v", views[0])
-	}
-	if got["env"] != "prod" || got["team"] != "agent" {
-		t.Fatalf("metadata mismatch in view: %v", got)
-	}
-
-	// A sandbox without metadata must omit the field (omitempty contract).
-	if err := state.SaveState("sbxmeta2", &state.ContainerState{ID: "sbxmeta2", Name: "sbxmeta2", Status: state.StatusReady}); err != nil {
-		t.Fatal(err)
-	}
-	rec = doCompat(t, e, http.MethodGet, "/sandboxes", "secret", "", false)
-	if err := json.Unmarshal(rec.Body.Bytes(), &views); err != nil {
-		t.Fatalf("list body: %v", err)
-	}
-	for _, v := range views {
-		if v["sandboxID"] == "sbxmeta2" {
-			if _, present := v["metadata"]; present {
-				t.Fatalf("metadata must be omitted when empty: %v", v)
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			// Isolated setup per subtest: fresh echo + fresh state root.
+			e := newCompatEcho(t)
+			if err := state.SaveState(tc.id, &state.ContainerState{
+				ID:        tc.id,
+				Name:      tc.id,
+				Status:    state.StatusReady,
+				StartedAt: time.Now().UTC(),
+				Metadata:  tc.metadata,
+			}); err != nil {
+				t.Fatal(err)
 			}
+
+			// Save/Load round-trip at the state layer.
+			st, err := state.LoadState(tc.id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.metadata == nil {
+				if len(st.Metadata) != 0 {
+					t.Fatalf("expected no metadata, got %v", st.Metadata)
+				}
+			} else {
+				if len(st.Metadata) != len(tc.metadata) {
+					t.Fatalf("metadata not persisted: %v", st.Metadata)
+				}
+				for k, v := range tc.metadata {
+					if st.Metadata[k] != v {
+						t.Fatalf("metadata[%q] = %q, want %q (all: %v)", k, st.Metadata[k], v, st.Metadata)
+					}
+				}
+			}
+
+			// List-response contract: present with values, or omitted entirely.
+			rec := doCompat(t, e, http.MethodGet, "/sandboxes", "secret", "", false)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("list: expected 200, got %d: %s", rec.Code, rec.Body.String())
+			}
+			var views []map[string]any
+			if err := json.Unmarshal(rec.Body.Bytes(), &views); err != nil {
+				t.Fatalf("list body: %v", err)
+			}
+			if len(views) != 1 {
+				t.Fatalf("expected 1 view, got %d: %s", len(views), rec.Body.String())
+			}
+			if views[0]["sandboxID"] != tc.id {
+				t.Fatalf("sandboxID = %v, want %s", views[0]["sandboxID"], tc.id)
+			}
+			got, present := views[0]["metadata"]
+			if tc.metadata == nil {
+				if present {
+					t.Fatalf("metadata must be omitted when empty: %v", views[0])
+				}
+				return
+			}
+			if !present {
+				t.Fatalf("metadata missing from view: %v", views[0])
+			}
+			gotMap, ok := got.(map[string]any)
+			if !ok {
+				t.Fatalf("metadata has unexpected shape: %v", got)
+			}
+			for k, v := range tc.metadata {
+				if gotMap[k] != v {
+					t.Fatalf("metadata mismatch in view: %v", gotMap)
+				}
+			}
+		})
+	}
+}
+
+func TestE2BCompatExactMatchBeatsPrefix(t *testing.T) {
+	e := newCompatEcho(t)
+
+	for _, id := range []string{"web", "web-container"} {
+		if err := state.SaveState(id, &state.ContainerState{ID: id, Name: id, Status: state.StatusReady}); err != nil {
+			t.Fatal(err)
 		}
+	}
+	// "web" is an exact ID AND a prefix of "web-container": the exact match
+	// must win (200), not collapse into an ambiguous-prefix 409.
+	rec := doCompat(t, e, http.MethodDelete, "/sandboxes/web", "secret", "", false)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("exact kill with longer sibling: expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	// The longer sibling must be untouched.
+	if _, err := state.LoadState("web-container"); err != nil {
+		t.Fatalf("web-container must survive the exact kill of web: %v", err)
 	}
 }
 

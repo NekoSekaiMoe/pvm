@@ -176,10 +176,11 @@ jobs:
           [ -d "$sub" ] || continue
           echo "----- $sub -----"
           ls -la "$sub" 2>&1 || true
-          echo "--- $sub/memory.max (cat attempt) ---"
+          echo "--- $sub/memory.max (read-only) ---"
           sudo cat "$sub/memory.max" 2>&1 || true
-          echo "--- try writing memory.max as root ---"
-          echo "9223372036854771712" | sudo tee "$sub/memory.max" >/dev/null 2>&1 && echo "write OK" || echo "write FAILED"
+          # NOTE: diagnostics must stay READ-ONLY. Writing memory.max here
+          # would mutate the limits of test processes that may still be
+          # running, turning evidence collection into interference.
         done
         echo "===== systemd-cgls top ====="
         systemd-cgls --no-pager 2>/dev/null | head -40 || true

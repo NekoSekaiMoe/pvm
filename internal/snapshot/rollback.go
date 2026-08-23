@@ -97,7 +97,18 @@ func RollbackWithForce(taskID, snapshotID string, force bool) error {
 			snapSpecFP = probe.SpecFP
 		}
 	}
-	currentState, _ := state.LoadState(taskID)
+	// The CURRENT state must load too: its load error was previously
+	// discarded, which silently skipped the spec guard below (currentState
+	// == nil) and rolled the disk back underneath a possibly-mismatched
+	// spec. Fail closed on missing/corrupt current state unless forced,
+	// exactly like the snapshot state copy above.
+	currentState, curStateErr := state.LoadState(taskID)
+	if curStateErr != nil {
+		if !force {
+			return fmt.Errorf("snapshot: failed to load current state: %w (retry with force)", curStateErr)
+		}
+		currentState = nil
+	}
 	if !force && snapSpecFP != "" && currentState != nil && currentState.SpecFP != "" && snapSpecFP != currentState.SpecFP {
 		return fmt.Errorf("%w: snapshot spec %q != current spec %q (retry with force)", ErrSpecMismatch, snapSpecFP, currentState.SpecFP)
 	}

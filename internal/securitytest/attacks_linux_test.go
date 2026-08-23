@@ -19,8 +19,11 @@ import (
 func TestAttack_SeccompFilterBlocksDangerousSyscalls(t *testing.T) {
 	dangerous := []string{"bpf", "io_uring_setup", "io_uring_enter", "mount", "unshare", "setns", "kexec_load", "reboot"}
 	for _, d := range dangerous {
-		if jail.IsSyscallAllowed(d) {
-			t.Errorf("SECURITY: dangerous syscall %q is allowed by UML seccomp filter", d)
-		}
+		d := d
+		t.Run(d, func(t *testing.T) {
+			if jail.IsSyscallAllowed(d) {
+				t.Errorf("SECURITY: dangerous syscall %q is allowed by UML seccomp filter", d)
+			}
+		})
 	}
 }
