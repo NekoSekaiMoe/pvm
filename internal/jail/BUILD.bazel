@@ -33,6 +33,7 @@ go_test(
         "capability_linux_test.go",
         "env_test.go",
         "jail_test.go",
+        "landlock_linux_test.go",
         "landlock_test.go",
         "process_flags_test.go",
         "process_test.go",

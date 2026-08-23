@@ -4,7 +4,6 @@ package jail
 
 import (
 	"fmt"
-	"os"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
@@ -17,6 +16,23 @@ const (
 
 type landlockRulesetAttr struct {
 	handledAccessFS uint64
+}
+
+// landlockRuleAccess returns the access mask legal for a rule tied to a path
+// of the given mode. The kernel (landlock_append_fs_rule) hard-fails EINVAL
+// when a NON-directory rule carries directory-only rights (READ_DIR,
+// MAKE_*, REMOVE_*, ...): a file rule may only hold
+// EXECUTE|WRITE_FILE|READ_FILE|TRUNCATE|IOCTL_DEV. This is what killed the
+// jail helper with "add rule for /images/rootfs.img: invalid argument" once
+// the rootfs image started being allowlisted as a file (CI run 88459717851).
+func landlockRuleAccess(mode uint32) uint64 {
+	if mode&unix.S_IFMT == unix.S_IFDIR {
+		return landlockAccessFSRw
+	}
+	// EXECUTE | WRITE_FILE | READ_FILE — the subset of landlockAccessFSRw
+	// that is valid on non-directories (TRUNCATE/IOCTL_DEV are not part of
+	// the handled set, so they cannot be granted either).
+	return 0x01 | 0x02 | 0x04
 }
 
 type landlockPathBeneathAttr struct {
@@ -54,13 +70,23 @@ func ApplyLandlockLockdown(allowedPaths []string) error {
 	const landlockRulePathBeneath = 1
 
 	for _, p := range allowedPaths {
-		f, openErr := os.Open(p)
+		// O_PATH is required for two reasons: it is the fd type
+		// LANDLOCK_ADD_RULE expects for parent_fd, and it opens EVERY file
+		// type — a plain os.Open(O_RDONLY) fails ENXIO on unix sockets
+		// (vhost-user socket bind) and is wrong for device nodes
+		// (/dev/net/tun bind).
+		fd, openErr := unix.Open(p, unix.O_PATH|unix.O_CLOEXEC, 0)
 		if openErr != nil {
 			return fmt.Errorf("landlock: open allowed path %s: %w", p, openErr)
 		}
+		var st unix.Stat_t
+		if statErr := unix.Fstat(fd, &st); statErr != nil {
+			unix.Close(fd)
+			return fmt.Errorf("landlock: stat allowed path %s: %w", p, statErr)
+		}
 		pathAttr := landlockPathBeneathAttr{
-			allowedAccess: landlockAccessFSRw,
-			parentFd:      int32(f.Fd()),
+			allowedAccess: landlockRuleAccess(st.Mode),
+			parentFd:      int32(fd),
 		}
 		_, _, addErr := unix.Syscall6(
 			unix.SYS_LANDLOCK_ADD_RULE,
@@ -69,7 +95,7 @@ func ApplyLandlockLockdown(allowedPaths []string) error {
 			uintptr(unsafe.Pointer(&pathAttr)),
 			0, 0, 0,
 		)
-		f.Close()
+		unix.Close(fd)
 		if addErr != 0 && addErr != unix.ENOSYS {
 			return fmt.Errorf("landlock: add rule for %s: %w", p, addErr)
 		}
