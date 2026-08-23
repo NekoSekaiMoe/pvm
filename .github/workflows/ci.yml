@@ -82,6 +82,12 @@ jobs:
       # for later non-root steps (HOME resets to /root, so caches stay
       # isolated at the cost of one module re-download).
       run: sudo env "PATH=$PATH" go test -v ./internal/network/ -run TestWhitelistRegistry
+
+    - name: Run unit tests (privileged Jail & Namespace subset)
+      # In unprivileged environments, tests that require user namespaces or
+      # Landlock LSM skip gracefully. This leg runs the jail unit tests under sudo
+      # to verify full process isolation, seccomp filters, and Landlock restrictions.
+      run: sudo env "PATH=$PATH" go test -v ./internal/jail/
       
     - name: Build UML Kernel
       run: |
