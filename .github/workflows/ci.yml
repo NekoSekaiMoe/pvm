@@ -147,11 +147,11 @@ jobs:
           cat "$f" 2>/dev/null || sudo cat "$f" 2>/dev/null || true
         done
         echo "===== UML container logs (console + strace) ====="
-        for f in /var/lib/uml-container/containers/*/logs/*; do
-          [ -f "$f" ] || continue
-          echo "----- $f -----"
-          sudo cat "$f"
-        done
+        # The glob must expand as ROOT: containers/<id>/ is 0700 root-owned
+        # (internal/log hardening), so a runner-uid glob silently matches
+        # nothing — exactly what emptied this section in the 1090982 run
+        # while the real console.log sat unreadable one directory down.
+        sudo sh -c 'for f in /var/lib/uml-container/containers/*/logs/*; do [ -f "$f" ] || continue; echo "----- $f -----"; cat "$f"; done'
         echo "===== end of logs ====="
 
     - name: Dump cgroup state on failure
