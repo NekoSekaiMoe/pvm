@@ -6,22 +6,11 @@ var BlockedDangerousSyscalls = []string{
 	"bpf", "io_uring_setup", "kexec_load", "reboot", "sys_chroot", "pivot_root", "mount", "unshare", "setns",
 }
 
-// Keep this in sync with the set TestSeccomp_AllowedSyscallsIntegrity
-// (shared, no build tag) requires on EVERY platform: ptrace/mmap/mprotect
-// plus the two rt_sig* entries.
-var UMLAllowedSyscalls = []string{
-	"ptrace", "mmap", "mprotect", "rt_sigaction", "rt_sigprocmask",
-	"read", "write", "open", "close", "socket",
-}
-
-// IsSyscallAllowed reports whether the named syscall is in the UML allowed set.
+// IsSyscallAllowed mirrors the Linux denylist semantics: everything not
+// flagged dangerous is allowed. The seccomp filter itself is Linux-only;
+// this stub keeps shared tests compiling and passing everywhere.
 func IsSyscallAllowed(name string) bool {
-	for _, s := range UMLAllowedSyscalls {
-		if s == name {
-			return true
-		}
-	}
-	return false
+	return !IsSyscallDangerous(name)
 }
 
 // IsSyscallDangerous reports whether the named syscall is explicitly blocked as dangerous.
@@ -40,14 +29,6 @@ func IsSyscallDangerous(name string) bool {
 func GetBlockedDangerousSyscalls() []string {
 	res := make([]string, len(BlockedDangerousSyscalls))
 	copy(res, BlockedDangerousSyscalls)
-	return res
-}
-
-// GetUMLAllowedSyscalls returns a copy of allowed UML syscalls (see the
-// mutation-safety note on GetBlockedDangerousSyscalls).
-func GetUMLAllowedSyscalls() []string {
-	res := make([]string, len(UMLAllowedSyscalls))
-	copy(res, UMLAllowedSyscalls)
 	return res
 }
 

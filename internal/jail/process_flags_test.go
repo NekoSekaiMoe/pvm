@@ -3,8 +3,8 @@
 package jail
 
 import (
-	"os/exec"
 	"os"
+	"os/exec"
 	"syscall"
 	"testing"
 )

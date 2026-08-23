@@ -70,9 +70,12 @@ func hostAuditArch() uint32 {
 	return 0
 }
 
-// TestSeccomp_FilterBranchSemantics verifies the JEQ jump logic of the
-// generated filter: matched (allowed) syscalls fall through to
-// SECCOMP_RET_ALLOW, unmatched ones skip it and end at the default EPERM.
+// TestSeccomp_FilterBranchSemantics verifies the DENYLIST jump logic of
+// the generated filter: dangerous syscalls match a JEQ and reach
+// SECCOMP_RET_ERRNO(EPERM); everything else — including the long tail of
+// loader/libc/UML syscalls that the old allowlist kept missing (fstat,
+// getrlimit, timer_create, restart_syscall, set_robust_list, ...) — falls
+// through to the default SECCOMP_RET_ALLOW.
 func TestSeccomp_FilterBranchSemantics(t *testing.T) {
 	arch := hostAuditArch()
 	if arch == 0 {
@@ -86,34 +89,39 @@ func TestSeccomp_FilterBranchSemantics(t *testing.T) {
 		nr   uint32
 		want uint32
 	}{
+		// Default-allowed: the historical allowlist gaps that each killed a
+		// boot (see the policy comment in seccomp_linux.go). Under the
+		// denylist these pass without any per-syscall rule.
 		{"allowed write", uint32(unix.SYS_WRITE), unix.SECCOMP_RET_ALLOW},
 		{"allowed getpid", uint32(unix.SYS_GETPID), unix.SECCOMP_RET_ALLOW},
 		{"allowed ptrace", uint32(unix.SYS_PTRACE), unix.SECCOMP_RET_ALLOW},
-		// The jail helper's final handoff to the workload: without this
-		// entry the helper dies with EPERM at exec time.
 		{"allowed execve", uint32(unix.SYS_EXECVE), unix.SECCOMP_RET_ALLOW},
-		// Loader/libc startup regressions (the filter is installed before
-		// execve, so it constrains ld.so too):
-		//  - fstat: ld.so stats every shared object it loads; without it a
-		//    dynamic workload dies with "cannot stat shared object:
-		//    Operation not permitted".
-		//  - getrlimit/prlimit64: UML main() -> set_stklim() exits(1) with
-		//    "getrlimit: Operation not permitted" when denied.
-		//  - wait4: waitpid() backing for guest-thread reaping.
-		{"allowed fstat", uint32(unix.SYS_FSTAT), unix.SECCOMP_RET_ALLOW},
-		{"allowed getrlimit", uint32(unix.SYS_GETRLIMIT), unix.SECCOMP_RET_ALLOW},
-		{"allowed prlimit64", uint32(unix.SYS_PRLIMIT64), unix.SECCOMP_RET_ALLOW},
-		{"allowed wait4", uint32(unix.SYS_WAIT4), unix.SECCOMP_RET_ALLOW},
-		// Guest tick: without timer_create no clocksource registers and the
-		// boot wedges in calibrate_delay(); restart_syscall resumes blocking
-		// syscalls (rt_sigsuspend idle loop) interrupted by SIGALRM.
-		{"allowed timer_create", uint32(unix.SYS_TIMER_CREATE), unix.SECCOMP_RET_ALLOW},
+		{"allowed fstat (ld.so stat of shared objects)", uint32(unix.SYS_FSTAT), unix.SECCOMP_RET_ALLOW},
+		{"allowed getrlimit (UML set_stklim)", uint32(unix.SYS_GETRLIMIT), unix.SECCOMP_RET_ALLOW},
+		{"allowed wait4 (guest-thread reaping)", uint32(unix.SYS_WAIT4), unix.SECCOMP_RET_ALLOW},
+		{"allowed timer_create (guest tick)", uint32(unix.SYS_TIMER_CREATE), unix.SECCOMP_RET_ALLOW},
 		{"allowed timer_settime", uint32(unix.SYS_TIMER_SETTIME), unix.SECCOMP_RET_ALLOW},
-		{"allowed timer_gettime", uint32(unix.SYS_TIMER_GETTIME), unix.SECCOMP_RET_ALLOW},
-		{"allowed restart_syscall", uint32(unix.SYS_RESTART_SYSCALL), unix.SECCOMP_RET_ALLOW},
+		{"allowed restart_syscall (signal-interrupted resume)", uint32(unix.SYS_RESTART_SYSCALL), unix.SECCOMP_RET_ALLOW},
+		{"allowed set_robust_list (glibc init)", uint32(unix.SYS_SET_ROBUST_LIST), unix.SECCOMP_RET_ALLOW},
+		{"allowed set_tid_address", uint32(unix.SYS_SET_TID_ADDRESS), unix.SECCOMP_RET_ALLOW},
+		{"allowed rseq", uint32(unix.SYS_RSEQ), unix.SECCOMP_RET_ALLOW},
+		// Dangerous denylist entries must hit EPERM.
 		{"blocked unshare", uint32(unix.SYS_UNSHARE), errnoEPERM},
 		{"blocked mount", uint32(unix.SYS_MOUNT), errnoEPERM},
 		{"blocked bpf", uint32(unix.SYS_BPF), errnoEPERM},
+		{"blocked setns", uint32(unix.SYS_SETNS), errnoEPERM},
+		{"blocked settimeofday (host clock)", uint32(unix.SYS_SETTIMEOFDAY), errnoEPERM},
+		{"blocked clock_settime", uint32(unix.SYS_CLOCK_SETTIME), errnoEPERM},
+		{"blocked process_vm_writev (host memory)", uint32(unix.SYS_PROCESS_VM_WRITEV), errnoEPERM},
+		{"blocked userfaultfd", uint32(unix.SYS_USERFAULTFD), errnoEPERM},
+		{"blocked swapon", uint32(unix.SYS_SWAPON), errnoEPERM},
+		{"blocked syslog", uint32(unix.SYS_SYSLOG), errnoEPERM},
+		{"blocked move_mount (new mount API)", uint32(unix.SYS_MOVE_MOUNT), errnoEPERM},
+		{"blocked open_tree", uint32(unix.SYS_OPEN_TREE), errnoEPERM},
+		{"blocked open_by_handle_at (Landlock bypass)", uint32(unix.SYS_OPEN_BY_HANDLE_AT), errnoEPERM},
+		{"blocked name_to_handle_at", uint32(unix.SYS_NAME_TO_HANDLE_AT), errnoEPERM},
+		{"blocked pidfd_send_signal (host PIDs)", uint32(unix.SYS_PIDFD_SEND_SIGNAL), errnoEPERM},
+		{"blocked process_mrelease", uint32(unix.SYS_PROCESS_MRELEASE), errnoEPERM},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -134,18 +142,19 @@ func TestSeccomp_FilterBranchSemantics(t *testing.T) {
 	})
 }
 
-// TestSeccomp_AllowedSyscallsResolvable pins the contract that every name
-// in UMLAllowedSyscalls resolves to a real syscall number via
-// getSyscallNumber. BuildUMLSeccompFilter silently skips unresolvable
-// names, so a missing table entry would quietly drop the syscall from the
-// installed filter — this is exactly how execve once fell to the default
-// EPERM and killed the jail helper's workload handoff.
-func TestSeccomp_AllowedSyscallsResolvable(t *testing.T) {
-	for _, name := range UMLAllowedSyscalls {
+// TestSeccomp_BlockedSyscallsResolvable pins the contract that every name
+// the filter consults — the denylist (BlockedDangerousSyscalls + per-arch
+// extras) and the argument-filtered syscalls — resolves to a real syscall
+// number via getSyscallNumber. Under a DENYLIST an unresolvable name is a
+// fail-OPEN gap: the syscall silently stays allowed. This is the mirror
+// image of the old allowlist resolvability test (there a missing entry
+// silently denied a needed syscall).
+func TestSeccomp_BlockedSyscallsResolvable(t *testing.T) {
+	for _, name := range append(append([]string{}, blockedSyscallsEffective...), "ioctl", "prlimit64") {
 		t.Run(name, func(t *testing.T) {
 			nr, ok := getSyscallNumber(name)
 			if !ok || nr < 0 {
-				t.Errorf("allowed syscall %q has no syscall-table entry; it will be silently denied (EPERM) by the installed filter", name)
+				t.Errorf("blocked/arg-filtered syscall %q has no syscall-table entry; it will be silently ALLOWED by the installed filter", name)
 			}
 		})
 	}
@@ -246,6 +255,11 @@ func TestSeccompSyscallHelperProcess(t *testing.T) {
 	// Allowed branch: write must succeed.
 	if _, err := unix.Write(1, []byte("seccomp syscall helper ok\n")); err != nil {
 		os.Exit(4)
+	}
+	// Denylist default: a benign syscall that was NEVER in the old
+	// allowlist must now succeed (getpriority was not allowlisted).
+	if _, err := unix.Getpriority(unix.PRIO_PROCESS, 0); err != nil {
+		os.Exit(10)
 	}
 	// Blocked branch: unshare must fail with EPERM.
 	if _, _, errno := unix.Syscall(unix.SYS_UNSHARE, 0, 0, 0); errno != unix.EPERM {

@@ -88,13 +88,22 @@ func runJailHelper() error {
 		return fmt.Errorf("disable ASLR for jailed workload (personality ADDR_NO_RANDOMIZE): %w", errno)
 	}
 
+	// Capability bounding-set hardening: drop CAP_SYS_PTRACE & friends so
+	// the workload (UML monitor) can never ptrace/signal/tamper with host
+	// processes outside its own tree — the largest residual escape surface
+	// of a privileged monitor. Irreversible across execve; failure aborts
+	// the launch. Must run before exec, and pairs with the seccomp filter
+	// (which cannot scope ptrace by target pid).
+	if err := DropDangerousCapabilities(); err != nil {
+		return fmt.Errorf("capability bounding-set drop: %w", err)
+	}
+
 	// Seccomp hardening is installed last when enabled: the filter survives
 	// execve and constrains the workload for its entire lifetime. It must
-	// come after setupJailFilesystem (mount/pivot_root are blocked syscalls)
-	// and after the personality call (not in the allowlist); execve IS
-	// allowlisted precisely for this final handoff. When the config does not
-	// opt in (EnforceHostSeccomp=false) the install is skipped entirely; when
-	// enabled, any failure aborts the launch.
+	// come after setupJailFilesystem and the personality call (mount,
+	// pivot_root and personality are all denied by the denylist filter).
+	// When the config does not opt in (EnforceHostSeccomp=false) the install
+	// is skipped entirely; when enabled, any failure aborts the launch.
 	if cfg.EnforceHostSeccomp {
 		if err := ApplyHostSeccompFilter(); err != nil {
 			return fmt.Errorf("seccomp filter: %w", err)

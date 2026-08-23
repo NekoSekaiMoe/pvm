@@ -12,13 +12,47 @@ import (
 
 // BlockedDangerousSyscalls contains host syscalls that must NEVER be accessible
 // by the UML host process to prevent host-kernel tampering, un-jailing, or breakouts.
+//
+// POLICY MODEL: this filter is a DENYLIST (fail-open), not an allowlist.
+// History: the original allowlist died by a thousand cuts — the filter is
+// installed before execve, so it constrains ld.so and glibc startup too, and
+// every missing entry killed the boot one CI round-trip at a time:
+//   - fstat (ld.so stats every shared object) -> "cannot stat shared object"
+//   - arch_prctl (x86_64 TLS setup) -> "Cannot allocate TLS block"
+//   - getrlimit/prlimit64 (UML set_stklim) -> "getrlimit: Operation not permitted"
+//   - timer_create/settime (guest tick) -> boot wedges in calibrate_delay
+//   - restart_syscall (resume of signal-interrupted blocking syscalls)
+//
+// UML + glibc need a long tail of host syscalls; enumerating them is
+// unmaintainable. The containment contract instead rests on:
+//  1. this denylist (host-kernel attack surface and breakout primitives),
+//  2. second-stage argument filters on ioctl and prlimit64 (multiplexed /
+//     dual-use syscalls stay restricted — see buildIoctlArgFilter and
+//     buildPrlimit64ArgFilter),
+//  3. the other jail layers: no_new_privs, mount/IPC/UTS namespaces,
+//     pivot_root into a minimal rootfs, and Landlock path lockdown.
+//
+// When adding to this list, prefer syscalls that are genuinely dangerous from
+// a jailed SUPERVISOR process (the UML kernel is ptrace-master of its guests;
+// guest syscalls never reach this filter). Anything the kernel returns EPERM
+// for here must be something UML legitimately never calls.
 var BlockedDangerousSyscalls = []string{
+	// Host-kernel attack surface / eBPF & I/O ring programming
 	"bpf",
 	"io_uring_setup",
 	"io_uring_enter",
 	"io_uring_register",
+	"perf_event_open",
+	"userfaultfd", // dirty-cow-class exploitation primitive; UML never uses it
+
+	// Kernel image / module loading
 	"kexec_load",
 	"kexec_file_load",
+	"init_module",
+	"finit_module",
+	"delete_module",
+
+	// Breakout primitives: namespace and root manipulation
 	"reboot",
 	"sys_chroot",
 	"pivot_root",
@@ -26,115 +60,79 @@ var BlockedDangerousSyscalls = []string{
 	"umount2",
 	"unshare",
 	"setns",
-	"init_module",
-	"finit_module",
-	"delete_module",
+
+	// Kernel keyring manipulation
 	"keyctl",
 	"add_key",
 	"request_key",
-	"perf_event_open",
-	"userfaultfd",
+
+	// Host wall-clock manipulation (a jail must not shift host time)
+	"settimeofday",
+	"clock_settime",
+	"adjtimex",
+	"clock_adjtime",
+
+	// Cross-process host memory access (UML ptraces only its OWN children)
+	"process_vm_readv",
+	"process_vm_writev",
+
+	// Host-global administrative knobs
+	"acct",
+	"swapon",
+	"swapoff",
+	"syslog",      // kernel ring buffer read/clear
+	"quotactl",    // filesystem quota control
+	"quotactl_fd", // fd-based quota variant
+	"vhangup",     // hang up all host terminals
+
+	// New mount API (the modern replacement for mount(2)): blocking only
+	// "mount"/"pivot_root" while leaving fsopen/fsmount/move_mount open
+	// would make the mount ban decorative. UML never uses any of these.
+	"fsopen",
+	"fsconfig",
+	"fsmount",
+	"fspick",
+	"move_mount",
+	"open_tree",
+	"mount_setattr",
+	// (fsinfo was never merged into the mainline kernel — nothing to block)
+
+	// File-handle I/O bypasses Landlock: Landlock scopes PATHS, and
+	// open_by_handle_at takes an inode handle instead. The jail's bind
+	// mounts share superblocks with the host directories they mirror, so a
+	// handle obtained (or brute-forced) inside the jail opens files on the
+	// host superblock — a textbook jail escape when running as real root
+	// with CAP_DAC_READ_SEARCH. UML never uses handle-based I/O.
+	"name_to_handle_at",
+	"open_by_handle_at",
+
+	// Cross-process signalling/memory via fds: the jail has no PID
+	// namespace (see ConfigureProcessIsolation), so these reach EVERY host
+	// process. UML signals its guests with kill/tgkill/wait4 (allowed —
+	// its children are known to it) and never uses the pidfd/process_m*
+	// families.
+	"pidfd_open",
+	"pidfd_send_signal",
+	"process_madvise",
+	"process_mrelease",
+
+	// NOTE (accepted residual risk, same as the old allowlist): clone/clone3
+	// are allowed without flag filtering. clone3 takes a flags STRUCT POINTER
+	// which seccomp cannot dereference, so CLONE_NEW* cannot be blocked
+	// there; filtering only clone would be security theater. A child in fresh
+	// namespaces still inherits this filter + no_new_privs + Landlock.
 }
 
-// UMLAllowedSyscalls contains the safe subset of host syscalls required by the
-// UML kernel process to manage guest tasks (ptrace/SKAS), emulate memory/pages (mmap/mprotect),
-// handle signals, communicate via vector TAP/vhost-user, and perform jailed I/O.
-//
-// The filter is installed BEFORE execve (see helper_linux.go), so it also
-// constrains the dynamic loader and libc startup of the workload itself —
-// every entry ld.so / glibc init needs must be listed here, or the workload
-// dies before main() with errors like:
-//
-//	"error while loading shared libraries: libc.so.6: cannot stat shared
-//	 object: Operation not permitted"   (ld.so fstat of the library)
-//	"Fatal glibc error: Cannot allocate TLS block"  (arch_prctl ARCH_SET_FS)
-var UMLAllowedSyscalls = append([]string{
-	// Ptrace (UML SKAS guest syscall interception)
-	"ptrace",
-
-	// Memory allocation & page tables
-	"mmap", "mprotect", "munmap", "brk", "mremap", "madvise", "msync", "mincore",
-
-	// Signals & Interrupts
-	"rt_sigaction", "rt_sigprocmask", "rt_sigreturn", "sigaltstack", "rt_sigsuspend", "kill", "tgkill", "tkill",
-
-	// Processes & Scheduling
-	"clone", "clone3", "futex", "exit", "exit_group", "set_tid_address", "set_robust_list", "get_robust_list", "rseq",
-	"getpid", "getppid", "gettid", "getuid", "geteuid", "getgid", "getegid", "getgroups", "setgroups", "prctl", "uname", "getrandom",
-	"sched_yield", "sched_getaffinity", "sched_setaffinity",
-
-	// Final exec handoff: the jail helper installs the filter and then
-	// execs the workload (seccomp filters survive execve).
-	"execve",
-
-	// Time
-	"clock_gettime", "clock_getres", "clock_nanosleep", "nanosleep", "gettimeofday",
-
-	// File I/O & IPC
-	"read", "write", "pread64", "pwrite64", "readv", "writev", "close", "lseek", "dup", "dup3", "pipe2",
-	"pselect6", "ppoll", "epoll_create1", "epoll_ctl", "epoll_pwait",
-	"eventfd2", "timerfd_create", "timerfd_settime", "timerfd_gettime", "signalfd4",
-
-	// Sockets (TAP transport, vhost-user Unix domain sockets)
-	"socket", "socketpair", "connect", "bind", "listen", "accept", "accept4", "sendto", "recvfrom", "sendmsg", "recvmsg", "shutdown",
-	"getsockname", "getpeername", "getsockopt", "setsockopt",
-
-	// Jailed Filesystem / HostFS
-	"openat", "openat2", "newfstatat", "statx", "fstatfs", "statfs",
-	// fstat is the canonical "stat an open fd" syscall (x86_64 nr 5, arm64
-	// nr 80): glibc's fstat() goes straight here (it does NOT route through
-	// newfstatat/statx), and ld.so fstats every shared object it loads —
-	// without this entry a dynamic workload dies in the loader.
-	"fstat",
-	"faccessat", "faccessat2", "readlinkat", "getcwd", "chdir", "fchdir",
-	"mkdirat", "unlinkat", "renameat2", "linkat", "symlinkat", "fchmodat", "fchownat",
-	"ftruncate", "fallocate", "fsync", "fdatasync", "sync", "getdents64", "fcntl",
-	// ioctl passes a second-stage argument filter: only the request numbers
-	// in allowedIoctlRequests are allowed through (see buildIoctlArgFilter).
-	"ioctl",
-
-	// Resource limits & process reaping. UML's main() calls
-	// getrlimit(RLIMIT_STACK) in set_stklim() and exits(1) with
-	// "getrlimit: Operation not permitted" if it fails (arch/um/os-Linux/
-	// main.c). glibc >= 2.36 implements getrlimit() via prlimit64, so both
-	// numbers must be allowed. wait4 backs waitpid() for guest-thread reaping
-	// (arch/um/os-Linux/skas/process.c). All are process-local reads/waits:
-	// they cannot touch the host outside this process tree.
-	"getrlimit", "wait4",
-	// prlimit64 passes a second-stage argument filter: only read-only
-	// SELF-queries are allowed (pid == 0, new_limit == NULL) — see
-	// buildPrlimit64ArgFilter. Raising own limits or touching another
-	// process's limits returns ERRNO(EPERM).
-	"prlimit64",
-
-	// POSIX interval timers: the guest's tick. os-Linux/time.c drives the
-	// UML clocksource/clockevent with timer_create(CLOCK_MONOTONIC) +
-	// timer_settime (SIGALRM delivery); without them no clocksource
-	// registers and the boot wedges in calibrate_delay() waiting for
-	// jiffies to advance. Timers are process-local.
-	"timer_create", "timer_settime", "timer_gettime",
-
-	// Kernel-internal resume mechanism: any blocking syscall interrupted
-	// by a signal (e.g. rt_sigsuspend in os_idle_sleep woken by SIGALRM)
-	// is restarted through restart_syscall. Denying it turns every such
-	// interruption into a spurious EPERM. Takes no arguments; pure
-	// kernel-internal control flow.
-	"restart_syscall",
-}, archSpecificAllowedSyscalls...)
-
-// IsSyscallAllowed reports whether the named syscall is in the UML allowed set.
+// IsSyscallAllowed reports whether the named syscall is permitted by the
+// denylist filter — i.e. everything not flagged dangerous (and not restricted
+// by an argument filter) is allowed.
 func IsSyscallAllowed(name string) bool {
-	for _, s := range UMLAllowedSyscalls {
-		if s == name {
-			return true
-		}
-	}
-	return false
+	return !IsSyscallDangerous(name)
 }
 
 // IsSyscallDangerous reports whether the named syscall is explicitly blocked as dangerous.
 func IsSyscallDangerous(name string) bool {
-	for _, s := range BlockedDangerousSyscalls {
+	for _, s := range blockedSyscallsEffective {
 		if s == name {
 			return true
 		}
@@ -144,27 +142,30 @@ func IsSyscallDangerous(name string) bool {
 
 // GetBlockedDangerousSyscalls returns a copy of blocked dangerous syscalls.
 func GetBlockedDangerousSyscalls() []string {
-	res := make([]string, len(BlockedDangerousSyscalls))
-	copy(res, BlockedDangerousSyscalls)
+	res := make([]string, len(blockedSyscallsEffective))
+	copy(res, blockedSyscallsEffective)
 	return res
 }
 
-// GetUMLAllowedSyscalls returns a copy of allowed UML syscalls.
-func GetUMLAllowedSyscalls() []string {
-	res := make([]string, len(UMLAllowedSyscalls))
-	copy(res, UMLAllowedSyscalls)
-	return res
-}
+// blockedSyscallsEffective is the runtime denylist: the portable dangerous
+// set plus per-architecture extras (e.g. modify_ldt/iopl on x86_64), defined
+// in seccomp_<goarch>.go.
+var blockedSyscallsEffective = append(append([]string{},
+	BlockedDangerousSyscalls...), archSpecificBlockedSyscalls...)
 
 // BuildUMLSeccompFilter compiles a Classic BPF filter for the host UML process.
 // It returns the package-local SockFilter type (a mirror of unix.SockFilter)
 // so the filter structure can be built and tested on non-Linux platforms.
+//
+// Denylist layout:
+//  1. Validate architecture (AUDIT_ARCH_X86_64 or AUDIT_ARCH_AARCH64);
+//     mismatch -> ERRNO(EPERM)
+//  2. Load syscall number
+//  3. Each dangerous syscall: match -> ERRNO(EPERM)
+//  4. ioctl / prlimit64: second-stage argument filters (match decides by
+//     arguments; mismatch falls through)
+//  5. Default: ALLOW
 func BuildUMLSeccompFilter() []SockFilter {
-	// Standard BPF Seccomp filter layout:
-	// 1. Validate Architecture (AUDIT_ARCH_X86_64 or AUDIT_ARCH_AARCH64)
-	// 2. Load Syscall Number: BPF_LD | BPF_W | BPF_ABS, offset 0
-	// 3. Jump and return ALLOW for allowed syscalls
-	// 4. Return EPERM for all other syscalls
 	var arch uint32
 	switch runtime.GOARCH {
 	case "amd64":
@@ -180,51 +181,61 @@ func BuildUMLSeccompFilter() []SockFilter {
 		return nil
 	}
 
+	eperm := SockFilter{
+		Code: unix.BPF_RET | unix.BPF_K,
+		K:    unix.SECCOMP_RET_ERRNO | (uint32(unix.EPERM) & unix.SECCOMP_RET_DATA),
+	}
+
 	filter := []SockFilter{
 		// [0] Load architecture: [4]
 		{Code: unix.BPF_LD | unix.BPF_W | unix.BPF_ABS, K: 4},
-		// [1] If arch != expected, kill process or deny
+		// [1] If arch != expected, deny
 		{Code: unix.BPF_JMP | unix.BPF_JEQ | unix.BPF_K, K: arch, Jt: 1, Jf: 0},
 		// [2] Return ERRNO(EPERM)
-		{Code: unix.BPF_RET | unix.BPF_K, K: unix.SECCOMP_RET_ERRNO | (uint32(unix.EPERM) & unix.SECCOMP_RET_DATA)},
+		eperm,
 		// [3] Load syscall number: [0]
 		{Code: unix.BPF_LD | unix.BPF_W | unix.BPF_ABS, K: 0},
 	}
 
-	// For each allowed syscall emit a JEQ/ALLOW pair: on a match fall
-	// through (Jt=0) to the SECCOMP_RET_ALLOW immediately below; on a
-	// mismatch skip it (Jf=1) and keep checking the remaining rules.
-	for _, name := range UMLAllowedSyscalls {
+	// Dangerous syscalls: match -> EPERM, mismatch -> keep checking.
+	for _, name := range blockedSyscallsEffective {
 		nr, ok := getSyscallNumber(name)
 		if !ok || nr < 0 {
-			continue
-		}
-		if name == "ioctl" {
-			filter = append(filter, buildIoctlArgFilter(uint32(nr))...)
-			continue
-		}
-		if name == "prlimit64" {
-			filter = append(filter, buildPrlimit64ArgFilter(uint32(nr))...)
+			// A blocked name that does not resolve would silently stay
+			// ALLOWED (fail-open gap). TestSeccomp_BlockedSyscallsResolvable
+			// pins every entry to a real number on each supported arch.
 			continue
 		}
 		filter = append(filter,
 			SockFilter{
 				Code: unix.BPF_JMP | unix.BPF_JEQ | unix.BPF_K,
 				K:    uint32(nr),
-				Jt:   0, // match: execute the ALLOW instruction directly below
-				Jf:   1, // mismatch: skip ALLOW, continue with the next rule
+				Jt:   0, // match: execute the EPERM directly below
+				Jf:   1, // mismatch: skip EPERM, continue with the next rule
 			},
-			SockFilter{
-				Code: unix.BPF_RET | unix.BPF_K,
-				K:    unix.SECCOMP_RET_ALLOW,
-			},
+			eperm,
 		)
 	}
 
-	// Default fallback: return ERRNO(EPERM)
+	// Dual-use syscalls keep their second-stage argument filters. On a
+	// syscall-number match the block decides ALLOW/EPERM by arguments; on a
+	// mismatch the block is skipped and evaluation continues.
+	for _, name := range []string{"ioctl", "prlimit64"} {
+		nr, ok := getSyscallNumber(name)
+		if !ok || nr < 0 {
+			continue
+		}
+		if name == "ioctl" {
+			filter = append(filter, buildIoctlArgFilter(uint32(nr))...)
+		} else {
+			filter = append(filter, buildPrlimit64ArgFilter(uint32(nr))...)
+		}
+	}
+
+	// Denylist default: allow everything else.
 	filter = append(filter, SockFilter{
 		Code: unix.BPF_RET | unix.BPF_K,
-		K:    unix.SECCOMP_RET_ERRNO | (uint32(unix.EPERM) & unix.SECCOMP_RET_DATA),
+		K:    unix.SECCOMP_RET_ALLOW,
 	})
 
 	return filter
@@ -308,6 +319,11 @@ func buildPrlimit64ArgFilter(nr uint32) []SockFilter {
 // ERRNO(EPERM) — the same action as a blocked syscall number. The classic
 // BPF jump offsets are relative: the initial JEQ's Jf skips the whole
 // argument block (1 LD + 2 per request + 1 EPERM).
+//
+// ioctl stays argument-filtered even under the denylist: it multiplexes the
+// entire kernel driver surface onto one number, and the jail shares the
+// host NETWORK namespace (interface setters like SIOCSIFFLAGS would
+// otherwise be reachable).
 func buildIoctlArgFilter(nr uint32) []SockFilter {
 	eperm := SockFilter{
 		Code: unix.BPF_RET | unix.BPF_K,
