@@ -26,6 +26,7 @@ go_test(
         "clone_rollback_test.go",
         "event_snapshot_test.go",
         "rollback_guard_test.go",
+        "rollback_specfp_test.go",
         "tar_archive_links_test.go",
         "tar_archive_test.go",
     ],

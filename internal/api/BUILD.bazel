@@ -2,7 +2,7 @@ load("@rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
     name = "api",
-    srcs = ["e2b_server.go"],
+    srcs = ["e2b_compat.go", "e2b_server.go"],
     importpath = "uml-container/internal/api",
     visibility = ["//:__subpackages__"],
     deps = [
@@ -32,6 +32,7 @@ go_test(
     name = "api_test",
     srcs = [
         "controlplanes_test.go",
+        "e2b_compat_test.go",
         "e2b_server_test.go",
         "secret_required_test.go",
         "snapshot_clone_rollback_test.go",
@@ -45,5 +46,6 @@ go_test(
         "//internal/pool",
         "//internal/snapshot",
         "//internal/state",
+        "@com_github_labstack_echo_v4//:echo",
     ],
 )
