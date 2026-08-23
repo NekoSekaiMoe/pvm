@@ -136,9 +136,14 @@ func setupJailFilesystem(cfg *jailHelperConfig) ([]string, error) {
 		allowed = append(allowed, v.GuestPath)
 	}
 
-	// Jail working directories created by SetupJail.
+	// Jail working directories created by SetupJail. Only allowlist the
+	// ones that actually exist in this rootfs: callers may construct a
+	// JailEnvironment without SetupJail, and Landlock fails hard when an
+	// allowed path cannot be opened after pivot_root.
 	for _, sub := range []string{"volumes", "images", "sockets", "dev", "tmp"} {
-		allowed = append(allowed, "/"+sub)
+		if fi, err := os.Stat(filepath.Join(rootfs, sub)); err == nil && fi.IsDir() {
+			allowed = append(allowed, "/"+sub)
+		}
 	}
 
 	// Switch root into the jail.
