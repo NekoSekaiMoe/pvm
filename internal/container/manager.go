@@ -14,6 +14,7 @@ import (
 	"uml-container/internal/config"
 	"uml-container/internal/cow"
 	"uml-container/internal/identity"
+	"uml-container/internal/jail"
 	"uml-container/internal/lifecycle"
 	"uml-container/internal/log"
 	"uml-container/internal/network/egress"
@@ -101,6 +102,25 @@ func (m *Manager) Start(ctx context.Context, cfg *config.ContainerConfig) error 
 	st.PID = 0
 	if saveErr := state.SaveState(cfg.ID, st); saveErr != nil {
 		fmt.Printf("Warning: failed to save state: %v\n", saveErr)
+	}
+
+	secRep, secErr := jail.CheckSecurity(cfg.AllowInsecureDegraded, true, true)
+	if secErr != nil {
+		st.Status = state.StatusExited
+		state.SaveState(cfg.ID, st)
+		return secErr
+	}
+	_ = secRep
+
+	jailEnv, _ := jail.SetupJail(jail.Config{
+		TaskID:                cfg.ID,
+		AllowInsecureDegraded: cfg.AllowInsecureDegraded,
+		EnforceHostSeccomp:    true,
+		EnforceLandlock:       true,
+	})
+	if jailEnv != nil {
+		defer jailEnv.Cleanup()
+		ctx = context.WithValue(ctx, uml.KeyJailEnv, jailEnv)
 	}
 
 	pid, p, err := m.Launcher.Start(ctx, cfg.Kernel, args, logFile)
@@ -234,6 +254,23 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 		_ = st.Transition(state.StatusFailed, state.ActorController, "audit spec append failed: "+err.Error())
 		state.SaveState(taskID, st)
 		return fmt.Errorf("container: audit taskspec for %s: %w", taskID, err)
+	}
+
+	// Security Baseline & Fail-Closed Gate:
+	secRep, secErr := jail.CheckSecurity(s.Security.AllowInsecureDegraded, s.Security.EnforceHostSeccomp, s.Security.EnforceLandlock)
+	if secErr != nil {
+		_ = st.Transition(state.StatusFailed, state.ActorController, "security check failed: "+secErr.Error())
+		state.SaveState(taskID, st)
+		return secErr
+	}
+	if secRep != nil && secRep.Degraded {
+		_ = ledger.Append(audit.Record{
+			Phase:    audit.PhaseExec,
+			Subject:  s.Caller,
+			Action:   "security:degraded_warning",
+			Decision: audit.DecisionAllow,
+			Reason:   secRep.Details,
+		})
 	}
 
 	// Provisioning: create overlay, start vhost daemon, set up network+policy.
@@ -582,6 +619,23 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 	// Ready: sandbox process about to start.
 	_ = st.Transition(state.StatusReady, state.ActorController, "provisioned")
 	state.SaveState(taskID, st)
+
+	jailEnv, err := jail.SetupJail(jail.Config{
+		TaskID:                taskID,
+		AllowInsecureDegraded: s.Security.AllowInsecureDegraded,
+		EnforceHostSeccomp:    s.Security.EnforceHostSeccomp,
+		EnforceLandlock:       s.Security.EnforceLandlock,
+	})
+	if err != nil {
+		cleanupVolumes()
+		_ = st.Transition(state.StatusFailed, state.ActorController, "jail setup failed: "+err.Error())
+		state.SaveState(taskID, st)
+		return err
+	}
+	if jailEnv != nil {
+		defer jailEnv.Cleanup()
+		ctx = context.WithValue(ctx, uml.KeyJailEnv, jailEnv)
+	}
 
 	pid, p, err := m.Launcher.Start(ctx, s.Kernel.Path, args, logFile)
 	st.PID = pid

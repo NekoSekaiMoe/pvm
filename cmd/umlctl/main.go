@@ -86,6 +86,7 @@ func main() {
 		it := startCmd.Bool("it", false, "Interactive mode (direct shell login, bypass logs)")
 		volume := startCmd.String("volume", "", "Host directory to mount via hostfs (e.g. /host:/container)")
 		configPath := startCmd.String("config", "", "Load container settings from TOML (overrides the flags below; default: none)")
+		insecureDegraded := startCmd.Bool("insecure-allow-degraded", false, "Allow running in degraded security mode")
 
 		startCmd.Parse(os.Args[2:])
 
@@ -130,6 +131,9 @@ func main() {
 				if s.Workspace.Ephemeral && !ephemeralFalseExplicit(startCmd) {
 					*ephemeral = true
 				}
+				if s.Security.AllowInsecureDegraded {
+					*insecureDegraded = true
+				}
 			} else {
 				// A bad -config must not silently fall back to flag defaults:
 				// the caller asked for a specific launch shape and booting a
@@ -156,17 +160,18 @@ func main() {
 		}
 
 		cfg := &config.ContainerConfig{
-			ID:          *name,
-			Name:        *name,
-			Kernel:      *kernel,
-			Rootfs:      *rootfs,
-			Memory:      *mem,
-			MemoryBytes: memBytes,
-			CPU:         *cpu,
-			UseVirtio:   *virtio,
-			Init:        *initCmd,
-			NetworkTap:  *netTap,
-			Ephemeral:   *ephemeral,
+			ID:                    *name,
+			Name:                  *name,
+			Kernel:                *kernel,
+			Rootfs:                *rootfs,
+			Memory:                *mem,
+			MemoryBytes:           memBytes,
+			CPU:                   *cpu,
+			UseVirtio:             *virtio,
+			Init:                  *initCmd,
+			NetworkTap:            *netTap,
+			Ephemeral:             *ephemeral,
+			AllowInsecureDegraded: *insecureDegraded,
 		}
 
 		// Ephemeral and overlay clone are mutually exclusive: an ephemeral

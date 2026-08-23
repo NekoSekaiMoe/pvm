@@ -6,9 +6,23 @@ import (
 	"path/filepath"
 	"testing"
 	"uml-container/internal/config"
+	"uml-container/internal/jail"
 	"uml-container/internal/state"
 	"uml-container/internal/uml"
 )
+
+func TestMain(m *testing.M) {
+	jail.ResetHostCapabilitiesForTest(&jail.HostCapabilities{
+		HasLandlock: true,
+		HasUserNS:   true,
+		HasMountNS:  true,
+		HasSeccomp:  true,
+		Details:     "test-simulated-full",
+	})
+	code := m.Run()
+	jail.ResetHostCapabilitiesForTest(nil)
+	os.Exit(code)
+}
 
 type mockLauncher struct {
 	lastKernel string
@@ -35,6 +49,13 @@ func contains(arr []string, str string) bool {
 }
 
 func TestManager_Start(t *testing.T) {
+	jail.ResetHostCapabilitiesForTest(&jail.HostCapabilities{
+		HasLandlock: true,
+		HasUserNS:   true,
+		HasMountNS:  true,
+		HasSeccomp:  true,
+		Details:     "test-simulated-full",
+	})
 	mock := &mockLauncher{}
 	manager := NewManager(mock)
 

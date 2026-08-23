@@ -27,14 +27,35 @@ import (
 	"uml-container/internal/policy"
 	"uml-container/internal/pool"
 	"uml-container/internal/spec"
+	"uml-container/internal/jail"
 	"uml-container/internal/state"
 	"uml-container/internal/uml"
 )
+
+func TestMain(m *testing.M) {
+	jail.ResetHostCapabilitiesForTest(&jail.HostCapabilities{
+		HasLandlock: true,
+		HasUserNS:   true,
+		HasMountNS:  true,
+		HasSeccomp:  true,
+		Details:     "test-simulated-full",
+	})
+	code := m.Run()
+	jail.ResetHostCapabilitiesForTest(nil)
+	os.Exit(code)
+}
 
 // setupIsolatedRoots points every plane at a per-test temp dir so they compose
 // without colliding on /var/lib.
 func setupIsolatedRoots(t *testing.T) {
 	t.Helper()
+	jail.ResetHostCapabilitiesForTest(&jail.HostCapabilities{
+		HasLandlock: true,
+		HasUserNS:   true,
+		HasMountNS:  true,
+		HasSeccomp:  true,
+		Details:     "test-simulated-full",
+	})
 	dir := t.TempDir()
 	state.RootDir = filepath.Join(dir, "state")
 	audit.LedgerRoot = filepath.Join(dir, "audit")

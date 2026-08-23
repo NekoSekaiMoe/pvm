@@ -40,6 +40,8 @@ init = "/init.sh"
 base_image = "$PVM_IMAGE_ROOT/rootfs.img"
 [kernel]
 path = "/nonexistent/linux"
+[security]
+allow_insecure_degraded = true
 EOF
 
 OUT=$("$TMP/agentpvm" run -config "$TMP/spec.toml" 2>&1 || true)

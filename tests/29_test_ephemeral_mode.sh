@@ -103,6 +103,8 @@ ephemeral = true
 [kernel]
 path = "/nonexistent/linux"
 use_vhost_blk = true
+[security]
+allow_insecure_degraded = true
 EOF
 OUT=$("$TMP/agentpvm" run -config "$TMP/eph.toml" 2>&1 || true)
 echo "$OUT" | grep -q "Loaded TaskSpec" || fail "config not loaded: $OUT"
@@ -132,6 +134,8 @@ compact_on_exit = true
 [kernel]
 path = "/nonexistent/linux"
 use_vhost_blk = true
+[security]
+allow_insecure_degraded = true
 EOF
 OUT=$("$TMP/agentpvm" run -config "$TMP/conflict.toml" -ephemeral 2>&1 || true)
 echo "$OUT" | grep -q "Loaded TaskSpec" || fail "config not loaded: $OUT"

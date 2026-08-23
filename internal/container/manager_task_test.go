@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"uml-container/internal/audit"
+	"uml-container/internal/jail"
 	"uml-container/internal/spec"
 	"uml-container/internal/state"
 	"uml-container/internal/uml"
@@ -32,6 +33,13 @@ func newTestManager(t *testing.T) (*Manager, *trackingLauncher) {
 	state.RootDir = t.TempDir()
 	audit.LedgerRoot = t.TempDir()
 	os.Setenv("PVM_CGROUP_ROOT", t.TempDir()) // throwaway, no real cgroup writes
+	jail.ResetHostCapabilitiesForTest(&jail.HostCapabilities{
+		HasLandlock: true,
+		HasUserNS:   true,
+		HasMountNS:  true,
+		HasSeccomp:  true,
+		Details:     "test-simulated-full",
+	})
 	tl := &trackingLauncher{pid: 999}
 	return &Manager{Launcher: tl}, tl
 }

@@ -25,6 +25,9 @@ type ContainerConfig struct {
 	// skip, so this is purely the ro/rw cmdline switch (umlctl -ephemeral
 	// additionally discards the container dir after exit).
 	Ephemeral bool `json:"ephemeral"`
+
+	// AllowInsecureDegraded allows execution in degraded security environments.
+	AllowInsecureDegraded bool `json:"allow_insecure_degraded"`
 }
 
 // ParseMemory parses strings like "512M", "1G" into bytes

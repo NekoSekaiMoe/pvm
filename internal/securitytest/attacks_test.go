@@ -18,7 +18,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -32,12 +31,15 @@ import (
 	"uml-container/internal/approval"
 	"uml-container/internal/artifact"
 	"uml-container/internal/audit"
+	"uml-container/internal/container"
 	"uml-container/internal/identity"
+	"uml-container/internal/jail"
 	"uml-container/internal/network/egress"
 	"uml-container/internal/policy"
 	"uml-container/internal/pool"
 	"uml-container/internal/spec"
 	"uml-container/internal/state"
+	"uml-container/internal/uml"
 )
 
 func setupRoots(t *testing.T) {
@@ -357,7 +359,130 @@ func TestAttack_ObservationLeak(t *testing.T) {
 	}
 }
 
-// --- helpers ---
+// =====================================================================
+// ATTACK 11: host security fail-closed bypass — if required host isolation
+// is missing, launch MUST fail closed unless allow_insecure_degraded is true.
+// =====================================================================
 
-// --- keep nothing else; stdlib json handles encoding. ---
-var _ = io.Copy
+type fakeLauncher struct{}
+
+func (f *fakeLauncher) Start(ctx context.Context, kernel string, args []string, logFile *os.File) (int, *uml.Process, error) {
+	return 99999, &uml.Process{}, nil
+}
+func (f *fakeLauncher) Wait(p *uml.Process) error { return nil }
+
+func TestAttack_HostSecurityFailClosed(t *testing.T) {
+	setupRoots(t)
+	// Simulate missing security primitives
+	sim := &jail.HostCapabilities{
+		HasSeccomp:  false,
+		HasLandlock: false,
+		HasMountNS:  false,
+		HasUserNS:   false,
+		Details:     "simulated-insecure-host",
+	}
+	jail.ResetHostCapabilitiesForTest(sim)
+	defer jail.ResetHostCapabilitiesForTest(nil)
+
+	mgr := container.NewManager(&fakeLauncher{})
+	s := &spec.TaskSpec{
+		Version: 1,
+		Caller:  "attacker",
+		Tenant:  "tenant-x",
+		Runtime: spec.RuntimeSpec{Name: "task-fail-closed"},
+		Workspace: spec.WorkspaceSpec{
+			Init: "/init.sh",
+		},
+		Security: spec.SecuritySpec{
+			AllowInsecureDegraded: false, // default fail-closed
+			EnforceHostSeccomp:    true,
+			EnforceLandlock:       true,
+		},
+	}
+
+	err := mgr.StartTask(context.Background(), "task-fail-closed", s)
+	if err == nil {
+		t.Fatal("SECURITY: task started despite missing host security baseline (fail-closed BYPASSED)")
+	}
+	if !strings.Contains(err.Error(), "fail-closed") {
+		t.Errorf("expected fail-closed error, got %v", err)
+	}
+}
+
+// =====================================================================
+// ATTACK 12: degraded security audit evasion — running in degraded mode
+// MUST append an immutable security:degraded_warning record to the audit ledger.
+// =====================================================================
+
+func TestAttack_SecurityBypassAudited(t *testing.T) {
+	setupRoots(t)
+	sim := &jail.HostCapabilities{
+		HasSeccomp:  true,
+		HasLandlock: false,
+		HasMountNS:  true,
+		HasUserNS:   true,
+		Details:     "simulated-missing-landlock",
+	}
+	jail.ResetHostCapabilitiesForTest(sim)
+	defer jail.ResetHostCapabilitiesForTest(nil)
+
+	mgr := container.NewManager(&fakeLauncher{})
+	s := &spec.TaskSpec{
+		Version: 1,
+		Caller:  "operator",
+		Tenant:  "tenant-audit",
+		Runtime: spec.RuntimeSpec{Name: "task-degraded-audit"},
+		Workspace: spec.WorkspaceSpec{
+			Init: "/init.sh",
+		},
+		Security: spec.SecuritySpec{
+			AllowInsecureDegraded: true, // explicit bypass
+			EnforceHostSeccomp:    true,
+			EnforceLandlock:       true,
+		},
+	}
+
+	err := mgr.StartTask(context.Background(), "task-degraded-audit", s)
+	if err != nil {
+		t.Fatalf("unexpected start error in degraded mode: %v", err)
+	}
+
+	// Verify ledger contains the degraded warning record and chain is valid
+	l, err := audit.Open("task-degraded-audit")
+	if err != nil {
+		t.Fatalf("open ledger: %v", err)
+	}
+	count, err := l.Verify()
+	if err != nil {
+		t.Fatalf("SECURITY: audit chain broken after degraded record: %v", err)
+	}
+	if count == 0 {
+		t.Fatalf("SECURITY: empty ledger verified")
+	}
+
+	data, err := os.ReadFile(filepath.Join(audit.LedgerRoot, "task-degraded-audit", "ledger.jsonl"))
+	if err != nil {
+		t.Fatalf("read ledger: %v", err)
+	}
+	if !strings.Contains(string(data), "security:degraded_warning") {
+		t.Fatal("SECURITY: running in degraded mode failed to record audit warning")
+	}
+	if !strings.Contains(string(data), "landlock-lsm") {
+		t.Fatalf("expected 'landlock-lsm' in audit ledger reason, got %s", string(data))
+	}
+}
+
+// =====================================================================
+// ATTACK 13: seccomp filter structure integrity — dangerous host syscalls
+// like bpf, io_uring, mount, unshare must NEVER be in the allowed set.
+// =====================================================================
+
+func TestAttack_SeccompFilterBlocksDangerousSyscalls(t *testing.T) {
+	dangerous := []string{"bpf", "io_uring_setup", "io_uring_enter", "mount", "unshare", "setns", "kexec_load", "reboot"}
+	for _, d := range dangerous {
+		if jail.IsSyscallAllowed(d) {
+			t.Errorf("SECURITY: dangerous syscall %q is allowed by UML seccomp filter", d)
+		}
+	}
+}
+

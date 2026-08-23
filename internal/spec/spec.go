@@ -78,6 +78,9 @@ type TaskSpec struct {
 
 	// --- volumes (Cube parity: per-sandbox persistent mounts) ---
 	Volumes []VolumeMount `toml:"volumes"`
+
+	// --- security & isolation policy ---
+	Security SecuritySpec `toml:"security" json:"security"`
 }
 
 // Identity describes the short-lived credential scope granted to the sandbox
@@ -277,6 +280,20 @@ type VolumeMount struct {
 	Path     string `toml:"path" json:"path"`
 	Driver   string `toml:"driver" json:"driver"`
 	ReadOnly bool   `toml:"read_only" json:"read_only"`
+}
+
+// SecuritySpec defines host security and isolation policies for the sandbox.
+type SecuritySpec struct {
+	// AllowInsecureDegraded allows task launch to proceed even if host security
+	// primitives (Landlock LSM, User Namespace, Seccomp) are not supported by
+	// the host kernel or environment. Defaults to false (fail-closed).
+	AllowInsecureDegraded bool `toml:"allow_insecure_degraded" json:"allow_insecure_degraded"`
+	// EnforceHostSeccomp enables host-level seccomp-bpf filtering for the UML process.
+	// Defaults to true when supported.
+	EnforceHostSeccomp bool `toml:"enforce_host_seccomp" json:"enforce_host_seccomp"`
+	// EnforceLandlock enables Landlock LSM path lockdown for hostfs volumes.
+	// Defaults to true when supported.
+	EnforceLandlock bool `toml:"enforce_landlock" json:"enforce_landlock"`
 }
 
 // ValidateMountPath rejects guest mount points that would corrupt the

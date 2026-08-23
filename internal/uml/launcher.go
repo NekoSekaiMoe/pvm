@@ -6,6 +6,13 @@ import (
 	"os"
 	"os/exec"
 	"sync"
+	"uml-container/internal/jail"
+)
+
+type ContextKey string
+
+const (
+	KeyJailEnv ContextKey = "jail_env"
 )
 
 // Process is the handle returned by Launcher.Start. It pairs the underlying
@@ -28,6 +35,9 @@ type DefaultLauncher struct{}
 
 func (l *DefaultLauncher) Start(ctx context.Context, kernel string, args []string, logFile *os.File) (int, *Process, error) {
 	cmd := exec.CommandContext(ctx, kernel, args...)
+	if jEnv, ok := ctx.Value(KeyJailEnv).(*jail.JailEnvironment); ok && jEnv != nil {
+		_ = jail.ConfigureProcessIsolation(cmd, jEnv)
+	}
 	// Use pipes for stdout/stderr to prevent UML epoll_ctl errors on regular files
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {

@@ -127,6 +127,8 @@ func runCmd(args []string) {
 	netTap := fs.String("net-tap", "", "Host TAP device name (overrides network.tap)")
 	ephemeral := fs.Bool("ephemeral", false,
 		"Non-persistent sandbox (overrides workspace.ephemeral): read-only rootfs, no qcow2 overlay")
+	insecureDegraded := fs.Bool("insecure-allow-degraded", false,
+		"Allow running in degraded security mode when host primitives are unavailable")
 	fs.Parse(args)
 
 	if *debug {
@@ -154,12 +156,15 @@ func runCmd(args []string) {
 	// apply the override when the flag was actually given on the command line.
 	netGiven := false
 	ephemeralGiven := false
+	insecureDegradedGiven := false
 	fs.Visit(func(f *flag.Flag) {
 		switch f.Name {
 		case "net":
 			netGiven = true
 		case "ephemeral":
 			ephemeralGiven = true
+		case "insecure-allow-degraded":
+			insecureDegradedGiven = true
 		}
 	})
 	if *rootfs != "" {
@@ -177,6 +182,9 @@ func runCmd(args []string) {
 	if *netTap != "" {
 		s.Network.Enabled = true // a TAP name implies the caller wants networking
 		s.Network.TAP = *netTap
+	}
+	if insecureDegradedGiven {
+		s.Security.AllowInsecureDegraded = *insecureDegraded
 	}
 	if ephemeralGiven {
 		s.Workspace.Ephemeral = *ephemeral
