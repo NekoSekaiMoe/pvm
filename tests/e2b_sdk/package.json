@@ -1,0 +1,9 @@
+{
+  "name": "pvm-e2b-sdk-driver",
+  "private": true,
+  "type": "module",
+  "description": "Real @e2b/sdk client used by tests/10_test_e2b_sdk.sh to regression-test PVM's /sandboxes compatibility surface.",
+  "dependencies": {
+    "@e2b/sdk": "0.12.5"
+  }
+}

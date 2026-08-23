@@ -92,6 +92,10 @@ func NewE2BServer() (*echo.Echo, error) {
 		return false, nil
 	}))
 
+	// E2B SDK-compatible surface (see e2b_compat.go): root-level
+	// /sandboxes routes so official E2B SDKs can drive PVM.
+	registerE2BCompat(e, apiSecretBytes, autoMgr)
+
 	// Per-task policy gateways registered by the controller / agentpvm run.
 	// /api/exec and /api/policy/:task both read from the SAME global registry
 	// (RegisterPolicyGateway writes here too), so a gateway registered by
