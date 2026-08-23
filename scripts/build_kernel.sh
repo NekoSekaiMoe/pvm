@@ -121,6 +121,35 @@ make "${MAKE_ARGS[@]}" defconfig
 ./scripts/config --enable CONFIG_UML_NET_VECTOR
 ./scripts/config --enable CONFIG_TUN
 
+# Statically link the UML kernel (bin/linux is a host userspace binary).
+#
+# 症状：在 seccomp 受限的 host 上（旧 Docker/libseccomp 默认 profile、gVisor、
+# 沙箱化 CI runner），动态链接的 bin/linux 连 loader 都起不来：
+#   ./bin/linux: error while loading shared libraries: libc.so.6:
+#   cannot stat shared object: Operation not permitted
+# 根因：glibc >= 2.33 的 ld.so 装载共享库时优先走 statx()；上述环境的
+# seccomp profile 对未知 syscall 返回 EPERM（而非 ENOSYS），glibc 不 fallback，
+# stat libc.so.6 直接失败，UML 代码还没开始跑就退出。
+#
+# 规避：CONFIG_STATIC_LINK=y 产出全静态 ELF，根本不经过动态 loader，对这类
+# host 免疫（STATIC_LINK 的设计场景本来就是 chroot/受限环境）。
+#
+# 冲突：CONFIG_UML_NET_VECTOR `select MAY_HAVE_RUNTIME_DEPS`，而 STATIC_LINK
+# depends on !MAY_HAVE_RUNTIME_DEPS。runtime deps 仅指 vector 的 UDP 类
+# transport 在 arch/um/drivers/vector_user.c 里用 getaddrinfo()（NSS 需要
+# 动态加载）；PVM 只用 vec0:transport=tap（直接 open /dev/net/tun，无 NSS），
+# 因此可以安全地摘掉这个 select。守卫式 patch：上游若已移除该 select 则跳过。
+# 注意：grep BRE 里 '\t' 是字面量 t（GNU grep 3.12），匹配 tab 必须用
+# [[:space:]] 或 $'\t'。
+DRIVERS_KCONFIG=arch/um/drivers/Kconfig
+if grep -q '^[[:space:]]*select MAY_HAVE_RUNTIME_DEPS' "${DRIVERS_KCONFIG}"; then
+    sed -i '/^[[:space:]]*select MAY_HAVE_RUNTIME_DEPS/d' "${DRIVERS_KCONFIG}"
+    echo "Patched ${DRIVERS_KCONFIG}: dropped 'select MAY_HAVE_RUNTIME_DEPS' from UML_NET_VECTOR (PVM uses tap transport only; enables CONFIG_STATIC_LINK)."
+else
+    echo "NOTE: 'select MAY_HAVE_RUNTIME_DEPS' not found in ${DRIVERS_KCONFIG}; patch skipped (already removed upstream?)."
+fi
+./scripts/config --enable CONFIG_STATIC_LINK
+
 make "${MAKE_ARGS[@]}" olddefconfig
 
 # olddefconfig silently DROPS symbols it doesn't know (e.g. renamed options:
@@ -135,7 +164,8 @@ for sym in CONFIG_NAMESPACES CONFIG_PID_NS CONFIG_NET_NS \
            CONFIG_DEVTMPFS CONFIG_DEVTMPFS_MOUNT \
            CONFIG_UNIX CONFIG_EXT4_FS CONFIG_OVERLAY_FS \
            CONFIG_VIRTIO_UML CONFIG_VIRTIO_BLK CONFIG_VIRTIO_NET CONFIG_VIRTIO_CONSOLE \
-           CONFIG_UML_NET_VECTOR CONFIG_TUN; do
+           CONFIG_UML_NET_VECTOR CONFIG_TUN \
+           CONFIG_STATIC_LINK; do
     if ! grep -q "^${sym}=y" .config; then
         echo "FATAL: ${sym} missing from .config (renamed symbol or unmet dependency)"
         missing=1
@@ -157,6 +187,14 @@ fi
 
 echo "Building UML Kernel (this will take a while)..."
 make "${MAKE_ARGS[@]}" -j$(nproc)
+
+# Fail loudly if the binary is not actually static — a dynamic bin/linux is
+# exactly what breaks on seccomp-restricted hosts (libc.so.6 stat EPERM).
+if ! file linux | grep -q 'statically linked'; then
+    echo "FATAL: linux binary is not statically linked (STATIC_LINK silently dropped?):"
+    file linux
+    exit 1
+fi
 
 echo "Copying kernel binary to bin/..."
 mkdir -p ../bin
