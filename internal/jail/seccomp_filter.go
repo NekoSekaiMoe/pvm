@@ -35,6 +35,14 @@ const (
 	ioctlTUNSETOWNER   = 0x400454CC
 	ioctlTUNSETGROUP   = 0x400454CE
 	ioctlTUNSETQUEUE   = 0x400454D9
+	// UML vector tap setup probes device capabilities and configures the
+	// vnet header after TUNSETIFF (arch/um/drivers/vector_user.c). Without
+	// TUNGETFEATURES the setup fails with EPERM and UML's error path
+	// (vector_net_close on a half-initialized device) NULL-derefs into a
+	// guest panic — CI run 88461751142, pkg-install and qcow2 tests.
+	ioctlTUNGETFEATURES  = 0x800454CF
+	ioctlTUNSETOFFLOAD   = 0x400454D0
+	ioctlTUNSETVNETHDRSZ = 0x400454D8
 
 	// Read-only interface getters (UML tap setup queries the pre-created
 	// host TAP's flags/MTU/MAC/index)
@@ -55,5 +63,6 @@ var allowedIoctlRequests = []uint32{
 	ioctlTIOCGWINSZ, ioctlTIOCSWINSZ,
 	ioctlFIONREAD, ioctlFIONBIO,
 	ioctlTUNSETIFF, ioctlTUNSETPERSIST, ioctlTUNSETOWNER, ioctlTUNSETGROUP, ioctlTUNSETQUEUE,
+	ioctlTUNGETFEATURES, ioctlTUNSETOFFLOAD, ioctlTUNSETVNETHDRSZ,
 	ioctlSIOCGIFFLAGS, ioctlSIOCGIFMTU, ioctlSIOCGIFHWADDR, ioctlSIOCGIFINDEX,
 }
