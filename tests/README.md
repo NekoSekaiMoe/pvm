@@ -38,7 +38,6 @@ This directory contains shell-based integration and end-to-end (E2E) suites vali
 | `28_test_webui_simulation.sh` | No | End-to-end verification of Nuxt 3 WebUI SPA routes, metrics, and page-dependent REST workflows |
 | `29_test_ephemeral_mode.sh` | No | Ephemeral (non-persistent) sandboxes: `workspace.ephemeral` spec validation + conflicts, `agentpvm run -ephemeral` override re-validation, no-overlay residue on failed launch, `umlctl -ephemeral` (mutual exclusion + state-dir discard), `/containers/start` ephemeral field |
 | `30_test_jail_seccomp_degraded.sh` | No | In-process Gofer jail, tailored host seccomp-bpf filter, fail-closed enforcement, CLI/TaskSpec `-insecure-allow-degraded` bypass, and tamper-evident audit security warning logging |
-| `31_test_jail_root_privileges.sh` | Yes (+ Root) | Privileged host testing of UserNS / MountNS process isolation and Landlock LSM under root/sudo |
 
 ---
 
