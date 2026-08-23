@@ -13,7 +13,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 )
 
 // forgeCluster0 applies fn to cluster 0 of the image at path and writes it
@@ -256,13 +255,30 @@ func TestConvertDestModeSurvivesSourcePathUnlink(t *testing.T) {
 	if err := os.Symlink(prev, link); err != nil {
 		t.Fatal(err)
 	}
-	go func() {
-		time.Sleep(2 * time.Millisecond)
+	// Unlink the source PATH at a deterministic point inside the convert
+	// window: the seam fires right after openGuestImage captured the chain
+	// (and src.Mode()), before any copying. The previous fixed 2ms sleep
+	// raced the OPEN itself — under CI load the main goroutine can be
+	// descheduled past the sleep, the link vanishes before openGuestImage,
+	// and the test fails with "open src: ... no such file or directory"
+	// (run 212, amd64 leg) without ever exercising the mode-capture path.
+	unlinked := make(chan struct{})
+	origHook := convertSrcOpenedHook
+	convertSrcOpenedHook = func() {
 		os.Remove(link) // open fd survives; only the path stat breaks
-	}()
+		close(unlinked)
+	}
+	defer func() { convertSrcOpenedHook = origHook }()
+
 	dst := filepath.Join(dir, "dst.qcow2")
 	if err := ConvertToQcow2(context.Background(), link, dst, ConvertDefaultOpt); err != nil {
 		t.Fatalf("ConvertToQcow2 via open fd: %v", err)
+	}
+	select {
+	case <-unlinked:
+		// the unlink provably landed inside the window
+	default:
+		t.Fatal("convertSrcOpenedHook never fired; scenario was not exercised")
 	}
 	st, err := os.Stat(dst)
 	if err != nil {

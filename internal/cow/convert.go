@@ -18,6 +18,11 @@ import (
 	"path/filepath"
 )
 
+// convertSrcOpenedHook, when non-nil, runs synchronously inside
+// ConvertToQcow2 immediately after the source chain is opened and its mode
+// captured, before any copying. Test seam only — see the call site.
+var convertSrcOpenedHook func()
+
 // ConvertToRaw flattens the image (and its backing chain) at srcPath into a
 // standalone raw image at destPath. Sparse in, sparse out: regions that read
 // as zero everywhere are skipped with seeks instead of written. It is the
@@ -128,6 +133,16 @@ func ConvertToQcow2(ctx context.Context, srcPath, destPath string, opt OverlayOp
 	// unlinked mid-convert (the open fd keeps the conversion alive), leaking
 	// os.CreateTemp's 0600 through the final rename.
 	srcMode := src.Mode()
+
+	// Test seam: fires synchronously right after the chain is open and its
+	// mode captured — before any copying. Tests use it to mutate the source
+	// PATH state at a deterministic point inside the convert window (a
+	// goroutine racing a fixed sleep can land before openGuestImage under
+	// scheduler contention; see TestConvertDestModeSurvivesSourcePathUnlink,
+	// which flaked exactly that way on a loaded CI runner).
+	if convertSrcOpenedHook != nil {
+		convertSrcOpenedHook()
+	}
 
 	// Now that the chain is OPEN (and its backing inodes known), re-check
 	// the destination against every member: converting onto the overlay's
