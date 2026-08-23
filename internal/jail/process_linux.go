@@ -21,7 +21,7 @@ func ConfigureProcessIsolation(cmd *exec.Cmd, j *JailEnvironment) error {
 	caps := DetectHostCapabilities()
 	// If UserNS and MountNS are available on the host, enable namespace isolation
 	if caps.HasUserNS && caps.HasMountNS && j != nil {
-		cmd.SysProcAttr.Cloneflags |= syscall.CLONE_NEWNS | syscall.CLONE_NEWPID | syscall.CLONE_NEWIPC | syscall.CLONE_NEWUTS
+		cmd.SysProcAttr.Cloneflags |= syscall.CLONE_NEWUSER | syscall.CLONE_NEWNS | syscall.CLONE_NEWPID | syscall.CLONE_NEWIPC | syscall.CLONE_NEWUTS
 		// Map current UID/GID to UID 0 inside container for rootless execution
 		cmd.SysProcAttr.UidMappings = []syscall.SysProcIDMap{
 			{ContainerID: 0, HostID: unix.Getuid(), Size: 1},

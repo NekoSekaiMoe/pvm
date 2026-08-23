@@ -1,8 +1,21 @@
 package jail
 
 import (
+	"os"
+	"os/exec"
 	"testing"
 )
+
+// TestSeccompHelperProcess tests applying the BPF filter inside an isolated subprocess.
+func TestSeccompHelperProcess(t *testing.T) {
+	if os.Getenv("GO_WANT_SECCOMP_HELPER") != "1" {
+		return
+	}
+	if err := ApplyHostSeccompFilter(); err != nil {
+		os.Exit(2)
+	}
+	os.Exit(0)
+}
 
 func TestSeccomp_AllowedSyscallsIntegrity(t *testing.T) {
 	// Must allow ptrace for UML SKAS execution
@@ -44,5 +57,19 @@ func TestSeccomp_FilterGeneration(t *testing.T) {
 	filter := BuildUMLSeccompFilter()
 	if len(filter) == 0 {
 		t.Fatalf("expected non-empty BPF filter")
+	}
+}
+
+func TestSeccomp_ApplyInSubprocess(t *testing.T) {
+	caps := DetectHostCapabilities()
+	if !caps.HasSeccomp {
+		t.Skip("skipping seccomp apply test: seccomp not supported on host")
+	}
+
+	cmd := exec.Command(os.Args[0], "-test.run=TestSeccompHelperProcess")
+	cmd.Env = append(os.Environ(), "GO_WANT_SECCOMP_HELPER=1")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("Seccomp helper process failed: %v, output: %s", err, string(out))
 	}
 }
