@@ -30,6 +30,11 @@ type jailHelperConfig struct {
 	Volumes []VolumeMapping `json:"volumes"`
 	Target  string          `json:"target"`
 	Args    []string        `json:"args"`
+	// EnforceHostSeccomp mirrors Config.EnforceHostSeccomp: when false the
+	// helper skips installing the host seccomp-bpf filter before exec'ing
+	// the workload. Defaults (false) preserve the pre-toggle behavior only
+	// for configs that never opted in; all first-class launch paths set it.
+	EnforceHostSeccomp bool `json:"enforce_host_seccomp"`
 }
 
 // ConfigureProcessIsolation decorates the exec.Cmd with death-signals and isolation attributes.
@@ -111,11 +116,12 @@ func wrapWithJailHelper(cmd *exec.Cmd, j *JailEnvironment) error {
 		return fmt.Errorf("jail: locate executable for re-exec helper: %w", err)
 	}
 	cfg := jailHelperConfig{
-		Rootfs:  j.Rootfs,
-		JailDir: j.JailDir,
-		Volumes: j.Config.Volumes,
-		Target:  cmd.Path,
-		Args:    cmd.Args,
+		Rootfs:             j.Rootfs,
+		JailDir:            j.JailDir,
+		Volumes:            j.Config.Volumes,
+		Target:             cmd.Path,
+		Args:               cmd.Args,
+		EnforceHostSeccomp: j.Config.EnforceHostSeccomp,
 	}
 	blob, err := json.Marshal(cfg)
 	if err != nil {

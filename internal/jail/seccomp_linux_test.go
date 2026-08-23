@@ -3,6 +3,7 @@
 package jail
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"runtime"
@@ -135,16 +136,16 @@ func TestSeccomp_IoctlArgFiltering(t *testing.T) {
 	filter := BuildUMLSeccompFilter()
 	errnoEPERM := uint32(unix.SECCOMP_RET_ERRNO | (uint32(unix.EPERM) & unix.SECCOMP_RET_DATA))
 
-	t.Run("every allowlisted request allowed", func(t *testing.T) {
-		if len(allowedIoctlRequests) == 0 {
-			t.Fatal("allowedIoctlRequests must not be empty (ioctl would be fully blocked)")
-		}
-		for _, req := range allowedIoctlRequests {
+	if len(allowedIoctlRequests) == 0 {
+		t.Fatal("allowedIoctlRequests must not be empty (ioctl would be fully blocked)")
+	}
+	for _, req := range allowedIoctlRequests {
+		t.Run(fmt.Sprintf("allowed request %#x", req), func(t *testing.T) {
 			if got := simulateSeccompFilter(t, filter, uint32(unix.SYS_IOCTL), arch, req); got != unix.SECCOMP_RET_ALLOW {
 				t.Errorf("ioctl request %#x: got action %#x, want ALLOW", req, got)
 			}
-		}
-	})
+		})
+	}
 
 	denied := []struct {
 		name string
