@@ -202,6 +202,14 @@ func getSyscallNumber(name string) (int, bool) {
 		return unix.SYS_PRLIMIT64, true
 	case "wait4":
 		return unix.SYS_WAIT4, true
+	case "timer_create":
+		return unix.SYS_TIMER_CREATE, true
+	case "timer_settime":
+		return unix.SYS_TIMER_SETTIME, true
+	case "timer_gettime":
+		return unix.SYS_TIMER_GETTIME, true
+	case "restart_syscall":
+		return unix.SYS_RESTART_SYSCALL, true
 	case "chdir":
 		return unix.SYS_CHDIR, true
 	case "fchdir":

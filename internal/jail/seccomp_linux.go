@@ -100,7 +100,26 @@ var UMLAllowedSyscalls = append([]string{
 	// numbers must be allowed. wait4 backs waitpid() for guest-thread reaping
 	// (arch/um/os-Linux/skas/process.c). All are process-local reads/waits:
 	// they cannot touch the host outside this process tree.
-	"getrlimit", "prlimit64", "wait4",
+	"getrlimit", "wait4",
+	// prlimit64 passes a second-stage argument filter: only read-only
+	// SELF-queries are allowed (pid == 0, new_limit == NULL) — see
+	// buildPrlimit64ArgFilter. Raising own limits or touching another
+	// process's limits returns ERRNO(EPERM).
+	"prlimit64",
+
+	// POSIX interval timers: the guest's tick. os-Linux/time.c drives the
+	// UML clocksource/clockevent with timer_create(CLOCK_MONOTONIC) +
+	// timer_settime (SIGALRM delivery); without them no clocksource
+	// registers and the boot wedges in calibrate_delay() waiting for
+	// jiffies to advance. Timers are process-local.
+	"timer_create", "timer_settime", "timer_gettime",
+
+	// Kernel-internal resume mechanism: any blocking syscall interrupted
+	// by a signal (e.g. rt_sigsuspend in os_idle_sleep woken by SIGALRM)
+	// is restarted through restart_syscall. Denying it turns every such
+	// interruption into a spurious EPERM. Takes no arguments; pure
+	// kernel-internal control flow.
+	"restart_syscall",
 }, archSpecificAllowedSyscalls...)
 
 // IsSyscallAllowed reports whether the named syscall is in the UML allowed set.
@@ -184,6 +203,10 @@ func BuildUMLSeccompFilter() []SockFilter {
 			filter = append(filter, buildIoctlArgFilter(uint32(nr))...)
 			continue
 		}
+		if name == "prlimit64" {
+			filter = append(filter, buildPrlimit64ArgFilter(uint32(nr))...)
+			continue
+		}
 		filter = append(filter,
 			SockFilter{
 				Code: unix.BPF_JMP | unix.BPF_JEQ | unix.BPF_K,
@@ -212,6 +235,72 @@ func BuildUMLSeccompFilter() []SockFilter {
 // Both supported architectures (x86_64, aarch64) are little-endian, so the
 // low word of the 64-bit argument sits at offset 24.
 const seccompArg1LowOffset = 24
+
+// 64-bit argument word offsets within struct seccomp_data (args start at
+// offset 16; each 64-bit arg occupies a low word at 16+8*i and a high word
+// at 16+8*i+4 on the little-endian x86_64/aarch64). Used by the prlimit64
+// second-stage filter to compare the COMPLETE 64-bit argument values.
+const (
+	seccompArg0LowOffset  = 16 // prlimit64: pid (low word)
+	seccompArg0HighOffset = 20 // prlimit64: pid (high word)
+	seccompArg2LowOffset  = 32 // prlimit64: new_limit pointer (low word)
+	seccompArg2HighOffset = 36 // prlimit64: new_limit pointer (high word)
+)
+
+// buildPrlimit64ArgFilter emits the two-stage rule for prlimit64: only
+// read-only self-queries pass — pid must be 0 (the calling process) and
+// new_limit must be NULL (nothing to set). Both arguments are compared as
+// complete 64-bit values (low and high words each must be zero); the
+// new_limit POINTER is compared, never dereferenced — seccomp filters
+// cannot safely follow userspace pointers. The resource selector and
+// old_limit output pointer are unrestricted: with new_limit == NULL the
+// call cannot change anything. A nonzero pid (another process's limits) or
+// a non-NULL new_limit (a limit raise, e.g. escaping RLIMIT_NOFILE /
+// RLIMIT_NPROC confinement) falls to ERRNO(EPERM).
+//
+// Block layout: [JEQ nr] then per check [LD word; JEQ 0 (fall through on
+// match, skip to the trailing EPERM on mismatch)], then ALLOW, then EPERM.
+// The initial JEQ's Jf skips the entire block (2 insns per check + ALLOW +
+// EPERM).
+func buildPrlimit64ArgFilter(nr uint32) []SockFilter {
+	eperm := SockFilter{
+		Code: unix.BPF_RET | unix.BPF_K,
+		K:    unix.SECCOMP_RET_ERRNO | (uint32(unix.EPERM) & unix.SECCOMP_RET_DATA),
+	}
+	allow := SockFilter{Code: unix.BPF_RET | unix.BPF_K, K: unix.SECCOMP_RET_ALLOW}
+
+	// Words that must all be zero for the call to be allowed.
+	zeroWordOffsets := []uint32{
+		seccompArg0LowOffset,  // pid low
+		seccompArg0HighOffset, // pid high
+		seccompArg2LowOffset,  // new_limit low
+		seccompArg2HighOffset, // new_limit high
+	}
+
+	block := []SockFilter{
+		{
+			Code: unix.BPF_JMP | unix.BPF_JEQ | unix.BPF_K,
+			K:    nr,
+			Jt:   0,                                 // match: fall through to the argument checks
+			Jf:   uint8(2*len(zeroWordOffsets) + 2), // mismatch: skip the whole block
+		},
+	}
+	for i, off := range zeroWordOffsets {
+		// On a nonzero word, jump to the trailing EPERM: past the remaining
+		// checks (2 insns each) and the ALLOW (1 insn).
+		jf := uint8(2*(len(zeroWordOffsets)-i-1) + 1)
+		block = append(block,
+			SockFilter{Code: unix.BPF_LD | unix.BPF_W | unix.BPF_ABS, K: off},
+			SockFilter{
+				Code: unix.BPF_JMP | unix.BPF_JEQ | unix.BPF_K,
+				K:    0,
+				Jt:   0,  // zero so far: keep checking
+				Jf:   jf, // nonzero: deny
+			},
+		)
+	}
+	return append(block, allow, eperm)
+}
 
 // buildIoctlArgFilter emits the two-stage rule for ioctl: on a syscall-number
 // match, load the request argument and compare it against

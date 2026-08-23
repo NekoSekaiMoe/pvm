@@ -13,10 +13,13 @@ import (
 )
 
 // simulateSeccompFilter interprets the classic BPF filter produced by
-// BuildUMLSeccompFilter against a synthetic seccomp_data record
-// {nr @ offset 0, arch @ offset 4, args[1] low word @ offset 24} and
-// returns the SECCOMP_RET_* action.
-func simulateSeccompFilter(t *testing.T, filter []SockFilter, nr, arch, arg1Low uint32) uint32 {
+// BuildUMLSeccompFilter against a synthetic seccomp_data record {nr @
+// offset 0, arch @ 4, args @ 16 (six 64-bit words, little-endian)} and
+// returns the SECCOMP_RET_* action. Argument-filtered rules (ioctl,
+// prlimit64) load individual 32-bit words of the 64-bit arguments; the
+// simulator reconstructs them from args so tests can exercise full 64-bit
+// values (e.g. a pointer with only its high word set).
+func simulateSeccompFilter(t *testing.T, filter []SockFilter, nr, arch uint32, args [6]uint64) uint32 {
 	t.Helper()
 	var a uint32
 	pc := 0
@@ -27,13 +30,18 @@ func simulateSeccompFilter(t *testing.T, filter []SockFilter, nr, arch, arg1Low 
 		ins := filter[pc]
 		switch ins.Code {
 		case unix.BPF_LD | unix.BPF_W | unix.BPF_ABS:
-			switch ins.K {
-			case 0:
+			switch {
+			case ins.K == 0:
 				a = nr
-			case 4:
+			case ins.K == 4:
 				a = arch
-			case seccompArg1LowOffset:
-				a = arg1Low
+			case ins.K >= 16 && ins.K <= 56 && (ins.K-16)%4 == 0:
+				word := (ins.K - 16) / 4 // 0..11: low/high words of args[0..5]
+				if word%2 == 0 {
+					a = uint32(args[word/2]) // low 32 bits
+				} else {
+					a = uint32(args[word/2] >> 32) // high 32 bits
+				}
 			default:
 				t.Fatalf("unexpected BPF_ABS offset %d", ins.K)
 			}
@@ -96,13 +104,20 @@ func TestSeccomp_FilterBranchSemantics(t *testing.T) {
 		{"allowed getrlimit", uint32(unix.SYS_GETRLIMIT), unix.SECCOMP_RET_ALLOW},
 		{"allowed prlimit64", uint32(unix.SYS_PRLIMIT64), unix.SECCOMP_RET_ALLOW},
 		{"allowed wait4", uint32(unix.SYS_WAIT4), unix.SECCOMP_RET_ALLOW},
+		// Guest tick: without timer_create no clocksource registers and the
+		// boot wedges in calibrate_delay(); restart_syscall resumes blocking
+		// syscalls (rt_sigsuspend idle loop) interrupted by SIGALRM.
+		{"allowed timer_create", uint32(unix.SYS_TIMER_CREATE), unix.SECCOMP_RET_ALLOW},
+		{"allowed timer_settime", uint32(unix.SYS_TIMER_SETTIME), unix.SECCOMP_RET_ALLOW},
+		{"allowed timer_gettime", uint32(unix.SYS_TIMER_GETTIME), unix.SECCOMP_RET_ALLOW},
+		{"allowed restart_syscall", uint32(unix.SYS_RESTART_SYSCALL), unix.SECCOMP_RET_ALLOW},
 		{"blocked unshare", uint32(unix.SYS_UNSHARE), errnoEPERM},
 		{"blocked mount", uint32(unix.SYS_MOUNT), errnoEPERM},
 		{"blocked bpf", uint32(unix.SYS_BPF), errnoEPERM},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := simulateSeccompFilter(t, filter, tc.nr, arch, 0); got != tc.want {
+			if got := simulateSeccompFilter(t, filter, tc.nr, arch, [6]uint64{}); got != tc.want {
 				t.Errorf("syscall nr=%d: got action %#x, want %#x", tc.nr, got, tc.want)
 			}
 		})
@@ -113,7 +128,7 @@ func TestSeccomp_FilterBranchSemantics(t *testing.T) {
 		if arch == badArch {
 			badArch = unix.AUDIT_ARCH_AARCH64
 		}
-		if got := simulateSeccompFilter(t, filter, uint32(unix.SYS_WRITE), badArch, 0); got != errnoEPERM {
+		if got := simulateSeccompFilter(t, filter, uint32(unix.SYS_WRITE), badArch, [6]uint64{}); got != errnoEPERM {
 			t.Errorf("wrong arch: got action %#x, want %#x", got, errnoEPERM)
 		}
 	})
@@ -153,7 +168,7 @@ func TestSeccomp_IoctlArgFiltering(t *testing.T) {
 	}
 	for _, req := range allowedIoctlRequests {
 		t.Run(fmt.Sprintf("allowed request %#x", req), func(t *testing.T) {
-			if got := simulateSeccompFilter(t, filter, uint32(unix.SYS_IOCTL), arch, req); got != unix.SECCOMP_RET_ALLOW {
+			if got := simulateSeccompFilter(t, filter, uint32(unix.SYS_IOCTL), arch, [6]uint64{1: uint64(req)}); got != unix.SECCOMP_RET_ALLOW {
 				t.Errorf("ioctl request %#x: got action %#x, want ALLOW", req, got)
 			}
 		})
@@ -170,8 +185,45 @@ func TestSeccomp_IoctlArgFiltering(t *testing.T) {
 	}
 	for _, tc := range denied {
 		t.Run("denied "+tc.name, func(t *testing.T) {
-			if got := simulateSeccompFilter(t, filter, uint32(unix.SYS_IOCTL), arch, tc.req); got != errnoEPERM {
+			if got := simulateSeccompFilter(t, filter, uint32(unix.SYS_IOCTL), arch, [6]uint64{1: uint64(tc.req)}); got != errnoEPERM {
 				t.Errorf("ioctl request %#x: got action %#x, want %#x", tc.req, got, errnoEPERM)
+			}
+		})
+	}
+}
+
+// TestSeccomp_Prlimit64ArgFiltering verifies the second-stage argument
+// check on prlimit64: only read-only self-queries (pid == 0 &&
+// new_limit == NULL) reach SECCOMP_RET_ALLOW. Both arguments are compared
+// as complete 64-bit values, so a pid or pointer with only its high word
+// set must still be denied. getrlimit stays unrestricted (it can only ever
+// read the calling process's limits).
+func TestSeccomp_Prlimit64ArgFiltering(t *testing.T) {
+	arch := hostAuditArch()
+	if arch == 0 {
+		t.Skip("unsupported architecture for audit arch check")
+	}
+	filter := BuildUMLSeccompFilter()
+	errnoEPERM := uint32(unix.SECCOMP_RET_ERRNO | (uint32(unix.EPERM) & unix.SECCOMP_RET_DATA))
+
+	cases := []struct {
+		name string
+		args [6]uint64 // [0]=pid [1]=resource [2]=new_limit [3]=old_limit
+		want uint32
+	}{
+		{"self read (pid=0, new=NULL)", [6]uint64{}, unix.SECCOMP_RET_ALLOW},
+		{"self read with old_limit output set", [6]uint64{3: 0x7fff00008000}, unix.SECCOMP_RET_ALLOW},
+		{"self read, any resource selector", [6]uint64{1: unix.RLIMIT_NOFILE}, unix.SECCOMP_RET_ALLOW},
+		{"deny other pid", [6]uint64{0: 1234}, errnoEPERM},
+		{"deny pid with high word set (64-bit compare)", [6]uint64{0: 1 << 32}, errnoEPERM},
+		{"deny non-NULL new_limit (limit raise)", [6]uint64{2: 0x7fff00008000}, errnoEPERM},
+		{"deny new_limit high word only (64-bit compare)", [6]uint64{2: 1 << 32}, errnoEPERM},
+		{"deny pid=1 even with new=NULL", [6]uint64{0: 1}, errnoEPERM},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := simulateSeccompFilter(t, filter, uint32(unix.SYS_PRLIMIT64), arch, tc.args); got != tc.want {
+				t.Errorf("prlimit64 args=%v: got action %#x, want %#x", tc.args, got, tc.want)
 			}
 		})
 	}
@@ -208,6 +260,17 @@ func TestSeccompSyscallHelperProcess(t *testing.T) {
 	}
 	if _, _, errno := unix.Syscall(unix.SYS_IOCTL, 1, 0xDEAD, 0); errno != unix.EPERM {
 		os.Exit(7)
+	}
+	// prlimit64 argument filter: a read-only self query (pid=0,
+	// new_limit=NULL) must reach the kernel and succeed, while any limit
+	// SET attempt (non-NULL new_limit) must be blocked with EPERM — even
+	// when re-setting the identical values.
+	var rl unix.Rlimit
+	if err := unix.Prlimit(0, unix.RLIMIT_NOFILE, nil, &rl); err != nil {
+		os.Exit(8)
+	}
+	if err := unix.Prlimit(0, unix.RLIMIT_NOFILE, &rl, nil); err != unix.EPERM {
+		os.Exit(9)
 	}
 	os.Exit(0)
 }

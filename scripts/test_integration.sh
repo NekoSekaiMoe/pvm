@@ -62,8 +62,46 @@ BOOT_TIMEOUT=480
 # identity before killing (a cmdline substring match is spoofable by any
 # process merely mentioning "bin/linux" in its argv).
 KERNEL_REAL=$(realpath ./bin/linux)
+# Hang diagnostics: run the launch in the BACKGROUND so this script can
+# inspect the live UML process while it is still stuck. Once timeout(1)
+# kills umlctl, the UML kernel dies via Pdeathsig (SIGKILL) and no live
+# evidence survives — the previous runs' "(none)" process dumps were exactly
+# that. DIAG_AFTER seconds into a still-alive launch, capture per-thread
+# /proc syscall/wchan/stack (a wedge shows the exact call it is parked in;
+# a seccomp-denied call loops as EPERM in the strace) plus a bounded live
+# strace of the UML pid. All /proc reads are read-only.
+DIAG_AFTER=90
 set +e
-sudo timeout -k 15 "${BOOT_TIMEOUT}" ./bin/umlctl start --name integration-test --kernel ./bin/linux --rootfs "$(pwd)/rootfs.img" --init /init.sh > "$UMLCTL_LOG" 2>&1
+sudo timeout -k 15 "${BOOT_TIMEOUT}" ./bin/umlctl start --name integration-test --kernel ./bin/linux --rootfs "$(pwd)/rootfs.img" --init /init.sh > "$UMLCTL_LOG" 2>&1 &
+LAUNCH_PID=$!
+ELAPSED=0
+DIAG_DONE=0
+while kill -0 "$LAUNCH_PID" 2>/dev/null; do
+    sleep 5
+    ELAPSED=$((ELAPSED + 5))
+    if [ "$ELAPSED" -ge "$DIAG_AFTER" ] && [ "$DIAG_DONE" -eq 0 ]; then
+        DIAG_DONE=1
+        UML_PID_LIVE=$(sudo grep -o '"pid"[[:space:]]*:[[:space:]]*[0-9]\+' /var/lib/uml-container/containers/integration-test/state.json 2>/dev/null | grep -o '[0-9]\+$' || true)
+        if [ -n "$UML_PID_LIVE" ] && sudo kill -0 "$UML_PID_LIVE" 2>/dev/null; then
+            echo "=== HANG DIAGNOSTICS (launch alive after ${ELAPSED}s; UML pid $UML_PID_LIVE) ==="
+            echo "--- process tree states (STAT+WCHAN) ---"
+            sudo ps -eo pid,ppid,stat,wchan:32,cmd | grep -E 'bin/linux|umlctl' | grep -v grep || true
+            echo "--- per-thread current syscall / wchan / kernel stack ---"
+            for T in /proc/"$UML_PID_LIVE"/task/*; do
+                echo "[$T]"
+                sudo cat "$T/syscall" 2>/dev/null || echo "(syscall unreadable)"
+                echo "wchan: $(sudo cat "$T/wchan" 2>/dev/null || echo '?')"
+                sudo cat "$T/stack" 2>/dev/null || true
+            done
+            echo "--- live strace of UML pid (15s, last 150 lines; EPERM = seccomp-denied) ---"
+            sudo timeout 15 strace -f -p "$UML_PID_LIVE" 2>&1 | tail -150 || true
+            echo "=== END HANG DIAGNOSTICS ==="
+        else
+            echo "(no live UML pid for hang diagnostics)"
+        fi
+    fi
+done
+wait "$LAUNCH_PID"
 START_RC=$?
 set -e
 if [ "$START_RC" -ne 0 ]; then
