@@ -97,15 +97,16 @@ type Transition struct {
 // ContainerState is the persisted task state. The new fields drive the FSM;
 // the legacy ID/Status/PID/StartedAt are kept for API compatibility.
 type ContainerState struct {
-	ID        string    `json:"id"`
-	Name      string    `json:"name"`
-	Tenant    string    `json:"tenant,omitempty"`
-	Caller    string    `json:"caller,omitempty"`
-	Status    Status    `json:"status"`
-	PID       int       `json:"pid"`
-	StartedAt time.Time `json:"started_at"`
-	EndedAt   time.Time `json:"ended_at,omitempty"`
-	SpecFP    string    `json:"spec_fingerprint,omitempty"`
+	ID        string            `json:"id"`
+	Name      string            `json:"name"`
+	Tenant    string            `json:"tenant,omitempty"`
+	Caller    string            `json:"caller,omitempty"`
+	Status    Status            `json:"status"`
+	PID       int               `json:"pid"`
+	StartedAt time.Time         `json:"started_at"`
+	EndedAt   time.Time         `json:"ended_at,omitempty"`
+	SpecFP    string            `json:"spec_fingerprint,omitempty"`
+	Metadata  map[string]string `json:"metadata,omitempty"`
 
 	// Lifecycle config snapshot (from TaskSpec.Lifecycle) so API endpoints
 	// can honor idle/resume policy without re-reading the spec file.
@@ -251,6 +252,12 @@ func (s *ContainerState) snapshotLocked() *ContainerState {
 		NetworkTap:  s.NetworkTap,
 		Bridge:      s.Bridge,
 		GatewayIP:   s.GatewayIP,
+	}
+	if len(s.Metadata) > 0 {
+		cp.Metadata = make(map[string]string, len(s.Metadata))
+		for k, v := range s.Metadata {
+			cp.Metadata[k] = v
+		}
 	}
 	if len(s.Transitions) > 0 {
 		cp.Transitions = append([]Transition(nil), s.Transitions...)

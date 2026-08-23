@@ -211,6 +211,66 @@ func TestE2BCompatRefreshAndKill(t *testing.T) {
 	}
 }
 
+func TestE2BCompatMetadataRoundTrip(t *testing.T) {
+	e := newCompatEcho(t)
+
+	// The create handler itself needs a UML kernel (unavailable in CI), so
+	// persistence is exercised at the state layer: metadata written at
+	// create time must survive Save/Load and surface in the list view.
+	meta := map[string]string{"env": "prod", "team": "agent"}
+	if err := state.SaveState("sbxmeta1", &state.ContainerState{
+		ID:        "sbxmeta1",
+		Name:      "sbxmeta1",
+		Status:    state.StatusReady,
+		StartedAt: time.Now().UTC(),
+		Metadata:  meta,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	st, err := state.LoadState("sbxmeta1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(st.Metadata) != len(meta) || st.Metadata["env"] != "prod" || st.Metadata["team"] != "agent" {
+		t.Fatalf("metadata not persisted: %v", st.Metadata)
+	}
+
+	rec := doCompat(t, e, http.MethodGet, "/sandboxes", "secret", "", false)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list: expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var views []map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &views); err != nil {
+		t.Fatalf("list body: %v", err)
+	}
+	if len(views) != 1 {
+		t.Fatalf("expected 1 view, got %d: %s", len(views), rec.Body.String())
+	}
+	got, ok := views[0]["metadata"].(map[string]any)
+	if !ok {
+		t.Fatalf("metadata missing from view: %v", views[0])
+	}
+	if got["env"] != "prod" || got["team"] != "agent" {
+		t.Fatalf("metadata mismatch in view: %v", got)
+	}
+
+	// A sandbox without metadata must omit the field (omitempty contract).
+	if err := state.SaveState("sbxmeta2", &state.ContainerState{ID: "sbxmeta2", Name: "sbxmeta2", Status: state.StatusReady}); err != nil {
+		t.Fatal(err)
+	}
+	rec = doCompat(t, e, http.MethodGet, "/sandboxes", "secret", "", false)
+	if err := json.Unmarshal(rec.Body.Bytes(), &views); err != nil {
+		t.Fatalf("list body: %v", err)
+	}
+	for _, v := range views {
+		if v["sandboxID"] == "sbxmeta2" {
+			if _, present := v["metadata"]; present {
+				t.Fatalf("metadata must be omitted when empty: %v", v)
+			}
+		}
+	}
+}
+
 func TestE2BCompatAmbiguousPrefix(t *testing.T) {
 	e := newCompatEcho(t)
 

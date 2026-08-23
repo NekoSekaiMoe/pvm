@@ -120,6 +120,7 @@ func registerE2BCompat(e *echo.Echo, apiSecretBytes []byte, autoMgr *lifecycle.M
 				SandboxID:  st.ID,
 				ClientID:   "",
 				TemplateID: st.Name,
+				Metadata:   st.Metadata,
 				StartedAt:  st.StartedAt,
 			})
 		}
@@ -164,6 +165,16 @@ func registerE2BCompat(e *echo.Echo, apiSecretBytes []byte, autoMgr *lifecycle.M
 		}
 		if err := mgr.Start(c.Request().Context(), cfg); err != nil {
 			return c.JSON(http.StatusInternalServerError, map[string]string{"message": err.Error()})
+		}
+		// Persist SDK metadata into the task state so GET /sandboxes can
+		// reflect it back (E2B metadata is a create-time label set).
+		if len(req.Metadata) > 0 {
+			if st, lerr := state.LoadState(name); lerr == nil {
+				st.Metadata = req.Metadata
+				if serr := state.SaveState(name, st); serr != nil {
+					return c.JSON(http.StatusInternalServerError, map[string]string{"message": serr.Error()})
+				}
+			}
 		}
 		return c.JSON(http.StatusOK, map[string]string{
 			"sandboxID":  name,

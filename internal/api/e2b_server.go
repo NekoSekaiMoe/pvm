@@ -323,6 +323,20 @@ func NewE2BServer() (*echo.Echo, error) {
 			}
 			return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		}
+		if l, lerr := audit.Open(id); lerr == nil {
+			reason := "rollback to " + req.SnapshotID
+			if req.Force {
+				reason = "forced rollback bypassing spec fingerprint guard to " + req.SnapshotID
+			}
+			_ = l.Append(audit.Record{
+				Phase:    audit.PhaseExec,
+				Subject:  "human",
+				Action:   "rollback",
+				Params:   map[string]string{"snapshot_id": req.SnapshotID, "force": strconv.FormatBool(req.Force)},
+				Decision: audit.DecisionAllow,
+				Reason:   reason,
+			})
+		}
 		return c.JSON(http.StatusOK, map[string]string{"status": "rolled_back", "id": id, "snapshot_id": req.SnapshotID})
 	})
 
@@ -650,13 +664,17 @@ func NewE2BServer() (*echo.Echo, error) {
 			return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		}
 		if l, lerr := audit.Open(id); lerr == nil {
+			reason := "historical rollback to " + req.SnapshotID
+			if req.Force {
+				reason = "forced rollback bypassing spec fingerprint guard to " + req.SnapshotID
+			}
 			_ = l.Append(audit.Record{
 				Phase:    audit.PhaseExec,
 				Subject:  "human",
 				Action:   "rollback",
-				Params:   map[string]string{"snapshot_id": req.SnapshotID},
+				Params:   map[string]string{"snapshot_id": req.SnapshotID, "force": strconv.FormatBool(req.Force)},
 				Decision: audit.DecisionAllow,
-				Reason:   "historical rollback to " + req.SnapshotID,
+				Reason:   reason,
 			})
 		}
 		st, err := state.LoadState(id)
