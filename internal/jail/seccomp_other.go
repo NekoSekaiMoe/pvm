@@ -24,16 +24,31 @@ func IsSyscallAllowed(name string) bool {
 	return false
 }
 
+// IsSyscallDangerous reports whether the named syscall is explicitly blocked as dangerous.
 func IsSyscallDangerous(name string) bool {
-	return true
+	for _, s := range BlockedDangerousSyscalls {
+		if s == name {
+			return true
+		}
+	}
+	return false
 }
 
+// GetBlockedDangerousSyscalls returns a copy of blocked dangerous syscalls,
+// matching the Linux implementation's contract: callers must not be able to
+// mutate the package-level backing array.
 func GetBlockedDangerousSyscalls() []string {
-	return BlockedDangerousSyscalls
+	res := make([]string, len(BlockedDangerousSyscalls))
+	copy(res, BlockedDangerousSyscalls)
+	return res
 }
 
+// GetUMLAllowedSyscalls returns a copy of allowed UML syscalls (see the
+// mutation-safety note on GetBlockedDangerousSyscalls).
 func GetUMLAllowedSyscalls() []string {
-	return UMLAllowedSyscalls
+	res := make([]string, len(UMLAllowedSyscalls))
+	copy(res, UMLAllowedSyscalls)
+	return res
 }
 
 // Classic BPF / seccomp constants, kept local because x/sys/unix does not

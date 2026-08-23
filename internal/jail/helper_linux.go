@@ -88,6 +88,15 @@ func runJailHelper() error {
 		return fmt.Errorf("disable ASLR for jailed workload (personality ADDR_NO_RANDOMIZE): %w", errno)
 	}
 
+	// Seccomp hardening is installed last: the filter survives execve and
+	// constrains the workload for its entire lifetime. It must come after
+	// setupJailFilesystem (mount/pivot_root are blocked syscalls) and after
+	// the personality call (not in the allowlist); execve IS allowlisted
+	// precisely for this final handoff. Any failure aborts the launch.
+	if err := ApplyHostSeccompFilter(); err != nil {
+		return fmt.Errorf("seccomp filter: %w", err)
+	}
+
 	if err := syscall.Exec(jailEntryPath, argv, env); err != nil {
 		return fmt.Errorf("exec workload %s (in-jail %s): %w", cfg.Target, jailEntryPath, err)
 	}

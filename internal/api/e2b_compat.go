@@ -113,10 +113,16 @@ func resolveSandboxID(shortID string) (string, error) {
 // registerE2BCompat wires the SDK-facing routes onto the echo instance at the
 // host root. autoMgr mirrors the legacy start handler's lifecycle wiring.
 func registerE2BCompat(e *echo.Echo, apiSecretBytes []byte, autoMgr *lifecycle.Manager) {
-	g := e.Group("", e2bCompatKeyAuth(apiSecretBytes))
+	// Register each route directly on the Echo instance with the auth
+	// middleware passed per route. An e.Group("", auth) would make Echo's
+	// Group.Use register catch-all RouteNotFound handlers ("" and "/*")
+	// wrapped with the group middleware, so unauthenticated WebUI SPA
+	// fallback requests would be intercepted with a 401 instead of being
+	// served index.html.
+	auth := e2bCompatKeyAuth(apiSecretBytes)
 
 	// GET /sandboxes — list all tasks in SDK shape.
-	g.GET("/sandboxes", func(c echo.Context) error {
+	e.GET("/sandboxes", func(c echo.Context) error {
 		all, err := state.ListAll()
 		if err != nil {
 			return c.JSON(http.StatusInternalServerError, map[string]string{"message": err.Error()})
@@ -132,13 +138,13 @@ func registerE2BCompat(e *echo.Echo, apiSecretBytes []byte, autoMgr *lifecycle.M
 			})
 		}
 		return c.JSON(http.StatusOK, views)
-	})
+	}, auth)
 
 	// POST /sandboxes — create (boot) a sandbox from a templateID, which maps
 	// to PVM's rootfs concept. Mirrors POST /api/containers/start's validation
 	// and launch path; without a UML kernel (CI) launch fails and surfaces as
 	// E2B's "server error" (500 + message), which the SDKs report cleanly.
-	g.POST("/sandboxes", func(c echo.Context) error {
+	e.POST("/sandboxes", func(c echo.Context) error {
 		var req struct {
 			TemplateID string            `json:"templateID"`
 			Metadata   map[string]string `json:"metadata"`
@@ -208,12 +214,12 @@ func registerE2BCompat(e *echo.Echo, apiSecretBytes []byte, autoMgr *lifecycle.M
 			"clientID":   "",
 			"templateID": req.TemplateID,
 		})
-	})
+	}, auth)
 
 	// DELETE /sandboxes/:sandboxID — kill + remove, mirroring the semantics
 	// of DELETE /api/containers/:id (PID-reuse-checked process kill, clone
 	// guard via snapshot.PrepareDelete, directory removal).
-	g.DELETE("/sandboxes/:sandboxID", func(c echo.Context) error {
+	e.DELETE("/sandboxes/:sandboxID", func(c echo.Context) error {
 		shortID := c.Param("sandboxID")
 		if !idRegex.MatchString(shortID) {
 			return c.JSON(http.StatusBadRequest, map[string]string{"message": "invalid sandbox ID"})
@@ -262,12 +268,12 @@ func registerE2BCompat(e *echo.Echo, apiSecretBytes []byte, autoMgr *lifecycle.M
 			})
 		}
 		return c.JSON(http.StatusOK, map[string]string{"message": "killed"})
-	})
+	}, auth)
 
 	// POST /sandboxes/:sandboxID/refreshes — keep-alive: push the task's
 	// Deadline out by `duration` seconds (the SDKs cap at 3600; enforce the
 	// same bound server-side).
-	g.POST("/sandboxes/:sandboxID/refreshes", func(c echo.Context) error {
+	e.POST("/sandboxes/:sandboxID/refreshes", func(c echo.Context) error {
 		shortID := c.Param("sandboxID")
 		if !idRegex.MatchString(shortID) {
 			return c.JSON(http.StatusBadRequest, map[string]string{"message": "invalid sandbox ID"})
@@ -301,7 +307,7 @@ func registerE2BCompat(e *echo.Echo, apiSecretBytes []byte, autoMgr *lifecycle.M
 			return c.JSON(http.StatusInternalServerError, map[string]string{"message": err.Error()})
 		}
 		return c.JSON(http.StatusOK, map[string]string{"message": "ok"})
-	})
+	}, auth)
 }
 
 // teardownBootedSandbox kills a just-booted sandbox whose create must fail,

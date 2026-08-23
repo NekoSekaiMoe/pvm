@@ -54,6 +54,10 @@ var UMLAllowedSyscalls = []string{
 	"getpid", "getppid", "gettid", "getuid", "geteuid", "getgid", "getegid", "getgroups", "setgroups", "prctl", "uname", "getrandom",
 	"sched_yield", "sched_getaffinity", "sched_setaffinity",
 
+	// Final exec handoff: the jail helper installs the filter and then
+	// execs the workload (seccomp filters survive execve).
+	"execve",
+
 	// Time
 	"clock_gettime", "clock_getres", "clock_nanosleep", "nanosleep", "gettimeofday",
 
@@ -201,7 +205,9 @@ func ApplyHostSeccompFilter() error {
 		0,
 		uintptr(unsafe.Pointer(&prog)),
 	)
-	if err != 0 && err != unix.ENOSYS {
+	// ENOSYS (kernel without seccomp-filter support) is a fail-closed
+	// condition — the task would otherwise run unfiltered — not a success.
+	if err != 0 {
 		return fmt.Errorf("seccomp: install filter: %w", err)
 	}
 	return nil

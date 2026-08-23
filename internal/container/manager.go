@@ -78,6 +78,10 @@ func NewManager(launcher uml.Launcher) *Manager {
 type Booted struct {
 	Process *uml.Process
 	jail    *jail.JailEnvironment
+	// logFile is the console log created during Boot (nil in interactive
+	// mode). The launcher only writes to it via copy goroutines drained by
+	// Wait; ownership of closing it stays with WaitExit / Boot error paths.
+	logFile *os.File
 }
 
 // Start is the legacy entry point used by umlctl. It boots a UML kernel with
@@ -128,6 +132,9 @@ func (m *Manager) Boot(ctx context.Context, cfg *config.ContainerConfig) (*Boote
 
 	secRep, secErr := jail.CheckSecurity(cfg.AllowInsecureDegraded, true, true)
 	if secErr != nil {
+		if logFile != nil {
+			_ = logFile.Close()
+		}
 		st.Status = state.StatusExited
 		state.SaveState(cfg.ID, st)
 		return nil, secErr
@@ -145,6 +152,9 @@ func (m *Manager) Boot(ctx context.Context, cfg *config.ContainerConfig) (*Boote
 		EnforceLandlock:       true,
 	})
 	if jailErr != nil {
+		if logFile != nil {
+			_ = logFile.Close()
+		}
 		st.Status = state.StatusExited
 		state.SaveState(cfg.ID, st)
 		return nil, jailErr
@@ -156,6 +166,9 @@ func (m *Manager) Boot(ctx context.Context, cfg *config.ContainerConfig) (*Boote
 	pid, p, err := m.Launcher.Start(ctx, cfg.Kernel, args, logFile)
 	st.PID = pid
 	if err != nil {
+		if logFile != nil {
+			_ = logFile.Close()
+		}
 		// The process never started, so nothing pivot_rooted into the jail:
 		// release it here (on success WaitExit owns the cleanup).
 		if jailEnv != nil {
@@ -178,7 +191,7 @@ func (m *Manager) Boot(ctx context.Context, cfg *config.ContainerConfig) (*Boote
 		m.OnProvisioned(cfg.ID, pid, "")
 	}
 
-	return &Booted{Process: p, jail: jailEnv}, nil
+	return &Booted{Process: p, jail: jailEnv, logFile: logFile}, nil
 }
 
 // WaitExit blocks until a Booted process exits, records the terminal legacy
@@ -192,8 +205,13 @@ func (m *Manager) WaitExit(id string, b *Booted) error {
 		defer b.jail.Cleanup()
 	}
 	err := m.Launcher.Wait(b.Process)
+	// Wait drained the log-copy goroutines; the console log can be closed
+	// now that the process lifecycle is complete.
+	if b.logFile != nil {
+		_ = b.logFile.Close()
+	}
 	st, lerr := state.LoadState(id)
-	if lerr == nil {
+	if lerr == nil && st != nil {
 		if err != nil {
 			st.Status = state.StatusExited
 		} else {

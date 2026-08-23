@@ -101,7 +101,7 @@ func CheckSecurity(allowDegraded bool, enforceSeccomp, enforceLandlock bool) (*S
 	return &SecurityReport{
 		Degraded:       false,
 		BypassedLayers: nil,
-		Details:        "all host security baselines satisfied (seccomp, landlock, namespaces)",
+		Details:        "all required host security baselines satisfied (seccomp, landlock, namespaces)",
 	}, nil
 }
 
@@ -138,8 +138,10 @@ func SetupJail(cfg Config) (*JailEnvironment, error) {
 	}
 	// The task ID becomes a path component of the default BaseDir; reject
 	// path separators and traversal components so an attacker-controlled ID
-	// cannot escape the jail root.
-	if strings.ContainsAny(cfg.TaskID, "/\\") || strings.Contains(cfg.TaskID, "..") {
+	// cannot escape the jail root. The exact value "." is rejected too:
+	// filepath.Join would collapse it away, pointing the jail at the shared
+	// pvm-jails parent directory itself.
+	if cfg.TaskID == "." || strings.ContainsAny(cfg.TaskID, "/\\") || strings.Contains(cfg.TaskID, "..") {
 		return nil, fmt.Errorf("jail: invalid task ID %q: must not contain path separators or '..' traversal components", cfg.TaskID)
 	}
 	if cfg.BaseDir == "" {

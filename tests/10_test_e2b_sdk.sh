@@ -24,7 +24,10 @@ if ! (cd tests/e2b_sdk && npm install --no-audit --no-fund --silent); then
 fi
 
 TMP="$(mktemp -d)"
-trap 'kill "$SRV" 2>/dev/null || true; rm -rf "$TMP"' EXIT
+# SRV is only assigned once the server starts; under set -u an early EXIT
+# (e.g. build failure) must not trip on an unbound SRV, and TMP cleanup must
+# always run.
+trap 'if [ -n "${SRV:-}" ]; then kill "$SRV" 2>/dev/null || true; fi; rm -rf "$TMP"' EXIT
 
 export PVM_STATE_ROOT="$TMP/state"
 export PVM_AUDIT_ROOT="$TMP/audit"

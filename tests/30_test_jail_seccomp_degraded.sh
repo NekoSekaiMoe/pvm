@@ -182,7 +182,12 @@ if [ "$(id -u)" -eq 0 ] || sudo -n true 2>/dev/null; then
     echo "   running privileged jail & namespace checks under $SUDO_CMD"
     $SUDO_CMD "$TMP/agentpvm" run -config "$SPEC_DEGRADED" -kernel "$TMP/fake_kernel" > "$TMP/root_agentpvm.log" 2>&1 || fail "root agentpvm run failed: $(cat "$TMP/root_agentpvm.log")"
     $SUDO_CMD "$TMP/umlctl" start -name "umlctl-root-test" -kernel "$TMP/fake_kernel" -rootfs "$PVM_IMAGE_ROOT/rootfs.img" -insecure-allow-degraded > "$TMP/root_umlctl.log" 2>&1 || fail "root umlctl start failed: $(cat "$TMP/root_umlctl.log")"
-    $SUDO_CMD go test -v -run "TestConfigureProcessIsolation|TestLandlock|TestSeccomp" ./internal/jail > "$TMP/root_jail_test.log" 2>&1 || fail "root jail tests failed: $(cat "$TMP/root_jail_test.log")"
+    # Compile the selected jail tests as the current user (running go test
+    # itself under sudo would leave root-owned entries in GOCACHE/GOMODCACHE),
+    # then elevate only the resulting test binary.
+    JAIL_TEST_BIN="$TMP/jail.test"
+    go test -c -o "$JAIL_TEST_BIN" ./internal/jail > "$TMP/root_jail_build.log" 2>&1 || fail "failed to compile jail tests: $(cat "$TMP/root_jail_build.log")"
+    $SUDO_CMD "$JAIL_TEST_BIN" -test.v -test.run "TestConfigureProcessIsolation|TestLandlock|TestSeccomp" > "$TMP/root_jail_test.log" 2>&1 || fail "root jail tests failed: $(cat "$TMP/root_jail_test.log")"
     echo "   root execution & privileged isolation verified ✓"
 else
     echo "   (no root/passwordless sudo in current environment; non-root paths verified) ✓"

@@ -99,7 +99,10 @@ if [ "$START_RC" -ne 0 ]; then
         PROC_EXE=$(sudo readlink -f "/proc/$UML_PID/exe" 2>/dev/null || true)
         JAIL_ENTRY=/tmp/pvm-jails/integration-test/root/pvm/entry
         ARGV0=$(sudo sh -c 'tr "\0" "\n" < "$1" | head -n1' _ "/proc/$UML_PID/cmdline" 2>/dev/null || true)
-        ROOTFS_REAL=$(realpath ./rootfs.img)
+        # Fall back to the raw path when rootfs.img is missing or realpath
+        # fails: under set -e a bare failing substitution would abort the
+        # script here, skipping the identity check and the kill cleanup.
+        ROOTFS_REAL=$(realpath ./rootfs.img 2>/dev/null || echo "./rootfs.img")
         IS_OURS=0
         case "$PROC_EXE" in
             "$KERNEL_REAL"|"$JAIL_ENTRY") IS_OURS=1 ;;

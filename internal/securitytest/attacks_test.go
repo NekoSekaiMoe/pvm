@@ -367,9 +367,12 @@ func TestAttack_ObservationLeak(t *testing.T) {
 // is missing, launch MUST fail closed unless allow_insecure_degraded is true.
 // =====================================================================
 
-type fakeLauncher struct{}
+type fakeLauncher struct {
+	starts int // number of Start invocations (fail-closed tests assert zero)
+}
 
 func (f *fakeLauncher) Start(ctx context.Context, kernel string, args []string, logFile *os.File) (int, *uml.Process, error) {
+	f.starts++
 	return 99999, &uml.Process{}, nil
 }
 func (f *fakeLauncher) Wait(p *uml.Process) error { return nil }
@@ -387,7 +390,8 @@ func TestAttack_HostSecurityFailClosed(t *testing.T) {
 	jail.ResetHostCapabilitiesForTest(sim)
 	defer jail.ResetHostCapabilitiesForTest(nil)
 
-	mgr := container.NewManager(&fakeLauncher{})
+	fl := &fakeLauncher{}
+	mgr := container.NewManager(fl)
 	s := &spec.TaskSpec{
 		Version: 1,
 		Caller:  "attacker",
@@ -409,6 +413,11 @@ func TestAttack_HostSecurityFailClosed(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "fail-closed") {
 		t.Errorf("expected fail-closed error, got %v", err)
+	}
+	// Fail-closed means the workload must never launch: the rejection has
+	// to happen BEFORE the launcher is invoked.
+	if fl.starts != 0 {
+		t.Errorf("SECURITY: launcher invoked %d times despite fail-closed rejection", fl.starts)
 	}
 }
 

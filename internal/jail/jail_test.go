@@ -119,6 +119,14 @@ func TestCheckSecurity(t *testing.T) {
 			if err != nil {
 				t.Fatalf("unexpected error with allowDegraded=true: %v", err)
 			}
+			// The non-degraded branch must claim only the REQUIRED baselines:
+			// with an enforcement layer disabled (enforceSeccomp/enforceLandlock
+			// = false) that layer was never checked, so "all baselines
+			// satisfied" would overstate the guarantee.
+			if len(tc.wantBypassed) == 0 &&
+				!strings.Contains(rep.Details, "all required host security baselines satisfied") {
+				t.Errorf("expected Details to state required baselines satisfied, got %q", rep.Details)
+			}
 			if len(tc.wantBypassed) > 0 && !rep.Degraded {
 				t.Errorf("expected report.Degraded to be true, bypassed=%v", rep.BypassedLayers)
 			}

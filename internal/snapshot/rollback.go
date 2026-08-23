@@ -168,6 +168,10 @@ func RollbackWithForce(taskID, snapshotID string, force bool) error {
 			AutoResume:  currentState.AutoResume,
 			Retries:     currentState.Retries,
 			Deadline:    currentState.Deadline,
+			// Metadata must be carried over too: dropping it here would make
+			// SaveState persist a state without the labels, and the E2B list
+			// response would silently lose the sandbox metadata.
+			Metadata:    currentState.Metadata,
 			Transitions: append([]state.Transition(nil), currentState.Transitions...),
 		}
 	}
