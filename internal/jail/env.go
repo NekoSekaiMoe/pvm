@@ -26,6 +26,14 @@ const JailHomeFallback = "/tmp"
 // The matching entry is REPLACED in place rather than appended: with
 // duplicate keys getenv returns the FIRST occurrence, so an appended
 // HOME=/tmp would be shadowed by the inherited HOME=/root.
+//
+// Note on writability: we check existence only, not whether HOME/.uml can
+// be created. That is sufficient by construction — post-pivot the only
+// directories that can serve as HOME are /tmp (the jail tmpfs, provably
+// writable: the kernel's physmem file and the mconsole socket already live
+// there) and the read-only system binds (/lib, /usr/lib, ...), which no
+// sane caller sets as HOME. Inherited values (/root, /home/runner) never
+// exist inside the jail and always take the fallback.
 func jailHomeEnv(env []string, dirExists func(string) bool) []string {
 	for i, e := range env {
 		if strings.HasPrefix(e, "HOME=") {
