@@ -133,7 +133,7 @@ func runJailHelper() error {
 
 // closeHelperFDs closes the hand-over fds recorded in the helper config.
 func closeHelperFDs(cfg *jailHelperConfig) {
-	for _, fd := range append([]int{cfg.ExeFD, cfg.TargetFD, cfg.RootfsFD}, cfg.VolumeFDs...) {
+	for _, fd := range append([]int{cfg.ExeFD, cfg.TargetFD, cfg.RootfsFD, cfg.RootfsParentFD}, cfg.VolumeFDs...) {
 		if fd > 0 {
 			unix.Close(fd)
 		}
@@ -241,8 +241,24 @@ func setupJailFilesystem(cfg *jailHelperConfig) ([]string, error) {
 	if err := os.MkdirAll(oldRoot, 0700); err != nil {
 		return nil, fmt.Errorf("create pivot_root mountpoint: %w", err)
 	}
-	if err := unix.PivotRoot(rootfs, oldRoot); err != nil {
-		return nil, fmt.Errorf("pivot_root into %s: %w", rootfs, err)
+	pivotRoot := rootfs
+	if cfg.RootfsParentFD > 0 {
+		// The rootfs fd was opened BEFORE the self-bind above, so its
+		// /proc/self/fd path resolves to the ORIGINAL parent mount and
+		// pivot_root would reject it ("not a mountpoint", EINVAL). Mount
+		// crossing only happens when a walk ENTERS the mountpoint dentry
+		// from its parent — re-walk openat(parent, base) after the
+		// self-bind to land on the bind mount.
+		bindF, err := os.Open(filepath.Join(procFDPath(cfg.RootfsParentFD), cfg.RootfsBaseName))
+		if err != nil {
+			return nil, fmt.Errorf("re-walk jail rootfs through parent fd: %w", err)
+		}
+		defer bindF.Close()
+		pivotRoot = procFDPath(int(bindF.Fd()))
+		oldRoot = filepath.Join(pivotRoot, ".pivot-old")
+	}
+	if err := unix.PivotRoot(pivotRoot, oldRoot); err != nil {
+		return nil, fmt.Errorf("pivot_root into %s: %w", cfg.Rootfs, err)
 	}
 	if err := unix.Chdir("/"); err != nil {
 		return nil, fmt.Errorf("chdir into new root: %w", err)

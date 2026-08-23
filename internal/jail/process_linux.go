@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"syscall"
 
 	"golang.org/x/sys/unix"
@@ -43,7 +44,17 @@ type jailHelperConfig struct {
 	ExeFD     int   `json:"exe_fd,omitempty"`
 	TargetFD  int   `json:"target_fd,omitempty"`
 	RootfsFD  int   `json:"rootfs_fd,omitempty"`
-	VolumeFDs []int `json:"volume_fds,omitempty"` // parallel to Volumes
+	// RootfsParentFD + RootfsBaseName exist for one namei subtlety: the
+	// rootfs fd is opened BEFORE the helper self-binds the rootfs (pivot_root
+	// requires new_root to be a mountpoint), so /proc/self/fd/<rootfs>
+	// resolves to the ORIGINAL parent mount and pivot_root rejects it with
+	// EINVAL ("not a mountpoint"). Mount crossing only happens when a walk
+	// ENTERS the mountpoint dentry from its parent, so the helper re-walks
+	// openat(RootfsParentFD, RootfsBaseName) AFTER the self-bind and pivots
+	// through that fresh fd.
+	RootfsParentFD int    `json:"rootfs_parent_fd,omitempty"`
+	RootfsBaseName string `json:"rootfs_base_name,omitempty"`
+	VolumeFDs      []int  `json:"volume_fds,omitempty"` // parallel to Volumes
 	// MountProc tells the helper to mount a private procfs at /proc after
 	// pivot_root. It is set exactly when the child got CLONE_NEWPID, so the
 	// procfs exposes only the jail's own process tree — safe to mount, and
@@ -231,6 +242,16 @@ func wrapWithJailHelper(cmd *exec.Cmd, j *JailEnvironment, mountProc bool) error
 		}
 		volFs = append(volFs, vf)
 	}
+	parentF, err := openBindSource(filepath.Dir(j.Rootfs))
+	if err != nil {
+		exeF.Close()
+		tgtF.Close()
+		rootF.Close()
+		for _, f := range volFs {
+			f.Close()
+		}
+		return fmt.Errorf("jail: open jail rootfs parent %s: %w", filepath.Dir(j.Rootfs), err)
+	}
 
 	cfg := jailHelperConfig{
 		Rootfs:             j.Rootfs,
@@ -249,6 +270,9 @@ func wrapWithJailHelper(cmd *exec.Cmd, j *JailEnvironment, mountProc bool) error
 		cfg.VolumeFDs = append(cfg.VolumeFDs, base+3+i)
 		cmd.ExtraFiles = append(cmd.ExtraFiles, vf)
 	}
+	cfg.RootfsParentFD = base + 3 + len(volFs)
+	cfg.RootfsBaseName = filepath.Base(j.Rootfs)
+	cmd.ExtraFiles = append(cmd.ExtraFiles, parentF)
 	blob, err := json.Marshal(cfg)
 	if err != nil {
 		return fmt.Errorf("jail: encode helper config: %w", err)
