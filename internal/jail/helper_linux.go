@@ -82,14 +82,16 @@ func runJailHelper() error {
 	}
 	// The UML kernel's main() (arch/um/os-Linux/main.c) calls
 	// personality(PER_LINUX | ADDR_NO_RANDOMIZE) and, when that CHANGES the
-	// persona, re-execs itself via readlink("/proc/self/exe") + execve. The
-	// jail has no /proc mounted (by design: no CLONE_NEWPID, so a mounted
-	// procfs would expose host processes), so that readlink gets ENOENT and
-	// the kernel dies instantly with "readlink failure: No such file or
-	// directory" before printing a single boot line. Pre-setting the exact
-	// persona the kernel asks for makes it skip the re-exec entirely
-	// (personality is inherited across execve, which is the mechanism UML
-	// itself relies on). This is fail-closed: without it the workload is
+	// persona, re-execs itself via readlink("/proc/self/exe") + execve. When
+	// the jail mounts a private /proc (MountProc) the readlink resolves and
+	// the re-exec would work; when it does not (degraded mountns-only jail
+	// without CLONE_NEWPID, where a mounted procfs would expose host
+	// processes), the readlink gets ENOENT and the kernel dies instantly
+	// with "readlink failure: No such file or directory" before printing a
+	// single boot line. Pre-setting the exact persona the kernel asks for
+	// makes it skip the re-exec entirely on BOTH paths (personality is
+	// inherited across execve, which is the mechanism UML itself relies on).
+	// This is fail-closed: without it the degraded-path workload is
 	// guaranteed to die in the jail with a cryptic error.
 	//   PER_LINUX = 0x0000, ADDR_NO_RANDOMIZE = 0x0040000 (linux/personality.h)
 	if _, _, errno := unix.Syscall(unix.SYS_PERSONALITY, 0x0040000, 0, 0); errno != 0 {
@@ -207,6 +209,24 @@ func setupJailFilesystem(cfg *jailHelperConfig) ([]string, error) {
 		return nil, fmt.Errorf("unmount old root: %w", err)
 	}
 	_ = os.Remove("/.pivot-old")
+
+	// Private procfs. Only mounted when the child got CLONE_NEWPID
+	// (MountProc): the procfs then exposes the jail's own PID namespace
+	// instead of the host process tree. Mounted after pivot_root so it
+	// lands in the jail view; requires CAP_SYS_ADMIN in the child's user
+	// namespace, which namespaced root has. Mount failures are fatal: a
+	// workload promised a private /proc must not silently run without it.
+	if cfg.MountProc {
+		// SetupJail pre-creates <rootfs>/proc, but JailEnvironments built
+		// by hand (tests, embedding callers) may lack it — create on demand.
+		if err := os.MkdirAll("/proc", 0555); err != nil {
+			return nil, fmt.Errorf("create /proc mountpoint: %w", err)
+		}
+		if err := unix.Mount("proc", "/proc", "proc", unix.MS_NOSUID|unix.MS_NOEXEC|unix.MS_NODEV, ""); err != nil {
+			return nil, fmt.Errorf("mount private /proc: %w", err)
+		}
+		allowed = append(allowed, "/proc")
+	}
 
 	return allowed, nil
 }

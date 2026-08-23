@@ -2,7 +2,9 @@ package container
 
 import (
 	"fmt"
+	"os"
 	"strings"
+	"syscall"
 
 	"uml-container/internal/jail"
 )
@@ -18,6 +20,50 @@ const (
 	jailGuestVhostSock = "/sockets/vhost-blk.sock"
 	jailGuestTun       = "/dev/net/tun"
 )
+
+// volumeAccessNote preflights a hostfs volume for the rootless jail and
+// returns a human-readable warning, or "" when access should work.
+//
+// The namespaced monitor accesses volume files with fixed host creds (host
+// uid uidBase+k for guest uid k). Files owned INSIDE the container's
+// allocated range appear to the guest with the right owner (host uidBase+k
+// maps to guest k through the userns map) and pass DAC; everything else
+// falls back to the world/other permission bits.
+//
+// Why not idmapped mounts: a mount idmap is a single injective mapping and
+// the monitor's host creds are fixed, so a FOREIGN owner uid can never be
+// mapped to both "guest sees uid k" and "monitor creds match owner" at the
+// same time — idmapped mounts are a no-op for this topology (the
+// k8s/podman idmapped-volume practice only works because their volumes are
+// already subuid-range-owned, which is exactly the case that needs
+// nothing). The contract therefore is: volumes are range-owned or
+// world-accessible.
+func volumeAccessNote(hostPath string, uidBase, uidRange uint32) string {
+	if uidRange == 0 {
+		return ""
+	}
+	fi, err := os.Stat(hostPath)
+	if err != nil {
+		return fmt.Sprintf("cannot stat volume host path: %v", err)
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return ""
+	}
+	if st.Uid >= uidBase && st.Uid < uidBase+uidRange {
+		return "" // owned inside the container's range: guest sees the right owner
+	}
+	need := os.FileMode(0004) // other-read
+	if fi.IsDir() {
+		need = 0005 // other r-x to traverse
+	}
+	if fi.Mode().Perm()&need == need {
+		return "" // world-accessible enough for the monitor's "other" creds
+	}
+	return fmt.Sprintf("owned by host uid %d outside the container uid range [%d,%d) and not world-accessible (mode %04o); "+
+		"the rootless monitor will get EACCES — chown -R %d:%d the volume or loosen its permission bits",
+		st.Uid, uidBase, uidBase+uidRange, fi.Mode().Perm(), uidBase, uidBase)
+}
 
 // routeLaunchThroughJail rewrites kernel args so that every host path the
 // kernel must open points at its in-jail bind mount, returning the volume

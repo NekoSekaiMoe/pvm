@@ -14,6 +14,13 @@ type ContextKey string
 
 const (
 	KeyJailEnv ContextKey = "jail_env"
+	// KeyExtraFiles carries host-side pre-opened files (tap fd, ...) that
+	// must be inherited by the workload. Entry i becomes fd 3+i in the
+	// direct child (os/exec.ExtraFiles contract) and survives the jail
+	// helper's exec into the workload, so kernel args can reference fd=3+i.
+	// This is the rootless-jail mechanism for moving privileged opens
+	// (TUNSETIFF) host-side (TODO.md "[P1] Jail rootless 化").
+	KeyExtraFiles ContextKey = "extra_files"
 )
 
 // Process is the handle returned by Launcher.Start. It pairs the underlying
@@ -36,6 +43,9 @@ type DefaultLauncher struct{}
 
 func (l *DefaultLauncher) Start(ctx context.Context, kernel string, args []string, logFile *os.File) (int, *Process, error) {
 	cmd := exec.CommandContext(ctx, kernel, args...)
+	if files, ok := ctx.Value(KeyExtraFiles).([]*os.File); ok && len(files) > 0 {
+		cmd.ExtraFiles = files
+	}
 	if jEnv, ok := ctx.Value(KeyJailEnv).(*jail.JailEnvironment); ok && jEnv != nil {
 		// A failed isolation setup must abort BEFORE cmd.Start: running the
 		// kernel without the promised sandbox would silently violate the

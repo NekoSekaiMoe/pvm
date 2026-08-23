@@ -287,6 +287,17 @@ type SecuritySpec struct {
 	// AllowInsecureDegraded allows task launch to proceed even if host security
 	// primitives (Landlock LSM, User Namespace, Seccomp) are not supported by
 	// the host kernel or environment. Defaults to false (fail-closed).
+	//
+	// Since the rootless jail (TODO.md "[P1] Jail rootless 化"), a privileged
+	// launch without usable user namespaces additionally reports the
+	// "user-namespace" layer: the monitor then runs with the legacy
+	// mountns-only jail — seccomp/capability CONSTRAINTS on a real-root
+	// supervisor, not the NEWUSER+NEWPID hard boundary (zero init_user_ns
+	// capabilities, host processes unaddressable). Degraded mode also skips
+	// the host-side tap fd handoff (vec0 falls back to transport=tap, which
+	// needs the monitor to hold CAP_NET_ADMIN), so it is strictly a
+	// compatibility escape hatch, never the target posture. Every degraded
+	// launch is audit-recorded (security:degraded_warning).
 	AllowInsecureDegraded bool `toml:"allow_insecure_degraded" json:"allow_insecure_degraded"`
 	// EnforceHostSeccomp enables host-level seccomp-bpf filtering for the UML process.
 	// Defaults to true when the key is absent from the TOML: LoadFile/LoadString

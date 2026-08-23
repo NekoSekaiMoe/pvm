@@ -1,6 +1,7 @@
 package container
 
 import (
+	"os"
 	"testing"
 
 	"uml-container/internal/jail"
@@ -97,6 +98,56 @@ func TestRouteLaunchThroughJail(t *testing.T) {
 			if args[i] != a {
 				t.Errorf("arg %d changed: %q -> %q", i, a, args[i])
 			}
+		}
+	})
+}
+
+func TestVolumeAccessNote(t *testing.T) {
+	const base, rng = 100000, 65536
+
+	t.Run("degraded mode is a no-op", func(t *testing.T) {
+		if note := volumeAccessNote("/nonexistent", 0, 0); note != "" {
+			t.Errorf("uidRange=0 must never warn, got %q", note)
+		}
+	})
+
+	t.Run("range-owned volume is silent", func(t *testing.T) {
+		dir := t.TempDir()
+		if os.Geteuid() != 0 {
+			t.Skip("chown requires root")
+		}
+		if err := os.Chown(dir, base+7, base+7); err != nil {
+			t.Fatal(err)
+		}
+		if note := volumeAccessNote(dir, base, rng); note != "" {
+			t.Errorf("range-owned volume warned: %q", note)
+		}
+	})
+
+	t.Run("world-accessible foreign volume is silent", func(t *testing.T) {
+		dir := t.TempDir() // 0700 by default...
+		if err := os.Chmod(dir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		if note := volumeAccessNote(dir, base, rng); note != "" {
+			t.Errorf("world-traversable volume warned: %q", note)
+		}
+	})
+
+	t.Run("locked-down foreign volume warns", func(t *testing.T) {
+		dir := t.TempDir()
+		if err := os.Chmod(dir, 0700); err != nil {
+			t.Fatal(err)
+		}
+		note := volumeAccessNote(dir, base, rng)
+		if note == "" {
+			t.Error("expected EACCES warning for foreign 0700 volume")
+		}
+	})
+
+	t.Run("missing path warns", func(t *testing.T) {
+		if note := volumeAccessNote("/nonexistent/path/xyz", base, rng); note == "" {
+			t.Error("expected stat-failure warning")
 		}
 	})
 }

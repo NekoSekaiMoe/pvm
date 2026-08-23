@@ -17,9 +17,11 @@ import (
 	"uml-container/internal/jail"
 	"uml-container/internal/lifecycle"
 	"uml-container/internal/log"
+	"uml-container/internal/network"
 	"uml-container/internal/network/egress"
 	"uml-container/internal/spec"
 	"uml-container/internal/state"
+	"uml-container/internal/uidalloc"
 	"uml-container/internal/uml"
 	"uml-container/internal/vhost"
 	"uml-container/internal/volume"
@@ -55,6 +57,13 @@ type Manager struct {
 	// register task->pid for incident hooks and to deliver the token into the
 	// sandbox via its init contract.
 	OnProvisioned func(taskID string, pid int, token string)
+
+	// UIDTable is the centralized host-uid-range allocation table backing the
+	// rootless hard boundary (internal/uidalloc; TODO.md "[P1] Jail rootless
+	// 化"). Always non-nil from NewManager; allocation is only attempted on
+	// privileged launches (the unprivileged leg maps the caller's own uid
+	// with size 1 and needs no table).
+	UIDTable *uidalloc.Table
 }
 
 // IncidentHooks is the subset of the incident controller the manager needs to
@@ -69,7 +78,71 @@ func NewManager(launcher uml.Launcher) *Manager {
 	if launcher == nil {
 		launcher = &uml.DefaultLauncher{}
 	}
-	return &Manager{Launcher: launcher}
+	// Open never fails for a non-empty path (the file is created lazily);
+	// allocation failures surface at Allocate time.
+	tbl, _ := uidalloc.Open(uidalloc.DefaultPath())
+	return &Manager{Launcher: launcher, UIDTable: tbl}
+}
+
+// uidRangeFor returns the container's allocated host uid range for the
+// rootless hard boundary. (0, 0, nil) for unprivileged callers: their
+// rootless leg maps the caller's own uid with size 1 and needs no
+// allocation. A privileged caller gets an idempotent allocation from the
+// centralized table (start allocates, stop releases — WaitExit/StartTask);
+// an error means the table is unusable and the caller must choose between
+// fail-closed and degraded (security.allow_insecure_degraded).
+func (m *Manager) uidRangeFor(id string) (uint32, uint32, error) {
+	if os.Geteuid() != 0 || m.UIDTable == nil {
+		return 0, 0, nil
+	}
+	base, err := m.UIDTable.Allocate(id)
+	if err != nil {
+		return 0, 0, err
+	}
+	return base, uidalloc.RangeSize, nil
+}
+
+// releaseUIDRange frees the container's uid slot at stop time. Releasing an
+// id that was never allocated is a no-op, so cleanup paths call it
+// unconditionally.
+func (m *Manager) releaseUIDRange(id string) {
+	if m.UIDTable == nil || os.Geteuid() != 0 {
+		return
+	}
+	if err := m.UIDTable.Release(id); err != nil {
+		fmt.Printf("Warning: release uid range for %s: %v\n", id, err)
+	}
+}
+
+// rootlessJailActive reports whether the upcoming launch will actually put
+// the monitor under NEWUSER+NEWPID (mirrors the predicate
+// ConfigureProcessIsolation applies): privileged caller, usable user+mount
+// namespaces, and an allocated uid range.
+func rootlessJailActive(uidRange uint32) bool {
+	if uidRange == 0 || os.Geteuid() != 0 {
+		return false
+	}
+	caps := jail.DetectHostCapabilities()
+	return caps.HasUserNS && caps.HasMountNS
+}
+
+// prepareTapFD performs the host-side privileged half of tap setup for a
+// rootless launch: open /dev/net/tun + TUNSETIFF + offload/vnet-header
+// programming (network.OpenTapFD), returning the fd to inherit into the
+// jail as ExtraFiles slot 0 — fd 3 in the workload (os/exec contract).
+// (nil, -1, nil) selects the legacy vec0:transport=tap path: no tap
+// configured, or a non-rootless launch where the (real-root) monitor can
+// still TUNSETIFF for itself. Fail-closed when a rootless launch cannot
+// attach: the namespaced monitor has no CAP_NET_ADMIN fallback.
+func prepareTapFD(tapName string, rootless bool) (*os.File, int, error) {
+	if tapName == "" || !rootless {
+		return nil, -1, nil
+	}
+	f, err := network.OpenTapFD(tapName)
+	if err != nil {
+		return nil, -1, fmt.Errorf("container: rootless tap attach for %s: %w", tapName, err)
+	}
+	return f, 3, nil
 }
 
 // Booted is a started legacy container: the process handle plus the jail
@@ -102,7 +175,37 @@ func (m *Manager) Start(ctx context.Context, cfg *config.ContainerConfig) error 
 // the process has started. The caller MUST eventually call WaitExit to reap
 // the process, record the terminal status, and release the jail directory.
 func (m *Manager) Boot(ctx context.Context, cfg *config.ContainerConfig) (*Booted, error) {
-	args, err := buildLegacyArgs(ctx, cfg)
+	// Rootless hard boundary plumbing, BEFORE args are built: the uid range
+	// decides both the jail mapping and whether the tap is attached
+	// host-side and inherited as an fd (vec0:transport=fd) instead of being
+	// TUNSETIFF'd at runtime by the monitor — namespaced root holds no
+	// CAP_NET_ADMIN in the host netns (TODO.md "[P1] Jail rootless 化").
+	uidBase, uidRange, err := m.uidRangeFor(cfg.ID)
+	if err != nil {
+		if !cfg.AllowInsecureDegraded {
+			return nil, fmt.Errorf("container: allocate uid range for %s: %w (set security.allow_insecure_degraded to run with the degraded mountns-only jail)", cfg.ID, err)
+		}
+		fmt.Printf("Warning: uid range allocation for %s failed (%v); running with degraded mountns-only jail\n", cfg.ID, err)
+		uidBase, uidRange = 0, 0
+	}
+	booted := false
+	defer func() {
+		if !booted {
+			m.releaseUIDRange(cfg.ID)
+		}
+	}()
+
+	tapFile, tapFD, err := prepareTapFD(cfg.NetworkTap, rootlessJailActive(uidRange))
+	if err != nil {
+		return nil, err
+	}
+	if tapFile != nil {
+		// The workload inherits its own copy via ExtraFiles; the manager's
+		// copy is closed when Boot returns, success or failure.
+		defer tapFile.Close()
+	}
+
+	args, err := buildLegacyArgs(ctx, cfg, tapFD)
 	if err != nil {
 		return nil, err
 	}
@@ -150,6 +253,8 @@ func (m *Manager) Boot(ctx context.Context, cfg *config.ContainerConfig) (*Boote
 		AllowInsecureDegraded: cfg.AllowInsecureDegraded,
 		EnforceHostSeccomp:    true,
 		EnforceLandlock:       true,
+		UIDBase:               uidBase,
+		UIDRangeSize:          uidRange,
 	})
 	if jailErr != nil {
 		if logFile != nil {
@@ -164,10 +269,19 @@ func (m *Manager) Boot(ctx context.Context, cfg *config.ContainerConfig) (*Boote
 			// The kernel will pivot_root into the jail: rewrite every host
 			// path on its command line (ubd image, vhost socket, hostfs
 			// volumes) to the in-jail bind mount and make the tap device
-			// node visible.
+			// node visible. With the fd transport (tapFD >= 0) the tap is
+			// already attached host-side and inherited, so /dev/net/tun is
+			// NOT bound into the jail at all.
+			tapName := cfg.NetworkTap
+			if tapFD >= 0 {
+				tapName = ""
+			}
 			var vols []jail.VolumeMapping
-			args, vols = routeLaunchThroughJail(args, cfg.NetworkTap)
+			args, vols = routeLaunchThroughJail(args, tapName)
 			jailEnv.Config.Volumes = vols
+		}
+		if tapFile != nil {
+			ctx = context.WithValue(ctx, uml.KeyExtraFiles, []*os.File{tapFile})
 		}
 		ctx = context.WithValue(ctx, uml.KeyJailEnv, jailEnv)
 	}
@@ -200,6 +314,7 @@ func (m *Manager) Boot(ctx context.Context, cfg *config.ContainerConfig) (*Boote
 		m.OnProvisioned(cfg.ID, pid, "")
 	}
 
+	booted = true
 	return &Booted{Process: p, jail: jailEnv, logFile: logFile}, nil
 }
 
@@ -213,6 +328,8 @@ func (m *Manager) WaitExit(id string, b *Booted) error {
 	if b.jail != nil {
 		defer b.jail.Cleanup()
 	}
+	// Start allocates the container's host uid range, stop releases it.
+	defer m.releaseUIDRange(id)
 	err := m.Launcher.Wait(b.Process)
 	// Wait drained the log-copy goroutines; the console log can be closed
 	// now that the process lifecycle is complete.
@@ -360,6 +477,34 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 		}
 	}
 
+	// Rootless hard boundary (TODO.md "[P1] Jail rootless 化"): allocate the
+	// task's dedicated 65536-wide host uid range. The range is released when
+	// StartTask returns (start allocates, stop releases); crashes leak a slot
+	// that uidalloc.Prune can reclaim later.
+	uidBase, uidRange, err := m.uidRangeFor(taskID)
+	if err != nil {
+		if !s.Security.AllowInsecureDegraded {
+			_ = st.Transition(state.StatusFailed, state.ActorController, "uid range allocation failed: "+err.Error())
+			state.SaveState(taskID, st)
+			return fmt.Errorf("container: allocate uid range for %s: %w", taskID, err)
+		}
+		// Same audit contract as the CheckSecurity degraded warning above:
+		// a downgraded sandbox must never boot without an auditable trace.
+		if aerr := ledger.Append(audit.Record{
+			Phase:    audit.PhaseExec,
+			Subject:  s.Caller,
+			Action:   "security:degraded_warning",
+			Decision: audit.DecisionAllow,
+			Reason:   "uid range allocation failed, running with degraded mountns-only jail: " + err.Error(),
+		}); aerr != nil {
+			_ = st.Transition(state.StatusFailed, state.ActorController, "audit degraded-warning append failed: "+aerr.Error())
+			state.SaveState(taskID, st)
+			return fmt.Errorf("container: audit degraded warning for %s: %w", taskID, aerr)
+		}
+		uidBase, uidRange = 0, 0
+	}
+	defer m.releaseUIDRange(taskID)
+
 	// Provisioning: create overlay, start vhost daemon, set up network+policy.
 	if err := st.Transition(state.StatusProvisioning, state.ActorController, "start task"); err != nil {
 		return err
@@ -459,6 +604,22 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 				state.SaveState(taskID, st)
 				return fmt.Errorf("container: volume attach %q: %w", vm.Name, err)
 			}
+			// Rootless jail ownership preflight (see volumeAccessNote): when
+			// the monitor will run under NEWUSER, foreign-owned volumes that
+			// are not world-accessible will EACCES in the guest. Warn with an
+			// audit record instead of failing — the top-level check is a
+			// heuristic and subdirectories may still be fine. An audit-append
+			// failure is non-fatal (the task contract is unchanged), matching
+			// the other warning-level audit sites below.
+			if note := volumeAccessNote(res.HostPath, uidBase, uidRange); note != "" {
+				fmt.Printf("Warning: volume %q for %s: %s\n", vm.Name, taskID, note)
+				if aerr := ledger.Append(audit.Record{
+					Phase: audit.PhaseExec, Subject: taskID, Action: "volume_access",
+					Decision: audit.DecisionConstrain, Reason: note,
+				}); aerr != nil {
+					fmt.Printf("Warning: audit append volume_access for %s: %v\n", taskID, aerr)
+				}
+			}
 			mode := "rw"
 			if vm.ReadOnly {
 				mode = "ro"
@@ -512,6 +673,18 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 					_ = st.Transition(state.StatusFailed, state.ActorController, "overlay creation failed: "+err.Error())
 					state.SaveState(taskID, st)
 					return fmt.Errorf("container: create qcow2 overlay for %s: %w", taskID, err)
+				}
+				// The overlay is opened by the vhost backend (manager-side) and,
+				// on ubd paths, potentially by the namespaced monitor: ownership
+				// must land inside the container's uid range so DAC passes once
+				// the monitor is mere namespaced root.
+				if uidRange > 0 {
+					if chErr := os.Chown(overlayPath, int(uidBase), int(uidBase)); chErr != nil {
+						cleanupVolumes()
+						_ = st.Transition(state.StatusFailed, state.ActorController, "overlay chown failed: "+chErr.Error())
+						state.SaveState(taskID, st)
+						return fmt.Errorf("container: chown overlay %s into uid range %d: %w", overlayPath, uidBase, chErr)
+					}
 				}
 				overlayCreated = true
 			}
@@ -576,6 +749,20 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 		}
 		sockPath = sock
 		vhostBackend = backend
+		// The namespaced monitor connects to the vhost socket through an
+		// in-jail bind of the HOST path: it must be able to traverse the
+		// state dir (o+x, no list) and write the socket inode (connect
+		// permission). The state dir contents stay root-owned; only
+		// traversal is granted.
+		if uidRange > 0 {
+			_ = os.Chmod(dir, 0711)
+			if chErr := os.Chown(sockPath, int(uidBase), int(uidBase)); chErr != nil {
+				cleanupVolumes()
+				_ = st.Transition(state.StatusFailed, state.ActorController, "vhost socket chown failed: "+chErr.Error())
+				state.SaveState(taskID, st)
+				return fmt.Errorf("container: chown vhost socket %s into uid range %d: %w", sockPath, uidBase, chErr)
+			}
+		}
 		defer func() {
 			if vhostBackend != nil {
 				vhostBackend.Close()
@@ -667,11 +854,31 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 		tokenStr = tok
 	}
 
+	// Host-side tap attach for the rootless jail: when the monitor will run
+	// under NEWUSER+NEWPID, TUNSETIFF is impossible from inside (no
+	// CAP_NET_ADMIN in the host netns), so the tap is opened and programmed
+	// here and inherited as an fd (vec0:transport=fd). The manager's copy of
+	// the fd closes when StartTask returns; the workload holds its own.
+	tapName := ""
+	if s.Network.Enabled {
+		tapName = s.Network.TAP
+	}
+	tapFile, tapFD, err := prepareTapFD(tapName, rootlessJailActive(uidRange))
+	if err != nil {
+		cleanupVolumes()
+		_ = st.Transition(state.StatusFailed, state.ActorController, "tap fd setup failed: "+err.Error())
+		state.SaveState(taskID, st)
+		return err
+	}
+	if tapFile != nil {
+		defer tapFile.Close()
+	}
+
 	// Build kernel args from the TaskSpec. Pass the resolved rootfs so the
 	// kernel command line matches what we actually provisioned. egressAddr is
 	// the host:port of this task's dedicated egress listener (authoritative
 	// attribution source); the task id is NOT exposed to the guest.
-	args, err := buildTaskArgs(s, sockPath, resolvedRootfs, egressAddr, volumeArgs)
+	args, err := buildTaskArgs(s, sockPath, resolvedRootfs, egressAddr, volumeArgs, tapFD)
 	if err != nil {
 		cleanupVolumes()
 		_ = st.Transition(state.StatusFailed, state.ActorController, "kernel args rejected: "+err.Error())
@@ -712,6 +919,8 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 		AllowInsecureDegraded: s.Security.AllowInsecureDegraded,
 		EnforceHostSeccomp:    s.Security.EnforceHostSeccomp,
 		EnforceLandlock:       s.Security.EnforceLandlock,
+		UIDBase:               uidBase,
+		UIDRangeSize:          uidRange,
 	})
 	if err != nil {
 		cleanupVolumes()
@@ -724,13 +933,18 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 		if jailEnv.IsolationActive() {
 			// Same jail path-rewrite as the legacy Boot path: the kernel
 			// must open the overlay/vhost socket/tun through in-jail binds.
-			tap := ""
-			if s.Network.Enabled {
-				tap = s.Network.TAP
+			// With the fd transport the tap is inherited instead, so
+			// /dev/net/tun is NOT bound into the jail.
+			tap := tapName
+			if tapFD >= 0 {
+				tap = ""
 			}
 			var vols []jail.VolumeMapping
 			args, vols = routeLaunchThroughJail(args, tap)
 			jailEnv.Config.Volumes = vols
+		}
+		if tapFile != nil {
+			ctx = context.WithValue(ctx, uml.KeyExtraFiles, []*os.File{tapFile})
 		}
 		ctx = context.WithValue(ctx, uml.KeyJailEnv, jailEnv)
 	}
@@ -1044,7 +1258,9 @@ func validateMemory(val string) error {
 // buildLegacyArgs reproduces the original UML command-line for the umlctl path.
 // Extracted from the pre-refactor Start() to keep behavior byte-identical
 // (modulo validation of interpolated fields).
-func buildLegacyArgs(ctx context.Context, cfg *config.ContainerConfig) ([]string, error) {
+// tapFD >= 0 replaces the vec0 tap transport with the fd transport: the tap
+// was attached host-side and is inherited by the workload as that fd.
+func buildLegacyArgs(ctx context.Context, cfg *config.ContainerConfig, tapFD int) ([]string, error) {
 	if err := validateKernelField("init", cfg.Init); err != nil {
 		return nil, err
 	}
@@ -1101,12 +1317,19 @@ func buildLegacyArgs(ctx context.Context, cfg *config.ContainerConfig) ([]string
 		args = append(args, "rw")
 	}
 	// Network device: vec0 (see buildTaskArgs — legacy eth0=tuntap is gone in
-	// Linux >= 6.16, only the vector transport remains).
+	// Linux >= 6.16, only the vector transport remains). tapFD >= 0 selects
+	// the rootless fd transport: the tap was attached host-side by
+	// prepareTapFD and is inherited as that fd (UML vector
+	// 'transport=fd,fd=N'), so the monitor never touches /dev/net/tun.
 	if cfg.NetworkTap != "" {
 		if err := validateKernelField("tap device", cfg.NetworkTap); err != nil {
 			return nil, err
 		}
-		args = append(args, fmt.Sprintf("vec0:transport=tap,ifname=%s,depth=128,gro=1", cfg.NetworkTap))
+		if tapFD >= 0 {
+			args = append(args, fmt.Sprintf("vec0:transport=fd,fd=%d,depth=128,gro=1", tapFD))
+		} else {
+			args = append(args, fmt.Sprintf("vec0:transport=tap,ifname=%s,depth=128,gro=1", cfg.NetworkTap))
+		}
 	}
 	vHost, hasVHost := ctx.Value(KeyVolumeHost).(string)
 	vGuest, hasVGuest := ctx.Value(KeyVolumeGuest).(string)
@@ -1130,7 +1353,9 @@ func buildLegacyArgs(ctx context.Context, cfg *config.ContainerConfig) ([]string
 // guest so the guest dials it as its HTTP proxy. The task id is deliberately
 // NOT passed: the guest cannot be trusted with its own attribution id, and
 // the per-task listener binds the id by closure on the host side instead.
-func buildTaskArgs(s *spec.TaskSpec, vhostSock, resolvedRootfs, egressAddr string, volumeArgs []string) ([]string, error) {
+// tapFD >= 0 replaces the vec0 tap transport with the fd transport (see
+// buildLegacyArgs).
+func buildTaskArgs(s *spec.TaskSpec, vhostSock, resolvedRootfs, egressAddr string, volumeArgs []string, tapFD int) ([]string, error) {
 	if err := validateKernelField("init", s.Workspace.Init); err != nil {
 		return nil, err
 	}
@@ -1196,7 +1421,13 @@ func buildTaskArgs(s *spec.TaskSpec, vhostSock, resolvedRootfs, egressAddr strin
 		if err := validateKernelField("tap device", s.Network.TAP); err != nil {
 			return nil, err
 		}
-		args = append(args, fmt.Sprintf("vec0:transport=tap,ifname=%s,depth=128,gro=1", s.Network.TAP))
+		if tapFD >= 0 {
+			// Rootless fd transport (prepareTapFD): the tap fd is inherited,
+			// no /dev/net/tun or CAP_NET_ADMIN needed inside the jail.
+			args = append(args, fmt.Sprintf("vec0:transport=fd,fd=%d,depth=128,gro=1", tapFD))
+		} else {
+			args = append(args, fmt.Sprintf("vec0:transport=tap,ifname=%s,depth=128,gro=1", s.Network.TAP))
+		}
 	}
 	// Forward the task's DEDICATED egress listener address (host:port) into the
 	// guest so it can dial it as its HTTP proxy. Attribution is established by

@@ -131,7 +131,7 @@ func TestBuildLegacyArgs_RejectsInjection(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			cfg := base
 			c.mut(&cfg)
-			if _, err := buildLegacyArgs(context.Background(), &cfg); err == nil {
+			if _, err := buildLegacyArgs(context.Background(), &cfg, -1); err == nil {
 				t.Fatalf("buildLegacyArgs accepted hostile config %+v", cfg)
 			}
 		})
@@ -153,7 +153,7 @@ func TestBuildLegacyArgs_AcceptsLegitFixture(t *testing.T) {
 		ID: "c1", Kernel: "/kernel", Rootfs: rootfs,
 		Memory: "512M", Init: "/init.sh", NetworkTap: "tap0",
 	}
-	args, err := buildLegacyArgs(context.Background(), &cfg)
+	args, err := buildLegacyArgs(context.Background(), &cfg, -1)
 	if err != nil {
 		t.Fatalf("buildLegacyArgs: %v", err)
 	}
@@ -205,7 +205,7 @@ func TestBuildTaskArgs_RejectsInjection(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			if _, err := buildTaskArgs(c.spec, c.vhostSock, c.rootfs, c.egressAddr, c.volumeArgs); err == nil {
+			if _, err := buildTaskArgs(c.spec, c.vhostSock, c.rootfs, c.egressAddr, c.volumeArgs, -1); err == nil {
 				t.Fatalf("buildTaskArgs accepted hostile input %q", c.name)
 			}
 		})
@@ -248,7 +248,7 @@ func TestBuildLegacyArgs_RelativeRootfs(t *testing.T) {
 				ID: "c1", Kernel: "/kernel", Rootfs: c.rel,
 				Memory: "512M", Init: "/init.sh",
 			}
-			args, err := buildLegacyArgs(context.Background(), &cfg)
+			args, err := buildLegacyArgs(context.Background(), &cfg, -1)
 			if err != nil {
 				t.Fatalf("buildLegacyArgs(relative rootfs %q): %v", c.rel, err)
 			}
@@ -319,7 +319,7 @@ func TestBuildTaskArgs_OptionalFields(t *testing.T) {
 				Workspace: spec.WorkspaceSpec{Init: "/init.sh"},
 				Runtime:   spec.RuntimeSpec{Memory: c.memory},
 			}
-			args, err := buildTaskArgs(s, "", c.rootfs, "", nil)
+			args, err := buildTaskArgs(s, "", c.rootfs, "", nil, -1)
 			if err != nil {
 				t.Fatalf("buildTaskArgs: %v", err)
 			}
@@ -349,7 +349,7 @@ func TestBuildTaskArgs_AcceptsLegitFixture(t *testing.T) {
 		Network:   spec.NetworkSpec{Enabled: true, TAP: "tap0"},
 	}
 	args, err := buildTaskArgs(s, "/run/x/vhost-blk.sock", "/overlays/t1.img", "10.0.0.1:3128",
-		[]string{"/host/share:/mnt/share"})
+		[]string{"/host/share:/mnt/share"}, -1)
 	if err != nil {
 		t.Fatalf("buildTaskArgs: %v", err)
 	}
@@ -381,7 +381,7 @@ func TestBuildTaskArgs_EphemeralReadOnly(t *testing.T) {
 			s := &spec.TaskSpec{
 				Workspace: spec.WorkspaceSpec{Init: "/init.sh", Ephemeral: c.ephemeral},
 			}
-			args, err := buildTaskArgs(s, "", "", "", nil)
+			args, err := buildTaskArgs(s, "", "", "", nil, -1)
 			if err != nil {
 				t.Fatalf("buildTaskArgs: %v", err)
 			}
@@ -429,7 +429,7 @@ func TestBuildLegacyArgs_EphemeralReadOnly(t *testing.T) {
 				Rootfs:    rootfs,
 				Ephemeral: c.ephemeral,
 			}
-			args, err := buildLegacyArgs(context.Background(), cfg)
+			args, err := buildLegacyArgs(context.Background(), cfg, -1)
 			if err != nil {
 				t.Fatalf("buildLegacyArgs: %v", err)
 			}

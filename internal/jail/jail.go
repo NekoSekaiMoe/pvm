@@ -81,6 +81,14 @@ func CheckSecurity(allowDegraded bool, enforceSeccomp, enforceLandlock bool) (*S
 	if !caps.HasMountNS || (!privileged && !caps.HasUserNS) {
 		bypassed = append(bypassed, "namespace-isolation")
 	}
+	// Rootless hard boundary: a privileged manager wraps the monitor in
+	// NEWUSER+NEWPID (TODO.md "[P1] Jail rootless 化"). A host without
+	// usable user namespaces forces the fallback to the plain mountns jail —
+	// constraints, not a hard boundary — so it is reported as its own
+	// bypassed layer and gated by allow_insecure_degraded like the rest.
+	if privileged && !caps.HasUserNS {
+		bypassed = append(bypassed, "user-namespace")
+	}
 
 	if len(bypassed) > 0 {
 		if !allowDegraded {
@@ -101,7 +109,7 @@ func CheckSecurity(allowDegraded bool, enforceSeccomp, enforceLandlock bool) (*S
 	return &SecurityReport{
 		Degraded:       false,
 		BypassedLayers: nil,
-		Details:        "all required host security baselines satisfied (seccomp, landlock, namespaces)",
+		Details:        "all required host security baselines satisfied (seccomp, landlock, namespaces, user-namespace)",
 	}, nil
 }
 
@@ -122,6 +130,19 @@ type Config struct {
 	AllowInsecureDegraded bool            `json:"allow_insecure_degraded"`
 	EnforceHostSeccomp    bool            `json:"enforce_host_seccomp"`
 	EnforceLandlock       bool            `json:"enforce_landlock"`
+	// UIDBase + UIDRangeSize select the rootless hard boundary for a
+	// PRIVILEGED manager: when UIDRangeSize > 0 and the process runs as real
+	// root, the monitor is placed in a user namespace mapping in-ns
+	// [0, UIDRangeSize) onto host uids [UIDBase, UIDBase+UIDRangeSize), plus
+	// a PID namespace (see ConfigureProcessIsolation). Namespaced root holds
+	// zero capabilities in init_user_ns, so ptrace/kill/mount of host objects
+	// is namespace-contained rather than seccomp-constrained. All
+	// runtime-privileged operations (tap attach, cgroup writes) must have
+	// been moved host-side by the caller before enabling this. The base comes
+	// from the centralized allocation table (internal/uidalloc).
+	// UIDRangeSize == 0 keeps the legacy mountns-only jail (degraded mode).
+	UIDBase      uint32 `json:"uid_base,omitempty"`
+	UIDRangeSize uint32 `json:"uid_range_size,omitempty"`
 }
 
 // JailEnvironment holds the created jail paths and configuration handles.
@@ -153,10 +174,29 @@ func SetupJail(cfg Config) (*JailEnvironment, error) {
 		return nil, fmt.Errorf("jail: create jail root: %w", err)
 	}
 
-	// Create subdirectories for jail mounts
-	for _, sub := range []string{"volumes", "images", "sockets", "dev", "tmp"} {
+	// Create subdirectories for jail mounts. "proc" is the mountpoint for
+	// the private procfs the helper mounts when the monitor gets its own
+	// PID namespace (ConfigureProcessIsolation).
+	for _, sub := range []string{"volumes", "images", "sockets", "dev", "tmp", "proc"} {
 		if err := os.MkdirAll(filepath.Join(jailDir, sub), 0700); err != nil {
 			return nil, fmt.Errorf("jail: create jail subfolder %s: %w", sub, err)
+		}
+	}
+
+	// Rootless hard boundary: the jail tree must be owned by the container's
+	// host uid range, or the namespaced-root workload (host uid UIDBase)
+	// cannot write its own /tmp, mountpoints or physmem files once DAC is
+	// real (host-root-owned 0700 dirs map to overflowuid inside the userns).
+	// Harmless in degraded mode (real root bypasses DAC) and skipped for the
+	// unprivileged leg, where the caller already owns what it created.
+	if os.Geteuid() == 0 && cfg.UIDRangeSize > 0 {
+		if err := os.Chown(jailDir, int(cfg.UIDBase), int(cfg.UIDBase)); err != nil {
+			return nil, fmt.Errorf("jail: chown jail root to uid range base %d: %w", cfg.UIDBase, err)
+		}
+		for _, sub := range []string{"volumes", "images", "sockets", "dev", "tmp", "proc"} {
+			if err := os.Chown(filepath.Join(jailDir, sub), int(cfg.UIDBase), int(cfg.UIDBase)); err != nil {
+				return nil, fmt.Errorf("jail: chown jail subfolder %s: %w", sub, err)
+			}
 		}
 	}
 
