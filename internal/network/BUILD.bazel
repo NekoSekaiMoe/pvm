@@ -70,7 +70,9 @@ go_library(
         "@rules_go//go/platform:amd64": [":bpf_bpfel.go"],
         "@rules_go//go/platform:arm": [":bpf_bpfel.go"],
         "@rules_go//go/platform:arm64": [":bpf_bpfel.go"],
-        "@rules_go//go/platform:loong64": [":bpf_bpfel.go"],
+        # NOTE: no loong64 key — rules_go 0.59 declares no loong64
+        # config_setting/toolchain; `go build` still covers it via the
+        # generated files' own //go:build tags.
         "@rules_go//go/platform:mips64le": [":bpf_bpfel.go"],
         "@rules_go//go/platform:mipsle": [":bpf_bpfel.go"],
         "@rules_go//go/platform:ppc64le": [":bpf_bpfel.go"],
@@ -88,7 +90,7 @@ go_library(
         "@rules_go//go/platform:amd64": [":bpf_bpfel.o"],
         "@rules_go//go/platform:arm": [":bpf_bpfel.o"],
         "@rules_go//go/platform:arm64": [":bpf_bpfel.o"],
-        "@rules_go//go/platform:loong64": [":bpf_bpfel.o"],
+        # loong64: see note on the srcs select above.
         "@rules_go//go/platform:mips64le": [":bpf_bpfel.o"],
         "@rules_go//go/platform:mipsle": [":bpf_bpfel.o"],
         "@rules_go//go/platform:ppc64le": [":bpf_bpfel.o"],
