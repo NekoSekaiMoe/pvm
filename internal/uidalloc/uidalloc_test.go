@@ -167,18 +167,20 @@ func TestCorruptTableReported(t *testing.T) {
 func TestRangesDoNotOverlap(t *testing.T) {
 	tbl := openTemp(t)
 	const n = 8
-	seen := map[uint32]string{}
+	// Interval comparison, not per-uid enumeration: ranges are contiguous
+	// [base, base+RangeSize), so pairwise base comparison proves disjointness.
+	bases := map[uint32]string{}
 	for i := 0; i < n; i++ {
 		id := fmt.Sprintf("c%d", i)
 		base, err := tbl.Allocate(id)
 		if err != nil {
 			t.Fatal(err)
 		}
-		for uid := base; uid < base+RangeSize; uid++ {
-			if owner, dup := seen[uid]; dup {
-				t.Fatalf("uid %d mapped to both %s and %s", uid, owner, id)
+		for other, owner := range bases {
+			if base < other+RangeSize && other < base+RangeSize {
+				t.Fatalf("range of %s at %d overlaps %s at %d", id, base, owner, other)
 			}
-			seen[uid] = id
 		}
+		bases[base] = id
 	}
 }

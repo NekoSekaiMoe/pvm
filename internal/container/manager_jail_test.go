@@ -106,7 +106,7 @@ func TestVolumeAccessNote(t *testing.T) {
 	const base, rng = 100000, 65536
 
 	t.Run("degraded mode is a no-op", func(t *testing.T) {
-		if note := volumeAccessNote("/nonexistent", 0, 0); note != "" {
+		if note := volumeAccessNote("/nonexistent", 0, 0, false); note != "" {
 			t.Errorf("uidRange=0 must never warn, got %q", note)
 		}
 	})
@@ -119,7 +119,7 @@ func TestVolumeAccessNote(t *testing.T) {
 		if err := os.Chown(dir, base+7, base+7); err != nil {
 			t.Fatal(err)
 		}
-		if note := volumeAccessNote(dir, base, rng); note != "" {
+		if note := volumeAccessNote(dir, base, rng, false); note != "" {
 			t.Errorf("range-owned volume warned: %q", note)
 		}
 	})
@@ -129,8 +129,24 @@ func TestVolumeAccessNote(t *testing.T) {
 		if err := os.Chmod(dir, 0755); err != nil {
 			t.Fatal(err)
 		}
-		if note := volumeAccessNote(dir, base, rng); note != "" {
-			t.Errorf("world-traversable volume warned: %q", note)
+		if note := volumeAccessNote(dir, base, rng, true); note != "" {
+			t.Errorf("world-traversable ro volume warned: %q", note)
+		}
+	})
+
+	t.Run("rw volume without other-write warns", func(t *testing.T) {
+		dir := t.TempDir()
+		if err := os.Chmod(dir, 0755); err != nil { // o+rx but NOT o+w
+			t.Fatal(err)
+		}
+		if note := volumeAccessNote(dir, base, rng, false); note == "" {
+			t.Error("expected EACCES warning for rw volume without other-write")
+		}
+		if err := os.Chmod(dir, 0757); err != nil {
+			t.Fatal(err)
+		}
+		if note := volumeAccessNote(dir, base, rng, false); note != "" {
+			t.Errorf("world-writable rw volume warned: %q", note)
 		}
 	})
 
@@ -139,14 +155,14 @@ func TestVolumeAccessNote(t *testing.T) {
 		if err := os.Chmod(dir, 0700); err != nil {
 			t.Fatal(err)
 		}
-		note := volumeAccessNote(dir, base, rng)
+		note := volumeAccessNote(dir, base, rng, false)
 		if note == "" {
 			t.Error("expected EACCES warning for foreign 0700 volume")
 		}
 	})
 
 	t.Run("missing path warns", func(t *testing.T) {
-		if note := volumeAccessNote("/nonexistent/path/xyz", base, rng); note == "" {
+		if note := volumeAccessNote("/nonexistent/path/xyz", base, rng, true); note == "" {
 			t.Error("expected stat-failure warning")
 		}
 	})

@@ -47,7 +47,7 @@ This directory contains shell-based integration and end-to-end (E2E) suites vali
 ```bash
 # Run all unprivileged CI-safe suites (fails fast on first error)
 set -e
-for s in tests/{05,06,07,08,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30}_*.sh; do
+for s in tests/{05,06,07,08,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31}_*.sh; do
     echo "Running $s..."
     ./"$s"
 done

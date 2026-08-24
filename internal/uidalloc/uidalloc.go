@@ -196,9 +196,14 @@ func (t *Table) mutate(fn func(*diskState) error) error {
 }
 
 // readLocked reads the table without mutating; caller must hold t.mu.
+// A missing table (or state root) is NOT an error for a read-only query:
+// it simply means nothing was ever allocated.
 func (t *Table) readLocked() (*diskState, error) {
-	f, err := os.OpenFile(t.path, os.O_CREATE|os.O_RDONLY, 0600)
+	f, err := os.Open(t.path)
 	if err != nil {
+		if os.IsNotExist(err) {
+			return &diskState{Allocations: map[string]uint32{}}, nil
+		}
 		return nil, fmt.Errorf("uidalloc: open table: %w", err)
 	}
 	defer f.Close()

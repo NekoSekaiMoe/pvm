@@ -160,10 +160,14 @@ func ConfigureProcessIsolation(cmd *exec.Cmd, j *JailEnvironment) error {
 				cfg.UIDBase = j.Config.UIDBase
 				cfg.UIDRangeSize = j.Config.UIDRangeSize
 			}
-			if os.Getenv(jailDisablePIDNSEnv) == "1" {
-				cfg.StagePIDNS = false
-				cfg.MountProc = false
-			}
+		}
+		// PVM_JAIL_DISABLE_PIDNS is a CI bisection hatch: apply it AFTER the
+		// switch so it disables the pidns/private-proc stage on BOTH legs —
+		// inside the privileged branch it silently did nothing for the
+		// unprivileged CI jobs it exists to debug.
+		if os.Getenv(jailDisablePIDNSEnv) == "1" {
+			cfg.StagePIDNS = false
+			cfg.MountProc = false
 		}
 		if err := wrapStage1(cmd, j, &cfg); err != nil {
 			return err
@@ -219,6 +223,11 @@ func wrapStage1(cmd *exec.Cmd, j *JailEnvironment, cfg *jailHelperConfig) error 
 		syncW.Close()
 		return fmt.Errorf("jail: clear cloexec on launch-sync fd: %w", err)
 	}
+	// Keep the manager's copy of the read end so SignalReady/Cleanup can
+	// close it once the stage-1 child has inherited its own at exec —
+	// otherwise every launch leaks one non-CLOEXEC fd that later children
+	// of the manager inherit as well.
+	j.syncR = os.NewFile(uintptr(syncFD), "jail-launch-sync")
 	j.syncW = syncW
 
 	// Preserve the inherited environment: exec.Cmd falls back to os.Environ()

@@ -124,6 +124,19 @@ if [ "$(id -u)" -ne 0 ] && ! sudo -n true 2>/dev/null; then
 fi
 SUDO_CMD=""
 if [ "$(id -u)" -ne 0 ]; then SUDO_CMD="sudo -E"; fi  # -E: keep PVM_*_ROOT env across privilege elevation
+# Elevated cleanup: sections below run umlctl/agentpvm under sudo, leaving
+# root-owned 0700 dirs under $TMP that an unprivileged rm -rf cannot enter;
+# the default jail root (/tmp/pvm-jails/<task>) lives OUTSIDE $TMP. TAP is
+# registered by section 4 once the interface actually exists.
+TAP=""
+TAP_CREATED=0
+cleanup() {
+    if [ "$TAP_CREATED" = 1 ]; then
+        $SUDO_CMD ip tuntap del "$TAP" mode tap 2>/dev/null || true
+    fi
+    $SUDO_CMD rm -rf "$TMP" /tmp/pvm-jails/rl31-* 2>/dev/null || true
+}
+trap cleanup EXIT
 if ! $SUDO_CMD unshare -m -i -u true 2>/dev/null; then
     echo "   (host kernel cannot clone the mount/ipc/uts namespace set; privileged legs skipped) ✓"
     echo "✅ 31_test_rootless_jail.sh PASSED"
@@ -142,7 +155,7 @@ for _ in $(seq 1 40); do
     sleep 0.25
 done
 [ -n "$found" ] || fail "uidmap.json never showed an allocation for rl31-uid (log: $(cat "$TMP/uid_run.log"))"
-grep -q '100000' "$UIDMAP" || fail "rl31-uid base is not the first slot (100000): $(cat "$UIDMAP")"
+grep -Eq '"rl31-uid":\s*100000\b' "$UIDMAP" || fail "rl31-uid base is not the first slot (100000): $(cat "$UIDMAP")"
 echo "   allocated base 100000 while running ✓"
 wait "$RUN_PID" || fail "umlctl start rl31-uid failed: $(cat "$TMP/uid_run.log")"
 if [ -f "$UIDMAP" ] && grep -q '"rl31-uid"' "$UIDMAP"; then
@@ -175,6 +188,9 @@ echo "==> 4. tap fd transport (vec0:transport=fd)"
 if [ "$HAS_USERNS" -eq 1 ] && [ -e /dev/net/tun ] && command -v ip >/dev/null; then
     TAP="tap_rl31"
     $SUDO_CMD ip tuntap add "$TAP" mode tap 2>/dev/null || true
+    # Register cleanup immediately: a fail() anywhere below must not leak
+    # the interface on the host.
+    if $SUDO_CMD ip link show "$TAP" >/dev/null 2>&1; then TAP_CREATED=1; fi
     $SUDO_CMD ip link set "$TAP" up 2>/dev/null || true
     $SUDO_CMD "$TMP/umlctl" start -name "rl31-tap" -kernel "$TMP/fake_kernel" \
         -rootfs "$PVM_IMAGE_ROOT/rootfs.img" -tap "$TAP" > "$TMP/tap_run.log" 2>&1 \
@@ -185,6 +201,7 @@ if [ "$HAS_USERNS" -eq 1 ] && [ -e /dev/net/tun ] && command -v ip >/dev/null; t
     grep -q TUN_ABSENT "$TAP_LOG" || fail "fd transport must not expose /dev/net/tun in the jail: $(cat "$TAP_LOG")"
     grep -q "NS_PID=1" "$TAP_LOG" || fail "tap run: not pidns init: $(cat "$TAP_LOG")"
     $SUDO_CMD ip tuntap del "$TAP" mode tap 2>/dev/null || true
+    TAP_CREATED=0
     echo "   tap attached host-side, fd inherited, no /dev/net/tun in jail ✓"
 else
     echo "   (skipped: needs userns + /dev/net/tun + iproute2) ✓"

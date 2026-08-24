@@ -155,6 +155,11 @@ type JailEnvironment struct {
 	// ConfigureProcessIsolation. Stage 1 blocks on the read end until the
 	// manager has finished post-fork setup (cgroup.procs) — see SignalReady.
 	syncW *os.File
+	// syncR is the MANAGER's copy of the dupped read end (fd 400). The
+	// stage-1 child inherits its own copy at exec; SignalReady/Cleanup close
+	// the manager's copy so each launch does not leak one fd (the fd is
+	// non-CLOEXEC, so later children of the manager would inherit it too).
+	syncR *os.File
 	// grants records host files whose ownership/mode was temporarily
 	// widened for the namespaced monitor (GrantMonitorRW); Cleanup restores
 	// the original owner/mode before releasing the jail directory.
@@ -199,7 +204,7 @@ func (j *JailEnvironment) GrantMonitorRW(hostPath string, uidBase, gidBase uint3
 	mode := fi.Mode().Perm()
 	// Monitor creds are exactly uidBase:gidBase; anything short of an
 	// owner match falls through to the world bits.
-	if st.Uid == uidBase && mode&0o200 != 0 || mode&0o006 == 0o006 {
+	if (st.Uid == uidBase && mode&0o200 != 0) || mode&0o006 == 0o006 {
 		return nil
 	}
 	grant := fileGrant{path: hostPath, uid: int(st.Uid), gid: int(st.Gid), mode: mode}
@@ -223,12 +228,32 @@ func (j *JailEnvironment) GrantMonitorRW(hostPath string, uidBase, gidBase uint3
 // race — stage 1 reaches the clone in microseconds). Idempotent and
 // nil-safe; a no-op when no sync pipe exists (isolation inactive).
 func (j *JailEnvironment) SignalReady() {
-	if j == nil || j.syncW == nil {
+	if j == nil {
+		return
+	}
+	// The stage-1 child inherited the read end at exec time, so once
+	// Launcher.Start has returned (the documented precondition for this
+	// call) the manager's copy is dead weight: close it here.
+	if j.syncR != nil {
+		_ = j.syncR.Close()
+		j.syncR = nil
+	}
+	if j.syncW == nil {
 		return
 	}
 	_, _ = j.syncW.Write([]byte{1})
 	_ = j.syncW.Close()
 	j.syncW = nil
+}
+
+// restoreGrants replays recorded grant mutations in reverse order,
+// best-effort (the container is gone either way).
+func restoreGrants(grants []fileGrant) {
+	for i := len(grants) - 1; i >= 0; i-- {
+		g := grants[i]
+		_ = os.Chmod(g.path, g.mode)
+		_ = os.Chown(g.path, g.uid, g.gid)
+	}
 }
 
 // SetupJail creates the in-process Gofer jail structure for the task.
@@ -276,6 +301,7 @@ func SetupJail(cfg Config) (*JailEnvironment, error) {
 	// and the per-task dir owned by the range. Harmless in degraded mode
 	// (real root bypasses DAC) and skipped for the unprivileged leg, where
 	// the caller already owns what it created.
+	var grants []fileGrant
 	if os.Geteuid() == 0 && cfg.UIDRangeSize > 0 {
 		// Stage 2 walks the rootfs path as the mapped uid, so EVERY ancestor
 		// of BaseDir must grant execute (traversal). Custom BaseDir values
@@ -290,17 +316,28 @@ func SetupJail(cfg Config) (*JailEnvironment, error) {
 			if fi.Mode().Perm()&0o111 == 0o111 {
 				continue
 			}
-			_ = os.Chmod(d, fi.Mode().Perm()|0o111)
+			// Record the widening so Cleanup restores the original mode:
+			// these ancestors are NOT ours (a custom BaseDir can sit beneath
+			// a 0700 home dir), the change must not outlive the container.
+			if ast, ok := fi.Sys().(*syscall.Stat_t); ok {
+				grants = append(grants, fileGrant{path: d, uid: int(ast.Uid), gid: int(ast.Gid), mode: fi.Mode().Perm()})
+			}
+			if err := os.Chmod(d, fi.Mode().Perm()|0o111); err != nil {
+				return nil, fmt.Errorf("jail: open traversal on ancestor %s: %w", d, err)
+			}
 		}
 		if err := os.Chown(cfg.BaseDir, int(cfg.UIDBase), int(cfg.UIDBase)); err != nil {
+			restoreGrants(grants)
 			return nil, fmt.Errorf("jail: chown jail base dir to uid range base %d: %w", cfg.UIDBase, err)
 		}
 		_ = os.Chmod(cfg.BaseDir, 0711)
 		if err := os.Chown(jailDir, int(cfg.UIDBase), int(cfg.UIDBase)); err != nil {
+			restoreGrants(grants)
 			return nil, fmt.Errorf("jail: chown jail root to uid range base %d: %w", cfg.UIDBase, err)
 		}
 		for _, sub := range []string{"volumes", "images", "sockets", "dev", "tmp", "proc"} {
 			if err := os.Chown(filepath.Join(jailDir, sub), int(cfg.UIDBase), int(cfg.UIDBase)); err != nil {
+				restoreGrants(grants)
 				return nil, fmt.Errorf("jail: chown jail subfolder %s: %w", sub, err)
 			}
 		}
@@ -310,6 +347,7 @@ func SetupJail(cfg Config) (*JailEnvironment, error) {
 		Config:  cfg,
 		JailDir: jailDir,
 		Rootfs:  jailDir,
+		grants:  grants,
 	}, nil
 }
 
@@ -324,13 +362,13 @@ func (j *JailEnvironment) Cleanup() error {
 		_ = j.syncW.Close()
 		j.syncW = nil
 	}
+	if j.syncR != nil {
+		_ = j.syncR.Close()
+		j.syncR = nil
+	}
 	// Restore host files widened by GrantMonitorRW (best-effort, reverse
 	// order) before the jail directory goes away.
-	for i := len(j.grants) - 1; i >= 0; i-- {
-		g := j.grants[i]
-		_ = os.Chmod(g.path, g.mode)
-		_ = os.Chown(g.path, g.uid, g.gid)
-	}
+	restoreGrants(j.grants)
 	j.grants = nil
 	if j.Config.BaseDir == "" {
 		return nil

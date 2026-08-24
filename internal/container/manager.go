@@ -618,7 +618,7 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 			// heuristic and subdirectories may still be fine. An audit-append
 			// failure is non-fatal (the task contract is unchanged), matching
 			// the other warning-level audit sites below.
-			if note := volumeAccessNote(res.HostPath, uidBase, uidRange); note != "" {
+			if note := volumeAccessNote(res.HostPath, uidBase, uidRange, vm.ReadOnly); note != "" {
 				fmt.Printf("Warning: volume %q for %s: %s\n", vm.Name, taskID, note)
 				if aerr := ledger.Append(audit.Record{
 					Phase: audit.PhaseExec, Subject: taskID, Action: "volume_access",
@@ -762,7 +762,12 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 		// permission). The state dir contents stay root-owned; only
 		// traversal is granted.
 		if uidRange > 0 {
-			_ = os.Chmod(dir, 0711)
+			if err := os.Chmod(dir, 0711); err != nil {
+				cleanupVolumes()
+				_ = st.Transition(state.StatusFailed, state.ActorController, "vhost state dir chmod failed: "+err.Error())
+				state.SaveState(taskID, st)
+				return fmt.Errorf("container: chmod vhost state dir %s for monitor traversal: %w", dir, err)
+			}
 			if chErr := os.Chown(sockPath, int(uidBase), int(uidBase)); chErr != nil {
 				cleanupVolumes()
 				_ = st.Transition(state.StatusFailed, state.ActorController, "vhost socket chown failed: "+chErr.Error())

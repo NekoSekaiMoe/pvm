@@ -77,6 +77,7 @@ func scrubStageMarkers() []string {
 	for _, e := range os.Environ() {
 		if strings.HasPrefix(e, jailStagerEnvMarker+"=") ||
 			strings.HasPrefix(e, jailHelperEnvMarker+"=") ||
+			strings.HasPrefix(e, jailSyncFDEnv+"=") ||
 			strings.HasPrefix(e, jailHelperEnvConfig+"=") {
 			continue
 		}

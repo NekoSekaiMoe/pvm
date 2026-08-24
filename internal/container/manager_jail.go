@@ -38,7 +38,7 @@ const (
 // already subuid-range-owned, which is exactly the case that needs
 // nothing). The contract therefore is: volumes are range-owned or
 // world-accessible.
-func volumeAccessNote(hostPath string, uidBase, uidRange uint32) string {
+func volumeAccessNote(hostPath string, uidBase, uidRange uint32, readOnly bool) string {
 	if uidRange == 0 {
 		return ""
 	}
@@ -56,6 +56,12 @@ func volumeAccessNote(hostPath string, uidBase, uidRange uint32) string {
 	need := os.FileMode(0004) // other-read
 	if fi.IsDir() {
 		need = 0005 // other r-x to traverse
+	}
+	if !readOnly {
+		// rw volumes: the namespaced monitor WRITES with its "other"
+		// creds too — without o+w the preflight would pass and the guest
+		// would hit EACCES on first write with no warning recorded.
+		need |= 0002
 	}
 	if fi.Mode().Perm()&need == need {
 		return "" // world-accessible enough for the monitor's "other" creds

@@ -1,10 +1,12 @@
 package network
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
 	"regexp"
+	"time"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
@@ -97,8 +99,11 @@ func OpenTapFD(name string) (*os.File, error) {
 	}
 
 	// A transiently created tap starts link-down; a pre-created one is
-	// already up (idempotent either way).
-	if out, err := exec.Command("ip", "link", "set", name, "up").CombinedOutput(); err != nil {
+	// already up (idempotent either way). Bounded: a stuck netlink must not
+	// wedge the container start path with the tap fd already open.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if out, err := exec.CommandContext(ctx, "ip", "link", "set", name, "up").CombinedOutput(); err != nil {
 		return fail(fmt.Errorf("network: bring up tap %s: %v (%s)", name, err, out))
 	}
 	return f, nil

@@ -3,6 +3,7 @@
 package securitytest
 
 import (
+	"bytes"
 	"os"
 	"os/exec"
 	"strings"
@@ -80,21 +81,37 @@ func TestAttack_JailedMonitorCannotTouchHostProcesses(t *testing.T) {
 if [ $$ -eq 1 ]; then echo PIDNS_INIT_OK; else echo PIDNS_MISSING pid=$$; fi
 kill -TERM 2 2>/dev/null || echo SIGNAL_HOST_PID_DENIED
 cat /proc/2/cmdline >/dev/null 2>&1 || echo PROC_HOST_PID_INVISIBLE
+cat /proc/1/cmdline >/dev/null 2>&1 && echo PROC_SELF_VISIBLE || echo PROC_SELF_MISSING
 `
 	cmd := exec.Command("/bin/sh", "-c", script)
 	if err := jail.ConfigureProcessIsolation(cmd, env); err != nil {
 		t.Fatalf("ConfigureProcessIsolation: %v", err)
 	}
-	out, err := cmd.CombinedOutput()
-	if err != nil {
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+	if err := cmd.Start(); err != nil {
+		// Start failed before any child reached the sync barrier; release
+		// the pipe so nothing lingers on it.
+		env.Cleanup()
 		if os.Geteuid() != 0 {
-			t.Skipf("unprivileged namespace execution not permitted in this environment: %v, output: %s", err, out)
+			t.Skipf("unprivileged namespace execution not permitted in this environment: %v", err)
 		}
-		t.Fatalf("privileged jailed launch failed: %v, output: %s", err, out)
+		t.Fatalf("privileged jailed launch failed to start: %v", err)
 	}
-	for _, want := range []string{"PIDNS_INIT_OK", "SIGNAL_HOST_PID_DENIED", "PROC_HOST_PID_INVISIBLE"} {
-		if !strings.Contains(string(out), want) {
-			t.Errorf("SECURITY: expected %q in jailed workload output, got:\n%s", want, out)
+	// Stage 1 blocks on the launch-sync barrier until the manager releases
+	// it: SignalReady MUST land between Start and Wait, otherwise the child
+	// (and this test) deadlocks on the sync pipe.
+	env.SignalReady()
+	if err := cmd.Wait(); err != nil {
+		if os.Geteuid() != 0 {
+			t.Skipf("unprivileged namespace execution not permitted in this environment: %v, output: %s", err, out.String())
+		}
+		t.Fatalf("privileged jailed launch failed: %v, output: %s", err, out.String())
+	}
+	for _, want := range []string{"PIDNS_INIT_OK", "SIGNAL_HOST_PID_DENIED", "PROC_HOST_PID_INVISIBLE", "PROC_SELF_VISIBLE"} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("SECURITY: expected %q in jailed workload output, got:\n%s", want, out.String())
 		}
 	}
 }

@@ -364,6 +364,42 @@ func TestBuildTaskArgs_AcceptsLegitFixture(t *testing.T) {
 	}
 }
 
+// TestBuildTaskArgs_TapFDTransport pins the vec0 transport contract for
+// both network hand-over modes: the legacy in-guest attach
+// (transport=tap, tapFD=-1) and the rootless inherited-fd mode
+// (transport=fd, tapFD>=0), which must NOT name an ifname (the monitor
+// never touches /dev/net/tun in that mode).
+func TestBuildTaskArgs_TapFDTransport(t *testing.T) {
+	cases := []struct {
+		name       string
+		tapFD      int
+		want       string
+		wantAbsent string
+	}{
+		{"legacy tap transport", -1, "vec0:transport=tap,ifname=tap0,depth=128,gro=1", "transport=fd"},
+		{"rootless fd transport", 3, "vec0:transport=fd,fd=3,vec=0", "ifname="},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s := &spec.TaskSpec{
+				Workspace: spec.WorkspaceSpec{Init: "/init.sh"},
+				Network:   spec.NetworkSpec{Enabled: true, TAP: "tap0"},
+			}
+			args, err := buildTaskArgs(s, "", "", "", nil, c.tapFD)
+			if err != nil {
+				t.Fatalf("buildTaskArgs: %v", err)
+			}
+			joined := strings.Join(args, "\n")
+			if !strings.Contains(joined, c.want) {
+				t.Errorf("args missing %q: %v", c.want, args)
+			}
+			if strings.Contains(joined, c.wantAbsent) {
+				t.Errorf("args must not contain %q: %v", c.wantAbsent, args)
+			}
+		})
+	}
+}
+
 // TestBuildTaskArgs_EphemeralReadOnly: ephemeral specs mount the root
 // read-only ("ro" instead of "rw") — the cmdline half of the non-persistent
 // contract (the vhost read-only backend is the other half).
