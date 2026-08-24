@@ -161,7 +161,7 @@ func ConfigureProcessIsolation(cmd *exec.Cmd, j *JailEnvironment) error {
 				cfg.UIDRangeSize = j.Config.UIDRangeSize
 			}
 		}
-		if err := wrapStage1(cmd, &cfg); err != nil {
+		if err := wrapStage1(cmd, j, &cfg); err != nil {
 			return err
 		}
 	}
@@ -169,11 +169,17 @@ func ConfigureProcessIsolation(cmd *exec.Cmd, j *JailEnvironment) error {
 	return nil
 }
 
+// jailSyncFDEnv names the inherited fd stage 1 blocks on until the manager
+// finishes post-fork setup (cgroup membership). Kept OUT of ExtraFiles so
+// the tap fd numbering (fd 3) is untouched; the fd is dupped high to stay
+// clear of runtime fds.
+const jailSyncFDEnv = "PVM_JAIL_SYNC_FD"
+
 // wrapStage1 rewrites cmd so that, instead of the target binary, the current
 // executable is re-exec'd as the stage-1 stager. Stage 1 runs with full
 // privileges in a fresh mount namespace, so the direct executable path is
 // always traversable — no fd hand-over is needed anywhere in the launch.
-func wrapStage1(cmd *exec.Cmd, cfg *jailHelperConfig) error {
+func wrapStage1(cmd *exec.Cmd, j *JailEnvironment, cfg *jailHelperConfig) error {
 	exe, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("jail: locate executable for stage-1 re-exec: %w", err)
@@ -182,6 +188,26 @@ func wrapStage1(cmd *exec.Cmd, cfg *jailHelperConfig) error {
 	if err != nil {
 		return fmt.Errorf("jail: encode stage config: %w", err)
 	}
+
+	// Launch-sync pipe: stage 1 blocks before cloning stage 2 until the
+	// manager writes a byte (after cgroup.procs). Non-CLOEXEC inheritance
+	// carries the read end through the stage-1 re-exec.
+	syncR, syncW, err := os.Pipe()
+	if err != nil {
+		return fmt.Errorf("jail: create launch-sync pipe: %w", err)
+	}
+	syncFD, err := unix.FcntlInt(syncR.Fd(), unix.F_DUPFD, 400)
+	syncR.Close()
+	if err != nil {
+		syncW.Close()
+		return fmt.Errorf("jail: dup launch-sync fd: %w", err)
+	}
+	if _, err := unix.FcntlInt(uintptr(syncFD), unix.F_SETFD, 0); err != nil {
+		unix.Close(syncFD)
+		syncW.Close()
+		return fmt.Errorf("jail: clear cloexec on launch-sync fd: %w", err)
+	}
+	j.syncW = syncW
 
 	// Preserve the inherited environment: exec.Cmd falls back to os.Environ()
 	// only while Env is nil, and the stages forward cmd.Env to the workload.
@@ -192,6 +218,7 @@ func wrapStage1(cmd *exec.Cmd, cfg *jailHelperConfig) error {
 	cmd.Env = append(env,
 		jailStagerEnvMarker+"=1",
 		jailHelperEnvConfig+"="+string(blob),
+		fmt.Sprintf("%s=%d", jailSyncFDEnv, syncFD),
 	)
 	cmd.Path = exe
 	if len(cmd.Args) == 0 {

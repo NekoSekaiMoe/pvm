@@ -306,6 +306,12 @@ func (m *Manager) Boot(ctx context.Context, cfg *config.ContainerConfig) (*Boote
 	if setupErr := cg.Setup(cfg.ID, pid, cfg.MemoryBytes, cfg.CPU); setupErr != nil {
 		fmt.Printf("Warning: failed to setup cgroup limits for %s: %v\n", cfg.ID, setupErr)
 	}
+	// Unblock stage 1 only AFTER cgroup membership covers the stage-1 pid:
+	// stage 2 is forked after this point and inherits the cgroup, so the
+	// whole workload tree is inside the limits.
+	if jailEnv != nil {
+		jailEnv.SignalReady()
+	}
 
 	st.Status = state.StatusRunning
 	state.SaveState(cfg.ID, st)
@@ -969,6 +975,9 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 	if setupErr := cg.Setup(taskID, pid, memBytes, s.Runtime.CPU); setupErr != nil {
 		fmt.Printf("Warning: failed to setup cgroup limits for %s: %v\n", taskID, setupErr)
 	}
+	// Unblock stage 1 only AFTER the cgroup write: stage 2 is forked past
+	// this barrier and inherits the stage-1 cgroup (see jail.SignalReady).
+	jailEnv.SignalReady()
 
 	// Budget enforcement: wall-clock deadline.
 	if s.Budget.MaxWallTime != "" {

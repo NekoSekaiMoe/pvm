@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 
@@ -152,6 +154,30 @@ func runJailStager() error {
 		return fmt.Errorf("bind stage-2 binary %s: %w", exe, err)
 	}
 
+	// Launch-sync barrier: block until the manager has written cgroup
+	// membership for THIS (stage 1) pid. cgroup membership is inherited at
+	// fork, so cloning stage 2 before the write would leave the whole
+	// workload tree outside the container's limits. EOF (manager died or
+	// aborted the launch) is fatal: no launch without confirmed limits.
+	if raw := os.Getenv(jailSyncFDEnv); raw != "" {
+		fd, err := strconv.Atoi(raw)
+		if err != nil {
+			return fmt.Errorf("invalid %s=%q", jailSyncFDEnv, raw)
+		}
+		buf := make([]byte, 1)
+		n, err := unix.Read(fd, buf)
+		unix.Close(fd)
+		if err != nil {
+			return fmt.Errorf("launch-sync read (manager died before cgroup setup): %w", err)
+		}
+		if n == 0 {
+			// EOF: the manager closed the pipe without signalling (launch
+			// aborted). Refuse to continue — a workload must never run
+			// outside its confirmed cgroup limits.
+			return fmt.Errorf("launch-sync closed without ready byte (manager aborted launch)")
+		}
+	}
+
 	// Clone stage 2 with the namespace flags the policy selected.
 	child := exec.Command(filepath.Join(cfg.Rootfs, jailStage2Path))
 	child.Env = append(scrubStageMarkers(),
@@ -198,10 +224,33 @@ func runJailStager() error {
 	if err := child.Start(); err != nil {
 		return fmt.Errorf("start stage 2: %w", err)
 	}
+	// Forward termination signals to the workload (by HOST pid — signal
+	// delivery is namespace-agnostic). Without this, a SIGTERM aimed at the
+	// recorded pid would kill stage 1 and the workload would only die via
+	// Pdeathsig=SIGKILL, turning a graceful-shutdown request into a hard
+	// kill.
+	sigCh := make(chan os.Signal, 4)
+	signal.Notify(sigCh, unix.SIGTERM, unix.SIGINT, unix.SIGHUP)
+	defer signal.Stop(sigCh)
+	go func() {
+		for sig := range sigCh {
+			if child.Process != nil {
+				_ = child.Process.Signal(sig)
+			}
+		}
+	}()
 	// Forward the workload's exit status to the manager waiting on stage 1.
 	err = child.Wait()
 	if exitErr, ok := err.(*exec.ExitError); ok {
 		if ws, ok := exitErr.Sys().(syscall.WaitStatus); ok {
+			if ws.Signaled() {
+				// Die by the SAME signal so the manager observes the real
+				// termination cause (ExitStatus() is -1 for signal deaths).
+				sig := ws.Signal()
+				signal.Reset(sig)
+				_ = unix.Kill(unix.Getpid(), sig)
+				os.Exit(128 + int(sig))
+			}
 			os.Exit(ws.ExitStatus())
 		}
 		os.Exit(1)

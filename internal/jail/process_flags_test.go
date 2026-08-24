@@ -3,6 +3,7 @@
 package jail
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"os/exec"
@@ -164,7 +165,17 @@ func TestRootlessJail_Execution(t *testing.T) {
 	if err := ConfigureProcessIsolation(cmd, env); err != nil {
 		t.Fatalf("ConfigureProcessIsolation: %v", err)
 	}
-	out, err := cmd.CombinedOutput()
+	// Two-stage launch: stage 1 waits on the launch-sync pipe until the
+	// manager (here: the test) confirms post-fork setup.
+	var buf bytes.Buffer
+	cmd.Stdout = &buf
+	cmd.Stderr = &buf
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	env.SignalReady()
+	err = cmd.Wait()
+	out := buf.Bytes()
 	if err != nil {
 		t.Fatalf("rootless jailed execution failed: %v, output: %s", err, out)
 	}

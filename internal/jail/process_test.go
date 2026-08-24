@@ -3,6 +3,7 @@
 package jail
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"os/exec"
@@ -59,7 +60,17 @@ func TestConfigureProcessIsolation_Execution(t *testing.T) {
 		t.Fatalf("ConfigureProcessIsolation failed: %v", err)
 	}
 
-	out, err := cmd.CombinedOutput()
+	// The two-stage launch blocks stage 1 on the launch-sync pipe until
+	// the manager confirms post-fork setup — in tests, that is us.
+	var buf bytes.Buffer
+	cmd.Stdout = &buf
+	cmd.Stderr = &buf
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	env.SignalReady()
+	err := cmd.Wait()
+	out := buf.Bytes()
 	if err != nil {
 		if os.Geteuid() != 0 {
 			// Known case: unprivileged CI containers without user-namespace

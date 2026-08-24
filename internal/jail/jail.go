@@ -150,6 +150,25 @@ type JailEnvironment struct {
 	Config  Config
 	JailDir string
 	Rootfs  string
+	// syncW is the write end of the launch-sync pipe created by
+	// ConfigureProcessIsolation. Stage 1 blocks on the read end until the
+	// manager has finished post-fork setup (cgroup.procs) — see SignalReady.
+	syncW *os.File
+}
+
+// SignalReady releases stage 1 to clone stage 2. The manager MUST call this
+// after Launcher.Start returns and cgroup membership has been written for
+// the stage-1 pid: cgroup membership is inherited at fork(), so a stage 2
+// cloned BEFORE the write would live outside the container's limits (a real
+// race — stage 1 reaches the clone in microseconds). Idempotent and
+// nil-safe; a no-op when no sync pipe exists (isolation inactive).
+func (j *JailEnvironment) SignalReady() {
+	if j == nil || j.syncW == nil {
+		return
+	}
+	_, _ = j.syncW.Write([]byte{1})
+	_ = j.syncW.Close()
+	j.syncW = nil
 }
 
 // SetupJail creates the in-process Gofer jail structure for the task.
@@ -198,11 +217,20 @@ func SetupJail(cfg Config) (*JailEnvironment, error) {
 	// (real root bypasses DAC) and skipped for the unprivileged leg, where
 	// the caller already owns what it created.
 	if os.Geteuid() == 0 && cfg.UIDRangeSize > 0 {
-		// Stage 2 walks the rootfs path as the mapped uid, so EVERY
-		// ancestor of BaseDir must be o+x — custom BaseDir values (tests
-		// under t.TempDir()) can sit beneath 0700 directories.
+		// Stage 2 walks the rootfs path as the mapped uid, so EVERY ancestor
+		// of BaseDir must grant execute (traversal). Custom BaseDir values
+		// (tests under t.TempDir()) can sit beneath 0700 directories.
+		// Traversal-only: ADD execute bits, never touch read bits — this
+		// must not weaken directories we did not create.
 		for d := filepath.Dir(cfg.BaseDir); d != "/" && d != "."; d = filepath.Dir(d) {
-			_ = os.Chmod(d, 0755)
+			fi, statErr := os.Stat(d)
+			if statErr != nil {
+				break
+			}
+			if fi.Mode().Perm()&0o111 == 0o111 {
+				continue
+			}
+			_ = os.Chmod(d, fi.Mode().Perm()|0o111)
 		}
 		if err := os.Chown(cfg.BaseDir, int(cfg.UIDBase), int(cfg.UIDBase)); err != nil {
 			return nil, fmt.Errorf("jail: chown jail base dir to uid range base %d: %w", cfg.UIDBase, err)
@@ -227,7 +255,16 @@ func SetupJail(cfg Config) (*JailEnvironment, error) {
 
 // Cleanup removes the jail directory and releases any held resources.
 func (j *JailEnvironment) Cleanup() error {
-	if j == nil || j.Config.BaseDir == "" {
+	if j == nil {
+		return nil
+	}
+	// Closing the sync pipe unreleased makes stage 1 see EOF and abort the
+	// launch (fail closed: no workload without cgroup membership confirmed).
+	if j.syncW != nil {
+		_ = j.syncW.Close()
+		j.syncW = nil
+	}
+	if j.Config.BaseDir == "" {
 		return nil
 	}
 	return os.RemoveAll(j.Config.BaseDir)
