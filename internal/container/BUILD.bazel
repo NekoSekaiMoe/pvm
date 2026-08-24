@@ -18,6 +18,7 @@ go_library(
         "//internal/lifecycle",
         "//internal/log",
         "//internal/network",
+        "//internal/network/dnslearn",
         "//internal/network/egress",
         "//internal/spec",
         "//internal/state",
