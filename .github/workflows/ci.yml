@@ -124,6 +124,9 @@ jobs:
         echo "Running additional test suites serially..."
         chmod +x tests/*.sh
         for script in tests/*.sh; do
+          # bazel_run.sh is the sh_test wrapper (suite name comes via
+          # args), not a suite; running it bare just errors out.
+          [ "$(basename "$script")" = "bazel_run.sh" ] && continue
           if [ -f "$script" ]; then
             echo "Running $script..."
             # sudo strips the env; re-export the prebuilt-binary vars so the

@@ -35,18 +35,13 @@ echo "=== Starting E2B API server on port $PORT ==="
 SRV=$!
 
 READY=0
-for _ in $(seq 1 30); do
+for _ in $(seq 1 60); do
     if curl -s "http://127.0.0.1:$PORT/api/containers" -H "Authorization: Bearer $SECRET" >/dev/null 2>&1; then
         READY=1
         break
     fi
-    sleep 0.1
+    sleep 0.5
 done
-[ "$READY" = "1" ] || fail "server failed to become ready on port $PORT"
-
-AUTH="Authorization: Bearer $SECRET"
-JSON_HDR="Content-Type: application/json"
-
 fail() {
     echo "FAIL: $*" >&2
     if [ -f "$TMP/srv.log" ]; then
@@ -55,6 +50,9 @@ fail() {
     fi
     exit 1
 }
+AUTH="Authorization: Bearer $SECRET"
+JSON_HDR="Content-Type: application/json"
+[ "$READY" = "1" ] || fail "server failed to become ready on port $PORT"
 
 # =========================================================================
 # Part 1: Event-Level Snapshot Lifecycle
