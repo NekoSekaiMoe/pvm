@@ -5,6 +5,10 @@
 # notes (manual/local/exclusive semantics, env-injected prebuilt binaries,
 # runfiles data).
 
+# Bazel 8 removed the native shell rules; sh_test comes from rules_shell
+# (MODULE.bazel). test_suite remains native.
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
+
 # Workspace files CI-safe suites read relative to the workspace root.
 # Keep in sync with: grep -l 'uml/\|agentpvm.toml' tests/*.sh
 CI_SAFE_DATA = [
@@ -14,7 +18,7 @@ CI_SAFE_DATA = [
 ]
 
 def pvm_suite(name, suite, data = []):
-    native.sh_test(
+    sh_test(
         name = name,
         srcs = [suite],
         data = CI_SAFE_DATA + data,
