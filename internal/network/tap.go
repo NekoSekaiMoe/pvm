@@ -29,23 +29,10 @@ func CreateTap(name string) error {
 // supports; the same values appear in internal/jail/seccomp_filter.go (the
 // workload-side ioctl allowlist) — keep them in sync.
 const (
-	ioctlTUNSETIFF       = 0x400454CA
-	ioctlTUNGETFEATURES  = 0x800454CF
-	ioctlTUNSETOFFLOAD   = 0x400454D0
-	ioctlTUNSETVNETHDRSZ = 0x400454D8
+	ioctlTUNSETIFF = 0x400454CA
 
-	iffTAP     = 0x0002
-	iffNOPI    = 0x1000
-	iffVNETHDR = 0x4000
-
-	tunFCSUM = 0x01
-	tunFTSO4 = 0x02
-	tunFTSO6 = 0x04
-
-	// virtioNetHdrLen is sizeof(struct virtio_net_hdr) — the value UML's
-	// vector tap setup programs via TUNSETVNETHDRSZ
-	// (arch/um/drivers/vector_user.c uml_tap_enable_vnet_headers).
-	virtioNetHdrLen = 10
+	iffTAP  = 0x0002
+	iffNOPI = 0x1000
 )
 
 // ifNameRe guards the ifreq buffer: IFNAMSIZ is 16 including the NUL, and
@@ -62,16 +49,23 @@ type ifreqFlags struct {
 }
 
 // OpenTapFD attaches a tap device host-side and returns the open fd, ready
-// to be inherited by the jailed UML kernel as vec0:transport=fd,fd=N.
+// to be inherited by the jailed UML kernel as vec0:transport=fd,fd=N,vec=0.
 //
 // This is the manager-side half of the rootless tap plan (TODO.md "[P1]
 // Jail rootless 化"): attaching a tap requires CAP_NET_ADMIN in the HOST
 // network namespace, which a namespaced-root monitor does not have — so the
-// manager (real root) performs open("/dev/net/tun") + TUNSETIFF + offload /
-// vnet-header setup here, mirroring exactly what UML's vector tap transport
-// would have done in create_tap_fd()/uml_tap_enable_vnet_headers(), and the
-// workload receives only the finished fd. Inside the jail nothing needs
+// manager (real root) performs open("/dev/net/tun") + TUNSETIFF here and
+// the workload receives only the finished fd. Inside the jail nothing needs
 // /dev/net/tun, CAP_NET_ADMIN or the TUN* ioctls anymore.
+//
+// Two UML fd-transport facts drive the exact shape (CI bisect 8856):
+//   - transport=fd defaults to VECTOR mode (VECTOR_RX|VECTOR_TX), whose TX
+//     path is sendmmsg(2) — SOCKETS only; on a tap char device every TX
+//     fails ENOTSOCK and vec0 dies on the first frame. vec=0 forces
+//     packet-at-a-time readv/writev, the only mode that works on tap fds.
+//   - the fd transport speaks raw ethernet frames (header_size=0), so the
+//     fd must be attached WITHOUT IFF_VNET_HDR — unlike the "tap"
+//     transport, which enables vnet headers on the fd it opens itself.
 //
 // Attaching to a PRE-CREATED tap (operator-managed, possibly bridged) works
 // unchanged: TUNSETIFF with an existing ifname attaches to it. When name
@@ -91,29 +85,15 @@ func OpenTapFD(name string) (*os.File, error) {
 		return nil, err
 	}
 
-	req := ifreqFlags{flags: iffTAP | iffNOPI | iffVNETHDR}
+	// Attach WITHOUT IFF_VNET_HDR, and no TUNSETOFFLOAD/TUNSETVNETHDRSZ:
+	// UML's fd transport (arch/um/drivers/vector_*) keeps header_size=0 and
+	// speaks RAW ethernet frames on the fd — the virtio-net header machinery
+	// is exclusive to the self-attaching "tap" transport. A vnet-enabled fd
+	// would have the first 10 bytes of every frame misparsed as a header.
+	req := ifreqFlags{flags: iffTAP | iffNOPI}
 	copy(req.name[:], name)
 	if _, _, errno := unix.Syscall(unix.SYS_IOCTL, f.Fd(), ioctlTUNSETIFF, uintptr(unsafe.Pointer(&req))); errno != 0 {
 		return fail(fmt.Errorf("network: TUNSETIFF %s: %w", name, errno))
-	}
-
-	// Same capability probe UML does before enabling vnet headers; without
-	// the feature the guest driver would mis-parse frames.
-	var features uint32
-	if _, _, errno := unix.Syscall(unix.SYS_IOCTL, f.Fd(), ioctlTUNGETFEATURES, uintptr(unsafe.Pointer(&features))); errno != 0 {
-		return fail(fmt.Errorf("network: TUNGETFEATURES %s: %w", name, errno))
-	}
-	if features&iffVNETHDR == 0 {
-		return fail(fmt.Errorf("network: tap %s lacks IFF_VNET_HDR support", name))
-	}
-
-	offload := tunFCSUM | tunFTSO4 | tunFTSO6
-	if _, _, errno := unix.Syscall(unix.SYS_IOCTL, f.Fd(), ioctlTUNSETOFFLOAD, uintptr(offload)); errno != 0 {
-		return fail(fmt.Errorf("network: TUNSETOFFLOAD %s: %w", name, errno))
-	}
-	hdrLen := virtioNetHdrLen
-	if _, _, errno := unix.Syscall(unix.SYS_IOCTL, f.Fd(), ioctlTUNSETVNETHDRSZ, uintptr(unsafe.Pointer(&hdrLen))); errno != 0 {
-		return fail(fmt.Errorf("network: TUNSETVNETHDRSZ %s: %w", name, errno))
 	}
 
 	// A transiently created tap starts link-down; a pre-created one is

@@ -16,7 +16,11 @@
 - **tap**:**未改内核**。v6.18 `arch/um/drivers/vector_user.c` 自带
   `transport=fd`(`user_init_fd_fds`);`network.OpenTapFD` 在宿主侧完成
   open+TUNSETIFF+TUNSETOFFLOAD+TUNSETVNETHDRSZ，经 `uml.KeyExtraFiles`
-  继承为 workload fd 3,kernel arg 改写为 `vec0:transport=fd,fd=3`;
+  继承为 workload fd 3,kernel arg 改写为 `vec0:transport=fd,fd=3,vec=0`
+  (fd 传输默认 vector 模式,TX 走 sendmmsg——socket 专用,tap 字符设备上
+  首帧即 ENOTSOCK 永久死路,CI bisect 8856 实证;vec=0 强制 readv/writev
+  单包模式;且 fd 路径 header_size=0 说裸以太帧,TUNSETIFF 不得带
+  IFF_VNET_HDR——与 UML 自开 tap 的 tap 传输恰好相反)
   rootless 模式下 `/dev/net/tun` 不再 bind 进 jail
 - **/proc**:pidns 内挂私有 procfs(helper 在 pivot_root 后挂载）,UML 的
   readlink("/proc/self/exe") re-exec 回退路径恢复可用（personality 预设保留）

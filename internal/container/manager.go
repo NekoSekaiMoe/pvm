@@ -1335,7 +1335,7 @@ func buildLegacyArgs(ctx context.Context, cfg *config.ContainerConfig, tapFD int
 			return nil, err
 		}
 		if tapFD >= 0 {
-			args = append(args, fmt.Sprintf("vec0:transport=fd,fd=%d,depth=128,gro=1", tapFD))
+			args = append(args, fmt.Sprintf("vec0:transport=fd,fd=%d,vec=0", tapFD))
 		} else {
 			args = append(args, fmt.Sprintf("vec0:transport=tap,ifname=%s,depth=128,gro=1", cfg.NetworkTap))
 		}
@@ -1433,7 +1433,7 @@ func buildTaskArgs(s *spec.TaskSpec, vhostSock, resolvedRootfs, egressAddr strin
 		if tapFD >= 0 {
 			// Rootless fd transport (prepareTapFD): the tap fd is inherited,
 			// no /dev/net/tun or CAP_NET_ADMIN needed inside the jail.
-			args = append(args, fmt.Sprintf("vec0:transport=fd,fd=%d,depth=128,gro=1", tapFD))
+			args = append(args, fmt.Sprintf("vec0:transport=fd,fd=%d,vec=0", tapFD))
 		} else {
 			args = append(args, fmt.Sprintf("vec0:transport=tap,ifname=%s,depth=128,gro=1", s.Network.TAP))
 		}
