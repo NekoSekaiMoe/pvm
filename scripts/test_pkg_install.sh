@@ -38,6 +38,17 @@ ip addr add 10.0.0.2/24 dev vec0 || true
 ip route add default via 10.0.0.1 || true
 echo "nameserver 8.8.8.8" > /etc/resolv.conf
 
+# ---- rootless fd-transport 取证（临时）----
+# 时序探针：guest tick 是否活着（uptime 必须前进）；vec0 xmit/中断计数器
+# 在 ping 前后各采一次：TX 不动 = UML 没往 fd 写；TX 动但 host tap RX=0
+# = 写进了错误的 fd/被丢弃；RX 中断不动 = SIGIO 没到。
+echo "### tick: $(cat /proc/uptime)"
+sleep 2
+echo "### tick2: $(cat /proc/uptime)"
+echo "### vec0 counters BEFORE ping"
+ip -s link show vec0 2>&1
+grep -i vec /proc/interrupts 2>&1 || true
+
 # ---- 诊断：确认 PATH、apk 与 musl 动态链接器是否存在 ----
 echo "PATH=$PATH"
 command -v apk || echo "command -v apk: NOT FOUND in PATH"
@@ -74,9 +85,11 @@ ip route show 2>&1
 echo "### ip link show vec0"
 ip link show vec0 2>&1 || echo "(vec0 does not exist in the guest)"
 echo "### ping gateway 10.0.0.1"
-ping -c 2 -W 3 10.0.0.1 2>&1 || echo "ping gw FAILED rc=$?"
-echo "### vec0 RX/TX counters (TX increments => UML really writes the fd)"
+ping -c 1 -W 1 10.0.0.1 2>&1 || echo "ping gw FAILED rc=$?"
+echo "### vec0 counters AFTER ping"
 ip -s link show vec0 2>&1
+grep -i vec /proc/interrupts 2>&1 || true
+cat /sys/class/net/vec0/statistics/tx_errors /sys/class/net/vec0/statistics/rx_errors 2>/dev/null
 echo "### nslookup dl-cdn.alpinelinux.org 8.8.8.8"
 nslookup dl-cdn.alpinelinux.org 8.8.8.8 2>&1 || echo "nslookup FAILED rc=$?"
 echo "### TCP 443 egress probe (authoritative — this is the transport apk actually uses)"
@@ -172,6 +185,15 @@ PVM_PID=$!
     echo "--- tap RX/TX counters ---"
     sudo ip -s link show tap_pkg 2>&1
     sudo timeout 6 tcpdump -i pvm_br0 -n -c 8 arp or icmp 2>&1 || true
+    echo "--- monitor syscall trace (vec0 fd + timer delivery) ---"
+    # UML monitor argv contains the kernel cmdline (ubd0=...), unique here.
+    MON=$(pgrep -f 'ubd0=' | head -1)
+    echo "monitor pid: ${MON:-NOT_FOUND}"
+    if [ -n "$MON" ]; then
+        sudo timeout 18 strace -f -tt \
+            -e trace=writev,sendmmsg,fcntl,fcntl64,timer_create,timer_settime,rt_sigsuspend \
+            -p "$MON" 2>&1 | grep -v "SIGALRM" | head -80
+    fi
 ) > pkg_tapdiag.log 2>&1 &
 TAPDIAG_PID=$!
 
