@@ -2,50 +2,71 @@
 # Bazel sh_test wrapper for the PVM CI-safe suites.
 #
 # Why this exists: the suites read AGENTPVM_BIN/UMLCTL_BIN from the
-# environment, but Bazel evaluates sh_test.env at ANALYSIS time — it cannot
-# know the runfiles tree's absolute path, and the relative value it can
-# provide (cmd/agentpvm/agentpvm) only resolves if the test's cwd happens
-# to be the runfiles workspace root, which is not guaranteed (and is false
-# for suites that cd elsewhere first).
+# environment, but sh_test.env is evaluated at ANALYSIS time — it cannot
+# know the runfiles tree path — and a relative value only resolves when
+# cwd IS the runfiles root, which is not guaranteed.
 #
-# This wrapper runs at EXECUTION time, where TEST_SRCDIR/TEST_WORKSPACE
-# name the runfiles tree, so it can absolutize the binary paths before
-# handing control to the real suite.
+# This wrapper runs at EXECUTION time and resolves the binaries through
+# the official runfiles library (rlocation), which works in BOTH runfiles
+# modes: symlink trees and the manifest mode Bazel defaults to on Linux
+# (where bazel-out artifacts have no symlink under $TEST_SRCDIR and plain
+# path joins miss them).
 #
-# Usage: bazel_run.sh <suite.sh> [suite args...]
+# Usage (as sh_test src, with the suite name in args): bazel_run.sh <suite.sh>
 set -euo pipefail
 
-SUITE="$1"; shift
+SUITE="${1:?suite name required}"; shift
 
-# Runfiles workspace directory (e.g. $TEST_SRCDIR/_main). Older Bazel
-# exports RUNFILES_DIR instead; handle both.
-if [ -n "${TEST_SRCDIR:-}" ] && [ -n "${TEST_WORKSPACE:-}" ]; then
-    WS="$TEST_SRCDIR/$TEST_WORKSPACE"
-elif [ -n "${RUNFILES_DIR:-}" ]; then
-    WS="$RUNFILES_DIR/${TEST_WORKSPACE:-_main}"
+# --- official runfiles bootstrap (manifest + symlink modes) ---
+runfiles_lib=""
+if [ -n "${TEST_SRCDIR:-}" ] && [ -e "$TEST_SRCDIR/../manifest_runfiles_lib.bash" ]; then
+    # not a real path; fall through to the canonical locations below
+    :
+fi
+for cand in \
+    "${TEST_SRCDIR:-/nonexistent}/_main/../bazel_tools/tools/bash/runfiles/runfiles.bash" \
+    "${TEST_SRCDIR:-/nonexistent}/bazel_tools/tools/bash/runfiles/runfiles.bash" \
+    "${RUNFILES_DIR:-/nonexistent}/bazel_tools/tools/bash/runfiles/runfiles.bash"; do
+    if [ -e "$cand" ]; then runfiles_lib="$cand"; break; fi
+done
+# bazel_tools is external to the workspace in bzlmod (name "bazel_tools"),
+# its runfiles path prefix is _main/../bazel_tools or the workspace alias.
+if [ -z "$runfiles_lib" ]; then
+    # Last resort: probe rlocation via the test's own runfiles manifest.
+    manifest="${RUNFILES_MANIFEST_FILE:-${TEST_SRCDIR:-}/MANIFEST}"
+    [ -f "$manifest" ] || { echo "bazel_run.sh: no runfiles library and no manifest at $manifest" >&2; exit 1; }
+    rloc() { # <workspace-relative path> -> absolute or empty
+        local key="${TEST_WORKSPACE:-_main}/$1" line
+        while IFS= read -r line; do
+            case "$line" in "$key "*) printf '%s\n' "${line#* }"; return 0;; esac
+        done < "$manifest"
+        return 1
+    }
 else
-    echo "bazel_run.sh: not running under bazel (no TEST_SRCDIR/RUNFILES_DIR)" >&2
-    exit 1
+    # shellcheck disable=SC1090
+    source "$runfiles_lib"
+    rloc() { rlocation "${TEST_WORKSPACE:-_main}/$1"; }
 fi
 
-# Locate a workspace file in the runfiles tree; fall back to execroot
-# (BUILD_WORKSPACE_DIRECTORY is only set for `bazel run`, not `bazel test`,
-# so the fallback is informational only).
-find_bin() { # <runfiles-relative path>
-    local rel="$1"
-    if [ -x "$WS/$rel" ]; then
-        printf '%s\n' "$WS/$rel"
-        return 0
-    fi
-    return 1
+AGENTPVM_BIN="$(rloc cmd/agentpvm/agentpvm)" || true
+UMLCTL_BIN="$(rloc cmd/umlctl/umlctl)" || true
+[ -n "${AGENTPVM_BIN:-}" ] && [ -x "$AGENTPVM_BIN" ] || {
+    echo "bazel_run.sh: runfiles binary not found via rlocation: cmd/agentpvm/agentpvm (lib=${runfiles_lib:-manifest})" >&2
+    exit 1
 }
-
-AGENTPVM_BIN="$(find_bin cmd/agentpvm/agentpvm)" \
-    || { echo "bazel_run.sh: runfiles binary not found: $WS/cmd/agentpvm/agentpvm" >&2; ls "$WS" >&2 || true; exit 1; }
-UMLCTL_BIN="$(find_bin cmd/umlctl/umlctl)" \
-    || { echo "bazel_run.sh: runfiles binary not found: $WS/cmd/umlctl/umlctl" >&2; exit 1; }
+[ -n "${UMLCTL_BIN:-}" ] && [ -x "$UMLCTL_BIN" ] || {
+    echo "bazel_run.sh: runfiles binary not found via rlocation: cmd/umlctl/umlctl" >&2
+    exit 1
+}
 export AGENTPVM_BIN UMLCTL_BIN
 
-# Suites resolve their own ROOT from $0's location; run the suite from the
-# runfiles tree so workspace-relative data (uml/agentpvm.toml) resolves.
-exec bash "$WS/tests/$SUITE" "$@"
+# Resolve the suite path itself (workspace file -> runfiles) and run it
+# with bash; the suite computes its own ROOT from $0, landing on the
+# runfiles workspace root so workspace-relative data (uml/agentpvm.toml)
+# resolves.
+SUITE_PATH="$(rloc "tests/$SUITE")"
+[ -n "${SUITE_PATH:-}" ] && [ -f "$SUITE_PATH" ] || {
+    echo "bazel_run.sh: suite not found in runfiles: tests/$SUITE" >&2
+    exit 1
+}
+exec bash "$SUITE_PATH" "$@"
