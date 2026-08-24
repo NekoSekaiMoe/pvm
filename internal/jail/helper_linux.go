@@ -345,6 +345,29 @@ func pivotIntoJail(cfg *jailHelperConfig) ([]string, error) {
 		return nil, fmt.Errorf("bind rootfs %s onto itself: %w", rootfs, err)
 	}
 
+	// Private procfs, mounted BEFORE pivot_root — order is load-bearing:
+	// mount_too_revealing()/mnt_already_visible() only permit a userns
+	// procfs mount when an existing procfs instance (any superblock — the
+	// check is per fs TYPE) is visible in the mount namespace with equally
+	// or more restrictive flags. After pivot_root detaches the old root
+	// tree, the inherited host-proc copy is gone and the fresh mount is
+	// rejected with EPERM (CI: "mount private /proc: operation not
+	// permitted"). Mounting now, while the inherited /proc copy is still
+	// visible, is allowed; the new procfs still exposes the NEW PID
+	// namespace (proc_init_fs_context binds task_active_pid_ns(current),
+	// and stage 2 is already pid 1 of the new pidns). Mount failures are
+	// fatal: a workload promised a private /proc must not silently run
+	// without it.
+	if cfg.MountProc {
+		procTarget := filepath.Join(rootfs, "proc")
+		if err := os.MkdirAll(procTarget, 0555); err != nil {
+			return nil, fmt.Errorf("create /proc mountpoint: %w", err)
+		}
+		if err := unix.Mount("proc", procTarget, "proc", unix.MS_NOSUID|unix.MS_NOEXEC|unix.MS_NODEV, ""); err != nil {
+			return nil, fmt.Errorf("mount private /proc: %w", err)
+		}
+	}
+
 	// Compute the Landlock allowlist from the in-jail view. Only allowlist
 	// directories that actually exist in this rootfs: callers may construct
 	// a JailEnvironment without SetupJail, and Landlock fails hard when an
@@ -380,17 +403,7 @@ func pivotIntoJail(cfg *jailHelperConfig) ([]string, error) {
 	}
 	_ = os.Remove("/.pivot-old")
 
-	// Private procfs. Only mounted when stage 2 got CLONE_NEWPID
-	// (MountProc): the procfs then exposes the jail's own PID namespace
-	// instead of the host process tree. Mount failures are fatal: a
-	// workload promised a private /proc must not silently run without it.
 	if cfg.MountProc {
-		if err := os.MkdirAll("/proc", 0555); err != nil {
-			return nil, fmt.Errorf("create /proc mountpoint: %w", err)
-		}
-		if err := unix.Mount("proc", "/proc", "proc", unix.MS_NOSUID|unix.MS_NOEXEC|unix.MS_NODEV, ""); err != nil {
-			return nil, fmt.Errorf("mount private /proc: %w", err)
-		}
 		allowed = append(allowed, "/proc")
 	}
 
