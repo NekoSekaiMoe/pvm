@@ -326,7 +326,10 @@ func (m *Manager) Boot(ctx context.Context, cfg *config.ContainerConfig) (*Boote
 			}
 			st.Status = state.StatusExited
 			state.SaveState(cfg.ID, st)
-			return nil, fmt.Errorf("container: cgroup setup for %s with requested limits: %w", cfg.ID, setupErr)
+			return nil, fmt.Errorf(
+				"container: cgroup setup for %s with requested limits: %w",
+				cfg.ID, setupErr,
+			)
 		}
 		fmt.Printf("Warning: failed to setup cgroup limits for %s: %v\n", cfg.ID, setupErr)
 	}
@@ -1017,7 +1020,10 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 			cleanupVolumes()
 			_ = st.Transition(state.StatusFailed, state.ActorController, "cgroup setup failed with requested limits: "+setupErr.Error())
 			state.SaveState(taskID, st)
-			return fmt.Errorf("container: cgroup setup for %s with requested limits: %w", taskID, setupErr)
+			return fmt.Errorf(
+				"container: cgroup setup for %s with requested limits: %w",
+				taskID, setupErr,
+			)
 		}
 		fmt.Printf("Warning: failed to setup cgroup limits for %s: %v\n", taskID, setupErr)
 	}
