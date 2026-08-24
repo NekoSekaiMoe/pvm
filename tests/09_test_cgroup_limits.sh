@@ -18,7 +18,13 @@ if [ ! -f ./bin/linux ]; then
     exit 1
 fi
 
-go build -o bin/umlctl ./cmd/umlctl
+if [ -n "${UMLCTL_BIN:-}" ]; then
+    echo "==> using prebuilt bin/umlctl ($UMLCTL_BIN)"
+    cp "$UMLCTL_BIN" "bin/umlctl"
+else
+    echo "==> building bin/umlctl"
+    go build -o "bin/umlctl" ./cmd/umlctl
+fi
 
 NAME="cgroup-limit-test"
 ROOTFS="$(pwd)/rootfs-cgroup-test.img"   # absolute: validateRootfs rejects relative paths

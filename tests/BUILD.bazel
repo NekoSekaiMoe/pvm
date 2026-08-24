@@ -1,0 +1,139 @@
+# Bazel entry points for the numbered end-to-end shell suites.
+#
+# Design notes (why this is deliberately conservative):
+#
+#   * Only the CI-SAFE suites are wired as sh_test targets (the set from
+#     tests/README.md). Suites that need a real UML kernel (01-04, 09) stay
+#     on the ci.yml loop, which also owns the root-owned console-log
+#     forensics that a Bazel sandbox cannot reproduce (internal/log hardens
+#     containers/<id>/logs to 0700 root).
+#   * tags = ["manual", "local", "exclusive"]:
+#       - manual: `bazel test //...` skips these; they are opt-in via
+#         `bazel test //tests:ci_safe` so an unprivileged dev machine (or
+#         the Bazel CI job) is never broken by design-intended root skips.
+#       - local: run outside the sandbox — the suites copy binaries, bind
+#         127.0.0.1 ports, and write to PVM_*_ROOT temp dirs.
+#       - exclusive: serialize; many suites share process-global state
+#         (fixed-ish ports, the IPAM registry).
+#   * The suites cd "$ROOT" (their own location's parent — inside runfiles
+#     that is the workspace root of the runfiles tree), so every workspace
+#     file they touch must be declared in `data` or Bazel will not
+#     materialize it: uml/agentpvm.toml via //uml:agentpvm.toml.
+#   * Prebuilt binaries are injected via AGENTPVM_BIN/UMLCTL_BIN pointing
+#     at the runfiles copies of the //cmd binaries built by Bazel; the
+#     suites' per-suite `go build` fallback then never runs, which is what
+#     makes these targets usable without a writable source tree.
+
+# Workspace files CI-safe suites read relative to the workspace root.
+# Keep in sync with: grep -l 'uml/\|agentpvm.toml' tests/*.sh
+_CI_SAFE_DATA = [
+    "//cmd/agentpvm",
+    "//cmd/umlctl",
+    "//uml:agentpvm.toml",
+]
+
+def _pvm_suite(name, suite, data = []):
+    sh_test(
+        name = name,
+        srcs = [suite],
+        data = _CI_SAFE_DATA + data,
+        env = {
+            # Suites cp these into their sandboxes instead of `go build`ing.
+            "AGENTPVM_BIN": "cmd/agentpvm/agentpvm",
+            "UMLCTL_BIN": "cmd/umlctl/umlctl",
+        },
+        tags = ["manual", "local", "exclusive"],
+    )
+
+[
+    _pvm_suite(
+        name = suite.replace(".sh", "").replace("-", "_"),
+        suite = suite,
+    )
+    for suite in [
+        # CI-safe set per tests/README.md. 30/31 run their unprivileged legs
+        # only (root legs skip themselves); 34 skips without python3; 36
+        # skips without node/npm. 02/03 are listed too — they assert CLI
+        # parsing and cgroup fakefs paths, which need no privileges.
+        "02_test_network_qos.sh",
+        "03_test_cgroup_freeze.sh",
+        "05_test_controlplane_api.sh",
+        "06_test_cli_smoke.sh",
+        "07_test_gate_snapshot_cli.sh",
+        "08_test_approval_pool_cli.sh",
+        "10_test_volume_api_cli.sh",
+        "11_test_template_api.sh",
+        "12_test_lifecycle_autopause.sh",
+        "13_test_e2b_api_security.sh",
+        "14_test_policy_gateway.sh",
+        "15_test_audit_ledger.sh",
+        "16_test_pool_quota.sh",
+        "17_test_umlctl_cli.sh",
+        "18_test_agentpvm_cli.sh",
+        "19_test_cow_advanced.sh",
+        "20_test_snapshot_security.sh",
+        "21_test_state_fsm_durability.sh",
+        "22_test_docker_image_pull.sh",
+        "23_test_container_api.sh",
+        "24_test_tasks_audit_api.sh",
+        "25_test_e2b_api_full.sh",
+        "26_test_full_feature_e2e.sh",
+        "27_test_event_snapshot_clone_rollback.sh",
+        "28_test_webui_simulation.sh",
+        "29_test_ephemeral_mode.sh",
+        "30_test_jail_seccomp_degraded.sh",
+        "31_test_rootless_jail.sh",
+        "32_test_uml_seccomp_mode.sh",
+        "33_test_audit_redaction.sh",
+        "34_test_dns_egress_policy.sh",
+        "35_test_tc_ebpf_dataplane.sh",
+        "36_test_e2b_sdk.sh",
+    ]
+]
+
+# Umbrella: `bazel test //tests:ci_safe` runs every suite above serially
+# (exclusive) without needing to enumerate them on the command line.
+test_suite(
+    name = "ci_safe",
+    tests = [
+        ":" + suite.replace(".sh", "").replace("-", "_")
+        for suite in [
+            "02_test_network_qos.sh",
+            "03_test_cgroup_freeze.sh",
+            "05_test_controlplane_api.sh",
+            "06_test_cli_smoke.sh",
+            "07_test_gate_snapshot_cli.sh",
+            "08_test_approval_pool_cli.sh",
+            "10_test_volume_api_cli.sh",
+            "11_test_template_api.sh",
+            "12_test_lifecycle_autopause.sh",
+            "13_test_e2b_api_security.sh",
+            "14_test_policy_gateway.sh",
+            "15_test_audit_ledger.sh",
+            "16_test_pool_quota.sh",
+            "17_test_umlctl_cli.sh",
+            "18_test_agentpvm_cli.sh",
+            "19_test_cow_advanced.sh",
+            "20_test_snapshot_security.sh",
+            "21_test_state_fsm_durability.sh",
+            "22_test_docker_image_pull.sh",
+            "23_test_container_api.sh",
+            "24_test_tasks_audit_api.sh",
+            "25_test_e2b_api_full.sh",
+            "26_test_full_feature_e2e.sh",
+            "27_test_event_snapshot_clone_rollback.sh",
+            "28_test_webui_simulation.sh",
+            "29_test_ephemeral_mode.sh",
+            "30_test_jail_seccomp_degraded.sh",
+            "31_test_rootless_jail.sh",
+            "32_test_uml_seccomp_mode.sh",
+            "33_test_audit_redaction.sh",
+            "34_test_dns_egress_policy.sh",
+            "35_test_tc_ebpf_dataplane.sh",
+            "36_test_e2b_sdk.sh",
+        ]
+    ],
+    # manual so //... skips the umbrella too; tags filter nothing (the
+    # member tests keep their own manual/local/exclusive tags).
+    tags = ["manual"],
+)

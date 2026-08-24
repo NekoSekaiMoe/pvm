@@ -19,8 +19,20 @@ echo "========== Test 04: qcow2 CoW + vhost-user-blk boot (vec0 networking) ====
 # because the stale socket file outlives the dead qemu-storage-daemon. Never
 # assert on file existence; assert on console.log boot markers.
 
-go build -o agentpvm cmd/agentpvm/main.go
-go build -o bin/umlctl ./cmd/umlctl
+if [ -n "${AGENTPVM_BIN:-}" ]; then
+    echo "==> using prebuilt agentpvm ($AGENTPVM_BIN)"
+    cp "$AGENTPVM_BIN" "agentpvm"
+else
+    echo "==> building agentpvm"
+    go build -o "agentpvm" ./cmd/agentpvm
+fi
+if [ -n "${UMLCTL_BIN:-}" ]; then
+    echo "==> using prebuilt bin/umlctl ($UMLCTL_BIN)"
+    cp "$UMLCTL_BIN" "bin/umlctl"
+else
+    echo "==> building bin/umlctl"
+    go build -o "bin/umlctl" ./cmd/umlctl
+fi
 
 # The vhost backend is pure Go by default (internal/vhost/vu + internal/cow).
 # qemu-img is only used to build a qcow2 LAYERED base (qcow2-over-qcow2

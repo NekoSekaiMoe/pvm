@@ -1,0 +1,6 @@
+# Guest-side assets consumed by tests and the default TaskSpec path.
+# agentpvm.toml is the default spec loaded by `agentpvm run` (no -config) and
+# read workspace-relative by the CI-safe shell suites (see tests/BUILD.bazel
+# runfiles data).
+
+exports_files(["agentpvm.toml"])

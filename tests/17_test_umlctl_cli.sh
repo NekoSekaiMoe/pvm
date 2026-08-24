@@ -26,8 +26,13 @@ run_fail() {
     [ "$code" -ne 0 ] || fail "expected non-zero exit code for: $*"
 }
 
-echo "==> building umlctl"
-go build -o "$TMP/umlctl" ./cmd/umlctl
+if [ -n "${UMLCTL_BIN:-}" ]; then
+    echo "==> using prebuilt $TMP/umlctl ($UMLCTL_BIN)"
+    cp "$UMLCTL_BIN" "$TMP/umlctl"
+else
+    echo "==> building $TMP/umlctl"
+    go build -o "$TMP/umlctl" ./cmd/umlctl
+fi
 
 echo "--- 1. umlctl with no args prints usage and fails"
 run_fail "$TMP/umlctl"

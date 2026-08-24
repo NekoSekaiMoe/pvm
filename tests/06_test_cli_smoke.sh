@@ -16,9 +16,20 @@ export PVM_AUDIT_ROOT="$TMP/audit"
 export PVM_CGROUP_ROOT="$TMP/cg"
 mkdir -p "$PVM_STATE_ROOT" "$PVM_AUDIT_ROOT" "$PVM_CGROUP_ROOT"
 
-echo "==> building binaries"
-go build -o "$TMP/agentpvm" ./cmd/agentpvm
-go build -o "$TMP/umlctl"   ./cmd/umlctl
+if [ -n "${AGENTPVM_BIN:-}" ]; then
+    echo "==> using prebuilt $TMP/agentpvm ($AGENTPVM_BIN)"
+    cp "$AGENTPVM_BIN" "$TMP/agentpvm"
+else
+    echo "==> building $TMP/agentpvm"
+    go build -o "$TMP/agentpvm" ./cmd/agentpvm
+fi
+if [ -n "${UMLCTL_BIN:-}" ]; then
+    echo "==> using prebuilt $TMP/umlctl ($UMLCTL_BIN)"
+    cp "$UMLCTL_BIN" "$TMP/umlctl"
+else
+    echo "==> building $TMP/umlctl"
+    go build -o "$TMP/umlctl" ./cmd/umlctl
+fi
 
 # --- 1. agentpvm run loads a config and reports the fingerprint ---
 echo "--- agentpvm run loads config (no kernel => fails at launch, but planes wire up)"

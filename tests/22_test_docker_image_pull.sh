@@ -37,9 +37,20 @@ run_fail() {
     [ "$code" -ne 0 ] || fail "expected non-zero exit code for: $*"
 }
 
-echo "==> building binaries"
-go build -o "$TMP/agentpvm" ./cmd/agentpvm
-go build -o "$TMP/umlctl"   ./cmd/umlctl
+if [ -n "${AGENTPVM_BIN:-}" ]; then
+    echo "==> using prebuilt $TMP/agentpvm ($AGENTPVM_BIN)"
+    cp "$AGENTPVM_BIN" "$TMP/agentpvm"
+else
+    echo "==> building $TMP/agentpvm"
+    go build -o "$TMP/agentpvm" ./cmd/agentpvm
+fi
+if [ -n "${UMLCTL_BIN:-}" ]; then
+    echo "==> using prebuilt $TMP/umlctl ($UMLCTL_BIN)"
+    cp "$UMLCTL_BIN" "$TMP/umlctl"
+else
+    echo "==> building $TMP/umlctl"
+    go build -o "$TMP/umlctl" ./cmd/umlctl
+fi
 
 echo "--- 1. umlctl image pull CLI argument parsing and nonzero exit"
 run_fail "$TMP/umlctl" image

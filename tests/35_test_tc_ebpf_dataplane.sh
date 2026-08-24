@@ -53,8 +53,13 @@ chmod 0755 "$TMP" "$PVM_IMAGE_ROOT"
 
 fail() { echo "❌ $1"; exit 1; }
 
-echo "==> building agentpvm"
-go build -o "$TMP/agentpvm" ./cmd/agentpvm
+if [ -n "${AGENTPVM_BIN:-}" ]; then
+    echo "==> using prebuilt $TMP/agentpvm ($AGENTPVM_BIN)"
+    cp "$AGENTPVM_BIN" "$TMP/agentpvm"
+else
+    echo "==> building $TMP/agentpvm"
+    go build -o "$TMP/agentpvm" ./cmd/agentpvm
+fi
 
 dd if=/dev/zero of="$PVM_IMAGE_ROOT/rootfs.img" bs=1M count=1 status=none
 

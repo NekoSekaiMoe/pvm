@@ -13,8 +13,13 @@ trap 'rm -rf "$TMP"' EXIT
 
 fail() { echo "❌ $1"; exit 1; }
 
-echo "==> building agentpvm"
-go build -o "$TMP/agentpvm" ./cmd/agentpvm
+if [ -n "${AGENTPVM_BIN:-}" ]; then
+    echo "==> using prebuilt $TMP/agentpvm ($AGENTPVM_BIN)"
+    cp "$AGENTPVM_BIN" "$TMP/agentpvm"
+else
+    echo "==> building $TMP/agentpvm"
+    go build -o "$TMP/agentpvm" ./cmd/agentpvm
+fi
 
 echo "--- 1. Path injection defense: comma in backing path rejected"
 OUT=$("$TMP/agentpvm" cow -backing "/tmp/base,injected=1.img" -overlay "$TMP/out.qcow2" 2>&1 || true)

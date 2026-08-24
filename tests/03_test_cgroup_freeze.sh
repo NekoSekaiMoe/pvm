@@ -3,7 +3,13 @@ set -eo pipefail
 
 echo "========== Test 03: Cgroup Freeze/Thaw =========="
 
-go build -o agentpvm cmd/agentpvm/main.go
+if [ -n "${AGENTPVM_BIN:-}" ]; then
+    echo "==> using prebuilt agentpvm ($AGENTPVM_BIN)"
+    cp "$AGENTPVM_BIN" "agentpvm"
+else
+    echo "==> building agentpvm"
+    go build -o "agentpvm" ./cmd/agentpvm
+fi
 
 # Use a throwaway cgroup root. internal/cgroup.NewManager() honours the
 # PVM_CGROUP_ROOT (preferred) / CGROUP_ROOT env vars; without it the manager
