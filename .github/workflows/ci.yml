@@ -215,5 +215,13 @@ jobs:
     - name: Bazel build
       run: bazelisk build //...
 
+    # First real run of the tests/BUILD.bazel sh_test targets (manual-tagged,
+    # so //... above neither builds nor runs them). ubuntu-latest has no
+    # python3 gap, no node for 36 (suite self-skips), no bpffs for 35's root
+    # leg (self-skips) — exactly the CI-safe posture the suites are built
+    # for. Runs unsandboxed (local) and serialized (exclusive) per target tags.
+    - name: Bazel test (sh suites)
+      run: bazelisk test //tests:ci_safe --test_output=errors
+
     - name: Bazel test
       run: bazelisk test //... --test_output=errors
