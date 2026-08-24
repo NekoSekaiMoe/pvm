@@ -18,6 +18,13 @@ import (
 // rootfs so it stays executable after pivot_root.
 const jailEntryPath = "/pvm/entry"
 
+// jailStage2Path is where stage 1 bind-mounts ITS OWN binary inside the
+// rootfs, so stage 2 can re-exec it through an in-jail path. A direct host
+// path would fail traversal: stage 2 runs as the container's mapped uid
+// (host UIDBase), which cannot descend into permission-restricted
+// workspaces (CI: /home/runner/work is 0750).
+const jailStage2Path = "/pvm/stage2"
+
 // init implements the re-exec stage branches: when ConfigureProcessIsolation
 // wrapped a command, the child process is this same binary with a stage
 // marker set. The branch runs before main() — inside the child's fresh
@@ -135,12 +142,18 @@ func runJailStager() error {
 		return err
 	}
 
-	// Clone stage 2 with the namespace flags the policy selected.
+	// Bind our own binary into the rootfs: stage 2 re-execs it through this
+	// in-jail path (see jailStage2Path).
 	exe, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("locate executable for stage-2 re-exec: %w", err)
 	}
-	child := exec.Command(exe)
+	if err := bindFile(exe, filepath.Join(cfg.Rootfs, jailStage2Path), true); err != nil {
+		return fmt.Errorf("bind stage-2 binary %s: %w", exe, err)
+	}
+
+	// Clone stage 2 with the namespace flags the policy selected.
+	child := exec.Command(filepath.Join(cfg.Rootfs, jailStage2Path))
 	child.Env = append(scrubStageMarkers(),
 		jailHelperEnvMarker+"=1",
 		jailHelperEnvConfig+"="+os.Getenv(jailHelperEnvConfig),
@@ -169,6 +182,15 @@ func runJailStager() error {
 		child.SysProcAttr.GidMappings = []syscall.SysProcIDMap{
 			{ContainerID: 0, HostID: int(cfg.UIDBase), Size: int(cfg.UIDRangeSize)},
 		}
+		// CRITICAL: clone(CLONE_NEWUSER) inherits the PARENT's kuid (host 0
+		// for the privileged leg), which lies OUTSIDE the written map — the
+		// child shows up as nobody and, decisively, execve's root capability
+		// grant requires euid == make_kuid(new_userns, 0) == host UIDBase.
+		// Without this Credential the child execs with ZERO capabilities and
+		// every subsequent mount EPERMs (CI debug dump: Uid: 65534, CapEff: 0).
+		// Go performs the setgid/setuid to these CONTAINER ids in the child
+		// after the parent has written the uid/gid maps.
+		child.SysProcAttr.Credential = &syscall.Credential{Uid: 0, Gid: 0}
 	}
 	if cfg.StagePIDNS {
 		child.SysProcAttr.Cloneflags |= syscall.CLONE_NEWPID
