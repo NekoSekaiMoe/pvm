@@ -314,3 +314,68 @@ enforce_landlock     = true
 		})
 	}
 }
+
+// TestValidate_DNSLearn pins the P1-B network.dns_learn_* contract: defaults
+// are filled, durations/upstreams are validated regardless of the enable
+// flag (config errors surface early), and the loader accepts the keys
+// (md.Undecoded rejects unknown keys, so a missing struct field would fail).
+func TestValidate_DNSLearn(t *testing.T) {
+	// Defaults filled on a bare spec.
+	s := &TaskSpec{Version: 1, Caller: "x"}
+	if err := s.Validate(); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	if s.Network.LearnTTL != DefaultLearnTTL.String() {
+		t.Errorf("learn_ttl default = %q, want %q", s.Network.LearnTTL, DefaultLearnTTL)
+	}
+	if s.Network.MaxLearnedEntries != DefaultMaxLearnedEntries {
+		t.Errorf("max_learned_entries default = %d, want %d",
+			s.Network.MaxLearnedEntries, DefaultMaxLearnedEntries)
+	}
+
+	bad := []struct {
+		name, ttl, upstream string
+		max                 int
+		wantFragment        string
+	}{
+		{"bad ttl", "not-a-duration", "", 0, "learn_ttl"},
+		{"zero ttl", "0s", "", 0, "learn_ttl"},
+		{"negative ttl", "-5s", "", 0, "learn_ttl"},
+		{"hostname upstream", "", "dns.google", 0, "dns_upstream"},
+		{"bad port", "", "1.1.1.1:notaport", 0, "dns_upstream"},
+		{"port range", "", "1.1.1.1:70000", 0, "dns_upstream"},
+		{"negative max", "", "", -1, "max_learned_entries"},
+		{"absurd max", "", "", MaxLearnedEntriesLimit + 1, "max_learned_entries"},
+	}
+	for _, tc := range bad {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &TaskSpec{Version: 1, Caller: "x", Network: NetworkSpec{
+				LearnTTL: tc.ttl, DNSUpstream: tc.upstream, MaxLearnedEntries: tc.max,
+			}}
+			err := s.Validate()
+			if err == nil || !strings.Contains(err.Error(), tc.wantFragment) {
+				t.Fatalf("want error containing %q, got: %v", tc.wantFragment, err)
+			}
+		})
+	}
+
+	// Valid forms, including bare-IP upstream.
+	s = &TaskSpec{Version: 1, Caller: "x", Network: NetworkSpec{
+		DNSLearnEnabled: true, LearnTTL: "30s", DNSUpstream: "1.1.1.1", MaxLearnedEntries: 64,
+	}}
+	if err := s.Validate(); err != nil {
+		t.Fatalf("valid dns-learn spec rejected: %v", err)
+	}
+
+	// TOML round-trip: the loader must accept all four keys.
+	s, err := LoadString("version = 1\ncaller = \"alice\"\n[network]\n" +
+		"enabled = true\ndns_learn_enabled = true\nlearn_ttl = \"1s\"\n" +
+		"dns_upstream = \"127.0.0.1:5353\"\nmax_learned_entries = 32\n")
+	if err != nil {
+		t.Fatalf("LoadString with dns_learn keys: %v", err)
+	}
+	if !s.Network.DNSLearnEnabled || s.Network.LearnTTL != "1s" ||
+		s.Network.DNSUpstream != "127.0.0.1:5353" || s.Network.MaxLearnedEntries != 32 {
+		t.Errorf("TOML round-trip mismatch: %+v", s.Network)
+	}
+}

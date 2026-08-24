@@ -412,6 +412,41 @@ func AddWhitelistEntry(taskID, tapName, ip string) error {
 	return m.Update(&key, &val, ebpf.UpdateAny)
 }
 
+// DeleteWhitelistEntry removes a previously whitelisted ip from a task's
+// whitelist map (registry handle first, pinned-map fallback for separate
+// CLI processes) — the map-side half of dnslearn's TTL expiry. A missing
+// map (degraded task, no filter attached) surfaces as an error; callers
+// that only maintain a table may ignore it. IPv4 only.
+func DeleteWhitelistEntry(taskID, tapName, ip string) error {
+	parsed := net.ParseIP(ip)
+	if parsed == nil {
+		return fmt.Errorf("network: invalid whitelist IP %q", ip)
+	}
+	ip4 := parsed.To4()
+	if ip4 == nil {
+		return fmt.Errorf("network: only IPv4 whitelist entries supported: %q", ip)
+	}
+	var key [4]byte
+	copy(key[:], ip4)
+
+	if tapName != "" {
+		if m := WhitelistMapFor(tapName); m != nil {
+			defer ReleaseWhitelistMap(tapName, m)
+			return m.Delete(&key)
+		}
+	}
+	pinPath, err := WhitelistPinPath(taskID)
+	if err != nil {
+		return err
+	}
+	m, err := ebpf.LoadPinnedMap(pinPath, nil)
+	if err != nil {
+		return fmt.Errorf("network: failed to open pinned map %s: %w", pinPath, err)
+	}
+	defer m.Close()
+	return m.Delete(&key)
+}
+
 // UnregisterWhitelistMap unregisters (and closes, once unreferenced) the
 // whitelist map previously registered for tapName. Safe to call when
 // nothing is attached. DetachTaskFilter calls this as part of the per-task

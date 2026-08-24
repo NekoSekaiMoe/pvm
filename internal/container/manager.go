@@ -20,6 +20,7 @@ import (
 	"uml-container/internal/lifecycle"
 	"uml-container/internal/log"
 	"uml-container/internal/network"
+	"uml-container/internal/network/dnslearn"
 	"uml-container/internal/network/egress"
 	"uml-container/internal/spec"
 	"uml-container/internal/state"
@@ -931,6 +932,9 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 	// it fails closed.
 	guestIP := ""
 	detachNet := func() {}
+	// dnsTeardown stops the P1-B DNS-learn proxy/sweeper and unregisters the
+	// learner; a no-op when dns_learn_enabled is off.
+	dnsTeardown := func() {}
 	if s.Network.Enabled && tapName != "" {
 		ipam, ierr := network.SharedIPAM(s.Network.GatewayIP)
 		if ierr != nil {
@@ -989,8 +993,87 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 			}
 			ipam.Release(taskID)
 		}
+
+		// DNS-learned domain egress (P1-B): snoop the guest's resolver
+		// traffic with a per-task UDP proxy and insert the resolved public
+		// IPs of ALLOWLISTED domains into the whitelist map attached above,
+		// TTL-bounded. The learner shares the filter's fate: when the TC
+		// attach degraded, map writes fail tolerated and the learned table
+		// only feeds the L7 gateway's rebinding guard — audited below. The
+		// guest is not told about the proxy (no kernel-cmdline knob): a guest
+		// using the gateway as its resolver (the default) is snooped
+		// automatically; anything else just misses learning while the L7
+		// proxy still enforces.
+		if s.Network.DNSLearnEnabled {
+			allow := append([]string(nil), s.Network.EgressAllowDomains...)
+			for _, r := range s.Network.EgressRules {
+				host := r.Host
+				if host == "" {
+					host = r.SNI
+				}
+				if host == "" || (r.Allow != nil && !*r.Allow) {
+					continue // deny rules never learn
+				}
+				allow = append(allow, host)
+			}
+			learnTTL, _ := time.ParseDuration(s.Network.LearnTTL) // spec-validated
+			learner, lerr := dnslearn.New(dnslearn.Config{
+				TaskID:       taskID,
+				TapName:      tapName,
+				AllowDomains: allow,
+				LearnTTL:     learnTTL,
+				Upstream:     s.Network.DNSUpstream,
+				MaxEntries:   s.Network.MaxLearnedEntries,
+				Ledger:       ledger,
+			})
+			if lerr != nil {
+				cleanupVolumes()
+				_ = st.Transition(state.StatusFailed, state.ActorController, "dns learner config failed: "+lerr.Error())
+				state.SaveState(taskID, st)
+				return fmt.Errorf("container: dns learner for %s: %w", taskID, lerr)
+			}
+			if !filterAttached {
+				warn := "dns_learn_enabled but the tc egress filter is degraded: " +
+					"learned entries are tracked in-memory only (L7 rebinding guard active, " +
+					"no eBPF whitelist-map updates)"
+				fmt.Printf("Warning: %s\n", warn)
+				if aerr := ledger.Append(audit.Record{
+					Phase:    audit.PhaseExec,
+					Subject:  s.Caller,
+					Action:   "security:degraded_warning",
+					Decision: audit.DecisionAllow,
+					Reason:   warn,
+				}); aerr != nil {
+					// Same fail-closed contract as the tc-filter degraded warning
+					// above: this row is the only evidence of table-only learning.
+					ipam.Release(taskID)
+					cleanupVolumes()
+					_ = st.Transition(state.StatusFailed, state.ActorController, "audit dns-learn degraded-warning append failed: "+aerr.Error())
+					state.SaveState(taskID, st)
+					return fmt.Errorf("container: audit dns-learn degraded warning for %s: %w", taskID, aerr)
+				}
+			}
+			dnsCtx, dnsCancel := context.WithCancel(context.Background())
+			learner.Run(dnsCtx)
+			preferBind := net.JoinHostPort(ipam.GatewayIP().String(), "53")
+			if addr, perr := learner.StartProxy(dnsCtx, preferBind); perr != nil {
+				// Even the loopback fallback failed: continue WITHOUT DNS
+				// learning (L7 proxy still enforces), with evidence.
+				learner.AuditDegraded(fmt.Sprintf("dns proxy bind failed: %v; task runs without DNS learning", perr))
+			} else {
+				fmt.Printf("DNS-learn proxy for %s on %s (upstream %s)\n", taskID, addr, learner.Upstream())
+			}
+			dnslearn.Register(learner)
+			dnsTeardown = func() {
+				dnslearn.Unregister(taskID, learner)
+				dnsCancel()
+				learner.Close()
+			}
+		}
 	}
 	defer detachNet()
+	// Runs before detachNet (LIFO): stop snooping before the map goes away.
+	defer dnsTeardown()
 
 	// UML seccomp userspace mode is an opt-in guest-integrity trade-off
 	// (see SecuritySpec.UMLSeccomp): every on/auto launch MUST leave an

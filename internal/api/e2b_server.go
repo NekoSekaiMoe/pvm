@@ -922,6 +922,9 @@ func NewE2BServer() (*echo.Echo, error) {
 
 	// POST /api/gate/verify — run the Artifact Gate on a submitted bundle.
 	// Body: artifact.Bundle JSON. Returns the verdict (pass/fail per step + hash).
+	// P1-B: DNS-learned domain egress (learned set, promote, drop, policy).
+	registerDNSEgressRoutes(api)
+
 	api.POST("/gate/verify", func(c echo.Context) error {
 		var b artifact.Bundle
 		if err := c.Bind(&b); err != nil {

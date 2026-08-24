@@ -38,6 +38,7 @@ import (
 	"uml-container/internal/lifecycle"
 	"uml-container/internal/log"
 	"uml-container/internal/network"
+	"uml-container/internal/network/dnslearn"
 	"uml-container/internal/network/egress"
 	"uml-container/internal/policy"
 	"uml-container/internal/snapshot"
@@ -259,6 +260,10 @@ func runCmd(args []string) {
 	// Attach the task-specific ledger so this task's egress audit rows are
 	// attributed to it, not to the controller's default ledger task.
 	eg.AttachTaskLedger(taskID, ledger)
+	// P1-B: close the DNS-rebinding gap for DNS-learned hosts — the gateway
+	// consults the dnslearn registry so a proxy-side resolution landing on
+	// an IP the guest never saw is rejected (default-on guard).
+	eg.SetLearnedChecker(dnslearn.Checker{})
 
 	// Volume plugins: wire the volume Manager so specs with volumes can
 	// attach. The builtin host-directory driver is always registered; extra
