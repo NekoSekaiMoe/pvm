@@ -180,8 +180,14 @@ if [ "$(id -u)" -eq 0 ] || sudo -n true 2>/dev/null; then
     fi
 
     echo "   running privileged jail & namespace checks under $SUDO_CMD"
-    $SUDO_CMD "$TMP/agentpvm" run -config "$SPEC_DEGRADED" -kernel "$TMP/fake_kernel" > "$TMP/root_agentpvm.log" 2>&1 || fail "root agentpvm run failed: $(cat "$TMP/root_agentpvm.log")"
-    $SUDO_CMD "$TMP/umlctl" start -name "umlctl-root-test" -kernel "$TMP/fake_kernel" -rootfs "$PVM_IMAGE_ROOT/rootfs.img" -insecure-allow-degraded > "$TMP/root_umlctl.log" 2>&1 || fail "root umlctl start failed: $(cat "$TMP/root_umlctl.log")"
+    # sudo strips the environment by default; re-export the per-suite roots
+    # explicitly so the privileged agentpvm/umlctl see the same trusted image
+    # and state roots as the non-root legs (CI has no sudo and skips this).
+    $SUDO_CMD env PVM_STATE_ROOT="$PVM_STATE_ROOT" PVM_AUDIT_ROOT="$PVM_AUDIT_ROOT" \
+        PVM_CGROUP_ROOT="$PVM_CGROUP_ROOT" PVM_IMAGE_ROOT="$PVM_IMAGE_ROOT" \
+        "$TMP/agentpvm" run -config "$SPEC_DEGRADED" -kernel "$TMP/fake_kernel" > "$TMP/root_agentpvm.log" 2>&1 || fail "root agentpvm run failed: $(cat "$TMP/root_agentpvm.log")"
+    $SUDO_CMD env PVM_IMAGE_ROOT="$PVM_IMAGE_ROOT" \
+        "$TMP/umlctl" start -name "umlctl-root-test" -kernel "$TMP/fake_kernel" -rootfs "$PVM_IMAGE_ROOT/rootfs.img" -insecure-allow-degraded > "$TMP/root_umlctl.log" 2>&1 || fail "root umlctl start failed: $(cat "$TMP/root_umlctl.log")"
     # Compile the selected jail tests as the current user (running go test
     # itself under sudo would leave root-owned entries in GOCACHE/GOMODCACHE),
     # then elevate only the resulting test binary.
