@@ -14,7 +14,7 @@ CI_SAFE_DATA = [
 ]
 
 def pvm_suite(name, suite, data = []):
-    sh_test(
+    native.sh_test(
         name = name,
         srcs = [suite],
         data = CI_SAFE_DATA + data,
@@ -35,7 +35,7 @@ def pvm_suites(suites):
         pvm_suite(name = name, suite = suite)
         names.append(":" + name)
 
-    test_suite(
+    native.test_suite(
         name = "ci_safe",
         tests = names,
         # manual so //... skips the umbrella too; member tests keep their
