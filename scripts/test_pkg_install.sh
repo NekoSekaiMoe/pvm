@@ -110,22 +110,7 @@ echo "INIT_DONE rc=$?"
 busybox poweroff -f
 
 EOF
-cat << 'EOF' | sudo tee mnt_pkg/init_ping.sh
-#!/bin/sh
-# Minimal bisect payload: tick liveness + one bounded ping, nothing that can
-# wedge the console for long. Used by the PVM_JAIL_DISABLE_PIDNS comparison
-# run at the bottom of this script.
-mount -t proc proc /proc
-ip link set vec0 up
-ip addr add 10.0.0.2/24 dev vec0
-ip route add default via 10.0.0.1
-echo "### tick: $(cat /proc/uptime)"
-sleep 2
-echo "### tick2: $(cat /proc/uptime)"
-ping -c 2 -W 2 10.0.0.1 && echo BISECT_PING_OK || echo BISECT_PING_FAIL
-busybox poweroff -f
-EOF
-sudo chmod +x mnt_pkg/init.sh mnt_pkg/init_ping.sh
+sudo chmod +x mnt_pkg/init.sh
 
 trap - EXIT
 sudo umount mnt_pkg
@@ -187,38 +172,6 @@ sudo timeout 180 ./bin/umlctl start --name pkg-test \
     --tap tap_pkg > pkg_umlctl.log 2>&1 &
 PVM_PID=$!
 
-# Rootless tap fd-transport diagnostics (temporary, chasing the CI datapath
-# regression): 8s after start the guest should be pinging — capture whether
-# its frames reach the bridge at all, and whether the tap has carrier
-# (i.e. a live fd is attached on the host side).
-(
-    sleep 8
-    echo "--- post-start host tap state ---"
-    sudo ip link show tap_pkg 2>&1
-    echo "--- bridge RX/TX (pvm_br0) ---"
-    sudo ip -s link show pvm_br0 2>&1
-    echo "--- tap RX/TX counters ---"
-    sudo ip -s link show tap_pkg 2>&1
-    sudo timeout 6 tcpdump -i pvm_br0 -n -c 8 arp or icmp 2>&1 || true
-    echo "--- monitor syscall trace (vec0 fd + timer delivery) ---"
-    # UML monitor argv contains the kernel cmdline (ubd0=...), unique here.
-    MON=$(pgrep -f 'ubd0=' | head -1)
-    echo "monitor pid: ${MON:-NOT_FOUND}"
-    if [ -n "$MON" ]; then
-        echo "--- monitor fd table (what IS fd 3 at wedge time?) ---"
-        sudo ls -l /proc/$MON/fd 2>&1 | head -15
-        # Broad trace, no signal noise: catch what the monitor BLOCKS in.
-        sudo timeout 12 strace -f -tt -e trace='!futex,getpid,gettid,clock_gettime' \
-            -p "$MON" 2>&1 | grep -v "SIGALRM\|SIGVTALRM\|SIGIO" | head -60
-        echo "--- monitor kernel stacks (mid-wedge) ---"
-        for t in /proc/$MON/task/*; do
-            echo "== thread ${t##*/}"
-            sudo cat "$t/stack" 2>/dev/null || echo "(no stack)"
-            sudo cat "$t/status" 2>/dev/null | grep -E "^State|SigBlk|SigCgt"
-        done
-    fi
-) > pkg_tapdiag.log 2>&1 &
-TAPDIAG_PID=$!
 
 cleanup() {
     # umlctl 仍在运行则终止它（其子进程 UML 会被一并回收）。
@@ -247,11 +200,6 @@ wait "$PVM_PID" 2>/dev/null
 PVM_RC=$?
 set -e
 echo "$PVM_RC" > "$STATUS_FILE"
-wait "$TAPDIAG_PID" 2>/dev/null || true
-
-echo "---- tap fd-transport diagnostics (pkg_tapdiag.log) ----"
-cat pkg_tapdiag.log 2>/dev/null || true
-
 echo "---- umlctl output (pkg_umlctl.log) ----"
 cat pkg_umlctl.log 2>/dev/null || echo "(no pkg_umlctl.log)"
 echo "---- Pkg Test Console Output ----"
@@ -271,20 +219,6 @@ if sudo grep -q "PKG_INSTALL_SUCCESS" "$CONSOLE_LOG" 2>/dev/null; then
 fi
 echo "❌ pkg-test FAIL: PKG_INSTALL_SUCCESS NOT observed in console.log"
 
-# Bisect the wedge trigger: same guest image WITHOUT the PID namespace.
-# Kernel stacks showed the monitor's main thread stuck in waitid(P_PID,
-# <guest task>) for minutes with the guest tick dead — UML was never
-# designed to BE pid 1 of a pid namespace (ns-init signal semantics).
-# If this variant's ping works, pidns is the trigger; if it also fails,
-# suspect the userns/fd-transport itself.
-echo "== bisect: same guest with PVM_JAIL_DISABLE_PIDNS=1 =="
-BISECT_LOG=/var/lib/uml-container/containers/pkg-test-nopidns/logs/console.log
-sudo rm -f "$BISECT_LOG"
-sudo env PVM_JAIL_DISABLE_PIDNS=1 timeout 60 ./bin/umlctl start --name pkg-test-nopidns \
-    --rootfs ${BASE_IMG} --kernel ./bin/linux --init /init_ping.sh \
-    --tap tap_pkg > pkg_bisect.log 2>&1 || true
-sudo grep -E "tick|BISECT" "$BISECT_LOG" 2>/dev/null | tail -6 || echo "(no bisect console output)"
-echo ""
 echo "--- DIAG: UML kernel command line (proves which block/net transports were passed) ---"
 sudo grep -E "Kernel command line:" "$CONSOLE_LOG" 2>/dev/null | tail -1 || echo "   (no 'Kernel command line' line — UML did not finish early boot)"
 echo ""
