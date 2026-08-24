@@ -2,7 +2,7 @@ load("@rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
     name = "api",
-    srcs = ["e2b_compat.go", "e2b_server.go"],
+    srcs = ["dns_egress.go", "e2b_compat.go", "e2b_server.go", "network_dataplane.go"],
     importpath = "uml-container/internal/api",
     visibility = ["//:__subpackages__"],
     deps = [
@@ -15,6 +15,8 @@ go_library(
         "//internal/cow",
         "//internal/image",
         "//internal/lifecycle",
+        "//internal/network",
+        "//internal/network/dnslearn",
         "//internal/policy",
         "//internal/pool",
         "//internal/snapshot",
@@ -32,6 +34,7 @@ go_test(
     name = "api_test",
     srcs = [
         "controlplanes_test.go",
+        "dns_egress_test.go",
         "e2b_compat_test.go",
         "e2b_server_test.go",
         "secret_required_test.go",
@@ -42,6 +45,7 @@ go_test(
     deps = [
         "//internal/approval",
         "//internal/audit",
+        "//internal/network/dnslearn",
         "//internal/policy",
         "//internal/pool",
         "//internal/snapshot",

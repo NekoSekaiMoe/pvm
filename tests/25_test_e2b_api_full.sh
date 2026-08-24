@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # 25_test_e2b_api_full.sh — exhaustive route sweep: EVERY endpoint exposed by
-# internal/api/e2b_server.go is hit exactly once with its best-achievable
+# internal/api/e2b_server.go (+ dns_egress.go) is hit exactly once with its
+# best-achievable
 # kernel-free outcome asserted (success path where possible, contract-correct
 # error where a UML kernel / root / writable /var/lib is required).
 # Does NOT require a UML kernel; safe to run in CI.
@@ -40,6 +41,13 @@
 #  [32] GET    /api/templates/:id
 #  [33] POST   /api/templates/:id/alias
 #  [34] DELETE /api/templates/:id
+#  [35] GET    /api/audit/redaction-policy
+#  [36] PUT    /api/audit/redaction-policy
+#  [37] GET    /api/egress/:task/learned
+#  [38] POST   /api/egress/:task/allow
+#  [39] DELETE /api/egress/:task/learned/:host
+#  [40] GET    /api/egress/:task/policy
+#  [41] PUT    /api/egress/:task/policy
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -274,5 +282,50 @@ pass 32 "get"
 pass 33 "alias bind + resolve"
 pass 34 "delete via alias + gone"
 
+echo "--- [35][36] audit redaction-policy: read posture / toggle round trip"
+OUT=$(req GET /audit/redaction-policy)
+assert_status "$(printf '%s' "$OUT" | jq -r .enabled)" "true" "redaction enabled by default"
+[ "$(printf '%s' "$OUT" | jq '.patterns_count')" -ge 1 ] || { echo "❌ patterns_count: $OUT"; exit 1; }
+assert_status "$(req PUT /audit/redaction-policy '{"enabled":false}' | jq -r .enabled)" "false" "disable round trip"
+assert_status "$(code PUT /audit/redaction-policy '{}')" "400" "missing enabled rejected"
+assert_status "$(req PUT /audit/redaction-policy '{"enabled":true}' | jq -r .enabled)" "true" "re-enable round trip"
+pass 35 "GET posture (enabled + patterns_count)"
+pass 36 "PUT toggle round trip + 400 on bad body"
+
+echo "--- [37]-[41] DNS-learned egress: learned / allow / drop / policy"
+# Unknown task: read-only endpoints are a contract 404, not a silent create.
+assert_status "$(code GET /egress/sweep-dns/learned)" "404" "learned before learner"
+assert_status "$(code GET /egress/sweep-dns/policy)" "404" "policy before learner"
+assert_status "$(code DELETE /egress/sweep-dns/learned/example.com)" "404" "drop before learner"
+assert_status "$(code PUT /egress/sweep-dns/policy '{"dns_learn_enabled":false}')" "404" "bare-disable PUT does not create"
+# Invalid task ids are rejected before any learner lookup.
+assert_status "$(code GET '/egress/bad%20task!/learned')" "400" "invalid task id rejected"
+# POST allow creates a control-plane learner on demand and promotes the domain.
+OUT=$(req POST /egress/sweep-dns/allow '{"domain":"example.com"}')
+assert_status "$(printf '%s' "$OUT" | jq -r .added_to_allowlist)" "true" "allow promotes domain"
+assert_status "$(code POST /egress/sweep-dns/allow '{"domain":"http://evil"}')" "400" "smuggled URL rejected"
+assert_status "$(code POST /egress/sweep-dns/allow '{}')" "400" "missing domain rejected"
+# Now the learner exists: reads succeed; the promoted domain is allowlisted.
+assert_status "$(req GET /egress/sweep-dns/policy | jq -r .task)" "sweep-dns" "policy view after create"
+CNT=$(req GET /egress/sweep-dns/policy | jq '[.allow_domains[] | select(.=="example.com")] | length')
+assert_status "$CNT" "1" "allow_domains echo"
+req GET /egress/sweep-dns/learned | jq -e '.entries' >/dev/null || { echo "❌ learned entries"; exit 1; }
+# DELETE learned/:host is a 200 whose dropped count mirrors what LearnNow
+# actually resolved (0 offline, >0 when a real upstream answers); assert the
+# contract shape plus that no learned entry for the host survives.
+DROPPED=$(req DELETE /egress/sweep-dns/learned/example.com | jq -r .dropped)
+[ "$DROPPED" -ge 0 ] 2>/dev/null || { echo "❌ drop host: dropped=$DROPPED"; exit 1; }
+LEFT=$(req GET /egress/sweep-dns/learned | jq '[.entries[]? | select(.domain=="example.com")] | length')
+assert_status "$LEFT" "0" "host gone from learned set"
+# Live learner: TTL retune works; fixed-at-creation knobs are a 400.
+assert_status "$(code PUT /egress/sweep-dns/policy '{"learn_ttl":"5m"}')" "200" "learn_ttl retune"
+assert_status "$(code PUT /egress/sweep-dns/policy '{"learn_ttl":"nope"}')" "400" "bad learn_ttl rejected"
+assert_status "$(code PUT /egress/sweep-dns/policy '{"dns_upstream":"8.8.8.8:53"}')" "400" "upstream change refused"
+pass 37 "learned 404 -> entries after allow"
+pass 38 "allow 200 promote + 400 invalid domain"
+pass 39 "drop host 200, host gone (dropped=$DROPPED)"
+pass 40 "policy 404 -> 200 view"
+pass 41 "PUT create/retune + fixed-knob 400s"
+
 echo ""
-echo "✅ 25_test_e2b_api_full: ALL 34 ROUTES SWEPT"
+echo "✅ 25_test_e2b_api_full: ALL 41 ROUTES SWEPT"

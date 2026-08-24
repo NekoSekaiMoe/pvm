@@ -379,3 +379,76 @@ func TestValidate_DNSLearn(t *testing.T) {
 		t.Errorf("TOML round-trip mismatch: %+v", s.Network)
 	}
 }
+
+func TestValidate_Dataplane(t *testing.T) {
+	base := func() *TaskSpec { return &TaskSpec{Version: 1, Caller: "x"} }
+
+	// Empty fills the historical default (bridge) and stays valid.
+	s := base()
+	if err := s.Validate(); err != nil {
+		t.Fatalf("default dataplane rejected: %v", err)
+	}
+	if s.Network.Dataplane != DataplaneBridge {
+		t.Fatalf("default dataplane = %q, want %q", s.Network.Dataplane, DataplaneBridge)
+	}
+
+	// "tc" is accepted.
+	s = base()
+	s.Network = NetworkSpec{Enabled: true, Dataplane: DataplaneTC}
+	if err := s.Validate(); err != nil {
+		t.Fatalf("dataplane=tc rejected: %v", err)
+	}
+
+	// Unknown values are config errors, never silently ignored.
+	s = base()
+	s.Network = NetworkSpec{Enabled: true, Dataplane: "ebpf-only"}
+	err := s.Validate()
+	if err == nil || !strings.Contains(err.Error(), `network.dataplane "ebpf-only"`) {
+		t.Fatalf("invalid dataplane not rejected with the field name: %v", err)
+	}
+
+	// tc mode IGNORES bridge/gateway_ip/guest_ip: an out-of-subnet or
+	// malformed-for-bridge guest_ip must not trip the bridge-only
+	// cross-checks (the fixed link-local addressing replaces them).
+	s = base()
+	s.Network = NetworkSpec{Enabled: true, Dataplane: "tc", GatewayIP: "10.0.0.1/24", GuestIP: "10.9.9.9"}
+	if err := s.Validate(); err != nil {
+		t.Fatalf("tc mode must ignore guest_ip/gateway_ip cross-checks: %v", err)
+	}
+
+	// Regression guard: bridge mode still enforces the subnet check.
+	s = base()
+	s.Network = NetworkSpec{Enabled: true, Dataplane: "bridge", GatewayIP: "10.0.0.1/24", GuestIP: "10.9.9.9"}
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "outside the bridge subnet") {
+		t.Fatalf("bridge mode lost the guest_ip subnet check: %v", err)
+	}
+}
+
+func TestLoadFile_DataplaneTOML(t *testing.T) {
+	// The TOML surface rejects unknown keys, so the new field must decode.
+	doc := `
+version = 1
+caller = "alice"
+[runtime]
+name = "tc-task"
+[workspace]
+base_image = "alpine.img"
+init = "/init.sh"
+[network]
+enabled = true
+dataplane = "tc"
+`
+	s, err := LoadFile(writeTemp(t, doc))
+	if err != nil {
+		t.Fatalf("dataplane=tc TOML rejected: %v", err)
+	}
+	if s.Network.Dataplane != DataplaneTC {
+		t.Fatalf("dataplane = %q, want tc", s.Network.Dataplane)
+	}
+
+	// Invalid value rejected at load.
+	bad := strings.Replace(doc, `dataplane = "tc"`, `dataplane = "bogus"`, 1)
+	if _, err := LoadFile(writeTemp(t, bad)); err == nil || !strings.Contains(err.Error(), "dataplane") {
+		t.Fatalf("dataplane=bogus not rejected at load: %v", err)
+	}
+}

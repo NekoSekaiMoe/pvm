@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 10_test_e2b_sdk.sh — drive PVM's /sandboxes compatibility surface with the
+# 36_test_e2b_sdk.sh — drive PVM's /sandboxes compatibility surface with the
 # REAL official E2B JS SDK (@e2b/sdk), turning the README's "E2B compatible"
 # claim into an executable assertion. The SDK pins its API host to
 # http://localhost:3000 when E2B_DEBUG=1, so agentpvm runs on port 3000.

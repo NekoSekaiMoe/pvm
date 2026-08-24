@@ -32,15 +32,18 @@ This directory contains shell-based integration and end-to-end (E2E) suites vali
 | `22_test_docker_image_pull.sh`| No | Docker image pull error handling and safeName sanitization |
 | `23_test_container_api.sh` | No | Container REST: list shape, logs/delete/snapshot/restore id validation, `/containers/start` validation chain (name/CPU/rootfs injection/memory) |
 | `24_test_tasks_audit_api.sh`| No | Task read API (`GET /tasks`, detail 400/404), unknown-task transition 404, `load-spec` path mode + `PVM_SPEC_ROOT` traversal defense, audit ledger read + chain verify |
-| `25_test_e2b_api_full.sh` | No | Exhaustive sweep of ALL 34 API routes: success path where kernel-free, contract-correct error where kernel/root required |
+| `25_test_e2b_api_full.sh` | No | Exhaustive sweep of ALL 41 API routes: success path where kernel-free, contract-correct error where kernel/root required |
 | `26_test_full_feature_e2e.sh`| No | One task's full cross-plane lifecycle: load-spec → FSM → tool gateway (allow/deny/approve) → approval → pause/resume → gate release → completed → destroy → audit chain |
 | `27_test_event_snapshot_clone_rollback.sh` | No | Event-level snapshots, instant task/container cloning (zero-copy CoW branching), historical rollback with audit verification |
 | `28_test_webui_simulation.sh` | No | End-to-end verification of Nuxt 3 WebUI SPA routes, metrics, and page-dependent REST workflows |
 | `29_test_ephemeral_mode.sh` | No | Ephemeral (non-persistent) sandboxes: `workspace.ephemeral` spec validation + conflicts, `agentpvm run -ephemeral` override re-validation, no-overlay residue on failed launch, `umlctl -ephemeral` (mutual exclusion + state-dir discard), `/containers/start` ephemeral field |
 | `30_test_jail_seccomp_degraded.sh` | No | In-process Gofer jail, tailored host seccomp-bpf filter, fail-closed enforcement, CLI/TaskSpec `-insecure-allow-degraded` bypass, and tamper-evident audit security warning logging |
 | `31_test_rootless_jail.sh` | No (root legs need ns-capable kernel) | Rootless jail: NEWUSER+NEWPID monitor asserted from inside the workload (pid 1, private /proc, host-pid signal denied), uidalloc table allocate/release lifecycle, tap fd transport (no /dev/net/tun in jail), user-namespace fail-closed baseline + degraded fallback |
-| `32_test_uml_seccomp_mode.sh` | Yes | UML seccomp fast-userspace mode (`security.uml_seccomp`): load-spec accept/reject (4xx on invalid value), `seccomp=` kernel cmdline arg asserted via fake-kernel argv dump (present on opt-in, absent by default), `security:uml_seccomp` audit record with mode+arch (+fallback note for auto) |
-| `33_test_audit_redaction.sh` | Yes | Audit ledger secret redaction (脱敏): planted secrets never land in on-disk ledger bytes, GET `/api/audit/:id` redacted markers, hash-chain verify still passes, GET+PUT `/api/audit/redaction-policy` round trip, disabled redaction stores unredacted (documented escape hatch) + read-side defense on re-enable |
+| `32_test_uml_seccomp_mode.sh` | No | UML seccomp fast-userspace mode (`security.uml_seccomp`): load-spec accept/reject (4xx on invalid value), `seccomp=` kernel cmdline arg asserted via fake-kernel argv dump (present on opt-in, absent by default), `security:uml_seccomp` audit record with mode+arch (+fallback note for auto) |
+| `33_test_audit_redaction.sh` | No | Audit ledger secret redaction (脱敏): planted secrets never land in on-disk ledger bytes, GET `/api/audit/:id` redacted markers, hash-chain verify still passes, GET+PUT `/api/audit/redaction-policy` round trip, disabled redaction stores unredacted (documented escape hatch) + read-side defense on re-enable |
+| `34_test_dns_egress_policy.sh` | No (needs python3) | DNS-learned domain egress policy: PUT `/api/egress/:task/policy` control-plane learner, wire-format DNS learning through the UDP proxy against a fake upstream, non-allowlisted domains not learned, dns:learn/dns:expire audit rows, TTL expiry + sweeper, DELETE learned/:host, per-task isolation, learn_ttl validation |
+| `35_test_tc_ebpf_dataplane.sh` | Partial (leg 3 root) | TC/eBPF dataplane consolidation: StartTask wires per-task eBPF egress itself (bridge-subnet IPAM guest IP as `pvm_ip=`, pinned whitelist map); CI-safe degraded leg (no-root TC attach failure -> audit `security:degraded_warning`) + root-guarded real clsact attach leg |
+| `36_test_e2b_sdk.sh` | No (needs node+npm) | Real official E2B JS SDK (@e2b/sdk) against the `/sandboxes` compatibility surface: X-API-KEY auth, list shape, create/kill error contracts (kernel-free subset; skips gracefully without node/npm) |
 
 ---
 
@@ -49,7 +52,7 @@ This directory contains shell-based integration and end-to-end (E2E) suites vali
 ```bash
 # Run all unprivileged CI-safe suites (fails fast on first error)
 set -e
-for s in tests/{05,06,07,08,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,33}_*.sh; do
+for s in tests/{05,06,07,08,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36}_*.sh; do
     echo "Running $s..."
     ./"$s"
 done
