@@ -114,6 +114,15 @@ func runJailStager() error {
 	child.SysProcAttr = &syscall.SysProcAttr{
 		// If stage 1 dies, the workload must not be orphaned.
 		Pdeathsig: unix.SIGKILL,
+		// CLONE_NEWNS is MANDATORY, not optional: without it stage 2 would
+		// SHARE stage 1's mount namespace, whose owner is init_user_ns —
+		// and may_mount() requires CAP_SYS_ADMIN in the mount namespace's
+		// owner, which the mapped uid does not have (CI: every mount in
+		// stage 2 EPERM'd). With NEWNS, copy_mnt_ns copies stage 1's
+		// prepared tree into a fresh namespace owned by the new user
+		// namespace, where stage 2's namespaced capabilities apply. It also
+		// keeps stage 2's pivot_root from hijacking stage 1's view.
+		Cloneflags: syscall.CLONE_NEWNS,
 	}
 	if cfg.StageUserNS {
 		child.SysProcAttr.Cloneflags |= syscall.CLONE_NEWUSER
