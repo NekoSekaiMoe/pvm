@@ -105,12 +105,8 @@ func TestRouteLaunchThroughJail(t *testing.T) {
 func TestVolumeAccessNote(t *testing.T) {
 	const base, rng = 100000, 65536
 
-	t.Run("degraded mode is a no-op", func(t *testing.T) {
-		if note := volumeAccessNote("/nonexistent", 0, 0, false); note != "" {
-			t.Errorf("uidRange=0 must never warn, got %q", note)
-		}
-	})
-
+	// Range ownership requires chown, so it stays a separate root-gated
+	// subtest; everything else is a permission-bits decision table.
 	t.Run("range-owned volume is silent", func(t *testing.T) {
 		dir := t.TempDir()
 		if os.Geteuid() != 0 {
@@ -124,46 +120,42 @@ func TestVolumeAccessNote(t *testing.T) {
 		}
 	})
 
-	t.Run("world-accessible foreign volume is silent", func(t *testing.T) {
-		dir := t.TempDir() // 0700 by default...
-		if err := os.Chmod(dir, 0755); err != nil {
-			t.Fatal(err)
+	dirWithMode := func(mode os.FileMode) func(t *testing.T) string {
+		return func(t *testing.T) string {
+			dir := t.TempDir() // 0700 by default
+			if err := os.Chmod(dir, mode); err != nil {
+				t.Fatal(err)
+			}
+			return dir
 		}
-		if note := volumeAccessNote(dir, base, rng, true); note != "" {
-			t.Errorf("world-traversable ro volume warned: %q", note)
-		}
-	})
+	}
+	staticPath := func(p string) func(t *testing.T) string {
+		return func(t *testing.T) string { return p }
+	}
 
-	t.Run("rw volume without other-write warns", func(t *testing.T) {
-		dir := t.TempDir()
-		if err := os.Chmod(dir, 0755); err != nil { // o+rx but NOT o+w
-			t.Fatal(err)
-		}
-		if note := volumeAccessNote(dir, base, rng, false); note == "" {
-			t.Error("expected EACCES warning for rw volume without other-write")
-		}
-		if err := os.Chmod(dir, 0757); err != nil {
-			t.Fatal(err)
-		}
-		if note := volumeAccessNote(dir, base, rng, false); note != "" {
-			t.Errorf("world-writable rw volume warned: %q", note)
-		}
-	})
-
-	t.Run("locked-down foreign volume warns", func(t *testing.T) {
-		dir := t.TempDir()
-		if err := os.Chmod(dir, 0700); err != nil {
-			t.Fatal(err)
-		}
-		note := volumeAccessNote(dir, base, rng, false)
-		if note == "" {
-			t.Error("expected EACCES warning for foreign 0700 volume")
-		}
-	})
-
-	t.Run("missing path warns", func(t *testing.T) {
-		if note := volumeAccessNote("/nonexistent/path/xyz", base, rng, true); note == "" {
-			t.Error("expected stat-failure warning")
-		}
-	})
+	cases := []struct {
+		name     string
+		setup    func(t *testing.T) string
+		uidRange uint32
+		readOnly bool
+		wantNote bool
+	}{
+		{"degraded mode is a no-op", staticPath("/nonexistent"), 0, false, false},
+		{"missing path warns", staticPath("/nonexistent/path/xyz"), rng, true, true},
+		{"locked-down foreign volume warns", dirWithMode(0700), rng, false, true},
+		{"world-traversable ro volume is silent", dirWithMode(0755), rng, true, false},
+		{"rw volume without other-write warns", dirWithMode(0755), rng, false, true},
+		{"world-writable rw volume is silent", dirWithMode(0757), rng, false, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			note := volumeAccessNote(c.setup(t), base, c.uidRange, c.readOnly)
+			if c.wantNote && note == "" {
+				t.Error("expected a warning, got none")
+			}
+			if !c.wantNote && note != "" {
+				t.Errorf("unexpected warning: %q", note)
+			}
+		})
+	}
 }

@@ -187,11 +187,15 @@ fi
 echo "==> 4. tap fd transport (vec0:transport=fd)"
 if [ "$HAS_USERNS" -eq 1 ] && [ -e /dev/net/tun ] && command -v ip >/dev/null; then
     TAP="tap_rl31"
-    $SUDO_CMD ip tuntap add "$TAP" mode tap 2>/dev/null || true
-    # Register cleanup immediately: a fail() anywhere below must not leak
-    # the interface on the host.
-    if $SUDO_CMD ip link show "$TAP" >/dev/null 2>&1; then TAP_CREATED=1; fi
-    $SUDO_CMD ip link set "$TAP" up 2>/dev/null || true
+    # Own what we clean up: refuse to touch a pre-existing interface (a
+    # leaked one from an earlier run must be removed by hand), and only
+    # register cleanup once OUR create actually succeeds.
+    if $SUDO_CMD ip link show "$TAP" >/dev/null 2>&1; then
+        fail "tap $TAP already exists and was NOT created by this test; remove it manually first"
+    fi
+    $SUDO_CMD ip tuntap add "$TAP" mode tap || fail "ip tuntap add $TAP failed"
+    TAP_CREATED=1
+    $SUDO_CMD ip link set "$TAP" up || fail "ip link set $TAP up failed"
     $SUDO_CMD "$TMP/umlctl" start -name "rl31-tap" -kernel "$TMP/fake_kernel" \
         -rootfs "$PVM_IMAGE_ROOT/rootfs.img" -tap "$TAP" > "$TMP/tap_run.log" 2>&1 \
         || { cat "$TMP/tap_run.log"; dump_run rl31-tap; fail "rootless tap run failed"; }

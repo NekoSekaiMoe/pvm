@@ -305,6 +305,29 @@ func (m *Manager) Boot(ctx context.Context, cfg *config.ContainerConfig) (*Boote
 
 	cg := cgroup.NewManager()
 	if setupErr := cg.Setup(cfg.ID, pid, cfg.MemoryBytes, cfg.CPU); setupErr != nil {
+		// Fail closed when limits were REQUESTED: releasing stage 1 now
+		// would run the whole workload tree WITHOUT the intended CPU/memory
+		// limits. Never SignalReady — kill the barrier-blocked stage-1
+		// child, reap it, then report the launch as failed (the jail
+		// cleanup closes the sync pipe, so the child would see EOF and
+		// abort even without the kill).
+		// Without requested limits a cgroup failure stays a warning: no
+		// intended limit is being dropped (cgroup-less test/CI hosts).
+		if cfg.MemoryBytes > 0 || cfg.CPU > 0 {
+			if p != nil && p.Cmd != nil && p.Cmd.Process != nil {
+				_ = p.Cmd.Process.Kill()
+				_ = m.Launcher.Wait(p)
+			}
+			if jailEnv != nil {
+				_ = jailEnv.Cleanup()
+			}
+			if logFile != nil {
+				_ = logFile.Close()
+			}
+			st.Status = state.StatusExited
+			state.SaveState(cfg.ID, st)
+			return nil, fmt.Errorf("container: cgroup setup for %s with requested limits: %w", cfg.ID, setupErr)
+		}
 		fmt.Printf("Warning: failed to setup cgroup limits for %s: %v\n", cfg.ID, setupErr)
 	}
 	// Unblock stage 1 only AFTER cgroup membership covers the stage-1 pid:
@@ -980,6 +1003,22 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 		}
 	}
 	if setupErr := cg.Setup(taskID, pid, memBytes, s.Runtime.CPU); setupErr != nil {
+		// Fail closed when limits were REQUESTED, same contract as the
+		// Boot path: do NOT SignalReady — a workload must never run
+		// outside its confirmed cgroup limits. Kill the barrier-blocked
+		// stage-1 child and reap it (the deferred jailEnv.Cleanup closes
+		// the sync pipe as a second fail-closed net). Without requested
+		// limits the failure stays a warning (cgroup-less test/CI hosts).
+		if memBytes > 0 || s.Runtime.CPU > 0 {
+			if p != nil && p.Cmd != nil && p.Cmd.Process != nil {
+				_ = p.Cmd.Process.Kill()
+				_ = m.Launcher.Wait(p)
+			}
+			cleanupVolumes()
+			_ = st.Transition(state.StatusFailed, state.ActorController, "cgroup setup failed with requested limits: "+setupErr.Error())
+			state.SaveState(taskID, st)
+			return fmt.Errorf("container: cgroup setup for %s with requested limits: %w", taskID, setupErr)
+		}
 		fmt.Printf("Warning: failed to setup cgroup limits for %s: %v\n", taskID, setupErr)
 	}
 	// Unblock stage 1 only AFTER the cgroup write: stage 2 is forked past
