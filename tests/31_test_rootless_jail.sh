@@ -177,7 +177,7 @@ if [ "$HAS_USERNS" -eq 1 ] && [ -e /dev/net/tun ] && command -v ip >/dev/null; t
     $SUDO_CMD ip tuntap add "$TAP" mode tap 2>/dev/null || true
     $SUDO_CMD ip link set "$TAP" up 2>/dev/null || true
     $SUDO_CMD "$TMP/umlctl" start -name "rl31-tap" -kernel "$TMP/fake_kernel" \
-        -rootfs "$PVM_IMAGE_ROOT/rootfs.img" -net-tap "$TAP" > "$TMP/tap_run.log" 2>&1 \
+        -rootfs "$PVM_IMAGE_ROOT/rootfs.img" -tap "$TAP" > "$TMP/tap_run.log" 2>&1 \
         || { cat "$TMP/tap_run.log"; dump_run rl31-tap; fail "rootless tap run failed"; }
     TAP_LOG="$(console_log rl31-tap)"
     grep -q FAKE_KERNEL_DONE "$TAP_LOG" || fail "tap run: fake kernel incomplete: $(cat "$TAP_LOG")"
