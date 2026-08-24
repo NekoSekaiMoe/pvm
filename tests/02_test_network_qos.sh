@@ -3,7 +3,13 @@ set -eo pipefail
 
 echo "========== Test 02: Network QoS and SSRF (Dry Run) =========="
 
-go build -o agentpvm cmd/agentpvm/main.go
+if [ -n "${AGENTPVM_BIN:-}" ]; then
+    echo "==> using prebuilt agentpvm ($AGENTPVM_BIN)"
+    cp "$AGENTPVM_BIN" "agentpvm"
+else
+    echo "==> building agentpvm"
+    go build -o "agentpvm" ./cmd/agentpvm
+fi
 
 # Since we might not be root in all CI environments, we just test if the CLI parses 
 # the QoS and Whitelist commands correctly.

@@ -31,9 +31,20 @@ export API_SECRET="secret"
 
 fail() { echo "❌ $1"; exit 1; }
 
-echo "==> building binaries"
-go build -o "$TMP/agentpvm" ./cmd/agentpvm
-go build -o "$TMP/umlctl"   ./cmd/umlctl
+if [ -n "${AGENTPVM_BIN:-}" ]; then
+    echo "==> using prebuilt $TMP/agentpvm ($AGENTPVM_BIN)"
+    cp "$AGENTPVM_BIN" "$TMP/agentpvm"
+else
+    echo "==> building $TMP/agentpvm"
+    go build -o "$TMP/agentpvm" ./cmd/agentpvm
+fi
+if [ -n "${UMLCTL_BIN:-}" ]; then
+    echo "==> using prebuilt $TMP/umlctl ($UMLCTL_BIN)"
+    cp "$UMLCTL_BIN" "$TMP/umlctl"
+else
+    echo "==> building $TMP/umlctl"
+    go build -o "$TMP/umlctl" ./cmd/umlctl
+fi
 
 # A real base image inside the trusted image root: daemon-side validation
 # (validateRootfsContained) requires a regular file under PVM_IMAGE_ROOT.

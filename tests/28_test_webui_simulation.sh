@@ -22,7 +22,13 @@ export PVM_COW_ROOT="$TMP/cow"
 mkdir -p "$PVM_STATE_ROOT" "$PVM_AUDIT_ROOT" "$PVM_VOLUME_ROOT" "$PVM_COW_ROOT"
 
 echo "=== Building agentpvm ==="
-go build -o "$TMP/agentpvm" ./cmd/agentpvm
+if [ -n "${AGENTPVM_BIN:-}" ]; then
+    echo "==> using prebuilt $TMP/agentpvm ($AGENTPVM_BIN)"
+    cp "$AGENTPVM_BIN" "$TMP/agentpvm"
+else
+    echo "==> building $TMP/agentpvm"
+    go build -o "$TMP/agentpvm" ./cmd/agentpvm
+fi
 
 echo "=== Starting agentpvm WebUI server on port $PORT ==="
 "$TMP/agentpvm" webui --port "$PORT" >"$TMP/webui.log" 2>&1 &

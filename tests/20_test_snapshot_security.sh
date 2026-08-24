@@ -25,8 +25,13 @@ run_fail() {
     [ "$code" -ne 0 ] || fail "expected non-zero exit code for: $*"
 }
 
-echo "==> building agentpvm"
-go build -o "$TMP/agentpvm" ./cmd/agentpvm
+if [ -n "${AGENTPVM_BIN:-}" ]; then
+    echo "==> using prebuilt $TMP/agentpvm ($AGENTPVM_BIN)"
+    cp "$AGENTPVM_BIN" "$TMP/agentpvm"
+else
+    echo "==> building $TMP/agentpvm"
+    go build -o "$TMP/agentpvm" ./cmd/agentpvm
+fi
 
 echo "--- 1. Setup mock container and snapshot export"
 mkdir -p "$PVM_STATE_ROOT/c-source/sub"

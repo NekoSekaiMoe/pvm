@@ -39,8 +39,13 @@ export API_SECRET="secret"
 # E2B_DEBUG=1 hardcodes the SDK's API host to http://localhost:3000.
 PORT=3000
 
-echo "==> building agentpvm"
-go build -o "$TMP/agentpvm" ./cmd/agentpvm
+if [ -n "${AGENTPVM_BIN:-}" ]; then
+    echo "==> using prebuilt $TMP/agentpvm ($AGENTPVM_BIN)"
+    cp "$AGENTPVM_BIN" "$TMP/agentpvm"
+else
+    echo "==> building $TMP/agentpvm"
+    go build -o "$TMP/agentpvm" ./cmd/agentpvm
+fi
 
 echo "==> starting agentpvm api on :$PORT"
 "$TMP/agentpvm" api -port "$PORT" &>"$TMP/server.log" &

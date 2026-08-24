@@ -31,9 +31,20 @@ export API_SECRET="secret"
 
 fail() { echo "❌ $1"; exit 1; }
 
-echo "==> building binaries"
-go build -o "$TMP/agentpvm" ./cmd/agentpvm
-go build -o "$TMP/umlctl"   ./cmd/umlctl
+if [ -n "${AGENTPVM_BIN:-}" ]; then
+    echo "==> using prebuilt $TMP/agentpvm ($AGENTPVM_BIN)"
+    cp "$AGENTPVM_BIN" "$TMP/agentpvm"
+else
+    echo "==> building $TMP/agentpvm"
+    go build -o "$TMP/agentpvm" ./cmd/agentpvm
+fi
+if [ -n "${UMLCTL_BIN:-}" ]; then
+    echo "==> using prebuilt $TMP/umlctl ($UMLCTL_BIN)"
+    cp "$UMLCTL_BIN" "$TMP/umlctl"
+else
+    echo "==> building $TMP/umlctl"
+    go build -o "$TMP/umlctl" ./cmd/umlctl
+fi
 
 dd if=/dev/zero of="$PVM_IMAGE_ROOT/rootfs.img" bs=1M count=1 status=none
 

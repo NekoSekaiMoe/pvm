@@ -30,8 +30,13 @@ AUTH="Authorization: Bearer secret"
 
 fail() { echo "❌ $1"; exit 1; }
 
-echo "==> building agentpvm"
-go build -o "$TMP/agentpvm" ./cmd/agentpvm
+if [ -n "${AGENTPVM_BIN:-}" ]; then
+    echo "==> using prebuilt $TMP/agentpvm ($AGENTPVM_BIN)"
+    cp "$AGENTPVM_BIN" "$TMP/agentpvm"
+else
+    echo "==> building $TMP/agentpvm"
+    go build -o "$TMP/agentpvm" ./cmd/agentpvm
+fi
 
 echo "==> starting server on :$PORT"
 "$TMP/agentpvm" webui --port "$PORT" &>"$TMP/server.log" &

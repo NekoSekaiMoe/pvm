@@ -20,8 +20,13 @@ run_fail() {
     [ "$code" -ne 0 ] || fail "expected non-zero exit code for: $*"
 }
 
-echo "==> building agentpvm"
-go build -o "$TMP/agentpvm" ./cmd/agentpvm
+if [ -n "${AGENTPVM_BIN:-}" ]; then
+    echo "==> using prebuilt $TMP/agentpvm ($AGENTPVM_BIN)"
+    cp "$AGENTPVM_BIN" "$TMP/agentpvm"
+else
+    echo "==> building $TMP/agentpvm"
+    go build -o "$TMP/agentpvm" ./cmd/agentpvm
+fi
 
 echo "--- 1. agentpvm with no args prints usage and fails"
 run_fail "$TMP/agentpvm"

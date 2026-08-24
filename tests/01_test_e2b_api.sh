@@ -4,7 +4,13 @@ set -eo pipefail
 echo "========== Test 01: E2B API Simulation =========="
 
 # Build the CLI
-go build -o agentpvm cmd/agentpvm/main.go
+if [ -n "${AGENTPVM_BIN:-}" ]; then
+    echo "==> using prebuilt agentpvm ($AGENTPVM_BIN)"
+    cp "$AGENTPVM_BIN" "agentpvm"
+else
+    echo "==> building agentpvm"
+    go build -o "agentpvm" ./cmd/agentpvm
+fi
 
 # Start the API server in the background (a secret is REQUIRED — the server
 # refuses to start without one). Randomize it per run; the Bearer header

@@ -25,8 +25,13 @@ API="http://127.0.0.1:$PORT/api"
 export API_SECRET="secret"
 AUTH="Authorization: Bearer secret"
 
-echo "==> building agentpvm"
-go build -o "$TMP/agentpvm" ./cmd/agentpvm
+if [ -n "${AGENTPVM_BIN:-}" ]; then
+    echo "==> using prebuilt $TMP/agentpvm ($AGENTPVM_BIN)"
+    cp "$AGENTPVM_BIN" "$TMP/agentpvm"
+else
+    echo "==> building $TMP/agentpvm"
+    go build -o "$TMP/agentpvm" ./cmd/agentpvm
+fi
 
 echo "==> starting server on :$PORT"
 "$TMP/agentpvm" webui --port "$PORT" &>"$TMP/server.log" &
