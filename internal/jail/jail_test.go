@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -168,5 +169,45 @@ func TestSetupJail_DirectoryStructure(t *testing.T) {
 		if fi, err := os.Stat(p); err != nil || !fi.IsDir() {
 			t.Errorf("expected directory %s to exist in jail", p)
 		}
+	}
+}
+
+// GrantMonitorRW must bridge the DAC gap for a foreign-owned image and
+// Cleanup must restore the original owner/mode. Requires root (chown).
+func TestGrantMonitorRW_RestoresOnCleanup(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("chown requires root")
+	}
+	img := filepath.Join(t.TempDir(), "rootfs.img")
+	if err := os.WriteFile(img, []byte("img"), 0o444); err != nil {
+		t.Fatal(err)
+	}
+	env := &JailEnvironment{}
+	const base = 165536
+	if err := env.GrantMonitorRW(img, base, base); err != nil {
+		t.Fatalf("grant: %v", err)
+	}
+	st, err := os.Stat(img)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := st.Sys().(*syscall.Stat_t).Uid; got != base {
+		t.Fatalf("owner = %d, want %d", got, base)
+	}
+	if st.Mode().Perm()&0o200 == 0 {
+		t.Fatal("owner-write bit not added")
+	}
+	if err := env.Cleanup(); err != nil {
+		t.Fatalf("cleanup: %v", err)
+	}
+	st, err = os.Stat(img)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := st.Sys().(*syscall.Stat_t).Uid; got != 0 {
+		t.Fatalf("owner not restored: %d", got)
+	}
+	if st.Mode().Perm() != 0o444 {
+		t.Fatalf("mode not restored: %o", st.Mode().Perm())
 	}
 }

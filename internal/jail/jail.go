@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 )
 
 // SecurityReport contains the evaluation results of host security mechanisms.
@@ -154,6 +155,65 @@ type JailEnvironment struct {
 	// ConfigureProcessIsolation. Stage 1 blocks on the read end until the
 	// manager has finished post-fork setup (cgroup.procs) — see SignalReady.
 	syncW *os.File
+	// grants records host files whose ownership/mode was temporarily
+	// widened for the namespaced monitor (GrantMonitorRW); Cleanup restores
+	// the original owner/mode before releasing the jail directory.
+	grants []fileGrant
+}
+
+// fileGrant is one recorded GrantMonitorRW mutation awaiting restore.
+type fileGrant struct {
+	path string
+	uid  int
+	gid  int
+	mode os.FileMode
+}
+
+// GrantMonitorRW ensures the namespaced monitor (fixed host creds
+// uidBase:gidBase) can open hostPath read-write, recording every change so
+// Cleanup can restore the file exactly. The monitor only ever opens the
+// in-jail BIND of the file (stage 1 binds it as real root), so ancestor
+// traversal never matters — the inode's own DAC is the entire check, and
+// for a foreign-owned image the monitor is "other", which on a typical
+// 0644 image means READ-ONLY. UML's ubd then silently degrades to a
+// read-only device: the guest rootfs mounts ro, /etc/resolv.conf cannot be
+// written, DNS via getaddrinfo fails ("wget: bad address") and the boot
+// limps to INIT_DONE rc=99 (CI run 8856, both arches, after every
+// networking theory had been eliminated by the pidns bisect).
+//
+// chown is used instead of setfacl/loop devices: zero external
+// dependencies, and Cleanup restores the original owner (and mode, if the
+// owner-write bit had to be added), so the mutation is temporary by
+// construction. Callers must treat rw images as per-container for the
+// duration of the jail (two concurrent jails would chown the same inode
+// back and forth — share via read-only/ephemeral images instead).
+func (j *JailEnvironment) GrantMonitorRW(hostPath string, uidBase, gidBase uint32) error {
+	fi, err := os.Stat(hostPath)
+	if err != nil {
+		return err
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fmt.Errorf("cannot inspect owner of %s", hostPath)
+	}
+	mode := fi.Mode().Perm()
+	// Monitor creds are exactly uidBase:gidBase; anything short of an
+	// owner match falls through to the world bits.
+	if st.Uid == uidBase && mode&0o200 != 0 || mode&0o006 == 0o006 {
+		return nil
+	}
+	grant := fileGrant{path: hostPath, uid: int(st.Uid), gid: int(st.Gid), mode: mode}
+	if err := os.Chown(hostPath, int(uidBase), int(gidBase)); err != nil {
+		return fmt.Errorf("chown %s into container uid range: %w", hostPath, err)
+	}
+	if mode&0o200 == 0 {
+		if err := os.Chmod(hostPath, mode|0o200); err != nil {
+			_ = os.Chown(hostPath, grant.uid, grant.gid)
+			return fmt.Errorf("add owner-write to %s: %w", hostPath, err)
+		}
+	}
+	j.grants = append(j.grants, grant)
+	return nil
 }
 
 // SignalReady releases stage 1 to clone stage 2. The manager MUST call this
@@ -264,6 +324,14 @@ func (j *JailEnvironment) Cleanup() error {
 		_ = j.syncW.Close()
 		j.syncW = nil
 	}
+	// Restore host files widened by GrantMonitorRW (best-effort, reverse
+	// order) before the jail directory goes away.
+	for i := len(j.grants) - 1; i >= 0; i-- {
+		g := j.grants[i]
+		_ = os.Chmod(g.path, g.mode)
+		_ = os.Chown(g.path, g.uid, g.gid)
+	}
+	j.grants = nil
 	if j.Config.BaseDir == "" {
 		return nil
 	}

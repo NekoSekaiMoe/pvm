@@ -122,3 +122,23 @@ func routeLaunchThroughJail(args []string, tapDevice string) ([]string, []jail.V
 	}
 	return out, vols
 }
+
+// grantMonitorImageAccess widens rw rootfs images so the namespaced monitor
+// can open them (see jail.GrantMonitorRW for why the in-jail bind alone is
+// not enough — the inode's DAC is checked against the monitor's fixed host
+// creds). A grant failure is NOT fatal: the guest still boots, just with a
+// read-only rootfs, so surface it loudly and let the caller decide.
+func grantMonitorImageAccess(jailEnv *jail.JailEnvironment, vols []jail.VolumeMapping, uidBase uint32) {
+	if uidBase == 0 {
+		return // degraded leg: the monitor is real root, no DAC gap to bridge
+	}
+	for _, v := range vols {
+		if v.GuestPath != jailGuestRootfs || v.ReadOnly {
+			continue
+		}
+		if err := jailEnv.GrantMonitorRW(v.HostPath, uidBase, uidBase); err != nil {
+			fmt.Printf("Warning: cannot grant the rootless monitor rw access to %s: %v "+
+				"(guest rootfs will be READ-ONLY)\n", v.HostPath, err)
+		}
+	}
+}

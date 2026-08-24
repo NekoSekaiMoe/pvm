@@ -279,6 +279,7 @@ func (m *Manager) Boot(ctx context.Context, cfg *config.ContainerConfig) (*Boote
 			var vols []jail.VolumeMapping
 			args, vols = routeLaunchThroughJail(args, tapName)
 			jailEnv.Config.Volumes = vols
+			grantMonitorImageAccess(jailEnv, vols, uidBase)
 		}
 		if tapFile != nil {
 			ctx = context.WithValue(ctx, uml.KeyExtraFiles, []*os.File{tapFile})
@@ -948,6 +949,7 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 			var vols []jail.VolumeMapping
 			args, vols = routeLaunchThroughJail(args, tap)
 			jailEnv.Config.Volumes = vols
+			grantMonitorImageAccess(jailEnv, vols, uidBase)
 		}
 		if tapFile != nil {
 			ctx = context.WithValue(ctx, uml.KeyExtraFiles, []*os.File{tapFile})
