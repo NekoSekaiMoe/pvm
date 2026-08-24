@@ -682,6 +682,11 @@ func (d *TapDataplane) Close() error {
 // crash) the pinned maps are removed best-effort — stale NIC/pvm-gw filters
 // from a dead process are inert (their maps are gone, every lookup misses,
 // packets pass) and can be cleared manually with `tc filter del`.
+// Permission errors on the best-effort leg are treated like "not there":
+// StartTask defers this unconditionally (even when nothing was attached,
+// e.g. attach degraded without root), so an unprivileged process probing
+// /sys/fs/bpf must not turn a no-op detach into an error (CI runs the unit
+// tests as non-root where every bpffs path is EACCES).
 func DetachTapDataplane(taskID string) error {
 	dataplaneMu.Lock()
 	d := dataplanes[taskID]
@@ -692,11 +697,11 @@ func DetachTapDataplane(taskID string) error {
 	var errs []error
 	if pinDir, err := whitelistPinDir(taskID); err == nil {
 		for _, name := range []string{pinEgressSessions, pinGwPortMap, pinDpStats} {
-			if err := os.Remove(filepath.Join(pinDir, name)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			if err := os.Remove(filepath.Join(pinDir, name)); err != nil && !benignDetachErr(err) {
 				errs = append(errs, fmt.Errorf("unpin %s: %w", name, err))
 			}
 		}
-		if err := os.Remove(pinDir); err != nil && !errors.Is(err, os.ErrNotExist) && !errors.Is(err, unix.ENOTEMPTY) {
+		if err := os.Remove(pinDir); err != nil && !benignDetachErr(err) && !errors.Is(err, unix.ENOTEMPTY) {
 			errs = append(errs, fmt.Errorf("remove pin dir %s: %w", pinDir, err))
 		}
 	}
