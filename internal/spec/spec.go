@@ -229,7 +229,28 @@ type NetworkSpec struct {
 	// DefaultMaxLearnedEntries) so a hostile guest cannot exhaust eBPF map
 	// capacity or host memory by flooding distinct allowlisted lookups.
 	MaxLearnedEntries int `toml:"max_learned_entries"`
+
+	// Dataplane selects the packet data plane (todo.md P2, CubeVS parity):
+	//   "bridge" (default) — TAP enslaved to a Linux bridge; the guest IP
+	//     comes from the per-bridge IPAM (gateway_ip subnet) and the eBPF TC
+	//     program on the TAP egress is the SSRF IP-floor.
+	//   "tc" — opt-in bridgeless mode: NO bridge, no iptables. Every sandbox
+	//     gets the SAME fixed link-local addressing (guest 169.254.68.6,
+	//     gateway/proxy 169.254.68.5); TC-attached eBPF programs SNAT guest
+	//     traffic out the host NIC and reverse-NAT replies via a per-task
+	//     session table. bridge/gateway_ip/guest_ip are IGNORED in tc mode
+	//     (pvm_ip=169.254.68.6 and egress_proxy=169.254.68.5:<port> are
+	//     injected instead). IPv4 TCP/UDP only; ICMP is dropped.
+	Dataplane string `toml:"dataplane"`
 }
+
+// Dataplane mode values for NetworkSpec.Dataplane.
+const (
+	// DataplaneBridge is the default: Linux bridge + per-bridge IPAM.
+	DataplaneBridge = "bridge"
+	// DataplaneTC is the opt-in CubeVS-style bridgeless TC/eBPF data plane.
+	DataplaneTC = "tc"
+)
 
 // EgressRule is one L7 egress rule, mirroring CubeSandbox's Rule/Match/Action.
 type EgressRule struct {
@@ -546,12 +567,26 @@ func (s *TaskSpec) Validate() error {
 	if s.Network.TAP != "" && !tapNameRe.MatchString(s.Network.TAP) {
 		errs = append(errs, fmt.Errorf("spec: network.tap %q must match ^[a-zA-Z0-9_-]{1,15}$", s.Network.TAP))
 	}
+	// Data plane selection (P2). Empty fills the historical default; an
+	// unrecognized value is a config error, never silently ignored — the
+	// enforcement posture differs too much between modes to guess.
+	switch s.Network.Dataplane {
+	case "":
+		s.Network.Dataplane = DataplaneBridge
+	case DataplaneBridge, DataplaneTC:
+	default:
+		errs = append(errs, fmt.Errorf("spec: network.dataplane %q must be %q or %q",
+			s.Network.Dataplane, DataplaneBridge, DataplaneTC))
+	}
 	// guest_ip lands verbatim in the kernel command line as pvm_ip=<ip>, so
 	// it must be a plain dotted-quad IPv4 (which the kernel-field charset
 	// check then re-verifies). When the gateway CIDR is also set, the guest
 	// address must live inside that subnet — an out-of-subnet guest IP would
 	// be unreachable and is a config error, not a runtime surprise.
-	if s.Network.GuestIP != "" {
+	// Skipped in tc mode: the data plane pins 169.254.68.6/169.254.68.5 and
+	// IGNORES guest_ip/gateway_ip, so cross-checking them would reject
+	// configs that are valid under the tc contract.
+	if s.Network.GuestIP != "" && s.Network.Dataplane != DataplaneTC {
 		ip := net.ParseIP(s.Network.GuestIP)
 		if ip == nil || ip.To4() == nil {
 			errs = append(errs, fmt.Errorf("spec: network.guest_ip %q is not a valid IPv4 address", s.Network.GuestIP))

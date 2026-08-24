@@ -278,10 +278,22 @@ func (t *taskListener) Close() error {
 // the task id string. The listener is owned by the caller, which must Close
 // it when the task exits.
 func (g *Gateway) ListenForTask(ctx context.Context, taskID string) (*taskListener, error) {
+	return g.ListenForTaskOn(ctx, taskID, "")
+}
+
+// ListenForTaskOn is ListenForTask with an explicit bind address: empty means
+// the historical default 127.0.0.1:0. The P2 bridgeless tc dataplane binds
+// the per-task listener on the fixed link-local gateway address
+// (169.254.68.5:0, served by the shared pvm-gw dummy device) so the guest's
+// egress_proxy= target is identical inside every sandbox; the TC programs
+// redirect gateway-destined frames into the host stack via pvm-gw.
+func (g *Gateway) ListenForTaskOn(ctx context.Context, taskID, addr string) (*taskListener, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	addr := "127.0.0.1:0"
+	if addr == "" {
+		addr = "127.0.0.1:0"
+	}
 	if deadline, ok := ctx.Deadline(); ok {
 		_ = deadline // currently informational; the listener has no dial timeout
 	}

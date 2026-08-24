@@ -765,6 +765,11 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 	var sockPath string
 	var vhostBackend io.Closer
 	var egressAddr string // host:port of this task's dedicated egress listener
+	// rawEgressAddr is the listener's real bound address before the tc
+	// dataplane rewrites it to the fixed gateway; the bridge fallback
+	// (tc attach failure + bridge configured) restores it so the guest
+	// dials exactly what bridge mode would have injected.
+	var rawEgressAddr string
 	if s.Kernel.UseVhostBlk && s.Workspace.BaseImage != "" {
 		var sock string
 		var backend io.Closer
@@ -822,6 +827,16 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 	// header (which the guest can forge). The listener port is forwarded into
 	// the guest as the proxy address it must dial; the task id never crosses
 	// the trust boundary.
+	//
+	// P2 (tc dataplane): the guest's proxy target is the FIXED link-local
+	// gateway 169.254.68.5 — identical inside every sandbox. The per-task
+	// listener then binds that address on the shared pvm-gw dummy device and
+	// the tap_ingress TC program redirects gateway-destined frames into the
+	// host stack via pvm-gw. When pvm-gw cannot be set up (no
+	// root/CAP_NET_ADMIN) or the bind fails, we degrade with an audit
+	// warning and STILL inject the fixed address: fail-closed (unreachable)
+	// beats silently telling the guest an address that happens to work.
+	tcDataplane := s.Network.Enabled && s.Network.Dataplane == spec.DataplaneTC
 	if m.Egress != nil && s.Network.Enabled {
 		pol := &egress.Policy{
 			AllowDomains:   s.Network.EgressAllowDomains,
@@ -859,16 +874,55 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 			})
 		}
 		m.Egress.SetPolicy(taskID, pol)
-		if lp, err := m.Egress.ListenForTask(ctx, taskID); err == nil {
-			defer lp.Close()
-			egressAddr = lp.Addr()
-		} else {
+		listenAddr := ""
+		if tcDataplane {
+			if _, gwErr := network.EnsureGwDevice(); gwErr != nil {
+				warn := fmt.Sprintf("tc dataplane pvm-gw setup failed: %v; "+
+					"egress listener falls back to loopback (proxy UNREACHABLE from the guest)", gwErr)
+				fmt.Printf("Warning: %s\n", warn)
+				if aerr := appendDegradedWarning(ledger, s.Caller, warn); aerr != nil {
+					cleanupVolumes()
+					_ = st.Transition(state.StatusFailed, state.ActorController, "audit pvm-gw degraded-warning append failed: "+aerr.Error())
+					state.SaveState(taskID, st)
+					return fmt.Errorf("container: audit pvm-gw degraded warning for %s: %w", taskID, aerr)
+				}
+			} else {
+				listenAddr = net.JoinHostPort(network.TapDataplaneGatewayIP, "0")
+			}
+		}
+		lp, err := m.Egress.ListenForTaskOn(ctx, taskID, listenAddr)
+		if err != nil && listenAddr != "" {
+			// The gateway address existed moments ago but cannot be bound
+			// (race with another teardown, port pressure): degrade to
+			// loopback with evidence, same fail-closed injection below.
+			warn := fmt.Sprintf("tc dataplane egress listener bind %s failed: %v; "+
+				"falling back to loopback (proxy UNREACHABLE from the guest)", listenAddr, err)
+			fmt.Printf("Warning: %s\n", warn)
+			if aerr := appendDegradedWarning(ledger, s.Caller, warn); aerr != nil {
+				cleanupVolumes()
+				_ = st.Transition(state.StatusFailed, state.ActorController, "audit egress-bind degraded-warning append failed: "+aerr.Error())
+				state.SaveState(taskID, st)
+				return fmt.Errorf("container: audit egress-bind degraded warning for %s: %w", taskID, aerr)
+			}
+			lp, err = m.Egress.ListenForTaskOn(ctx, taskID, "")
+		}
+		if err != nil {
 			cleanupVolumes()
 			// Without a per-task listener we cannot safely attribute traffic,
 			// so fail closed rather than falling back to the forgeable header.
 			_ = st.Transition(state.StatusFailed, state.ActorController, "egress listener failed: "+err.Error())
 			state.SaveState(taskID, st)
 			return fmt.Errorf("container: egress listener for %s: %w", taskID, err)
+		}
+		defer lp.Close()
+		egressAddr = lp.Addr()
+		rawEgressAddr = egressAddr
+		if tcDataplane {
+			// The tc contract injects egress_proxy=169.254.68.5:<port>
+			// regardless of where the listener actually landed (see above).
+			if _, port, perr := net.SplitHostPort(egressAddr); perr == nil {
+				egressAddr = net.JoinHostPort(network.TapDataplaneGatewayIP, port)
+			}
 		}
 	}
 
@@ -936,62 +990,111 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 	// learner; a no-op when dns_learn_enabled is off.
 	dnsTeardown := func() {}
 	if s.Network.Enabled && tapName != "" {
-		ipam, ierr := network.SharedIPAM(s.Network.GatewayIP)
-		if ierr != nil {
-			cleanupVolumes()
-			_ = st.Transition(state.StatusFailed, state.ActorController, "guest IPAM init failed: "+ierr.Error())
-			state.SaveState(taskID, st)
-			return fmt.Errorf("container: guest IPAM for %s: %w", taskID, ierr)
-		}
-		var gip net.IP
-		if s.Network.GuestIP != "" {
-			gip, ierr = ipam.AllocateGuest(taskID, s.Network.GuestIP)
-		} else {
-			gip, ierr = ipam.Allocate(taskID)
-		}
-		if ierr != nil {
-			cleanupVolumes()
-			_ = st.Transition(state.StatusFailed, state.ActorController, "guest IP allocation failed: "+ierr.Error())
-			state.SaveState(taskID, st)
-			return fmt.Errorf("container: guest IP for %s: %w", taskID, ierr)
-		}
-		guestIP = gip.String()
+		var ipam *network.IPAM
 		filterAttached := false
-		if _, ferr := network.AttachEgressFilter(tapName, taskID, ipam.GatewayIP(), gip); ferr != nil {
-			warn := fmt.Sprintf("tc egress filter attach failed for tap %s: %v; "+
-				"running WITHOUT the BPF IP-floor (L7 egress proxy remains the enforcement point)", tapName, ferr)
-			fmt.Printf("Warning: %s\n", warn)
-			if aerr := ledger.Append(audit.Record{
-				Phase:    audit.PhaseExec,
-				Subject:  s.Caller,
-				Action:   "security:degraded_warning",
-				Decision: audit.DecisionAllow,
-				Reason:   warn,
-			}); aerr != nil {
-				// The degraded warning is the ONLY auditable trace that this
-				// task runs without the BPF floor; fail closed rather than boot
-				// a downgraded sandbox with no evidence (mirrors the jail
-				// degraded-warning contract above).
-				ipam.Release(taskID)
-				cleanupVolumes()
-				_ = st.Transition(state.StatusFailed, state.ActorController, "audit tc-filter degraded-warning append failed: "+aerr.Error())
-				state.SaveState(taskID, st)
-				return fmt.Errorf("container: audit tc-filter degraded warning for %s: %w", taskID, aerr)
+		dpAttached := false
+		// dnsGateway is where the guest's default resolver points (the
+		// bridge gateway in bridge mode, the fixed tc gateway otherwise);
+		// the DNS-learn proxy prefer-binds there.
+		var dnsGateway net.IP
+
+		// bridgePlane selects the classic P1-A data plane (per-bridge IPAM +
+		// TAP-egress whitelist filter). It is the default; in tc mode it only
+		// runs as the FALLBACK when the tc attach failed and the spec still
+		// names a bridge (documented degraded composition).
+		bridgePlane := !tcDataplane
+		if tcDataplane {
+			// P2 bridgeless tc data plane: the guest gets the FIXED
+			// link-local 169.254.68.6 (same inside every sandbox), no IPAM,
+			// no bridge. tap_ingress subsumes the egress filter's floor
+			// (policy + SNAT on guest-originated traffic) and owns the
+			// whitelist pin at the same standard path, so the whitelist CLI
+			// and dnslearn work unchanged; the classic TAP-egress filter is
+			// NOT attached (its host->guest direction is exempted by the
+			// fixed addresses anyway). Attach failure degrades with an audit
+			// warning; with a bridge configured we fall back to the classic
+			// plane below, otherwise the task continues degraded (the L7
+			// proxy via pvm-gw remains the enforcement point when it exists).
+			guestIP = network.TapDataplaneGuestIP
+			dnsGateway = net.ParseIP(network.TapDataplaneGatewayIP)
+			if _, derr := network.AttachTapDataplane(taskID, tapName, ""); derr != nil {
+				warn := fmt.Sprintf("tc dataplane attach failed for tap %s: %v; "+
+					"running WITHOUT the bridgeless TC NAT/policy plane", tapName, derr)
+				fmt.Printf("Warning: %s\n", warn)
+				if aerr := appendDegradedWarning(ledger, s.Caller, warn); aerr != nil {
+					cleanupVolumes()
+					_ = st.Transition(state.StatusFailed, state.ActorController, "audit tc-dataplane degraded-warning append failed: "+aerr.Error())
+					state.SaveState(taskID, st)
+					return fmt.Errorf("container: audit tc-dataplane degraded warning for %s: %w", taskID, aerr)
+				}
+				if s.Network.Bridge != "" {
+					bridgePlane = true
+					egressAddr = rawEgressAddr // undo the fixed-gateway injection
+				}
+			} else {
+				dpAttached = true
 			}
-		} else {
-			filterAttached = true
 		}
-		// Symmetric teardown (mirrors SetupBridge's rollback style): unpin
-		// the map, drop the tc filter, release the registry entry and free
-		// the guest IP. Runs on every return path after this point, including
-		// the normal task-exit path below.
+		if bridgePlane {
+			ipam, ierr := network.SharedIPAM(s.Network.GatewayIP)
+			if ierr != nil {
+				cleanupVolumes()
+				_ = st.Transition(state.StatusFailed, state.ActorController, "guest IPAM init failed: "+ierr.Error())
+				state.SaveState(taskID, st)
+				return fmt.Errorf("container: guest IPAM for %s: %w", taskID, ierr)
+			}
+			var gip net.IP
+			if s.Network.GuestIP != "" {
+				gip, ierr = ipam.AllocateGuest(taskID, s.Network.GuestIP)
+			} else {
+				gip, ierr = ipam.Allocate(taskID)
+			}
+			if ierr != nil {
+				cleanupVolumes()
+				_ = st.Transition(state.StatusFailed, state.ActorController, "guest IP allocation failed: "+ierr.Error())
+				state.SaveState(taskID, st)
+				return fmt.Errorf("container: guest IP for %s: %w", taskID, ierr)
+			}
+			guestIP = gip.String()
+			dnsGateway = ipam.GatewayIP()
+			if _, ferr := network.AttachEgressFilter(tapName, taskID, ipam.GatewayIP(), gip); ferr != nil {
+				warn := fmt.Sprintf("tc egress filter attach failed for tap %s: %v; "+
+					"running WITHOUT the BPF IP-floor (L7 egress proxy remains the enforcement point)", tapName, ferr)
+				fmt.Printf("Warning: %s\n", warn)
+				if aerr := appendDegradedWarning(ledger, s.Caller, warn); aerr != nil {
+					// The degraded warning is the ONLY auditable trace that this
+					// task runs without the BPF floor; fail closed rather than boot
+					// a downgraded sandbox with no evidence (mirrors the jail
+					// degraded-warning contract above).
+					ipam.Release(taskID)
+					cleanupVolumes()
+					_ = st.Transition(state.StatusFailed, state.ActorController, "audit tc-filter degraded-warning append failed: "+aerr.Error())
+					state.SaveState(taskID, st)
+					return fmt.Errorf("container: audit tc-filter degraded warning for %s: %w", taskID, aerr)
+				}
+			} else {
+				filterAttached = true
+			}
+		}
+		// Symmetric teardown (mirrors SetupBridge's rollback style): detach
+		// the tc dataplane (filters + pins + sweeper) and/or the classic
+		// filter, unpin maps, release the registry entry and free the guest
+		// IP. Runs on every return path after this point, including the
+		// normal task-exit path below.
 		detachNet = func() {
+			if dpAttached {
+				if derr := network.DetachTapDataplane(taskID); derr != nil {
+					fmt.Printf("Warning: tc dataplane detach for %s: %v\n", taskID, derr)
+				}
+			}
 			if filterAttached {
 				if derr := network.DetachTaskFilter(taskID, tapName); derr != nil {
 					fmt.Printf("Warning: tc filter detach for %s: %v\n", taskID, derr)
 				}
 			}
-			ipam.Release(taskID)
+			if ipam != nil {
+				ipam.Release(taskID)
+			}
 		}
 
 		// DNS-learned domain egress (P1-B): snoop the guest's resolver
@@ -1055,7 +1158,10 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 			}
 			dnsCtx, dnsCancel := context.WithCancel(context.Background())
 			learner.Run(dnsCtx)
-			preferBind := net.JoinHostPort(ipam.GatewayIP().String(), "53")
+			// dnsGateway is the bridge gateway in bridge mode and the fixed
+			// 169.254.68.5 (pvm-gw) in tc mode; binding it may fail without
+			// root — StartProxy then falls back to loopback (audited there).
+			preferBind := net.JoinHostPort(dnsGateway.String(), "53")
 			if addr, perr := learner.StartProxy(dnsCtx, preferBind); perr != nil {
 				// Even the loopback fallback failed: continue WITHOUT DNS
 				// learning (L7 proxy still enforces), with evidence.
@@ -1610,6 +1716,20 @@ func buildLegacyArgs(ctx context.Context, cfg *config.ContainerConfig, tapFD int
 		args = append(args, fmt.Sprintf("hostfs_volume=%s:%s", vHost, vGuest))
 	}
 	return args, nil
+}
+
+// appendDegradedWarning records a security:degraded_warning audit row — the
+// ONLY auditable trace that a task runs with a downgraded enforcement layer.
+// Callers fail closed when the append itself fails (a downgraded sandbox must
+// never boot without evidence); mirrors the jail degraded-warning contract.
+func appendDegradedWarning(ledger *audit.Ledger, caller, reason string) error {
+	return ledger.Append(audit.Record{
+		Phase:    audit.PhaseExec,
+		Subject:  caller,
+		Action:   "security:degraded_warning",
+		Decision: audit.DecisionAllow,
+		Reason:   reason,
+	})
 }
 
 // buildTaskArgs builds the UML command-line from a TaskSpec. Mirrors the legacy

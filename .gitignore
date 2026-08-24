@@ -16,6 +16,7 @@ pkg_rootfs.img
 bazel-*
 MODULE.bazel.lock
 internal/network/bpf_bpf*
+internal/network/tapdp_bpf*
 node_modules/
 # Root package.json is local agent tooling state (pi extensions), not project
 # code; ignore only THIS file so package.json files elsewhere stay visible.
