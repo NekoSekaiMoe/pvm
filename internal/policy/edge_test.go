@@ -29,8 +29,8 @@ func TestSanitize_Coverage(t *testing.T) {
 		"private_key", "privateKey",
 	}
 	for _, k := range mustDrop {
-		if isSafeSummaryKey(k) {
-			t.Errorf("isSafeSummaryKey(%q) = true; should be DROPPED", k)
+		if audit.IsSafeSummaryKey(k) {
+			t.Errorf("audit.IsSafeSummaryKey(%q) = true; should be DROPPED", k)
 		}
 	}
 	mustPass := []string{
@@ -38,8 +38,8 @@ func TestSanitize_Coverage(t *testing.T) {
 		"branch", "commit", "result", "stdout", "exit_code",
 	}
 	for _, k := range mustPass {
-		if !isSafeSummaryKey(k) {
-			t.Errorf("isSafeSummaryKey(%q) = false; should PASS", k)
+		if !audit.IsSafeSummaryKey(k) {
+			t.Errorf("audit.IsSafeSummaryKey(%q) = false; should PASS", k)
 		}
 	}
 }

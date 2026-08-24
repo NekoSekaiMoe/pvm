@@ -16,7 +16,6 @@ package policy
 import (
 	"errors"
 	"fmt"
-	"regexp"
 	"strings"
 
 	"uml-container/internal/audit"
@@ -185,51 +184,13 @@ func sanitize(r ToolResponse) ToolResponse {
 	// Summary/Reason are free-text; the executor may accidentally echo a
 	// secret into them. Always apply the regex-based redactor, even when the
 	// Result map is nil, so prose can't leak a token.
-	r.Summary = redactSecrets(r.Summary)
-	r.Reason = redactSecrets(r.Reason)
+	r.Summary = audit.RedactSecrets(r.Summary)
+	r.Reason = audit.RedactSecrets(r.Reason)
 	if r.Result == nil {
 		return r
 	}
-	r.Result = scrubValue(r.Result).(map[string]interface{})
+	r.Result = audit.ScrubValue(r.Result).(map[string]interface{})
 	return r
-}
-
-// scrubValue recursively scrubs a value: maps have secret-named keys dropped
-// (and their values recursively scrubbed), slices are element-wise scrubbed,
-// strings are passed through redactSecrets so a credential pattern in a value
-// is masked even when the key name is benign (e.g. {"url": "...token=ghp_..."}).
-func scrubValue(v interface{}) interface{} {
-	switch x := v.(type) {
-	case map[string]interface{}:
-		out := make(map[string]interface{}, len(x))
-		for k, vv := range x {
-			if isSafeSummaryKey(k) {
-				out[k] = scrubValue(vv)
-			}
-		}
-		return out
-	case []interface{}:
-		out := make([]interface{}, len(x))
-		for i, vv := range x {
-			out[i] = scrubValue(vv)
-		}
-		return out
-	case string:
-		return redactSecrets(x)
-	}
-	return v
-}
-
-// isSafeSummaryKey returns true for keys that may legitimately appear in an
-// Observation. Anything else (token, secret, password, key, ...) is dropped.
-func isSafeSummaryKey(k string) bool {
-	low := strings.ToLower(k)
-	for _, bad := range []string{"token", "secret", "password", "passwd", "key", "credential", "cookie", "auth"} {
-		if strings.Contains(low, bad) {
-			return false
-		}
-	}
-	return true
 }
 
 func (g *Gateway) audit(req ToolRequest, dec audit.Decision, reason string) {
@@ -238,34 +199,18 @@ func (g *Gateway) audit(req ToolRequest, dec audit.Decision, reason string) {
 	}
 	// Redact before persisting: tool args and error text often carry tokens,
 	// and the ledger is append-only on disk. ScrubValue recursively drops
-	// secret-named keys and redactSecrets masks pattern hits in prose.
-	safeArgs := scrubValue(req.Args)
+	// secret-named keys and RedactSecrets masks pattern hits in prose. The
+	// ledger's own redactor (audit.Ledger.Append) applies the same scrub as a
+	// second line of defense; both are idempotent.
+	safeArgs := audit.ScrubValue(req.Args)
 	_ = g.ledger.Append(audit.Record{
 		Phase:    audit.PhaseExec,
 		Subject:  "agent",
 		Action:   "tool:" + req.Name,
 		Params:   safeArgs,
 		Decision: dec,
-		Reason:   redactSecrets(reason),
+		Reason:   audit.RedactSecrets(reason),
 	})
-}
-
-// secretRedactionPatterns matches high-signal credential shapes in prose so
-// an executor that echoes a token into a Summary/Reason/error string still
-// gets masked before the value reaches the agent or the audit ledger.
-var secretRedactionPatterns = []*regexp.Regexp{
-	regexp.MustCompile(`gh[pousr]_[A-Za-z0-9]{36,}`),
-	regexp.MustCompile(`AKIA[0-9A-Z]{16}`),
-	regexp.MustCompile(`xox[baprs]-[A-Za-z0-9-]{10,}`),
-	regexp.MustCompile(`(?i)Bearer\s+[A-Za-z0-9\-._~+]{20,}`),
-}
-
-// redactSecrets masks credential-looking substrings in s with "[REDACTED]".
-func redactSecrets(s string) string {
-	for _, p := range secretRedactionPatterns {
-		s = p.ReplaceAllString(s, "[REDACTED]")
-	}
-	return s
 }
 
 // ErrDenied is returned when a tool call is denied by policy.

@@ -40,6 +40,7 @@ func TestValidateMatrix(t *testing.T) {
 		{"bad budget duration", func(s *TaskSpec) { s.Budget.MaxWallTime = "two-minutes" }, "max_wall_time"},
 		{"bad lifecycle ttl", func(s *TaskSpec) { s.Lifecycle.TTL = "never" }, "lifecycle.ttl"},
 		{"bad on_anomaly", func(s *TaskSpec) { s.Lifecycle.OnAnomaly = "pray" }, "on_anomaly"},
+		{"bad uml_seccomp", func(s *TaskSpec) { s.Security.UMLSeccomp = "maybe" }, "uml_seccomp"},
 		{"bad approval timeout", func(s *TaskSpec) { s.Approval.Timeout = "soon" }, "approval.timeout"},
 		{"idle timeout zero", func(s *TaskSpec) { s.Lifecycle.IdleTimeout = "0s" }, "idle_timeout must be positive"},
 		{"idle timeout negative", func(s *TaskSpec) { s.Lifecycle.IdleTimeout = "-1s" }, "idle_timeout must be positive"},
@@ -192,5 +193,31 @@ func TestFingerprint_DistinguishesContracts(t *testing.T) {
 	s2.Caller = "bob"
 	if s1.Fingerprint() == s2.Fingerprint() {
 		t.Error("fingerprint must change when caller changes")
+	}
+}
+
+// TestValidate_UMLSeccomp pins the on|auto|off contract of
+// security.uml_seccomp: empty normalizes to the "off" default, the three
+// documented modes validate, and anything else is rejected (negative case
+// lives in TestValidateMatrix).
+func TestValidate_UMLSeccomp(t *testing.T) {
+	for _, mode := range []string{"", "on", "auto", "off"} {
+		s := baseValid()
+		s.Security.UMLSeccomp = mode
+		if err := s.Validate(); err != nil {
+			t.Fatalf("mode %q: %v", mode, err)
+		}
+		if mode == "" && s.Security.UMLSeccomp != "off" {
+			t.Errorf("empty mode must default to \"off\", got %q", s.Security.UMLSeccomp)
+		}
+	}
+	// TOML round-trip: the loader must accept the key (md.Undecoded rejects
+	// unknown keys, so a missing struct field would fail the load).
+	s, err := LoadString("version = 1\ncaller = \"alice\"\n[security]\numl_seccomp = \"auto\"\n")
+	if err != nil {
+		t.Fatalf("LoadString with uml_seccomp: %v", err)
+	}
+	if s.Security.UMLSeccomp != "auto" {
+		t.Errorf("TOML round-trip: got %q", s.Security.UMLSeccomp)
 	}
 }

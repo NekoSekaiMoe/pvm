@@ -502,3 +502,40 @@ func TestBuildLegacyArgs_EphemeralReadOnly(t *testing.T) {
 		})
 	}
 }
+
+// TestBuildTaskArgs_UMLSeccomp pins the seccomp= kernel-arg contract: the
+// arg appears exactly when the spec opts in (on|auto) and is absent for
+// off/unset (kernel default). The value is validated by spec.Validate
+// (on|auto|off only), so no character-class re-check is needed here.
+func TestBuildTaskArgs_UMLSeccomp(t *testing.T) {
+	cases := []struct {
+		name string
+		mode string
+		want string // "" means the arg must be absent
+	}{
+		{"unset", "", ""},
+		{"off (default)", "off", ""},
+		{"on", "on", "seccomp=on"},
+		{"auto", "auto", "seccomp=auto"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s := &spec.TaskSpec{
+				Workspace: spec.WorkspaceSpec{Init: "/init.sh"},
+				Security:  spec.SecuritySpec{UMLSeccomp: c.mode},
+			}
+			args, err := buildTaskArgs(s, "", "", "", nil, -1)
+			if err != nil {
+				t.Fatalf("buildTaskArgs: %v", err)
+			}
+			joined := strings.Join(args, "\n")
+			if c.want == "" {
+				if strings.Contains(joined, "seccomp=") {
+					t.Errorf("args must not contain seccomp= for mode %q: %v", c.mode, args)
+				}
+			} else if !strings.Contains(joined, c.want) {
+				t.Errorf("args missing %q: %v", c.want, args)
+			}
+		})
+	}
+}

@@ -116,16 +116,16 @@ func TestStringContains(t *testing.T) {
 	// Conservative posture: any key whose name contains a secret-like
 	// substring is dropped, even if it's a false positive (e.g. 'keyboard').
 	// This is intentional: deny-by-default on the Observation surface.
-	if isSafeSummaryKey("keyboard") {
+	if audit.IsSafeSummaryKey("keyboard") {
 		t.Error("'keyboard' should be dropped (contains 'key'); conservative deny-by-default")
 	}
-	if isSafeSummaryKey("api_token") {
+	if audit.IsSafeSummaryKey("api_token") {
 		t.Error("'api_token' should be dropped")
 	}
-	if !isSafeSummaryKey("path") {
+	if !audit.IsSafeSummaryKey("path") {
 		t.Error("'path' is safe and should pass")
 	}
-	if !isSafeSummaryKey("bytes") {
+	if !audit.IsSafeSummaryKey("bytes") {
 		t.Error("'bytes' is safe and should pass")
 	}
 }

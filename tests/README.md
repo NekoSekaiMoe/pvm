@@ -39,6 +39,8 @@ This directory contains shell-based integration and end-to-end (E2E) suites vali
 | `29_test_ephemeral_mode.sh` | No | Ephemeral (non-persistent) sandboxes: `workspace.ephemeral` spec validation + conflicts, `agentpvm run -ephemeral` override re-validation, no-overlay residue on failed launch, `umlctl -ephemeral` (mutual exclusion + state-dir discard), `/containers/start` ephemeral field |
 | `30_test_jail_seccomp_degraded.sh` | No | In-process Gofer jail, tailored host seccomp-bpf filter, fail-closed enforcement, CLI/TaskSpec `-insecure-allow-degraded` bypass, and tamper-evident audit security warning logging |
 | `31_test_rootless_jail.sh` | No (root legs need ns-capable kernel) | Rootless jail: NEWUSER+NEWPID monitor asserted from inside the workload (pid 1, private /proc, host-pid signal denied), uidalloc table allocate/release lifecycle, tap fd transport (no /dev/net/tun in jail), user-namespace fail-closed baseline + degraded fallback |
+| `32_test_uml_seccomp_mode.sh` | Yes | UML seccomp fast-userspace mode (`security.uml_seccomp`): load-spec accept/reject (4xx on invalid value), `seccomp=` kernel cmdline arg asserted via fake-kernel argv dump (present on opt-in, absent by default), `security:uml_seccomp` audit record with mode+arch (+fallback note for auto) |
+| `33_test_audit_redaction.sh` | Yes | Audit ledger secret redaction (脱敏): planted secrets never land in on-disk ledger bytes, GET `/api/audit/:id` redacted markers, hash-chain verify still passes, GET+PUT `/api/audit/redaction-policy` round trip, disabled redaction stores unredacted (documented escape hatch) + read-side defense on re-enable |
 
 ---
 
@@ -47,7 +49,7 @@ This directory contains shell-based integration and end-to-end (E2E) suites vali
 ```bash
 # Run all unprivileged CI-safe suites (fails fast on first error)
 set -e
-for s in tests/{05,06,07,08,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31}_*.sh; do
+for s in tests/{05,06,07,08,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,33}_*.sh; do
     echo "Running $s..."
     ./"$s"
 done
