@@ -345,6 +345,16 @@ func delBpfFilter(tapName string) {
 	})
 }
 
+// benignDetachErr reports whether a pin-cleanup failure can be ignored for
+// idempotent detach semantics: the target never existed, or this (likely
+// unprivileged) process cannot even probe the bpffs tree — nothing it could
+// clean up there is reachable for it anyway. Stale pins owned by dead root
+// processes are documented cleanup-by-operator leftovers.
+func benignDetachErr(err error) bool {
+	return errors.Is(err, os.ErrNotExist) || errors.Is(err, os.ErrPermission) ||
+		errors.Is(err, unix.EACCES) || errors.Is(err, unix.EPERM)
+}
+
 // DetachTaskFilter is the symmetric teardown of AttachEgressFilter: it
 // removes the tc filter from the tap, unregisters (and closes, once
 // unreferenced) the per-tap whitelist map, and removes the task's pinned
@@ -363,12 +373,12 @@ func DetachTaskFilter(taskID, tapName string) error {
 		UnregisterWhitelistMap(tapName)
 	}
 	if pinPath, err := WhitelistPinPath(taskID); err == nil {
-		if err := os.Remove(pinPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		if err := os.Remove(pinPath); err != nil && !benignDetachErr(err) {
 			errs = append(errs, fmt.Errorf("unpin %s: %w", pinPath, err))
 		}
 	}
 	if pinDir, err := whitelistPinDir(taskID); err == nil {
-		if err := os.Remove(pinDir); err != nil && !errors.Is(err, os.ErrNotExist) {
+		if err := os.Remove(pinDir); err != nil && !benignDetachErr(err) {
 			errs = append(errs, fmt.Errorf("remove pin dir %s: %w", pinDir, err))
 		}
 	}
