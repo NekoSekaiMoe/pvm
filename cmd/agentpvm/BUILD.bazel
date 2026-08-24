@@ -14,7 +14,6 @@ go_library(
         "//internal/config",
         "//internal/container",
         "//internal/cow",
-        "//internal/ebpf",
         "//internal/identity",
         "//internal/incident",
         "//internal/lifecycle",

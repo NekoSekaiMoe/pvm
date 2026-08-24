@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -179,6 +180,12 @@ type NetworkSpec struct {
 	Bridge string `toml:"bridge"`
 	// GatewayIP is the bridge CIDR, e.g. "10.0.0.1/24".
 	GatewayIP string `toml:"gateway_ip"`
+	// GuestIP optionally pins the guest's IPv4 address inside the bridge
+	// subnet. Empty = the host IPAM allocates one (starting at offset .100)
+	// and hands it to the guest via the pvm_ip= kernel parameter. When both
+	// guest_ip and gateway_ip are set, guest_ip must lie inside the gateway
+	// subnet and differ from the gateway address.
+	GuestIP string `toml:"guest_ip"`
 	// TAP is the host TAP device name. If empty, derived from the task name.
 	TAP string `toml:"tap"`
 	// EgressAllowDomains is the L7 allowlist applied by the proxy.
@@ -488,6 +495,27 @@ func (s *TaskSpec) Validate() error {
 	}
 	if s.Network.TAP != "" && !tapNameRe.MatchString(s.Network.TAP) {
 		errs = append(errs, fmt.Errorf("spec: network.tap %q must match ^[a-zA-Z0-9_-]{1,15}$", s.Network.TAP))
+	}
+	// guest_ip lands verbatim in the kernel command line as pvm_ip=<ip>, so
+	// it must be a plain dotted-quad IPv4 (which the kernel-field charset
+	// check then re-verifies). When the gateway CIDR is also set, the guest
+	// address must live inside that subnet — an out-of-subnet guest IP would
+	// be unreachable and is a config error, not a runtime surprise.
+	if s.Network.GuestIP != "" {
+		ip := net.ParseIP(s.Network.GuestIP)
+		if ip == nil || ip.To4() == nil {
+			errs = append(errs, fmt.Errorf("spec: network.guest_ip %q is not a valid IPv4 address", s.Network.GuestIP))
+		} else if s.Network.GatewayIP != "" {
+			gwIP, ipnet, err := net.ParseCIDR(s.Network.GatewayIP)
+			switch {
+			case err != nil:
+				errs = append(errs, fmt.Errorf("spec: network.gateway_ip %q is not a valid CIDR: %v", s.Network.GatewayIP, err))
+			case !ipnet.Contains(ip):
+				errs = append(errs, fmt.Errorf("spec: network.guest_ip %q is outside the bridge subnet %s", s.Network.GuestIP, s.Network.GatewayIP))
+			case gwIP.Equal(ip):
+				errs = append(errs, fmt.Errorf("spec: network.guest_ip %q collides with the gateway address", s.Network.GuestIP))
+			}
+		}
 	}
 	for _, f := range []struct{ field, val string }{
 		{"workspace.base_image", s.Workspace.BaseImage},

@@ -12,8 +12,20 @@ struct {
     __uint(max_entries, 1024);
     __type(key, __u32);
     __type(value, __u32);
-    __uint(pinning, LIBBPF_PIN_BY_NAME);
+    // No LIBBPF_PIN_BY_NAME: pinning is userspace-controlled per task.
+    // The loader (internal/network/filter.go AttachEgressFilter) pins this
+    // map at /sys/fs/bpf/pvm/<taskID>/whitelist_map so each task owns an
+    // independent whitelist instead of sharing one global pinned map.
 } whitelist_map SEC(".maps");
+
+// Load-time configurable SSRF-floor exemptions (rewritten per task via
+// ebpf.CollectionSpec.RewriteConstants before load). Both are destination
+// IPv4 addresses in NETWORK byte order (the same raw __u32 form as
+// ip->daddr); 0 means unset. The loader sets them to the task's gateway IP
+// and the guest's own IP: both live inside the RFC1918 floor below but must
+// stay reachable for the sandbox to function (default route / proxy).
+const volatile __u32 exempt_ip_a = 0;
+const volatile __u32 exempt_ip_b = 0;
 
 SEC("tc")
 int egress_filter(struct __sk_buff *skb) {
@@ -33,6 +45,12 @@ int egress_filter(struct __sk_buff *skb) {
     struct iphdr *ip = data + sizeof(*eth);
     if ((void*)(ip + 1) > data_end)
         return TC_ACT_SHOT;
+
+    // Per-task exemptions checked BEFORE the floor: the gateway and the
+    // guest's own address pass even though they are inside the always-denied
+    // private ranges. Compared against the raw (network-order) daddr.
+    if (exempt_ip_a && ip->daddr == exempt_ip_a) return TC_ACT_OK;
+    if (exempt_ip_b && ip->daddr == exempt_ip_b) return TC_ACT_OK;
 
     // SSRF Protection: Block internal and sensitive IP addresses regardless of whitelist
     __u32 dest_ip_host = __builtin_bswap32(ip->daddr);
