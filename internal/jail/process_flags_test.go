@@ -142,6 +142,10 @@ func TestRootlessJail_Execution(t *testing.T) {
 	if !caps.HasUserNS || !caps.HasMountNS {
 		t.Skip("host lacks user/mount namespaces")
 	}
+	// On failure the stage processes dump uid_map/capabilities/LSM label/
+	// mountinfo — mount EPERM inside user namespaces has too many possible
+	// causes to debug blind.
+	t.Setenv("PVM_JAIL_DEBUG", "1")
 
 	env, err := SetupJail(Config{
 		TaskID:       "rootless-exec-test",

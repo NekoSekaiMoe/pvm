@@ -198,7 +198,12 @@ func SetupJail(cfg Config) (*JailEnvironment, error) {
 	// (real root bypasses DAC) and skipped for the unprivileged leg, where
 	// the caller already owns what it created.
 	if os.Geteuid() == 0 && cfg.UIDRangeSize > 0 {
-		_ = os.Chmod(filepath.Dir(cfg.BaseDir), 0755)
+		// Stage 2 walks the rootfs path as the mapped uid, so EVERY
+		// ancestor of BaseDir must be o+x — custom BaseDir values (tests
+		// under t.TempDir()) can sit beneath 0700 directories.
+		for d := filepath.Dir(cfg.BaseDir); d != "/" && d != "."; d = filepath.Dir(d) {
+			_ = os.Chmod(d, 0755)
+		}
 		if err := os.Chown(cfg.BaseDir, int(cfg.UIDBase), int(cfg.UIDBase)); err != nil {
 			return nil, fmt.Errorf("jail: chown jail base dir to uid range base %d: %w", cfg.UIDBase, err)
 		}

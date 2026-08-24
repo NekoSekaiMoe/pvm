@@ -27,6 +27,7 @@ func init() {
 	if os.Getenv(jailStagerEnvMarker) == "1" {
 		if err := runJailStager(); err != nil {
 			fmt.Fprintf(os.Stderr, "jail stager: %v\n", err)
+			dumpJailDebug()
 			os.Exit(1)
 		}
 		// runJailStager never returns on success (it waits for stage 2 and
@@ -36,6 +37,7 @@ func init() {
 	if os.Getenv(jailHelperEnvMarker) == "1" {
 		if err := runJailHelper(); err != nil {
 			fmt.Fprintf(os.Stderr, "jail helper: %v\n", err)
+			dumpJailDebug()
 			os.Exit(1)
 		}
 		// runJailHelper only returns on error; a successful syscall.Exec never returns.
@@ -72,6 +74,41 @@ func scrubStageMarkers() []string {
 		env = append(env, e)
 	}
 	return env
+}
+
+// dumpJailDebug dumps the namespace/credential state of the failing stage to
+// stderr when PVM_JAIL_DEBUG is set. Mount EPERM/EINVAL failures inside user
+// namespaces have half a dozen possible causes (capability sets, idmaps, LSM
+// labels, mount flags), and reading them off the live process beats guessing.
+func dumpJailDebug() {
+	if os.Getenv("PVM_JAIL_DEBUG") == "" {
+		return
+	}
+	dump := func(label, path string) {
+		blob, err := os.ReadFile(path)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "jail debug: %s: %v\n", label, err)
+			return
+		}
+		fmt.Fprintf(os.Stderr, "jail debug: %s:\n%s\n", label, strings.TrimRight(string(blob), "\n"))
+	}
+	fmt.Fprintf(os.Stderr, "jail debug: euid=%d egid=%d\n", unix.Geteuid(), unix.Getegid())
+	dump("uid_map", "/proc/self/uid_map")
+	dump("gid_map", "/proc/self/gid_map")
+	// status carries CapEff/CapBnd/NoNewPrivs/Seccomp — trim to the lines
+	// that matter to keep CI logs readable.
+	if blob, err := os.ReadFile("/proc/self/status"); err == nil {
+		for _, line := range strings.Split(string(blob), "\n") {
+			if strings.HasPrefix(line, "Cap") || strings.HasPrefix(line, "NoNewPrivs") ||
+				strings.HasPrefix(line, "Seccomp") || strings.HasPrefix(line, "Uid:") ||
+				strings.HasPrefix(line, "Gid:") || strings.HasPrefix(line, "NStgid") ||
+				strings.HasPrefix(line, "NSpid") {
+				fmt.Fprintf(os.Stderr, "jail debug: status %s\n", line)
+			}
+		}
+	}
+	dump("attr/current (LSM label)", "/proc/self/attr/current")
+	dump("mountinfo", "/proc/self/mountinfo")
 }
 
 // runJailStager is stage 1: full privileges in a fresh mount namespace. It
