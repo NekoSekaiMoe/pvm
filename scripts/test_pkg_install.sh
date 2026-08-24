@@ -190,9 +190,17 @@ PVM_PID=$!
     MON=$(pgrep -f 'ubd0=' | head -1)
     echo "monitor pid: ${MON:-NOT_FOUND}"
     if [ -n "$MON" ]; then
-        sudo timeout 18 strace -f -tt \
-            -e trace=writev,sendmmsg,fcntl,fcntl64,timer_create,timer_settime,rt_sigsuspend \
-            -p "$MON" 2>&1 | grep -v "SIGALRM" | head -80
+        echo "--- monitor fd table (what IS fd 3 at wedge time?) ---"
+        sudo ls -l /proc/$MON/fd 2>&1 | head -15
+        # Broad trace, no signal noise: catch what the monitor BLOCKS in.
+        sudo timeout 12 strace -f -tt -e trace='!futex,getpid,gettid,clock_gettime' \
+            -p "$MON" 2>&1 | grep -v "SIGALRM\|SIGVTALRM\|SIGIO" | head -60
+        echo "--- monitor kernel stacks (mid-wedge) ---"
+        for t in /proc/$MON/task/*; do
+            echo "== thread ${t##*/}"
+            sudo cat "$t/stack" 2>/dev/null || echo "(no stack)"
+            sudo cat "$t/status" 2>/dev/null | grep -E "^State|SigBlk|SigCgt"
+        done
     fi
 ) > pkg_tapdiag.log 2>&1 &
 TAPDIAG_PID=$!

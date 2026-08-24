@@ -160,6 +160,10 @@ func ConfigureProcessIsolation(cmd *exec.Cmd, j *JailEnvironment) error {
 				cfg.UIDBase = j.Config.UIDBase
 				cfg.UIDRangeSize = j.Config.UIDRangeSize
 			}
+			if os.Getenv(jailDisablePIDNSEnv) == "1" {
+				cfg.StagePIDNS = false
+				cfg.MountProc = false
+			}
 		}
 		if err := wrapStage1(cmd, j, &cfg); err != nil {
 			return err
@@ -174,6 +178,14 @@ func ConfigureProcessIsolation(cmd *exec.Cmd, j *JailEnvironment) error {
 // the tap fd numbering (fd 3) is untouched; the fd is dupped high to stay
 // clear of runtime fds.
 const jailSyncFDEnv = "PVM_JAIL_SYNC_FD"
+
+// jailDisablePIDNSEnv is a debug escape hatch for CI bisection:
+// PVM_JAIL_DISABLE_PIDNS=1 drops the PID namespace (and the private /proc)
+// from the launch, keeping everything else. It DEGRADES isolation (the
+// monitor can see host processes if a procfs is reachable) — never set in
+// production. Exists to answer "is the pidns the trigger?" for the vec0
+// fd-transport wedge without a code change.
+const jailDisablePIDNSEnv = "PVM_JAIL_DISABLE_PIDNS"
 
 // wrapStage1 rewrites cmd so that, instead of the target binary, the current
 // executable is re-exec'd as the stage-1 stager. Stage 1 runs with full
