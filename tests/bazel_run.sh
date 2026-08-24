@@ -40,6 +40,13 @@ if [ -z "$runfiles_lib" ]; then
         while IFS= read -r line; do
             case "$line" in "$key "*) printf '%s\n' "${line#* }"; return 0;; esac
         done < "$manifest"
+        # rules_go emits the go_binary under an "agentpvm_/"-suffixed dir
+        # (target-name + "_/"), so the exact key misses; fall back to a
+        # prefix scan for the package dir ending in the target file name.
+        local pkgdir="${key%/*}/" want="${key##*/}"
+        while IFS= read -r line; do
+            case "$line" in "${pkgdir}"*"/${want} "*) printf '%s\n' "${line#* }"; return 0;; esac
+        done < "$manifest"
         return 1
     }
 else
