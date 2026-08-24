@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"time"
 	"uml-container/internal/audit"
@@ -912,6 +913,36 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 		defer tapFile.Close()
 	}
 
+	// UML seccomp userspace mode is an opt-in guest-integrity trade-off
+	// (see SecuritySpec.UMLSeccomp): every on/auto launch MUST leave an
+	// auditable trace naming the configured mode and arch. mode=auto can
+	// silently fall back to ptrace inside the guest (undetectable from the
+	// host), so the record notes that fallback is possible. Fail closed on
+	// append failure, matching the spec-evidence/degraded-warning contract.
+	if s.Security.UMLSeccomp == "on" || s.Security.UMLSeccomp == "auto" {
+		params := map[string]interface{}{
+			"mode": s.Security.UMLSeccomp,
+			"arch": runtime.GOARCH,
+		}
+		reason := "UML seccomp userspace mode enabled: guest kernel integrity no longer guaranteed (in-guest cgroup enforcement advisory); host jail boundary unaffected"
+		if s.Security.UMLSeccomp == "auto" {
+			params["note"] = "fallback possible: kernel may silently use ptrace mode"
+		}
+		if err := ledger.Append(audit.Record{
+			Phase:    audit.PhaseExec,
+			Subject:  s.Caller,
+			Action:   "security:uml_seccomp",
+			Params:   params,
+			Decision: audit.DecisionAllow,
+			Reason:   reason,
+		}); err != nil {
+			cleanupVolumes()
+			_ = st.Transition(state.StatusFailed, state.ActorController, "audit uml_seccomp append failed: "+err.Error())
+			state.SaveState(taskID, st)
+			return fmt.Errorf("container: audit uml_seccomp for %s: %w", taskID, err)
+		}
+	}
+
 	// Build kernel args from the TaskSpec. Pass the resolved rootfs so the
 	// kernel command line matches what we actually provisioned. egressAddr is
 	// the host:port of this task's dedicated egress listener (authoritative
@@ -1499,6 +1530,13 @@ func buildTaskArgs(s *spec.TaskSpec, vhostSock, resolvedRootfs, egressAddr strin
 			return nil, err
 		}
 		args = append(args, fmt.Sprintf("egress_proxy=%s", egressAddr))
+	}
+	// UML fast seccomp userspace mode (runtime kernel param since mainline
+	// 6.16 on x86_64; zalexdev aarch64 port): `seccomp=on|auto`. "off" (the
+	// spec default) passes nothing, keeping the kernel default. Arch-neutral:
+	// the same cmdline parameter is parsed on both architectures.
+	if s.Security.UMLSeccomp != "" && s.Security.UMLSeccomp != "off" {
+		args = append(args, fmt.Sprintf("seccomp=%s", s.Security.UMLSeccomp))
 	}
 	for _, v := range volumeArgs {
 		// v is a composite "<host>:<guest>" pair produced by the volume

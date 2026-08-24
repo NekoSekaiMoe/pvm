@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/subtle"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -715,7 +716,45 @@ func NewE2BServer() (*echo.Echo, error) {
 		if err != nil {
 			return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		}
-		return c.JSON(http.StatusOK, records)
+		// Read-side defense in depth: LEGACY ledgers (written before
+		// write-time redaction, or while it was toggled off) may hold
+		// plaintext secrets on disk. Redact a COPY for the response and
+		// flag every row the redactor actually changed. The on-disk bytes
+		// are never touched — /api/audit/:id/verify stays byte-accurate.
+		redactor := audit.DefaultRedactor()
+		views := make([]auditRecordView, 0, len(records))
+		for _, r := range records {
+			before := redactionFingerprint(r)
+			redactor.RedactRecord(&r)
+			after := redactionFingerprint(r)
+			// Flag a row when the read-side pass changed it (legacy plaintext)
+			// OR when it already carries masked material from write-time
+			// redaction — either way the row once held a secret.
+			redacted := after != before || strings.Contains(after, audit.RedactedPlaceholder)
+			views = append(views, auditRecordView{Record: r, Redacted: redacted})
+		}
+		return c.JSON(http.StatusOK, views)
+	})
+
+	// GET /api/audit/redaction-policy — current redaction posture.
+	// (Static route: Echo matches it ahead of /audit/:id.)
+	api.GET("/audit/redaction-policy", func(c echo.Context) error {
+		return c.JSON(http.StatusOK, redactionPolicyView())
+	})
+
+	// PUT /api/audit/redaction-policy — toggle the default redactor at
+	// runtime. Body: {"enabled": bool}. Disabling stores NEW records
+	// unredacted (operator escape hatch); existing rows stay as written and
+	// are still redacted on READ once re-enabled.
+	api.PUT("/audit/redaction-policy", func(c echo.Context) error {
+		var req struct {
+			Enabled *bool `json:"enabled"`
+		}
+		if err := c.Bind(&req); err != nil || req.Enabled == nil {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "body must be {\"enabled\": bool}"})
+		}
+		audit.SetRedactionEnabled(*req.Enabled)
+		return c.JSON(http.StatusOK, redactionPolicyView())
 	})
 
 	// GET /api/audit/:id/verify — replay the hash chain; reports broken links.
@@ -1720,6 +1759,30 @@ func policyErrApproval() error { return policy.ErrApprovalRequired }
 
 // idRegex is the shared container/task id validator.
 var idRegex = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
+
+// auditRecordView decorates a ledger record for the RECONSTRUCT view with a
+// marker telling the reader whether read-side redaction masked anything in
+// this row (true for legacy rows written before write-time redaction).
+type auditRecordView struct {
+	audit.Record
+	Redacted bool `json:"redacted"`
+}
+
+// redactionFingerprint captures the fields the redactor may change, so the
+// /api/audit/:id handler can tell whether a row was actually modified.
+func redactionFingerprint(r audit.Record) string {
+	p, _ := json.Marshal(r.Params)
+	return string(p) + "\x00" + r.Subject + "\x00" + r.Action + "\x00" + r.Reason
+}
+
+// redactionPolicyView is the response body for the redaction-policy endpoints.
+func redactionPolicyView() map[string]interface{} {
+	return map[string]interface{}{
+		"enabled":        audit.RedactionEnabled(),
+		"patterns_count": audit.RedactionPatternCount(),
+		"key_denylist":   audit.SecretKeyDenylist(),
+	}
+}
 
 // validateAPIRootfs constrains the caller-supplied rootfs of the legacy
 // /api/containers/start endpoint. The value is interpolated verbatim into the

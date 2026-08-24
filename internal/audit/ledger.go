@@ -95,10 +95,24 @@ type Ledger struct {
 	// this offset instead of re-scanning the whole file, making back-to-back
 	// appends amortized O(record delta) instead of O(total ledger size).
 	readOffset int64
+	// redactor scrubs secrets out of every record BEFORE it is hashed and
+	// persisted (see redact.go). Defaults to DefaultRedactor(); nil disables
+	// redaction entirely (test escape hatch via WithRedactor).
+	redactor Redactor
+}
+
+// Option customizes a Ledger at Open time.
+type Option func(*Ledger)
+
+// WithRedactor overrides the redactor applied to records before hashing.
+// Passing nil disables redaction (escape hatch for tests and forensics
+// tooling that must reproduce historical byte-exact writes).
+func WithRedactor(r Redactor) Option {
+	return func(l *Ledger) { l.redactor = r }
 }
 
 // Open returns (creating if needed) the ledger for a task.
-func Open(task string) (*Ledger, error) {
+func Open(task string, opts ...Option) (*Ledger, error) {
 	if !taskIDRegex.MatchString(task) {
 		return nil, fmt.Errorf("audit: invalid task id %q", task)
 	}
@@ -113,6 +127,10 @@ func Open(task string) (*Ledger, error) {
 		task:     task,
 		path:     filepath.Join(dir, ledgerFileName),
 		headPath: filepath.Join(dir, headFileName),
+		redactor: DefaultRedactor(),
+	}
+	for _, o := range opts {
+		o(l)
 	}
 	// Best-effort tightening of pre-existing files created by older versions
 	// with looser modes.
@@ -259,6 +277,14 @@ func (l *Ledger) Append(r Record) error {
 	l.seq++
 	r.Seq = l.seq
 	r.Task = l.task
+	// Redact BEFORE hashing: Params/Reason/Subject/Action must be scrubbed
+	// prior to hashRecord or the plaintext secret becomes part of the chained
+	// digest and lands permanently in the append-only file. A post-write
+	// scrub is impossible (it would break Verify), so this is the only point
+	// where redaction can happen.
+	if l.redactor != nil {
+		l.redactor.RedactRecord(&r)
+	}
 	if r.At.IsZero() {
 		r.At = time.Now().UTC()
 	}

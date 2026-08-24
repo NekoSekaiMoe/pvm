@@ -2,7 +2,10 @@ load("@rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
     name = "audit",
-    srcs = ["ledger.go"],
+    srcs = [
+        "ledger.go",
+        "redact.go",
+    ],
     importpath = "uml-container/internal/audit",
     visibility = ["//:__subpackages__"],
 )
@@ -12,6 +15,7 @@ go_test(
     srcs = [
         "edge_test.go",
         "ledger_test.go",
+        "redact_test.go",
     ],
     embed = [":audit"],
 )

@@ -56,6 +56,8 @@ PVM 将 Nuxt 3 前端静态资源直接内嵌至 Go 二进制中，一条命令�
 ./agentpvm run -config uml/agentpvm.toml
 ```
 
+> **🔐 安全可选项 — `security.uml_seccomp`**：TaskSpec 的 `[security]` 段支持 `uml_seccomp = "on"|"auto"|"off"`（默认 `off`），通过 UML 内核运行时参数 `seccomp=` 启用 fast userspace 模式（mainline x86_64 ≥ 6.16；aarch64 zalexdev 移植版同样在 defconfig 中开启，两者共用同一内核参数）。**安全权衡（上游原文警告）**：启用后 guest 用户态可读写 guest 物理内存并干扰 stub 的 SIGALRM，guest 内核完整性不再受保证——因此 guest 内的 cgroup 限制（MEMCG/pids）将降级为“建议性”约束；宿主机侧的 jail 隔离边界不受影响。此为逐任务显式开启项，每次 `on`/`auto` 启动都会写入审计记录 `security:uml_seccomp`。
+
 ### 4. 或启动独立 UML 容器
 
 使用轻量 CLI `umlctl` 快速启动单个容器实例：

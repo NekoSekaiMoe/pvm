@@ -308,6 +308,19 @@ type SecuritySpec struct {
 	// EnforceLandlock enables Landlock LSM path lockdown for hostfs volumes.
 	// Same defaulting rule as EnforceHostSeccomp: true unless explicitly set.
 	EnforceLandlock bool `toml:"enforce_landlock" json:"enforce_landlock"`
+	// UMLSeccomp selects the UML kernel's fast seccomp userspace mode via the
+	// runtime kernel command-line parameter `seccomp=on|auto|off` (mainline
+	// x86_64 since Linux 6.16; the aarch64 zalexdev port enables the same
+	// mechanism in defconfig). "on" is fail-closed at kernel boot,
+	// "auto" falls back to ptrace silently, "off" (default) keeps ptrace.
+	//
+	// SECURITY TRADE-OFF (upstream help text): with seccomp mode the guest
+	// userspace can read/write guest physical memory and can interfere with
+	// the stub's SIGALRM — guest kernel integrity is no longer guaranteed,
+	// so in-guest cgroup enforcement (MEMCG/pids, tests/09) becomes advisory.
+	// The host-side jail boundary is unaffected. This is therefore opt-in per
+	// task, and every on/auto launch is audit-recorded (security:uml_seccomp).
+	UMLSeccomp string `toml:"uml_seccomp" json:"uml_seccomp"`
 }
 
 // ValidateMountPath rejects guest mount points that would corrupt the
@@ -534,6 +547,14 @@ func (s *TaskSpec) Validate() error {
 	}
 	if s.Lifecycle.OnAnomaly == "" {
 		s.Lifecycle.OnAnomaly = "pause"
+	}
+	if s.Security.UMLSeccomp == "" {
+		s.Security.UMLSeccomp = "off"
+	}
+	switch s.Security.UMLSeccomp {
+	case "on", "auto", "off":
+	default:
+		errs = append(errs, fmt.Errorf("spec: security.uml_seccomp %q invalid (on|auto|off)", s.Security.UMLSeccomp))
 	}
 	switch s.Lifecycle.OnAnomaly {
 	case "pause", "terminate":

@@ -173,14 +173,19 @@ for sym in CONFIG_NAMESPACES CONFIG_PID_NS CONFIG_NET_NS \
 done
 # CONFIG_MEMCG_V1 intentionally left off: tests use v2-native detection
 # (cgroup.controllers), and 6.18 defaults it to n.
-# aarch64 extra: the port supports the SECCOMP userspace mode (mainline since
-# 6.16 as CONFIG_UML_SECCOMP); its defconfig already enables it — verify, and
-# note it in the build log for visibility.
+# aarch64 extra: the zalexdev arm64 port tree has a CONFIG_UML_SECCOMP
+# Kconfig symbol and its defconfig enables it — verify, and note it in the
+# build log for visibility. Mainline x86_64 has NO such Kconfig symbol: the
+# seccomp userspace mode there is selected purely at runtime via the kernel
+# command-line parameter `seccomp=on|auto|off` (parsed in
+# arch/um/os-Linux/start_up.c, default off) since Linux 6.16, so no rebuild
+# is needed for x86_64. Both arches share the same `seccomp=` cmdline
+# (see spec security.uml_seccomp).
 if [ "$ARCH" = "aarch64" ]; then
     if ! grep -q "^CONFIG_UML_SECCOMP=y" .config; then
-        echo "NOTE: CONFIG_UML_SECCOMP not set on aarch64 (defconfig change?); ptrace userspace mode will be used"
+        echo "NOTE: CONFIG_UML_SECCOMP not set on aarch64 (zalexdev tree defconfig change?); ptrace userspace mode will be used"
     else
-        echo "aarch64: CONFIG_UML_SECCOMP=y (fast userspace mode available via seccomp=on)"
+        echo "aarch64: CONFIG_UML_SECCOMP=y (fast userspace mode available via runtime param seccomp=on)"
     fi
 fi
 [ "$missing" -eq 0 ] || exit 1

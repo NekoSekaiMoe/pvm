@@ -3,7 +3,10 @@ load("@rules_go//go:def.bzl", "go_test")
 # Adversarial security tests: each test tries to break a safety guarantee.
 go_test(
     name = "securitytest_test",
-    srcs = ["attacks_test.go"],
+    srcs = [
+        "attacks_test.go",
+        "redaction_test.go",
+    ],
     deps = [
         "//internal/approval",
         "//internal/artifact",
