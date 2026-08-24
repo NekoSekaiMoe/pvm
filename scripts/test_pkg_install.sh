@@ -75,6 +75,8 @@ echo "### ip link show vec0"
 ip link show vec0 2>&1 || echo "(vec0 does not exist in the guest)"
 echo "### ping gateway 10.0.0.1"
 ping -c 2 -W 3 10.0.0.1 2>&1 || echo "ping gw FAILED rc=$?"
+echo "### vec0 RX/TX counters (TX increments => UML really writes the fd)"
+ip -s link show vec0 2>&1
 echo "### nslookup dl-cdn.alpinelinux.org 8.8.8.8"
 nslookup dl-cdn.alpinelinux.org 8.8.8.8 2>&1 || echo "nslookup FAILED rc=$?"
 echo "### TCP 443 egress probe (authoritative — this is the transport apk actually uses)"
@@ -157,6 +159,22 @@ sudo timeout 180 ./bin/umlctl start --name pkg-test \
     --tap tap_pkg > pkg_umlctl.log 2>&1 &
 PVM_PID=$!
 
+# Rootless tap fd-transport diagnostics (temporary, chasing the CI datapath
+# regression): 8s after start the guest should be pinging — capture whether
+# its frames reach the bridge at all, and whether the tap has carrier
+# (i.e. a live fd is attached on the host side).
+(
+    sleep 8
+    echo "--- post-start host tap state ---"
+    sudo ip link show tap_pkg 2>&1
+    echo "--- bridge RX/TX (pvm_br0) ---"
+    sudo ip -s link show pvm_br0 2>&1
+    echo "--- tap RX/TX counters ---"
+    sudo ip -s link show tap_pkg 2>&1
+    sudo timeout 6 tcpdump -i pvm_br0 -n -c 8 arp or icmp 2>&1 || true
+) > pkg_tapdiag.log 2>&1 &
+TAPDIAG_PID=$!
+
 cleanup() {
     # umlctl 仍在运行则终止它（其子进程 UML 会被一并回收）。
     kill "$PVM_PID" 2>/dev/null || true
@@ -181,6 +199,10 @@ while kill -0 "$PVM_PID" 2>/dev/null; do
 done
 wait "$PVM_PID" 2>/dev/null
 echo $? > "$STATUS_FILE"
+wait "$TAPDIAG_PID" 2>/dev/null || true
+
+echo "---- tap fd-transport diagnostics (pkg_tapdiag.log) ----"
+cat pkg_tapdiag.log 2>/dev/null || true
 
 echo "---- umlctl output (pkg_umlctl.log) ----"
 cat pkg_umlctl.log 2>/dev/null || echo "(no pkg_umlctl.log)"
