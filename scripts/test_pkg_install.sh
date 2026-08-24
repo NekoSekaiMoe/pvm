@@ -242,8 +242,11 @@ while kill -0 "$PVM_PID" 2>/dev/null; do
     fi
     sleep 2
 done
+set +e
 wait "$PVM_PID" 2>/dev/null
-echo $? > "$STATUS_FILE"
+PVM_RC=$?
+set -e
+echo "$PVM_RC" > "$STATUS_FILE"
 wait "$TAPDIAG_PID" 2>/dev/null || true
 
 echo "---- tap fd-transport diagnostics (pkg_tapdiag.log) ----"
