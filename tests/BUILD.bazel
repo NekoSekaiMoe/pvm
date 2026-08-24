@@ -27,10 +27,15 @@
 load(":pvm_suite.bzl", "pvm_suites")
 
 pvm_suites([
-    # CI-safe set per tests/README.md. 30/31 run their unprivileged legs
-    # only (root legs skip themselves); 34 skips without python3; 36
-    # skips without node/npm. 02/03 are listed too — they assert CLI
-    # parsing and cgroup fakefs paths, which need no privileges.
+    # CI-safe set per tests/README.md. 34 skips without python3; 36 skips
+    # without node/npm. 02/03 assert CLI parsing and cgroup fakefs paths,
+    # which need no privileges.
+    #
+    # NOT here (jail/userns/fake-kernel legs need the ci.yml sudo loop,
+    # where they are green): 30, 31, 32, 35 — under Bazel's non-root
+    # context the jail stager cannot make mounts private and the
+    # fail-closed expectations diverge (runner has passwordless sudo but
+    # bazel tests run as euid 1001 outside that loop).
     "02_test_network_qos.sh",
     "03_test_cgroup_freeze.sh",
     "05_test_controlplane_api.sh",
@@ -57,11 +62,7 @@ pvm_suites([
     "27_test_event_snapshot_clone_rollback.sh",
     "28_test_webui_simulation.sh",
     "29_test_ephemeral_mode.sh",
-    "30_test_jail_seccomp_degraded.sh",
-    "31_test_rootless_jail.sh",
-    "32_test_uml_seccomp_mode.sh",
     "33_test_audit_redaction.sh",
     "34_test_dns_egress_policy.sh",
-    "35_test_tc_ebpf_dataplane.sh",
     "36_test_e2b_sdk.sh",
 ])
