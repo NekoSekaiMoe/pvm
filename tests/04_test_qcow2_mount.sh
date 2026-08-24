@@ -94,21 +94,28 @@ mount -t sysfs sys /sys
 mount -o remount,rw / 2>/dev/null || true
 # vec0 is the only UML net transport in Linux >= 6.16 (legacy eth0=tuntap
 # was removed). PVM passes vec0:transport=tap,ifname=<tap> on the cmdline.
+# Guest address follows the P1-A contract: the host IPAM allocator injects
+# pvm_ip=<addr> on the kernel cmdline and it arrives here as an init env
+# var; the per-task eBPF egress filter exempts exactly that address (plus
+# the gateway), so a hardcoded IP different from pvm_ip would have its
+# replies dropped by the SSRF floor (10/8) — observed as 100% ping loss.
+IP="${pvm_ip:-10.0.0.2}"
+GW="${GW:-10.0.0.1}"
 ip link set vec0 up || true
-ip addr add 10.0.0.2/24 dev vec0 || true
-ip route add default via 10.0.0.1 || true
+ip addr add "$IP/24" dev vec0 || true
+ip route add default via "$GW" || true
 
 echo "--- /proc/partitions (root must be vda via vhost-user-blk) ---"
 cat /proc/partitions
 mount | grep ' / ' || true
-echo "--- vec0 ---"
+echo "--- vec0 (pvm_ip=$IP gw=$GW) ---"
 ip addr show vec0 2>&1 || echo "(vec0 missing in guest)"
-ping -c 2 -W 3 10.0.0.1 2>&1 || echo "ping gw FAILED rc=$?"
+ping -c 2 -W 3 "$GW" 2>&1 || echo "ping gw FAILED rc=$?"
 
 # Success gate: root on a virtio-blk partition AND vec0 up AND gateway alive.
 if grep -Eq 'vda[0-9]?' /proc/partitions \
    && ip link show vec0 >/dev/null 2>&1 \
-   && ping -c 1 -W 3 10.0.0.1 >/dev/null 2>&1; then
+   && ping -c 1 -W 3 "$GW" >/dev/null 2>&1; then
     echo "VHOST_COW_SUCCESS"
 fi
 
