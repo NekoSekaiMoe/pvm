@@ -43,13 +43,16 @@ else
 fi
 
 echo "Testing eBPF Whitelist Configuration CLI..."
-# Without root / a pinned bpffs map (typical CI) the update must fail
-# gracefully with a clear error; with a live map it must succeed. Either
-# outcome proves the CLI parsed and dispatched the command correctly.
-WL_OUT=$(./agentpvm network whitelist add api.openai.com 198.51.100.1 2>&1) || true
+# P1-A: the whitelist is per-task now — `whitelist add <task_id> <ip>`
+# writes the task's own map (pinned at /sys/fs/bpf/pvm/<task_id>/
+# whitelist_map). Without root / a pinned bpffs map (typical CI) the update
+# must fail gracefully with a clear pinned-map error; with a live map it
+# must succeed. Either outcome proves the CLI parsed and dispatched the
+# command correctly.
+WL_OUT=$(./agentpvm network whitelist add ci-task 198.51.100.1 2>&1) || true
 echo "$WL_OUT"
 case "$WL_OUT" in
-    *"Whitelist updated"*|*"Whitelist Error: failed to open pinned map"*)
+    *"Whitelist updated"*|*"Whitelist Error:"*"pinned map"*)
         echo "✅ eBPF Whitelist CLI structure passed (pinned-map failure is expected without root/bpffs)"
         ;;
     *)

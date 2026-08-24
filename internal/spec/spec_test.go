@@ -125,6 +125,45 @@ func TestValidate_BadDuration(t *testing.T) {
 	}
 }
 
+func TestValidate_GuestIP(t *testing.T) {
+	base := func() *TaskSpec { return &TaskSpec{Version: 1, Caller: "x"} }
+
+	// Valid: override inside the gateway subnet.
+	s := base()
+	s.Network = NetworkSpec{Enabled: true, GatewayIP: "10.0.0.1/24", GuestIP: "10.0.0.50"}
+	if err := s.Validate(); err != nil {
+		t.Fatalf("valid guest_ip rejected: %v", err)
+	}
+	// Valid without a gateway CIDR (subnet check deferred to the IPAM).
+	s = base()
+	s.Network = NetworkSpec{Enabled: true, GuestIP: "10.0.0.50"}
+	if err := s.Validate(); err != nil {
+		t.Fatalf("guest_ip without gateway rejected: %v", err)
+	}
+
+	cases := []struct {
+		name         string
+		gw, guest    string
+		wantFragment string
+	}{
+		{"malformed", "10.0.0.1/24", "10.0.0.x", "not a valid IPv4"},
+		{"ipv6", "10.0.0.1/24", "2001:db8::1", "not a valid IPv4"},
+		{"outside subnet", "10.0.0.1/24", "10.0.9.5", "outside the bridge subnet"},
+		{"gateway collision", "10.0.0.1/24", "10.0.0.1", "collides with the gateway"},
+		{"bad gateway cidr", "bogus", "10.0.0.5", "not a valid CIDR"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := base()
+			s.Network = NetworkSpec{Enabled: true, GatewayIP: tc.gw, GuestIP: tc.guest}
+			err := s.Validate()
+			if err == nil || !strings.Contains(err.Error(), tc.wantFragment) {
+				t.Fatalf("want error containing %q, got: %v", tc.wantFragment, err)
+			}
+		})
+	}
+}
+
 func TestFingerprint_Stable(t *testing.T) {
 	p := writeTemp(t, minimalValid)
 	s1, _ := LoadFile(p)

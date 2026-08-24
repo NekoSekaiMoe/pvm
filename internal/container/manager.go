@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -913,6 +914,84 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 		defer tapFile.Close()
 	}
 
+	// Per-task network data plane (P1-A): when a tap is in use, allocate the
+	// guest IP from the bridge subnet (in-memory IPAM; the guest self-assigns
+	// the address handed down as pvm_ip= on the kernel command line) and
+	// attach the per-task TC egress filter whose whitelist map is pinned at
+	// /sys/fs/bpf/pvm/<taskID>/. The BPF program's SSRF floor exempts the
+	// gateway and the guest's own IP (RewriteConstants at load), so the
+	// default route stays usable while other RFC1918 destinations drop.
+	//
+	// Degraded semantics: the BPF floor is defense in depth BELOW the L7
+	// egress proxy, which remains the enforcement point. An attach failure
+	// (no root/CAP_BPF, unmounted bpffs, no clsact) therefore degrades with
+	// an audit security:degraded_warning instead of failing the task — the
+	// same contract the jail's degraded mode follows. An IPAM failure is
+	// different: it is a config/exhaustion error, not an environment gap, so
+	// it fails closed.
+	guestIP := ""
+	detachNet := func() {}
+	if s.Network.Enabled && tapName != "" {
+		ipam, ierr := network.SharedIPAM(s.Network.GatewayIP)
+		if ierr != nil {
+			cleanupVolumes()
+			_ = st.Transition(state.StatusFailed, state.ActorController, "guest IPAM init failed: "+ierr.Error())
+			state.SaveState(taskID, st)
+			return fmt.Errorf("container: guest IPAM for %s: %w", taskID, ierr)
+		}
+		var gip net.IP
+		if s.Network.GuestIP != "" {
+			gip, ierr = ipam.AllocateGuest(taskID, s.Network.GuestIP)
+		} else {
+			gip, ierr = ipam.Allocate(taskID)
+		}
+		if ierr != nil {
+			cleanupVolumes()
+			_ = st.Transition(state.StatusFailed, state.ActorController, "guest IP allocation failed: "+ierr.Error())
+			state.SaveState(taskID, st)
+			return fmt.Errorf("container: guest IP for %s: %w", taskID, ierr)
+		}
+		guestIP = gip.String()
+		filterAttached := false
+		if _, ferr := network.AttachEgressFilter(tapName, taskID, ipam.GatewayIP(), gip); ferr != nil {
+			warn := fmt.Sprintf("tc egress filter attach failed for tap %s: %v; "+
+				"running WITHOUT the BPF IP-floor (L7 egress proxy remains the enforcement point)", tapName, ferr)
+			fmt.Printf("Warning: %s\n", warn)
+			if aerr := ledger.Append(audit.Record{
+				Phase:    audit.PhaseExec,
+				Subject:  s.Caller,
+				Action:   "security:degraded_warning",
+				Decision: audit.DecisionAllow,
+				Reason:   warn,
+			}); aerr != nil {
+				// The degraded warning is the ONLY auditable trace that this
+				// task runs without the BPF floor; fail closed rather than boot
+				// a downgraded sandbox with no evidence (mirrors the jail
+				// degraded-warning contract above).
+				ipam.Release(taskID)
+				cleanupVolumes()
+				_ = st.Transition(state.StatusFailed, state.ActorController, "audit tc-filter degraded-warning append failed: "+aerr.Error())
+				state.SaveState(taskID, st)
+				return fmt.Errorf("container: audit tc-filter degraded warning for %s: %w", taskID, aerr)
+			}
+		} else {
+			filterAttached = true
+		}
+		// Symmetric teardown (mirrors SetupBridge's rollback style): unpin
+		// the map, drop the tc filter, release the registry entry and free
+		// the guest IP. Runs on every return path after this point, including
+		// the normal task-exit path below.
+		detachNet = func() {
+			if filterAttached {
+				if derr := network.DetachTaskFilter(taskID, tapName); derr != nil {
+					fmt.Printf("Warning: tc filter detach for %s: %v\n", taskID, derr)
+				}
+			}
+			ipam.Release(taskID)
+		}
+	}
+	defer detachNet()
+
 	// UML seccomp userspace mode is an opt-in guest-integrity trade-off
 	// (see SecuritySpec.UMLSeccomp): every on/auto launch MUST leave an
 	// auditable trace naming the configured mode and arch. mode=auto can
@@ -953,6 +1032,19 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 		_ = st.Transition(state.StatusFailed, state.ActorController, "kernel args rejected: "+err.Error())
 		state.SaveState(taskID, st)
 		return err
+	}
+	// Hand the allocated guest IP to the guest (it self-assigns this address
+	// on vec0). Injected here rather than inside buildTaskArgs because the
+	// IP only exists after the IPAM step above; same injection pattern as
+	// egress_proxy= (validate-then-append).
+	if guestIP != "" {
+		if err := validateKernelField("guest ip", guestIP); err != nil {
+			cleanupVolumes()
+			_ = st.Transition(state.StatusFailed, state.ActorController, "kernel args rejected: "+err.Error())
+			state.SaveState(taskID, st)
+			return err
+		}
+		args = append(args, fmt.Sprintf("pvm_ip=%s", guestIP))
 	}
 
 	defer func() {

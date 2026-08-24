@@ -33,7 +33,6 @@ import (
 	"uml-container/internal/config"
 	"uml-container/internal/container"
 	"uml-container/internal/cow"
-	"uml-container/internal/ebpf"
 	"uml-container/internal/identity"
 	"uml-container/internal/incident"
 	"uml-container/internal/lifecycle"
@@ -574,18 +573,21 @@ func snapshotCmd(args []string) {
 
 func networkCmd(args []string) {
 	if len(args) < 2 {
-		fmt.Println("Usage: agentpvm network [whitelist|qos]")
+		fmt.Println("Usage: agentpvm network [whitelist add <task_id> <ip>|qos <tap> <rate>]")
 		os.Exit(1)
 	}
 	sub := args[0]
 	if sub == "whitelist" && len(args) >= 4 && args[1] == "add" {
-		// UpdateWhitelist returns an error (pinned map missing, bad IP,
-		// map update failure) — surfacing it beats silently succeeding.
-		if err := ebpf.UpdateWhitelist(args[2], args[3]); err != nil {
+		// agentpvm network whitelist add <task_id> <ip>: writes the task's
+		// per-task whitelist map (pinned at /sys/fs/bpf/pvm/<task_id>/
+		// whitelist_map by the loader in internal/network). The global
+		// tc-shell-out loader and its single shared pinned map are gone —
+		// each task owns its own map now.
+		if err := network.AddWhitelistEntry(args[2], "", args[3]); err != nil {
 			fmt.Printf("Whitelist Error: %v\n", err)
 			os.Exit(1)
 		} else {
-			fmt.Printf("Whitelist updated: %s -> %s\n", args[2], args[3])
+			fmt.Printf("Whitelist updated: task %s -> %s\n", args[2], args[3])
 		}
 	} else if sub == "qos" && len(args) >= 3 {
 		if err := network.SetupQoS(args[1], args[2]); err != nil {
@@ -595,7 +597,7 @@ func networkCmd(args []string) {
 			fmt.Printf("QoS limit set to %s on %s\n", args[2], args[1])
 		}
 	} else {
-		fmt.Println("Usage: agentpvm network [whitelist|qos]")
+		fmt.Println("Usage: agentpvm network [whitelist add <task_id> <ip>|qos <tap> <rate>]")
 		os.Exit(1)
 	}
 }
