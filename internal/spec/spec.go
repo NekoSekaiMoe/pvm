@@ -18,6 +18,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -37,6 +38,15 @@ const (
 	DefaultNetBudgetMB   = 0 // 0 = unlimited
 	DefaultCostBudgetUSD = 0 // 0 = unlimited (US Dollars, micro-US cents at the ledger)
 	DefaultTokenTTL      = 15 * time.Minute
+	// DefaultLearnTTL caps DNS-learned whitelist entries (P1-B) when the spec
+	// sets no learn_ttl.
+	DefaultLearnTTL = 5 * time.Minute
+	// DefaultMaxLearnedEntries bounds one task's DNS-learned IP set when the
+	// spec sets no max_learned_entries.
+	DefaultMaxLearnedEntries = 256
+	// MaxLearnedEntriesLimit is the upper bound Validate accepts for
+	// network.max_learned_entries (sane-range guard against map pressure).
+	MaxLearnedEntriesLimit = 4096
 )
 
 // DefaultApprovalTimeout bounds how long an approval ticket may pend.
@@ -201,6 +211,24 @@ type NetworkSpec struct {
 	// domain allowlist; the deny list is always evaluated first at the gateway
 	// and can never be overridden by a rule.
 	EgressRules []EgressRule `toml:"egress_rules"`
+
+	// DNSLearnEnabled turns on DNS-learned domain egress (todo.md P1-B,
+	// CubeVS dns_allow/dns_query_track parity): a per-task UDP DNS proxy
+	// snoops resolver responses and inserts the resolved public IPs of
+	// ALLOWLISTED domains into the task's eBPF whitelist map with a TTL, so
+	// the IP-floor admits exactly the addresses the guest actually resolved.
+	DNSLearnEnabled bool `toml:"dns_learn_enabled"`
+	// LearnTTL caps how long a learned IP stays whitelisted (Go duration,
+	// default DefaultLearnTTL). The effective per-entry lifetime is
+	// min(DNS TTL, learn_ttl) so a short-lived DNS answer never lingers.
+	LearnTTL string `toml:"learn_ttl"`
+	// DNSUpstream is the resolver the DNS proxy forwards to, "IP" or
+	// "IP:port". Empty = the host's first /etc/resolv.conf nameserver.
+	DNSUpstream string `toml:"dns_upstream"`
+	// MaxLearnedEntries bounds the per-task learned IP set (default
+	// DefaultMaxLearnedEntries) so a hostile guest cannot exhaust eBPF map
+	// capacity or host memory by flooding distinct allowlisted lookups.
+	MaxLearnedEntries int `toml:"max_learned_entries"`
 }
 
 // EgressRule is one L7 egress rule, mirroring CubeSandbox's Rule/Match/Action.
@@ -401,6 +429,28 @@ type LifecycleSpec struct {
 
 // --- loading & validation ---
 
+// validateDNSUpstream checks network.dns_upstream is a bare IPv4/IPv6
+// address (port 53 implied) or IP:port with a numeric port in 1..65535.
+// Hostnames are deliberately rejected: the DNS-learn proxy must not itself
+// depend on untrusted DNS to find its resolver.
+func validateDNSUpstream(up string) error {
+	if ip := net.ParseIP(up); ip != nil {
+		return nil
+	}
+	host, port, err := net.SplitHostPort(up)
+	if err != nil {
+		return fmt.Errorf("spec: network.dns_upstream %q must be IP or IP:port: %v", up, err)
+	}
+	if ip := net.ParseIP(host); ip == nil {
+		return fmt.Errorf("spec: network.dns_upstream %q: host %q is not an IP", up, host)
+	}
+	p, err := strconv.Atoi(port)
+	if err != nil || p < 1 || p > 65535 {
+		return fmt.Errorf("spec: network.dns_upstream %q: invalid port %q", up, port)
+	}
+	return nil
+}
+
 // LoadFile reads, parses and validates a TaskSpec from a TOML file.
 func LoadFile(path string) (*TaskSpec, error) {
 	if _, err := os.Stat(path); err != nil {
@@ -516,6 +566,30 @@ func (s *TaskSpec) Validate() error {
 				errs = append(errs, fmt.Errorf("spec: network.guest_ip %q collides with the gateway address", s.Network.GuestIP))
 			}
 		}
+	}
+	// DNS-learned egress (P1-B) knobs. Validated regardless of
+	// dns_learn_enabled: a malformed value is a config error signal, not
+	// something to defer until the feature is switched on.
+	if s.Network.LearnTTL != "" {
+		d, err := time.ParseDuration(s.Network.LearnTTL)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("spec: network.learn_ttl: %w", err))
+		} else if d <= 0 {
+			errs = append(errs, fmt.Errorf("spec: network.learn_ttl %q must be > 0", s.Network.LearnTTL))
+		}
+	} else {
+		s.Network.LearnTTL = DefaultLearnTTL.String()
+	}
+	if s.Network.DNSUpstream != "" {
+		if err := validateDNSUpstream(s.Network.DNSUpstream); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if s.Network.MaxLearnedEntries == 0 {
+		s.Network.MaxLearnedEntries = DefaultMaxLearnedEntries
+	} else if s.Network.MaxLearnedEntries < 0 || s.Network.MaxLearnedEntries > MaxLearnedEntriesLimit {
+		errs = append(errs, fmt.Errorf("spec: network.max_learned_entries %d out of range (1..%d)",
+			s.Network.MaxLearnedEntries, MaxLearnedEntriesLimit))
 	}
 	for _, f := range []struct{ field, val string }{
 		{"workspace.base_image", s.Workspace.BaseImage},

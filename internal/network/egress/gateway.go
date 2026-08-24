@@ -109,6 +109,70 @@ type Gateway struct {
 	// Production code MUST NOT set this; it's unexported and only written via
 	// EnableSSRFBypassForTest.
 	ssrfBypass bool
+
+	// learnChecker, when non-nil, closes the DNS-rebinding gap for
+	// DNS-learned hosts (todo.md P1-B): if a host's IPs were learned from the
+	// guest's own DNS traffic, a dial that lands on an IP OUTSIDE the learned
+	// set is rejected — the proxy's own resolver must not be able to roam to
+	// an address the guest never saw. Implemented by the dnslearn registry.
+	learnChecker LearnedIPChecker
+	// rebindGuardOff disables the learned-IP dial check. The guard defaults
+	// to ON (zero value) but is inert until a checker is attached, so bare
+	// &Gateway{} unit tests are unaffected.
+	rebindGuardOff bool
+}
+
+// LearnedIPChecker reports the live DNS-learned IP set for a (task, host)
+// pair. An empty/nil result means "no learned constraint" and the dial is
+// checked only against the SSRF floor. dnslearn.RegistryFor implements this.
+type LearnedIPChecker interface {
+	LearnedIPs(task, host string) []net.IP
+}
+
+// SetLearnedChecker attaches the DNS-learn plane's checker. Nil disables.
+func (g *Gateway) SetLearnedChecker(c LearnedIPChecker) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.learnChecker = c
+}
+
+// SetRebindingGuard toggles the learned-IP dial check (default on). It only
+// takes effect once a LearnedIPChecker is attached.
+func (g *Gateway) SetRebindingGuard(enabled bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.rebindGuardOff = !enabled
+}
+
+// learnedDialSet returns the live learned-IP set constraining dials to host
+// for task, or nil when the guard does not apply (disabled, no checker, or
+// the host was never DNS-learned for this task).
+func (g *Gateway) learnedDialSet(task, host string) map[string]struct{} {
+	g.mu.RLock()
+	checker, off := g.learnChecker, g.rebindGuardOff
+	g.mu.RUnlock()
+	if checker == nil || off || host == "" {
+		return nil
+	}
+	ips := checker.LearnedIPs(task, host)
+	if len(ips) == 0 {
+		return nil
+	}
+	set := make(map[string]struct{}, len(ips))
+	for _, ip := range ips {
+		set[ip.String()] = struct{}{}
+	}
+	return set
+}
+
+// learnedSetContainsIP reports whether addr's IP is in the learned set.
+func learnedSetContainsIP(set map[string]struct{}, addr net.Addr) bool {
+	ta, ok := addr.(*net.TCPAddr)
+	if !ok {
+		return false
+	}
+	_, ok = set[ta.IP.String()]
+	return ok
 }
 
 // NewGateway constructs an empty gateway. Register policies with SetPolicy.
@@ -348,6 +412,15 @@ func (g *Gateway) handleConnect(w http.ResponseWriter, r *http.Request, task str
 		http.Error(w, "egress: private IP blocked", http.StatusForbidden)
 		return
 	}
+	// Rebinding guard (P1-B): when the host was DNS-learned for this task,
+	// the dialed IP must be one the guest itself resolved — a proxy-side
+	// resolution landing elsewhere is treated as a rebind attempt.
+	if set := g.learnedDialSet(task, v.host); set != nil && !learnedSetContainsIP(set, targetConn.RemoteAddr()) {
+		targetConn.Close()
+		g.record(task, r, DecisionBlock, "dialed IP not in DNS-learned set (rebinding guard)")
+		http.Error(w, "egress: rebinding guard", http.StatusForbidden)
+		return
+	}
 	hj, ok := w.(http.Hijacker)
 	if !ok {
 		targetConn.Close()
@@ -451,12 +524,17 @@ func (g *Gateway) handleHTTP(w http.ResponseWriter, r *http.Request, task string
 	// any IP that resolves to a private/loopback/link-local range. This mirrors
 	// the isPrivate() check on handleConnect's established connection. Tests
 	// that need to hit a loopback upstream bypass it via EnableSSRFBypassForTest.
-	transport := g.dialCheckedTransport()
+	// When the host was DNS-learned for this task, transportForTask adds the
+	// rebinding guard on top (dialed IP must be in the learned set).
+	transport := g.transportForTask(task, v.host)
 	resp, err := transport.RoundTrip(outReq)
 	if err != nil {
 		reason := "upstream error: " + err.Error()
 		if isSSRFDialError(err) {
 			reason = "target resolved to private IP (SSRF floor)"
+		}
+		if errors.Is(err, errLearnedIPMismatch) {
+			reason = "dialed IP not in DNS-learned set (rebinding guard)"
 		}
 		// Bill the request-body bytes the countingReader already handed to
 		// the transport (and that left the sandbox) before the failure: a
@@ -466,7 +544,7 @@ func (g *Gateway) handleHTTP(w http.ResponseWriter, r *http.Request, task string
 		g.addBytes(task, reqBytes.total())
 		g.record(task, r, DecisionBlock, reason)
 		code := http.StatusBadGateway
-		if isSSRFDialError(err) {
+		if isSSRFDialError(err) || errors.Is(err, errLearnedIPMismatch) {
 			code = http.StatusForbidden
 		}
 		http.Error(w, "egress: "+reason, code)
@@ -555,6 +633,39 @@ func (g *Gateway) dialCheckedTransport() *http.Transport {
 // errPrivateIPBlocked is returned by dialCheckedTransport when the dial lands
 // on a private/loopback/link-local IP. isSSRFDialError recognizes it.
 var errPrivateIPBlocked = errors.New("egress: dialed address is private/loopback")
+
+// errLearnedIPMismatch is returned by the rebinding-guard dial wrapper when
+// the dialed IP is outside the task's DNS-learned set for the host.
+var errLearnedIPMismatch = errors.New("egress: dialed IP not in DNS-learned set")
+
+// transportForTask returns the transport handleHTTP must use for this
+// request: the shared SSRF-checked transport normally, or — when the
+// rebinding guard has a learned-IP constraint for (task, host) — a clone
+// whose DialContext additionally rejects dialed IPs outside the learned
+// set. Cloning per constrained request intentionally forfeits keep-alive
+// pooling for DNS-learned hosts: a pooled connection could otherwise
+// smuggle a stale, pre-guard dial past the check.
+func (g *Gateway) transportForTask(task, host string) *http.Transport {
+	base := g.dialCheckedTransport()
+	set := g.learnedDialSet(task, host)
+	if set == nil {
+		return base
+	}
+	t := base.Clone()
+	orig := t.DialContext
+	t.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		conn, err := orig(ctx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+		if !learnedSetContainsIP(set, conn.RemoteAddr()) {
+			conn.Close()
+			return nil, errLearnedIPMismatch
+		}
+		return conn, nil
+	}
+	return t
+}
 
 // isSSRFDialError reports whether err is the SSRF-floor rejection.
 func isSSRFDialError(err error) bool { return errors.Is(err, errPrivateIPBlocked) }
@@ -780,6 +891,13 @@ func domainMatches(host, rule string) bool {
 	}
 	return false
 }
+
+// DomainMatches exposes the gateway's allowlist matching semantics (exact or
+// "*.suffix" wildcard, lowercase rules) so the DNS-learn plane
+// (internal/network/dnslearn) learns IPs for EXACTLY the domains the L7
+// proxy would allow — the two enforcement layers must agree on what
+// "allowlisted" means or the eBPF floor would drift from L7 policy.
+func DomainMatches(host, rule string) bool { return domainMatches(host, rule) }
 
 // methodAllowed defaults to a safe set if the policy lists none.
 func methodAllowed(method string, allowed []string) bool {

@@ -26,9 +26,10 @@
             <span class="muted">·</span>
             <span class="mono">{{ r.subject }}</span>
             <span class="pill allow" style="background:rgba(148,163,184,0.2);color:#94a3b8;">{{ r.phase }}</span>
+            <span v-if="r.redacted" class="pill redacted" title="Secret material in this record was masked by the audit redactor">🔒 redacted</span>
           </div>
           <div class="timeline-meta">{{ fmt(r.at) }} · seq {{ r.seq }}<span v-if="r.reason"> — {{ r.reason }}</span></div>
-          <div v-if="r.params" class="timeline-meta mono" style="opacity:0.85;">{{ JSON.stringify(r.params) }}</div>
+          <div v-if="r.params" class="timeline-meta mono" style="opacity:0.85;"><span v-for="(p, j) in splitMasked(r.params)" :key="j" :class="{ 'redacted-val': p.masked }">{{ p.text }}</span></div>
           <div class="timeline-hash">prev: {{ r.prev_hash?.slice(0,16) || '∅' }} → this: {{ r.this_hash?.slice(0,16) }}</div>
         </div>
       </div>
@@ -64,5 +65,18 @@ const verify = async () => {
   catch (e) { error.value = e.message }
 }
 const fmt = (iso) => iso ? new Date(iso).toLocaleString() : '—'
+
+// Render params with masked secret material ([REDACTED]) visually distinct.
+const MASK = '[REDACTED]'
+const splitMasked = (val) => {
+  const s = typeof val === 'string' ? val : JSON.stringify(val)
+  if (!s || !s.includes(MASK)) return [{ text: s, masked: false }]
+  return s.split(MASK).flatMap((part, i, arr) => {
+    const out = []
+    if (part) out.push({ text: part, masked: false })
+    if (i < arr.length - 1) out.push({ text: MASK, masked: true })
+    return out
+  })
+}
 onMounted(() => { if (taskId.value) load() })
 </script>

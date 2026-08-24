@@ -307,6 +307,55 @@ textarea:focus { border-color: var(--primary); }
   margin-bottom: 0.75rem;
 }
 
+/* UML seccomp mode badges (TaskSpec security.uml_seccomp) */
+.badge.seccomp-off  { background: rgba(148, 163, 184, 0.15); color: #94a3b8; }
+.badge.seccomp-auto { background: rgba(59, 130, 246, 0.2);   color: #60a5fa; }
+.badge.seccomp-on   { background: rgba(245, 158, 11, 0.2);   color: #fbbf24; }
+
+/* Audit redaction markers */
+.pill.redacted { background: rgba(245, 158, 11, 0.2); color: #fbbf24; text-transform: none; }
+.redacted-val {
+  background: rgba(245, 158, 11, 0.15);
+  border: 1px solid rgba(245, 158, 11, 0.4);
+  border-radius: 0.25rem;
+  padding: 0 0.3rem;
+  color: #fbbf24;
+  font-style: italic;
+}
+
+/* Toggle switch (audit redaction policy) */
+.switch {
+  position: relative;
+  display: inline-block;
+  width: 44px;
+  height: 24px;
+  flex: none;
+}
+.switch input { opacity: 0; width: 0; height: 0; }
+.switch .slider {
+  position: absolute;
+  inset: 0;
+  cursor: pointer;
+  background: rgba(148, 163, 184, 0.3);
+  border: 1px solid var(--glass-border);
+  border-radius: 999px;
+  transition: background 0.2s ease;
+}
+.switch .slider::before {
+  content: '';
+  position: absolute;
+  height: 16px;
+  width: 16px;
+  left: 3px;
+  top: 3px;
+  border-radius: 50%;
+  background: white;
+  transition: transform 0.2s ease;
+}
+.switch input:checked + .slider { background: var(--success); }
+.switch input:checked + .slider::before { transform: translateX(20px); }
+.switch input:disabled + .slider { opacity: 0.5; cursor: not-allowed; }
+
 /* Success/warn/danger callouts */
 .callout {
   padding: 0.75rem 1rem;
