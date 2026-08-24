@@ -2,8 +2,8 @@
 #
 # Kept in a .bzl file because BUILD files may not contain function
 # definitions (Starlark constraint). See tests/BUILD.bazel for the design
-# notes (manual/local/exclusive semantics, env-injected prebuilt binaries,
-# runfiles data).
+# notes (manual/local/exclusive semantics, prebuilt binaries, runfiles
+# data).
 
 # Bazel 8 removed the native shell rules; sh_test comes from rules_shell
 # (MODULE.bazel). test_suite remains native.
@@ -15,19 +15,18 @@ CI_SAFE_DATA = [
     "//cmd/agentpvm",
     "//cmd/umlctl",
     "//uml:agentpvm.toml",
+    "//tests:bazel_run.sh",
 ]
 
 def pvm_suite(name, suite, data = []):
     sh_test(
         name = name,
-        srcs = [suite],
-        data = CI_SAFE_DATA + data,
-        env = {
-            # Suites cp these into their sandboxes instead of `go build`ing.
-            # Relative to the runfiles root, which is the test's cwd.
-            "AGENTPVM_BIN": "cmd/agentpvm/agentpvm",
-            "UMLCTL_BIN": "cmd/umlctl/umlctl",
-        },
+        # The wrapper absolutizes AGENTPVM_BIN/UMLCTL_BIN against the
+        # runfiles tree at execution time (sh_test.env is evaluated at
+        # analysis time and cannot know the runfiles path).
+        srcs = ["bazel_run.sh"],
+        args = [suite],
+        data = CI_SAFE_DATA + data + [suite],
         tags = ["manual", "local", "exclusive"],
     )
 
