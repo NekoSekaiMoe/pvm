@@ -166,7 +166,12 @@ func SetupJail(cfg Config) (*JailEnvironment, error) {
 		return nil, fmt.Errorf("jail: invalid task ID %q: must not contain path separators or '..' traversal components", cfg.TaskID)
 	}
 	if cfg.BaseDir == "" {
-		cfg.BaseDir = filepath.Join(os.TempDir(), "pvm-jails", cfg.TaskID)
+		// /tmp, not os.TempDir(): stage 2 resolves the rootfs by DIRECT path
+		// as the container's mapped uid, so every ancestor must be
+		// traversable by it. /tmp is 1777 by POSIX convention; $TMPDIR may
+		// point into permission-restricted workspaces (CI: /home/runner/work
+		// is 0750, which broke the rootless launch).
+		cfg.BaseDir = filepath.Join(string(os.PathSeparator), "tmp", "pvm-jails", cfg.TaskID)
 	}
 
 	jailDir := filepath.Join(cfg.BaseDir, "root")
@@ -187,9 +192,17 @@ func SetupJail(cfg Config) (*JailEnvironment, error) {
 	// host uid range, or the namespaced-root workload (host uid UIDBase)
 	// cannot write its own /tmp, mountpoints or physmem files once DAC is
 	// real (host-root-owned 0700 dirs map to overflowuid inside the userns).
-	// Harmless in degraded mode (real root bypasses DAC) and skipped for the
-	// unprivileged leg, where the caller already owns what it created.
+	// The BaseDir ancestors get the same treatment: stage 2 walks the
+	// rootfs path as the mapped uid, so pvm-jails must be traversable (0755)
+	// and the per-task dir owned by the range. Harmless in degraded mode
+	// (real root bypasses DAC) and skipped for the unprivileged leg, where
+	// the caller already owns what it created.
 	if os.Geteuid() == 0 && cfg.UIDRangeSize > 0 {
+		_ = os.Chmod(filepath.Dir(cfg.BaseDir), 0755)
+		if err := os.Chown(cfg.BaseDir, int(cfg.UIDBase), int(cfg.UIDBase)); err != nil {
+			return nil, fmt.Errorf("jail: chown jail base dir to uid range base %d: %w", cfg.UIDBase, err)
+		}
+		_ = os.Chmod(cfg.BaseDir, 0711)
 		if err := os.Chown(jailDir, int(cfg.UIDBase), int(cfg.UIDBase)); err != nil {
 			return nil, fmt.Errorf("jail: chown jail root to uid range base %d: %w", cfg.UIDBase, err)
 		}

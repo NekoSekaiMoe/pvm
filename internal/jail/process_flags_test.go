@@ -3,6 +3,7 @@
 package jail
 
 import (
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -43,25 +44,26 @@ func TestConfigureProcessIsolation_FlagPolicy(t *testing.T) {
 
 	if os.Geteuid() == 0 {
 		// Privileged leg WITHOUT an allocated uid range: degraded
-		// mountns-only jail (no userns, no pidns) — the legacy shape.
+		// mountns-only jail — stage 1 (real root) gets mount/ipc/uts only.
 		if flags&syscall.CLONE_NEWUSER != 0 {
-			t.Errorf("privileged run without uid range must not set CLONE_NEWUSER, got flags %#x", flags)
+			t.Errorf("stage 1 of a privileged run must not set CLONE_NEWUSER (stage 2 enters the userns), got flags %#x", flags)
 		}
 		if flags&syscall.CLONE_NEWPID != 0 {
-			t.Errorf("privileged run without uid range must not set CLONE_NEWPID, got flags %#x", flags)
+			t.Errorf("stage 1 must not set CLONE_NEWPID (stage 2 enters the pidns), got flags %#x", flags)
 		}
 		if len(cmd.SysProcAttr.UidMappings) != 0 || len(cmd.SysProcAttr.GidMappings) != 0 {
 			t.Errorf("privileged run without uid range must not install uid/gid mappings, got uid=%v gid=%v",
 				cmd.SysProcAttr.UidMappings, cmd.SysProcAttr.GidMappings)
 		}
 	} else {
-		// Rootless leg: the user namespace + single uid/gid mapping is the
-		// point of running without privileges; the PID namespace rides along.
+		// Rootless leg: stage 1 gets the user namespace + single uid/gid
+		// self-map (it needs the capabilities for its mount setup); the PID
+		// namespace is entered by STAGE 2, so NEWPID must NOT be here.
 		if flags&syscall.CLONE_NEWUSER == 0 {
 			t.Errorf("rootless run with user namespaces available must set CLONE_NEWUSER, got flags %#x", flags)
 		}
-		if flags&syscall.CLONE_NEWPID == 0 {
-			t.Errorf("rootless run with user namespaces available must set CLONE_NEWPID, got flags %#x", flags)
+		if flags&syscall.CLONE_NEWPID != 0 {
+			t.Errorf("stage 1 must not set CLONE_NEWPID (stage 2 enters the pidns), got flags %#x", flags)
 		}
 		if len(cmd.SysProcAttr.UidMappings) != 1 || len(cmd.SysProcAttr.GidMappings) != 1 {
 			t.Errorf("rootless run expects exactly one uid and one gid mapping, got uid=%v gid=%v",
@@ -96,18 +98,32 @@ func TestConfigureProcessIsolation_RootlessHardBoundary(t *testing.T) {
 	}
 
 	flags := cmd.SysProcAttr.Cloneflags
-	if flags&syscall.CLONE_NEWUSER == 0 {
-		t.Errorf("privileged rootless run must set CLONE_NEWUSER, got flags %#x", flags)
+	// Two-stage design: stage 1 does the mount setup as REAL ROOT in a
+	// fresh mountns (no NEWUSER); stage 2 enters NEWUSER+NEWPID per the
+	// JSON stage plan in the environment.
+	if flags&syscall.CLONE_NEWUSER != 0 {
+		t.Errorf("stage 1 of a privileged rootless run must not set CLONE_NEWUSER, got flags %#x", flags)
 	}
-	if flags&syscall.CLONE_NEWPID == 0 {
-		t.Errorf("privileged rootless run must set CLONE_NEWPID, got flags %#x", flags)
+	if flags&syscall.CLONE_NEWPID != 0 {
+		t.Errorf("stage 1 of a privileged rootless run must not set CLONE_NEWPID, got flags %#x", flags)
 	}
-	want := []syscall.SysProcIDMap{{ContainerID: 0, HostID: 100000, Size: 65536}}
-	if len(cmd.SysProcAttr.UidMappings) != 1 || cmd.SysProcAttr.UidMappings[0] != want[0] {
-		t.Errorf("uid mappings = %v, want %v", cmd.SysProcAttr.UidMappings, want)
+	var stageCfg *jailHelperConfig
+	for _, e := range cmd.Env {
+		if raw, ok := strings.CutPrefix(e, jailHelperEnvConfig+"="); ok {
+			stageCfg = &jailHelperConfig{}
+			if err := json.Unmarshal([]byte(raw), stageCfg); err != nil {
+				t.Fatalf("decode stage config: %v", err)
+			}
+		}
 	}
-	if len(cmd.SysProcAttr.GidMappings) != 1 || cmd.SysProcAttr.GidMappings[0] != want[0] {
-		t.Errorf("gid mappings = %v, want %v", cmd.SysProcAttr.GidMappings, want)
+	if stageCfg == nil {
+		t.Fatal("no stage config in environment")
+	}
+	if !stageCfg.StageUserNS || !stageCfg.StagePIDNS || !stageCfg.MountProc {
+		t.Errorf("stage config = %+v, want StageUserNS+StagePIDNS+MountProc", stageCfg)
+	}
+	if stageCfg.UIDBase != 100000 || stageCfg.UIDRangeSize != 65536 {
+		t.Errorf("stage config uid range = %d+%d, want 100000+65536", stageCfg.UIDBase, stageCfg.UIDRangeSize)
 	}
 }
 

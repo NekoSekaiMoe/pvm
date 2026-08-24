@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -17,47 +18,187 @@ import (
 // rootfs so it stays executable after pivot_root.
 const jailEntryPath = "/pvm/entry"
 
-// init implements the re-exec helper branch: when ConfigureProcessIsolation
-// wrapped a command, the child process is this same binary with
-// PVM_JAIL_HELPER=1 set. The branch runs before main() — inside the child's
-// fresh mount/user namespaces — performs the filesystem isolation and then
-// replaces the process image with the real workload via execve(2). Any
-// failure is fatal: the workload must never start without the promised jail.
+// init implements the re-exec stage branches: when ConfigureProcessIsolation
+// wrapped a command, the child process is this same binary with a stage
+// marker set. The branch runs before main() — inside the child's fresh
+// namespaces. Any failure is fatal: the workload must never start without
+// the promised jail.
 func init() {
-	if os.Getenv(jailHelperEnvMarker) != "1" {
-		return
+	if os.Getenv(jailStagerEnvMarker) == "1" {
+		if err := runJailStager(); err != nil {
+			fmt.Fprintf(os.Stderr, "jail stager: %v\n", err)
+			os.Exit(1)
+		}
+		// runJailStager never returns on success (it waits for stage 2 and
+		// exits with its status).
+		os.Exit(0)
 	}
-	if err := runJailHelper(); err != nil {
-		fmt.Fprintf(os.Stderr, "jail helper: %v\n", err)
-		os.Exit(1)
+	if os.Getenv(jailHelperEnvMarker) == "1" {
+		if err := runJailHelper(); err != nil {
+			fmt.Fprintf(os.Stderr, "jail helper: %v\n", err)
+			os.Exit(1)
+		}
+		// runJailHelper only returns on error; a successful syscall.Exec never returns.
+		os.Exit(0)
 	}
-	// runJailHelper only returns on error; a successful syscall.Exec never returns.
-	os.Exit(0)
 }
 
-// runJailHelper executes the isolation plan and execs the target binary.
-func runJailHelper() error {
+// loadJailConfig decodes the shared stage plan from the environment.
+func loadJailConfig() (*jailHelperConfig, error) {
 	raw := os.Getenv(jailHelperEnvConfig)
 	if raw == "" {
-		return fmt.Errorf("missing %s", jailHelperEnvConfig)
+		return nil, fmt.Errorf("missing %s", jailHelperEnvConfig)
 	}
 	var cfg jailHelperConfig
 	if err := json.Unmarshal([]byte(raw), &cfg); err != nil {
-		return fmt.Errorf("decode helper config: %w", err)
+		return nil, fmt.Errorf("decode stage config: %w", err)
 	}
 	if cfg.Rootfs == "" || cfg.Target == "" {
-		return fmt.Errorf("helper config requires rootfs and target (got rootfs=%q target=%q)", cfg.Rootfs, cfg.Target)
+		return nil, fmt.Errorf("stage config requires rootfs and target (got rootfs=%q target=%q)", cfg.Rootfs, cfg.Target)
 	}
+	return &cfg, nil
+}
 
-	allowed, err := setupJailFilesystem(&cfg)
+// scrubStageMarkers returns the environment without the stage markers, ready
+// to be handed to the workload.
+func scrubStageMarkers() []string {
+	env := make([]string, 0, len(os.Environ()))
+	for _, e := range os.Environ() {
+		if strings.HasPrefix(e, jailStagerEnvMarker+"=") ||
+			strings.HasPrefix(e, jailHelperEnvMarker+"=") ||
+			strings.HasPrefix(e, jailHelperEnvConfig+"=") {
+			continue
+		}
+		env = append(env, e)
+	}
+	return env
+}
+
+// runJailStager is stage 1: full privileges in a fresh mount namespace. It
+// isolates mount propagation, bind-mounts everything the workload needs into
+// the jail rootfs (direct paths — it can traverse anything), and then clones
+// stage 2 with the user/PID namespaces. Doing ALL mount work here is the
+// point of the two-stage design: mount operations from inside a user
+// namespace are subject to lockdown/LSM restrictions (CI: EPERM on
+// propagation changes), while mounts are namespace-scoped objects that
+// cannot be handed over via fds from the parent namespace.
+func runJailStager() error {
+	cfg, err := loadJailConfig()
 	if err != nil {
 		return err
 	}
 
-	// All host resources are bind-mounted now: close the hand-over fds so
-	// they do not leak into the workload (caller-owned ExtraFiles like the
-	// tap fd are untouched).
-	closeHelperFDs(&cfg)
+	// Detach mount propagation from the host so none of the mounts below
+	// leak into the parent mount namespace.
+	if err := unix.Mount("", "/", "", unix.MS_PRIVATE|unix.MS_REC, ""); err != nil {
+		return fmt.Errorf("make host mounts private: %w", err)
+	}
+
+	if err := stageBinds(cfg); err != nil {
+		return err
+	}
+
+	// Clone stage 2 with the namespace flags the policy selected.
+	exe, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("locate executable for stage-2 re-exec: %w", err)
+	}
+	child := exec.Command(exe)
+	child.Env = append(scrubStageMarkers(),
+		jailHelperEnvMarker+"=1",
+		jailHelperEnvConfig+"="+os.Getenv(jailHelperEnvConfig),
+	)
+	child.Stdin = os.Stdin
+	child.Stdout = os.Stdout
+	child.Stderr = os.Stderr
+	child.SysProcAttr = &syscall.SysProcAttr{
+		// If stage 1 dies, the workload must not be orphaned.
+		Pdeathsig: unix.SIGKILL,
+	}
+	if cfg.StageUserNS {
+		child.SysProcAttr.Cloneflags |= syscall.CLONE_NEWUSER
+		child.SysProcAttr.UidMappings = []syscall.SysProcIDMap{
+			{ContainerID: 0, HostID: int(cfg.UIDBase), Size: int(cfg.UIDRangeSize)},
+		}
+		child.SysProcAttr.GidMappings = []syscall.SysProcIDMap{
+			{ContainerID: 0, HostID: int(cfg.UIDBase), Size: int(cfg.UIDRangeSize)},
+		}
+	}
+	if cfg.StagePIDNS {
+		child.SysProcAttr.Cloneflags |= syscall.CLONE_NEWPID
+	}
+	if err := child.Start(); err != nil {
+		return fmt.Errorf("start stage 2: %w", err)
+	}
+	// Forward the workload's exit status to the manager waiting on stage 1.
+	err = child.Wait()
+	if exitErr, ok := err.(*exec.ExitError); ok {
+		if ws, ok := exitErr.Sys().(syscall.WaitStatus); ok {
+			os.Exit(ws.ExitStatus())
+		}
+		os.Exit(1)
+	}
+	return err
+}
+
+// stageBinds bind-mounts the workload binary, system trees, devices and
+// configured volumes into the jail rootfs. Runs in stage 1 (full privileges,
+// direct paths).
+func stageBinds(cfg *jailHelperConfig) error {
+	rootfs := cfg.Rootfs
+
+	// The workload binary lives on the host filesystem; bind it into the
+	// jail together with the read-only system trees its dynamic loader and
+	// shared libraries live in, so execve still works after pivot_root.
+	if err := bindFile(cfg.Target, filepath.Join(rootfs, jailEntryPath), true); err != nil {
+		return fmt.Errorf("bind workload binary %s: %w", cfg.Target, err)
+	}
+	for _, dir := range []string{"/lib", "/lib64", "/usr/lib", "/usr/lib64", "/bin", "/sbin", "/usr/bin", "/usr/sbin"} {
+		if fi, err := os.Stat(dir); err != nil || !fi.IsDir() {
+			continue
+		}
+		if err := bindDir(dir, filepath.Join(rootfs, dir), true); err != nil {
+			return fmt.Errorf("bind system directory %s: %w", dir, err)
+		}
+	}
+
+	// Minimal device nodes a workload cannot function without.
+	for _, dev := range []string{"null", "zero", "full", "random", "urandom"} {
+		host := filepath.Join("/dev", dev)
+		if fi, err := os.Stat(host); err != nil || fi.IsDir() {
+			continue
+		}
+		if err := bindFile(host, filepath.Join(rootfs, "dev", dev), false); err != nil {
+			return fmt.Errorf("bind device %s: %w", host, err)
+		}
+	}
+
+	// Configured volumes: host path -> guest path inside the rootfs.
+	for _, v := range cfg.Volumes {
+		if v.HostPath == "" || !filepath.IsAbs(v.GuestPath) {
+			return fmt.Errorf("invalid volume mapping %+v: need host path and absolute guest path", v)
+		}
+		if err := bindPath(v.HostPath, filepath.Join(rootfs, v.GuestPath), v.ReadOnly); err != nil {
+			return fmt.Errorf("bind volume %s -> %s: %w", v.HostPath, v.GuestPath, err)
+		}
+	}
+	return nil
+}
+
+// runJailHelper is stage 2: it runs inside the user+PID namespaces selected
+// by the policy (or no additional namespaces on the degraded leg), pivots
+// into the rootfs stage 1 prepared, applies the hardening layers and execs
+// the workload.
+func runJailHelper() error {
+	cfg, err := loadJailConfig()
+	if err != nil {
+		return err
+	}
+
+	allowed, err := pivotIntoJail(cfg)
+	if err != nil {
+		return err
+	}
 
 	// Landlock hardening runs after pivot_root so the allowed paths are the
 	// in-jail views. Any failure aborts the launch.
@@ -65,18 +206,11 @@ func runJailHelper() error {
 		return fmt.Errorf("landlock lockdown: %w", err)
 	}
 
-	// Scrub the helper markers before handing over to the real workload.
-	env := make([]string, 0, len(os.Environ()))
-	for _, e := range os.Environ() {
-		if strings.HasPrefix(e, jailHelperEnvMarker+"=") || strings.HasPrefix(e, jailHelperEnvConfig+"=") {
-			continue
-		}
-		env = append(env, e)
-	}
 	// Repoint HOME at a directory that exists inside the jail: UML's
 	// make_umid() crashes the whole kernel on a missing $HOME (see
 	// jailHomeEnv). This runs after pivot_root, so the existence check
 	// sees the jail view, not the host's.
+	env := scrubStageMarkers()
 	env = jailHomeEnv(env, func(p string) bool {
 		fi, err := os.Stat(p)
 		return err == nil && fi.IsDir()
@@ -105,20 +239,16 @@ func runJailHelper() error {
 
 	// Capability bounding-set hardening: drop CAP_SYS_PTRACE & friends so
 	// the workload (UML monitor) can never ptrace/signal/tamper with host
-	// processes outside its own tree — the largest residual escape surface
-	// of a privileged monitor. Irreversible across execve; failure aborts
-	// the launch. Must run before exec, and pairs with the seccomp filter
-	// (which cannot scope ptrace by target pid).
+	// processes outside its own tree. Irreversible across execve; failure
+	// aborts the launch. Defense in depth under the rootless hard boundary
+	// (namespaces are the real containment), load-bearing on the degraded
+	// leg.
 	if err := DropDangerousCapabilities(); err != nil {
 		return fmt.Errorf("capability bounding-set drop: %w", err)
 	}
 
 	// Seccomp hardening is installed last when enabled: the filter survives
-	// execve and constrains the workload for its entire lifetime. It must
-	// come after setupJailFilesystem and the personality call (mount,
-	// pivot_root and personality are all denied by the denylist filter).
-	// When the config does not opt in (EnforceHostSeccomp=false) the install
-	// is skipped entirely; when enabled, any failure aborts the launch.
+	// execve and constrains the workload for its entire lifetime.
 	if cfg.EnforceHostSeccomp {
 		if err := ApplyHostSeccompFilter(); err != nil {
 			return fmt.Errorf("seccomp filter: %w", err)
@@ -131,105 +261,35 @@ func runJailHelper() error {
 	return nil // unreachable
 }
 
-// closeHelperFDs closes the hand-over fds recorded in the helper config.
-func closeHelperFDs(cfg *jailHelperConfig) {
-	for _, fd := range append([]int{cfg.ExeFD, cfg.TargetFD, cfg.RootfsFD, cfg.RootfsParentFD}, cfg.VolumeFDs...) {
-		if fd > 0 {
-			unix.Close(fd)
-		}
-	}
-}
-
-// setupJailFilesystem builds the jailed filesystem view from the helper
-// config and pivots into it. It returns the post-pivot paths Landlock should
-// keep accessible. Every mount / root-switch failure is fatal to the launch.
-//
-// Host-side sources are referenced ONLY through /proc/self/fd/N (see
-// jailHelperConfig): the mapped uid inside the user namespace cannot
-// necessarily traverse their ancestor directories.
-func setupJailFilesystem(cfg *jailHelperConfig) ([]string, error) {
+// pivotIntoJail self-binds the rootfs (creating the mountpoint pivot_root
+// requires IN THIS NAMESPACE — a mount copied from stage 1's namespace could
+// be lockdown-flagged and rejected), pivots into it, optionally mounts the
+// private procfs, and returns the post-pivot paths Landlock should keep
+// accessible. Every mount / root-switch failure is fatal to the launch.
+func pivotIntoJail(cfg *jailHelperConfig) ([]string, error) {
 	rootfs := cfg.Rootfs
-	if cfg.RootfsFD > 0 {
-		rootfs = procFDPath(cfg.RootfsFD)
-	}
-	target := cfg.Target
-	if cfg.TargetFD > 0 {
-		target = procFDPath(cfg.TargetFD)
-	}
 
-	// Detach mount propagation from the host so none of the mounts below
-	// leak into the parent mount namespace.
-	if err := unix.Mount("", "/", "", unix.MS_PRIVATE|unix.MS_REC, ""); err != nil {
-		return nil, fmt.Errorf("make host mounts private: %w", err)
-	}
-
-	// pivot_root requires new_root to be a mount point: bind the rootfs onto
-	// itself.
+	// pivot_root requires new_root to be a mount point: bind the rootfs
+	// onto itself. Doing this in stage 2's own namespace (rather than
+	// inheriting stage 1's self-bind) guarantees the mount is free of
+	// cross-namespace lockdown flags.
 	if err := unix.Mount(rootfs, rootfs, "", unix.MS_BIND|unix.MS_REC, ""); err != nil {
 		return nil, fmt.Errorf("bind rootfs %s onto itself: %w", rootfs, err)
 	}
 
-	// roTargets collects the POST-PIVOT in-jail paths that must become
-	// read-only. The remount runs after pivot_root on plain absolute paths:
-	// inside a user namespace, remounting through a /proc/self/fd magic
-	// link fails EINVAL (privileged CI leg), and MS_RDONLY on the initial
-	// bind is silently ignored — hence the two-phase approach.
-	var roTargets []string
-
-	// The workload binary lives on the host filesystem; bind it into the
-	// jail together with the read-only system trees its dynamic loader and
-	// shared libraries live in, so execve still works after pivot_root.
-	if err := bindFile(target, filepath.Join(rootfs, jailEntryPath)); err != nil {
-		return nil, fmt.Errorf("bind workload binary %s: %w", cfg.Target, err)
-	}
-	roTargets = append(roTargets, jailEntryPath)
+	// Compute the Landlock allowlist from the in-jail view. Only allowlist
+	// directories that actually exist in this rootfs: callers may construct
+	// a JailEnvironment without SetupJail, and Landlock fails hard when an
+	// allowed path cannot be opened after pivot_root.
 	allowed := []string{filepath.Dir(jailEntryPath)}
 	for _, dir := range []string{"/lib", "/lib64", "/usr/lib", "/usr/lib64", "/bin", "/sbin", "/usr/bin", "/usr/sbin"} {
-		if fi, err := os.Stat(dir); err != nil || !fi.IsDir() {
-			continue
-		}
-		if err := bindDir(dir, filepath.Join(rootfs, dir)); err != nil {
-			return nil, fmt.Errorf("bind system directory %s: %w", dir, err)
-		}
-		allowed = append(allowed, dir)
-		roTargets = append(roTargets, dir)
-	}
-
-	// Minimal device nodes a workload cannot function without.
-	for _, dev := range []string{"null", "zero", "full", "random", "urandom"} {
-		host := filepath.Join("/dev", dev)
-		if fi, err := os.Stat(host); err != nil || fi.IsDir() {
-			continue
-		}
-		if err := bindFile(host, filepath.Join(rootfs, "dev", dev)); err != nil {
-			return nil, fmt.Errorf("bind device %s: %w", host, err)
+		if fi, err := os.Stat(filepath.Join(rootfs, dir)); err == nil && fi.IsDir() {
+			allowed = append(allowed, dir)
 		}
 	}
-
-	// Configured volumes: host path -> guest path inside the rootfs. Sources
-	// are the inherited fds (procfd magic links), never the raw host paths.
-	for i, v := range cfg.Volumes {
-		if v.HostPath == "" || !filepath.IsAbs(v.GuestPath) {
-			return nil, fmt.Errorf("invalid volume mapping %+v: need host path and absolute guest path", v)
-		}
-		src := v.HostPath
-		if i < len(cfg.VolumeFDs) && cfg.VolumeFDs[i] > 0 {
-			src = procFDPath(cfg.VolumeFDs[i])
-		}
-		dst := filepath.Join(rootfs, v.GuestPath)
-		if err := bindPath(src, dst); err != nil {
-			return nil, fmt.Errorf("bind volume %s -> %s: %w", v.HostPath, v.GuestPath, err)
-		}
+	for _, v := range cfg.Volumes {
 		allowed = append(allowed, v.GuestPath)
-		if v.ReadOnly {
-			roTargets = append(roTargets, v.GuestPath)
-		}
 	}
-
-	// Jail working directories created by SetupJail. Only allowlist the
-	// ones that actually exist in this rootfs: callers may construct a
-	// JailEnvironment without SetupJail, and Landlock fails hard when an
-	// allowed path cannot be opened after pivot_root.
 	for _, sub := range []string{"volumes", "images", "sockets", "dev", "tmp"} {
 		if fi, err := os.Stat(filepath.Join(rootfs, sub)); err == nil && fi.IsDir() {
 			allowed = append(allowed, "/"+sub)
@@ -241,24 +301,8 @@ func setupJailFilesystem(cfg *jailHelperConfig) ([]string, error) {
 	if err := os.MkdirAll(oldRoot, 0700); err != nil {
 		return nil, fmt.Errorf("create pivot_root mountpoint: %w", err)
 	}
-	pivotRoot := rootfs
-	if cfg.RootfsParentFD > 0 {
-		// The rootfs fd was opened BEFORE the self-bind above, so its
-		// /proc/self/fd path resolves to the ORIGINAL parent mount and
-		// pivot_root would reject it ("not a mountpoint", EINVAL). Mount
-		// crossing only happens when a walk ENTERS the mountpoint dentry
-		// from its parent — re-walk openat(parent, base) after the
-		// self-bind to land on the bind mount.
-		bindF, err := os.Open(filepath.Join(procFDPath(cfg.RootfsParentFD), cfg.RootfsBaseName))
-		if err != nil {
-			return nil, fmt.Errorf("re-walk jail rootfs through parent fd: %w", err)
-		}
-		defer bindF.Close()
-		pivotRoot = procFDPath(int(bindF.Fd()))
-		oldRoot = filepath.Join(pivotRoot, ".pivot-old")
-	}
-	if err := unix.PivotRoot(pivotRoot, oldRoot); err != nil {
-		return nil, fmt.Errorf("pivot_root into %s: %w", cfg.Rootfs, err)
+	if err := unix.PivotRoot(rootfs, oldRoot); err != nil {
+		return nil, fmt.Errorf("pivot_root into %s: %w", rootfs, err)
 	}
 	if err := unix.Chdir("/"); err != nil {
 		return nil, fmt.Errorf("chdir into new root: %w", err)
@@ -268,15 +312,11 @@ func setupJailFilesystem(cfg *jailHelperConfig) ([]string, error) {
 	}
 	_ = os.Remove("/.pivot-old")
 
-	// Private procfs. Only mounted when the child got CLONE_NEWPID
+	// Private procfs. Only mounted when stage 2 got CLONE_NEWPID
 	// (MountProc): the procfs then exposes the jail's own PID namespace
-	// instead of the host process tree. Mounted after pivot_root so it
-	// lands in the jail view; requires CAP_SYS_ADMIN in the child's user
-	// namespace, which namespaced root has. Mount failures are fatal: a
+	// instead of the host process tree. Mount failures are fatal: a
 	// workload promised a private /proc must not silently run without it.
 	if cfg.MountProc {
-		// SetupJail pre-creates <rootfs>/proc, but JailEnvironments built
-		// by hand (tests, embedding callers) may lack it — create on demand.
 		if err := os.MkdirAll("/proc", 0555); err != nil {
 			return nil, fmt.Errorf("create /proc mountpoint: %w", err)
 		}
@@ -286,50 +326,29 @@ func setupJailFilesystem(cfg *jailHelperConfig) ([]string, error) {
 		allowed = append(allowed, "/proc")
 	}
 
-	// Apply the read-only remounts on plain post-pivot paths (see roTargets).
-	for _, t := range roTargets {
-		if err := remountReadOnly(t); err != nil {
-			return nil, fmt.Errorf("make %s read-only: %w", t, err)
-		}
-	}
-
 	return allowed, nil
 }
 
 // bindPath bind-mounts a host file or directory onto target inside the rootfs.
-// Read-only is NOT applied here: see roTargets/remountReadOnly.
-func bindPath(host, target string) error {
+func bindPath(host, target string, readOnly bool) error {
 	fi, err := os.Stat(host)
 	if err != nil {
 		return err
 	}
 	if fi.IsDir() {
-		return bindDir(host, target)
+		return bindDir(host, target, readOnly)
 	}
-	return bindFile(host, target)
+	return bindFile(host, target, readOnly)
 }
 
-// remountReadOnly switches a bind mount to read-only. It must be called with
-// the POST-PIVOT in-jail path, never with a pre-pivot /proc/self/fd/-prefixed
-// path: inside a user namespace, remounting through a procfs magic link fails
-// with EINVAL (privileged CI leg, TestConfigureProcessIsolation_Execution).
-func remountReadOnly(target string) error {
-	// A read-only bind requires a separate remount pass; MS_RDONLY on the
-	// initial bind is silently ignored.
-	if err := unix.Mount("", target, "", unix.MS_BIND|unix.MS_REMOUNT|unix.MS_RDONLY, ""); err != nil {
-		return fmt.Errorf("remount read-only: %w", err)
-	}
-	return nil
-}
-
-func bindDir(host, target string) error {
+func bindDir(host, target string, readOnly bool) error {
 	if err := os.MkdirAll(target, 0755); err != nil {
 		return err
 	}
-	return bindMount(host, target)
+	return bindMount(host, target, readOnly)
 }
 
-func bindFile(host, target string) error {
+func bindFile(host, target string, readOnly bool) error {
 	if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
 		return err
 	}
@@ -340,12 +359,20 @@ func bindFile(host, target string) error {
 	if err := f.Close(); err != nil {
 		return err
 	}
-	return bindMount(host, target)
+	return bindMount(host, target, readOnly)
 }
 
-func bindMount(host, target string) error {
-	// The bind itself is always created read-WRITE; read-only is applied
-	// after pivot_root via remountReadOnly on the plain in-jail path (see
-	// there for why the remount must not go through procfs magic links).
-	return unix.Mount(host, target, "", unix.MS_BIND|unix.MS_REC, "")
+func bindMount(host, target string, readOnly bool) error {
+	if err := unix.Mount(host, target, "", unix.MS_BIND|unix.MS_REC, ""); err != nil {
+		return err
+	}
+	if readOnly {
+		// A read-only bind requires a separate remount pass; MS_RDONLY on
+		// the initial bind is silently ignored. Safe here: stage 1 runs
+		// with full privileges on direct in-namespace paths.
+		if err := unix.Mount("", target, "", unix.MS_BIND|unix.MS_REMOUNT|unix.MS_RDONLY, ""); err != nil {
+			return fmt.Errorf("remount read-only: %w", err)
+		}
+	}
+	return nil
 }

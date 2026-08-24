@@ -27,12 +27,15 @@
 - **vhost-user / egress proxy**：两者本是 manager 进程内 goroutine（非子
   进程），随 manager 保持宿主侧 root；已处理的是 monitor 触达面的属主
   (vhost socket chown 进 uid 段、state 目录 o+x 遍历、overlay chown)
-- **fd 化（fd-only inside namespace）**:helper 接触的所有宿主路径——
-  re-exec 自身、jail rootfs、workload binary、volume bind 源——在 fork 前
-  由 manager 以 O_RDONLY 打开并继承，namespace 内只走 /proc/self/fd/N
-  （magic link 直解 dentry，绕过祖先目录穿越权限；修复 CI 上
-  /home/runner/work 0750 导致的 fork/exec EACCES)。launcher 在 Start 后
-  关闭全部 ExtraFiles 宿主侧副本
+- **两段式 nsexec 启动（runc 模型）**:stage 1 = 真 root 新 mountns（降级腿）
+  或 self-map namespaced root（非特权腿），负责 rprivate + 全部 bind
+  （workload binary/系统目录/设备/volumes，直接路径）;stage 2 再 clone
+  NEWUSER|NEWPID(uid_map 由 stage 1 这个 init_userns 真 root 写入），
+  只负责 self-bind rootfs + pivot + 私有 /proc + Landlock/cap/seccomp。
+  关键教训：mount 是 namespace 作用域对象，父 ns 打开的 fd 在子 ns 做
+  bind 源过不了 check_mnt（曾走 fd 化弯路，CI 三连挂后废弃）;stage1 的
+  退出码/pdeathsig/cgroup 继承链已核对（manager 记录的 stage1 pid 经
+  cgroup 继承覆盖整棵树，杀 stage1 经 pdeathsig 带走 workload）
 - **seccomp**：黑名单保持不动（fail-open 为既有定论，见
   `internal/jail/seccomp_linux.go` 头部历史注释），降级为纵深防御
 - **对抗测试**:`internal/securitytest` 新增
