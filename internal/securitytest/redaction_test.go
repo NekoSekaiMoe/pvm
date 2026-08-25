@@ -76,8 +76,11 @@ func TestAttack_RedactorEscapeHatchStoresRaw(t *testing.T) {
 	// The default redactor is a process-global switch; another test in
 	// this package may have flipped it off without restoring. Pin it so
 	// the "default ledger still scrubs" assertion below holds
-	// independently of test ordering.
+	// independently of test ordering — and restore the previous state so
+	// this test is not the ordering hazard it fixes.
+	previous := audit.RedactionEnabled()
 	audit.SetRedactionEnabled(true)
+	t.Cleanup(func() { audit.SetRedactionEnabled(previous) })
 
 	secret := "ghp_" + strings.Repeat("0", 40)
 	l, err := audit.Open("sec-raw", audit.WithRedactor(nil))

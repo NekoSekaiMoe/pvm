@@ -375,13 +375,16 @@ func (l *Learner) LearnedIPs(host string) []net.IP {
 // than skipDomain. Callers must hold l.mu. Two allowlisted domains commonly
 // share a CDN IP; deleting the whitelist entry while the other domain still
 // holds it would drop that traffic at the data plane until the next learn.
-func (l *Learner) ipStillReferenced(skipDomain, ip string) bool {
+// Callers must hold l.mu. An entry whose TTL already elapsed but which
+// sweep has not collected yet is NOT a live reference: counting it would
+// keep the shared whitelist entry past the other domain's expiry.
+func (l *Learner) ipStillReferenced(skipDomain, ip string, now time.Time) bool {
 	for domain, es := range l.learned {
 		if domain == skipDomain {
 			continue
 		}
 		for _, e := range es {
-			if e.ip == ip {
+			if e.ip == ip && e.expiry.After(now) {
 				return true
 			}
 		}
@@ -392,6 +395,7 @@ func (l *Learner) ipStillReferenced(skipDomain, ip string) bool {
 func (l *Learner) Drop(host string) int {
 	domain := normalizeName(host)
 	l.mu.Lock()
+	now := l.now()
 	es := l.learned[domain]
 	delete(l.learned, domain)
 	l.total -= len(es)
@@ -399,7 +403,7 @@ func (l *Learner) Drop(host string) int {
 	// domain entry must stay in the whitelist map.
 	var doomed []entry
 	for _, e := range es {
-		if !l.ipStillReferenced(domain, e.ip) {
+		if !l.ipStillReferenced(domain, e.ip, now) {
 			doomed = append(doomed, e)
 		}
 	}
@@ -568,7 +572,7 @@ func (l *Learner) sweep() {
 	// whitelist map (shared-CDN case).
 	var doomed []expired
 	for _, d := range dead {
-		if !l.ipStillReferenced(d.domain, d.e.ip) {
+		if !l.ipStillReferenced(d.domain, d.e.ip, now) {
 			doomed = append(doomed, d)
 		}
 	}

@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"net/http"
 	"regexp"
+	"sync"
 	"time"
 
 	"uml-container/internal/audit"
@@ -111,6 +112,27 @@ func ensureDNSLearner(taskID string, req *dnsPolicyRequest) (*dnslearn.Learner, 
 
 // registerDNSEgressRoutes wires the P1-B DNS-learned egress endpoints.
 // Called from NewE2BServer; all routes sit behind the /api Bearer auth.
+// dnsTaskLocks serializes learner lifecycle transitions per task id.
+// The registry itself only guards the map; without this lock a DELETE
+// (Unregister then Close) races a concurrent POST allow / PUT policy
+// creating a replacement learner in between — DELETE would report
+// success while the task ends up with a live learner again.
+var dnsTaskLocks = struct {
+	sync.Mutex
+	m map[string]*sync.Mutex
+}{m: map[string]*sync.Mutex{}}
+
+func dnsTaskLock(taskID string) *sync.Mutex {
+	dnsTaskLocks.Lock()
+	defer dnsTaskLocks.Unlock()
+	mu := dnsTaskLocks.m[taskID]
+	if mu == nil {
+		mu = &sync.Mutex{}
+		dnsTaskLocks.m[taskID] = mu
+	}
+	return mu
+}
+
 func registerDNSEgressRoutes(api *echo.Group) {
 	// Live learned set with expiries.
 	api.GET("/egress/:task/learned", func(c echo.Context) error {
@@ -138,6 +160,9 @@ func registerDNSEgressRoutes(api *echo.Group) {
 		if !idRegex.MatchString(task) {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid task id"})
 		}
+		mu := dnsTaskLock(task)
+		mu.Lock()
+		defer mu.Unlock()
 		var body struct {
 			Domain string `json:"domain"`
 		}
@@ -205,6 +230,9 @@ func registerDNSEgressRoutes(api *echo.Group) {
 		if !idRegex.MatchString(task) {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid task id"})
 		}
+		mu := dnsTaskLock(task)
+		mu.Lock()
+		defer mu.Unlock()
 		var req dnsPolicyRequest
 		if err := c.Bind(&req); err != nil {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid body"})
@@ -268,6 +296,13 @@ func registerDNSEgressRoutes(api *echo.Group) {
 		if !idRegex.MatchString(task) {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid task id"})
 		}
+		// Held across Unregister AND Close: without the lock a concurrent
+		// POST allow could register a replacement learner between the two
+		// and this handler would return "deleted" for a task that ends up
+		// with a live learner.
+		mu := dnsTaskLock(task)
+		mu.Lock()
+		defer mu.Unlock()
 		l := dnslearn.For(task)
 		if l == nil {
 			return c.JSON(http.StatusNotFound, map[string]string{
