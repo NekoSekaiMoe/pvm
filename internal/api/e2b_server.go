@@ -754,6 +754,25 @@ func NewE2BServer() (*echo.Echo, error) {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": "body must be {\"enabled\": bool}"})
 		}
 		audit.SetRedactionEnabled(*req.Enabled)
+		// This toggle flips a process-global security posture: with it
+		// off, every task's NEW ledger rows hit disk in plaintext. The
+		// change itself must be answerable after the fact ("who disabled
+		// redaction, when"), mirroring how /tasks/:id/rollback audits
+		// itself. A dedicated control-plane ledger (task id "control-
+		// plane") keeps the row out of every task's chain.
+		actor, _ := c.Get("actor").(string)
+		if cl, cerr := audit.Open("control-plane"); cerr == nil {
+			_ = cl.Append(audit.Record{
+				At:       time.Now().UTC(),
+				Tenant:   "system",
+				Phase:    audit.PhaseRelease,
+				Subject:  actor,
+				Action:   "audit:redaction_policy",
+				Params:   map[string]interface{}{"enabled": *req.Enabled},
+				Decision: audit.DecisionAllow,
+				Reason:   "redaction policy toggled via PUT /api/audit/redaction-policy",
+			})
+		}
 		return c.JSON(http.StatusOK, redactionPolicyView())
 	})
 

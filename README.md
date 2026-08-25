@@ -88,11 +88,11 @@ PVM 将 Nuxt 3 前端静态资源直接内嵌至 Go 二进制中，一条命令�
 采用 CubeVS 风格的无 bridge 数据面（每沙箱固定内网地址，全部转发/NAT 由 TC 挂载的
 eBPF 完成，无 iptables 规则）：
 
-```
+```text
  guest 169.254.68.6                host
     │ TAP ingress (tc/eBPF)
     │  ├─ 目的 169.254.68.5 (网关/代理/DNS) → redirect pvm-gw
-    │  ├─ SSRF 楼底 + 白名单校验
+    │  ├─ SSRF 兜底 + 白名单校验
     │  └─ SNAT(host_ip, 端口段) + 会话表 → host NIC
     ▼
  host NIC ingress (tc/eBPF): 会话表反查 → 反向 DNAT → TAP

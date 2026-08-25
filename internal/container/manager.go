@@ -1035,8 +1035,9 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 				dpAttached = true
 			}
 		}
+		var ierr error
 		if bridgePlane {
-			ipam, ierr := network.SharedIPAM(s.Network.GatewayIP)
+			ipam, ierr = network.SharedIPAM(s.Network.GatewayIP)
 			if ierr != nil {
 				cleanupVolumes()
 				_ = st.Transition(state.StatusFailed, state.ActorController, "guest IPAM init failed: "+ierr.Error())
@@ -1066,7 +1067,9 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 					// task runs without the BPF floor; fail closed rather than boot
 					// a downgraded sandbox with no evidence (mirrors the jail
 					// degraded-warning contract above).
-					ipam.Release(taskID)
+					if ipam != nil { // nil in tc mode (no IPAM there)
+						ipam.Release(taskID)
+					}
 					cleanupVolumes()
 					_ = st.Transition(state.StatusFailed, state.ActorController, "audit tc-filter degraded-warning append failed: "+aerr.Error())
 					state.SaveState(taskID, st)
@@ -1149,7 +1152,9 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 				}); aerr != nil {
 					// Same fail-closed contract as the tc-filter degraded warning
 					// above: this row is the only evidence of table-only learning.
-					ipam.Release(taskID)
+					if ipam != nil { // nil in tc mode (no IPAM there)
+						ipam.Release(taskID)
+					}
 					cleanupVolumes()
 					_ = st.Transition(state.StatusFailed, state.ActorController, "audit dns-learn degraded-warning append failed: "+aerr.Error())
 					state.SaveState(taskID, st)

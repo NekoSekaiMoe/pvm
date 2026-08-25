@@ -60,52 +60,53 @@ func maxEntriesForView(l *dnslearn.Learner) int { return l.MaxEntries() }
 // control-plane one when absent. Control-plane learners are table-only
 // (NopWriter: no per-task eBPF map is reachable here) and bind their DNS
 // proxy on a loopback ephemeral port; they exist so learn mode can be
-// driven/tested through the API without a running task.
+// driven/tested through the API without a running task. The whole
+// check-create-register runs through dnslearn.GetOrCreate so concurrent
+// PUT policy / POST allow calls cannot leak a learner (the loser is
+// closed inside GetOrCreate).
 func ensureDNSLearner(taskID string, req *dnsPolicyRequest) (*dnslearn.Learner, error) {
-	if l := dnslearn.For(taskID); l != nil {
-		return l, nil
-	}
-	ledger, err := audit.Open(taskID)
-	if err != nil {
-		return nil, fmt.Errorf("open ledger: %w", err)
-	}
-	cfg := dnslearn.Config{
-		TaskID: taskID,
-		Ledger: ledger,
-		Writer: dnslearn.NopWriter{},
-	}
-	if req != nil {
-		cfg.Upstream = req.DNSUpstream
-		cfg.AllowDomains = req.AllowDomains
-		cfg.MaxEntries = req.MaxLearnedEntries
-		if req.LearnTTL != "" {
-			d, err := time.ParseDuration(req.LearnTTL)
-			if err != nil || d <= 0 {
-				return nil, fmt.Errorf("learn_ttl %q: must be a positive Go duration", req.LearnTTL)
-			}
-			cfg.LearnTTL = d
+	return dnslearn.GetOrCreate(taskID, func() (*dnslearn.Learner, error) {
+		ledger, err := audit.Open(taskID)
+		if err != nil {
+			return nil, fmt.Errorf("open ledger: %w", err)
 		}
-	}
-	if cfg.MaxEntries < 0 || cfg.MaxEntries > spec.MaxLearnedEntriesLimit {
-		return nil, fmt.Errorf("max_learned_entries %d out of range (0..%d)",
-			cfg.MaxEntries, spec.MaxLearnedEntriesLimit)
-	}
-	l, err := dnslearn.New(cfg)
-	if err != nil {
-		return nil, err
-	}
-	if req != nil && req.DNSLearnEnabled != nil {
-		l.SetEnabled(*req.DNSLearnEnabled)
-	}
-	// The loopback bind can still fail (fd exhaustion); learning then
-	// continues via promote/LearnNow only, with evidence.
-	ctx := context.Background()
-	l.Run(ctx)
-	if _, err := l.StartProxy(ctx, "127.0.0.1:0"); err != nil {
-		l.AuditDegraded(fmt.Sprintf("control-plane dns proxy bind failed: %v", err))
-	}
-	dnslearn.Register(l)
-	return l, nil
+		cfg := dnslearn.Config{
+			TaskID: taskID,
+			Ledger: ledger,
+			Writer: dnslearn.NopWriter{},
+		}
+		if req != nil {
+			cfg.Upstream = req.DNSUpstream
+			cfg.AllowDomains = req.AllowDomains
+			cfg.MaxEntries = req.MaxLearnedEntries
+			if req.LearnTTL != "" {
+				d, err := time.ParseDuration(req.LearnTTL)
+				if err != nil || d <= 0 {
+					return nil, fmt.Errorf("learn_ttl %q: must be a positive Go duration", req.LearnTTL)
+				}
+				cfg.LearnTTL = d
+			}
+		}
+		if cfg.MaxEntries < 0 || cfg.MaxEntries > spec.MaxLearnedEntriesLimit {
+			return nil, fmt.Errorf("max_learned_entries %d out of range (0..%d)",
+				cfg.MaxEntries, spec.MaxLearnedEntriesLimit)
+		}
+		l, err := dnslearn.New(cfg)
+		if err != nil {
+			return nil, err
+		}
+		if req != nil && req.DNSLearnEnabled != nil {
+			l.SetEnabled(*req.DNSLearnEnabled)
+		}
+		// The loopback bind can still fail (fd exhaustion); learning then
+		// continues via promote/LearnNow only, with evidence.
+		ctx := context.Background()
+		l.Run(ctx)
+		if _, err := l.StartProxy(ctx, "127.0.0.1:0"); err != nil {
+			l.AuditDegraded(fmt.Sprintf("control-plane dns proxy bind failed: %v", err))
+		}
+		return l, nil
+	})
 }
 
 // registerDNSEgressRoutes wires the P1-B DNS-learned egress endpoints.
@@ -254,5 +255,32 @@ func registerDNSEgressRoutes(api *echo.Group) {
 			l.AddAllow(d)
 		}
 		return c.JSON(http.StatusOK, dnsPolicyView(l))
+	})
+
+	// Release path for control-plane learners (review: every PUT with a new
+	// task id pinned a sweeper goroutine, a UDP socket and an open ledger
+	// forever). DELETE closes the learner and unregisters it; live task
+	// learners are ALSO deletable — StartTask's teardown tolerates a missing
+	// learner, and removing one early only stops learning (the L7 proxy and
+	// the BPF floor keep enforcing).
+	api.DELETE("/egress/:task/policy", func(c echo.Context) error {
+		task := c.Param("task")
+		if !idRegex.MatchString(task) {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid task id"})
+		}
+		l := dnslearn.For(task)
+		if l == nil {
+			return c.JSON(http.StatusNotFound, map[string]string{
+				"error": "no DNS learner registered for task",
+			})
+		}
+		dnslearn.Unregister(task, l)
+		if err := l.Close(); err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		}
+		return c.JSON(http.StatusOK, map[string]interface{}{
+			"task":    task,
+			"deleted": true,
+		})
 	})
 }

@@ -124,10 +124,14 @@ echo "--- vec0 (pvm_ip=$IP gw=$GW) ---"
 ip addr show vec0 2>&1 || echo "(vec0 missing in guest)"
 ping -c 2 -W 3 "$GW" 2>&1 || echo "ping gw FAILED rc=$?"
 
-# Success gate: root on a virtio-blk partition AND vec0 up AND gateway alive.
+# Success gate: root on a virtio-blk partition AND vec0 actually carries
+# the pvm_ip address (UP state + address match, not mere existence) AND
+# the gateway is reachable THROUGH vec0 (pin the interface so another
+# route cannot satisfy the probe).
 if grep -Eq 'vda[0-9]?' /proc/partitions \
-   && ip link show vec0 >/dev/null 2>&1 \
-   && ping -c 1 -W 3 "$GW" >/dev/null 2>&1; then
+   && ip link show vec0 2>/dev/null | grep -q 'state UP' \
+   && ip addr show vec0 2>/dev/null | grep -q "inet $IP/" \
+   && ping -c 1 -W 3 -I vec0 "$GW" >/dev/null 2>&1; then
     echo "VHOST_COW_SUCCESS"
 fi
 
