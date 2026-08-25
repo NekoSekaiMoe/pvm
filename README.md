@@ -1,6 +1,6 @@
 # PVM (Pico VM)
 
-[![Go Version](https://img.shields.io/badge/Go-1.22+-00ADD8?style=flat&logo=go)](https://golang.org)
+[![Go Version](https://img.shields.io/badge/Go-1.23+-00ADD8?style=flat&logo=go)](https://golang.org)
 [![Nuxt 3](https://img.shields.io/badge/Nuxt-3-00DC82?style=flat&logo=nuxtdotjs)](https://nuxt.com)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
@@ -82,34 +82,9 @@ PVM 将 Nuxt 3 前端静态资源直接内嵌至 Go 二进制中，一条命令�
 
 ---
 
-## 🧭 无 bridge TC/eBPF 数据面（实验性，P2）
-
-除默认的 Linux bridge + iptables 模型外，TaskSpec 可选 `network.dataplane = "tc"`，
-采用 CubeVS 风格的无 bridge 数据面（每沙箱固定内网地址，全部转发/NAT 由 TC 挂载的
-eBPF 完成，无 iptables 规则）：
-
-```text
- guest 169.254.68.6                host
-    │ TAP ingress (tc/eBPF)
-    │  ├─ 目的 169.254.68.5 (网关/代理/DNS) → redirect pvm-gw
-    │  ├─ SSRF 兜底 + 白名单校验
-    │  └─ SNAT(host_ip, 端口段) + 会话表 → host NIC
-    ▼
- host NIC ingress (tc/eBPF): 会话表反查 → 反向 DNAT → TAP
- pvm-gw egress   (tc/eBPF): 代理/DNS 应答按监听端口回送 TAP
-```
-
-- 每个沙箱内地址固定为 `169.254.68.6`，网关/代理固定为 `169.254.68.5`
-  （`pvm_ip=` / `egress_proxy=` 内核参数注入）；宿主侧由 `pvm-gw` dummy 设备承接。
-- 会话/NAT 状态在 per-task pinned maps（`/sys/fs/bpf/pvm/<task>/`），空闲超时由
-  sweeper 回收；SNAT 端口按任务哈希分段，冲突重试插入。
-- 限制（当前）：仅 IPv4 + TCP/UDP（ICMP 丢弃）；需要 root + bpffs；不可用时
-  自动降级并写入 `security:degraded_warning` 审计（L7 代理仍是执行点）。
-- 状态查询：`GET /api/network/dataplane{,/:task}`（模式、挂载点、会话数、计数器）。
-
 ## 🧪 自动化测试
 
-仓库提供完善的单元测试与 18 个 CI-Safe 端到端 Shell 测试套件（套件 `05`–`08` 与 `10`–`22` 为 CI-Safe 无特权测试，`01`–`04` 与 `09` 需 Kernel/Root 支持）：
+仓库提供完善的单元测试与 35 个 CI-Safe 端到端 Shell 测试套件（套件 `05`–`08` 与 `10`–`22` 为 CI-Safe 无特权测试，`01`–`04` 与 `09` 需 Kernel/Root 支持）：
 
 ```bash
 # 运行 Go 单元测试与对抗安全测试
