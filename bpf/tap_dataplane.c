@@ -53,6 +53,11 @@
 
 #define TC_ACT_OK 0
 #define TC_ACT_SHOT 2
+/* -1: skip this filter, continue down the chain. Required on shared devices
+ * (host NIC, pvm-gw) where several per-task filters chain on one hook:
+ * TC_ACT_OK would TERMINATE the chain and steal packets from the tasks
+ * whose filters sit at later priorities. */
+#define TC_ACT_UNSPEC -1
 
 #ifndef BPF_F_INGRESS
 #define BPF_F_INGRESS (1ULL << 0)
@@ -367,26 +372,26 @@ int world_ingress(struct __sk_buff *skb)
 
     struct ethhdr *eth = data;
     if ((void *)(eth + 1) > data_end)
-        return TC_ACT_OK;
+        return TC_ACT_UNSPEC;
     if (eth->h_proto != __builtin_bswap16(ETH_P_IP))
-        return TC_ACT_OK;
+        return TC_ACT_UNSPEC;
 
     struct iphdr *ip = (void *)(eth + 1);
     if ((void *)(ip + 1) > data_end)
-        return TC_ACT_OK;
+        return TC_ACT_UNSPEC;
     if (ip->ihl != 5)
-        return TC_ACT_OK; /* not ours to mangle; the host stack decides */
+        return TC_ACT_UNSPEC; /* not ours to mangle; the host stack decides */
 
     struct l4ports {
         __u16 sport;
         __u16 dport;
     } *l4 = (void *)(ip + 1);
     if ((void *)l4 + sizeof(struct tcphdr) > data_end)
-        return TC_ACT_OK;
+        return TC_ACT_UNSPEC;
 
     __u8 proto = ip->protocol;
     if (proto != L4PROTO_TCP && proto != L4PROTO_UDP)
-        return TC_ACT_OK;
+        return TC_ACT_UNSPEC;
 
     struct session_key key;
     __builtin_memset(&key, 0, sizeof(key));
@@ -398,7 +403,7 @@ int world_ingress(struct __sk_buff *skb)
 
     struct session_value *val = bpf_map_lookup_elem(&egress_sessions, &key);
     if (!val)
-        return TC_ACT_OK; /* host traffic: untouched */
+        return TC_ACT_UNSPEC; /* host traffic: untouched */
 
     /* Copy everything needed before the mutating helpers run. */
     __u32 guest_ip_v = val->guest_ip;
@@ -462,31 +467,31 @@ int gw_egress(struct __sk_buff *skb)
 
     struct ethhdr *eth = data;
     if ((void *)(eth + 1) > data_end)
-        return TC_ACT_OK;
+        return TC_ACT_UNSPEC;
     if (eth->h_proto != __builtin_bswap16(ETH_P_IP))
-        return TC_ACT_OK;
+        return TC_ACT_UNSPEC;
 
     struct iphdr *ip = (void *)(eth + 1);
     if ((void *)(ip + 1) > data_end)
-        return TC_ACT_OK;
+        return TC_ACT_UNSPEC;
     if (ip->ihl != 5)
-        return TC_ACT_OK;
+        return TC_ACT_UNSPEC;
 
     struct l4ports {
         __u16 sport;
         __u16 dport;
     } *l4 = (void *)(ip + 1);
     if ((void *)l4 + sizeof(struct tcphdr) > data_end)
-        return TC_ACT_OK;
+        return TC_ACT_UNSPEC;
 
     __u8 proto = ip->protocol;
     if (proto != L4PROTO_TCP && proto != L4PROTO_UDP)
-        return TC_ACT_OK;
+        return TC_ACT_UNSPEC;
 
     __u16 listen_port = l4->sport;
     struct gw_target *tgt = bpf_map_lookup_elem(&gw_port_map, &listen_port);
     if (!tgt)
-        return TC_ACT_OK; /* not a known task listener: dummy drops it */
+        return TC_ACT_UNSPEC; /* not a known task listener: dummy drops it */
 
     __u32 tap_ifindex = tgt->tap_ifindex;
     __u8 guest_mac[ETH_ALEN];

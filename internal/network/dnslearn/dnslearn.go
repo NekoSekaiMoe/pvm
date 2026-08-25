@@ -371,22 +371,50 @@ func (l *Learner) LearnedIPs(host string) []net.IP {
 
 // Drop removes every learned entry for host, deleting each from the map.
 // Returns the number dropped.
+// ipStillReferenced reports whether ip remains live under any domain other
+// than skipDomain. Callers must hold l.mu. Two allowlisted domains commonly
+// share a CDN IP; deleting the whitelist entry while the other domain still
+// holds it would drop that traffic at the data plane until the next learn.
+func (l *Learner) ipStillReferenced(skipDomain, ip string) bool {
+	for domain, es := range l.learned {
+		if domain == skipDomain {
+			continue
+		}
+		for _, e := range es {
+			if e.ip == ip {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (l *Learner) Drop(host string) int {
 	domain := normalizeName(host)
 	l.mu.Lock()
 	es := l.learned[domain]
 	delete(l.learned, domain)
 	l.total -= len(es)
+	// Collect the deletions that are safe: an IP shared with a still-live
+	// domain entry must stay in the whitelist map.
+	var doomed []entry
+	for _, e := range es {
+		if !l.ipStillReferenced(domain, e.ip) {
+			doomed = append(doomed, e)
+		}
+	}
 	writer := l.writer
 	l.mu.Unlock()
 
-	for _, e := range es {
+	for _, e := range doomed {
 		if writer != nil {
 			if err := writer.DeleteWhitelist(e.ip); err != nil {
 				log.Printf("dnslearn: whitelist map delete %s for task %s failed: %v",
 					e.ip, l.taskID, err)
 			}
 		}
+	}
+	for _, e := range es { // every dropped entry is audited, shared or not
 		l.audit("dns:expire", map[string]interface{}{
 			"domain": domain, "ip": e.ip, "expiry": e.expiry.UTC().Format(time.RFC3339),
 		}, fmt.Sprintf("dropped %s -> %s via API", domain, e.ip))
@@ -534,16 +562,28 @@ func (l *Learner) sweep() {
 			l.learned[domain] = keep
 		}
 	}
+	// Prune the deletions: every entry in `dead` is already gone from the
+	// table, so ipStillReferenced reflects the post-expiry state — an IP
+	// still held by a live (non-expired) domain entry stays in the
+	// whitelist map (shared-CDN case).
+	var doomed []expired
+	for _, d := range dead {
+		if !l.ipStillReferenced(d.domain, d.e.ip) {
+			doomed = append(doomed, d)
+		}
+	}
 	writer := l.writer
 	l.mu.Unlock()
 
-	for _, d := range dead {
+	for _, d := range doomed {
 		if writer != nil {
 			if err := writer.DeleteWhitelist(d.e.ip); err != nil {
 				log.Printf("dnslearn: whitelist map expire-delete %s for task %s failed: %v",
 					d.e.ip, l.taskID, err)
 			}
 		}
+	}
+	for _, d := range dead { // audit every expiry, shared or not
 		l.audit("dns:expire", map[string]interface{}{
 			"domain": d.domain, "ip": d.e.ip, "expiry": d.e.expiry.UTC().Format(time.RFC3339),
 		}, fmt.Sprintf("TTL expired for %s -> %s", d.domain, d.e.ip))
@@ -619,6 +659,35 @@ func Register(l *Learner) {
 	registry.Lock()
 	defer registry.Unlock()
 	registry.m[l.taskID] = l
+}
+
+// GetOrCreate atomically returns the registered learner for taskID, or
+// calls new (outside the registry lock, so new may itself touch the
+// registry) and registers it. When two callers race, both learners exist
+// but only the winner is published; the loser's learner is closed by the
+// caller-provided new's owner responsibility here — GetOrCreate closes the
+// loser before returning it, so callers never leak a bound UDP socket or
+// sweeper goroutine. This is the only race-free construction path for the
+// API's control-plane learners (PUT policy + POST allow can race).
+func GetOrCreate(taskID string, new func() (*Learner, error)) (*Learner, error) {
+	if l := For(taskID); l != nil {
+		return l, nil
+	}
+	l, err := new()
+	if err != nil {
+		return nil, err
+	}
+	registry.Lock()
+	winner, race := registry.m[taskID]
+	if !race {
+		registry.m[taskID] = l
+	}
+	registry.Unlock()
+	if race {
+		_ = l.Close() // lost the race: the winner stays registered
+		return winner, nil
+	}
+	return l, nil
 }
 
 // Unregister removes the learner for taskID if (and only if) it is l, so a

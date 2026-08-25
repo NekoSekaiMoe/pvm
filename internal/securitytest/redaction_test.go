@@ -73,6 +73,11 @@ func TestAttack_SecretLeakIntoLedgerBytes(t *testing.T) {
 // This documents that ONLY an explicit opt-out stores plaintext.
 func TestAttack_RedactorEscapeHatchStoresRaw(t *testing.T) {
 	setupRoots(t)
+	// The default redactor is a process-global switch; another test in
+	// this package may have flipped it off without restoring. Pin it so
+	// the "default ledger still scrubs" assertion below holds
+	// independently of test ordering.
+	audit.SetRedactionEnabled(true)
 
 	secret := "ghp_" + strings.Repeat("0", 40)
 	l, err := audit.Open("sec-raw", audit.WithRedactor(nil))

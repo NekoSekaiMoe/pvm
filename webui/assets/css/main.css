@@ -355,6 +355,12 @@ textarea:focus { border-color: var(--primary); }
 .switch input:checked + .slider { background: var(--success); }
 .switch input:checked + .slider::before { transform: translateX(20px); }
 .switch input:disabled + .slider { opacity: 0.5; cursor: not-allowed; }
+/* Keyboard focus ring: the real <input> is visually hidden (opacity/size 0),
+   so paint the ring on the visible slider instead. */
+.switch input:focus-visible + .slider {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
+}
 
 /* Success/warn/danger callouts */
 .callout {

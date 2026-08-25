@@ -616,7 +616,16 @@ func (d *TapDataplane) sweepOnce(idle time.Duration) int {
 	if d.sessions == nil {
 		return 0
 	}
-	cutoff := monotonicNanos() - uint64(idle)
+	now := monotonicNanos()
+	// Underflow guard: CLOCK_MONOTONIC counts from boot, so on a host
+	// younger than the idle timeout the subtraction would wrap uint64 and
+	// every session would compare as stale (and a failed clock read
+	// returning 0 would do the same). No sessions can be older than the
+	// host uptime, so sweeping is a no-op in that window.
+	if now < uint64(idle) {
+		return 0
+	}
+	cutoff := now - uint64(idle)
 	var stale []tapdpSessionKey
 	var (
 		k tapdpSessionKey

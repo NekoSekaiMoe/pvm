@@ -664,6 +664,11 @@ func (g *Gateway) transportForTask(task, host string) *http.Transport {
 		return base
 	}
 	t := base.Clone()
+	// The clone is per-request, so its (independent) idle-conn pool would
+	// strand readLoop/writeLoop goroutines for the inherited 90s
+	// IdleConnTimeout on every constrained request. Connections close as
+	// soon as the response is read instead.
+	t.DisableKeepAlives = true
 	orig := t.DialContext
 	t.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
 		conn, err := orig(ctx, network, addr)

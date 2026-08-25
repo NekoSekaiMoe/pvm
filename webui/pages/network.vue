@@ -122,8 +122,13 @@ import { apiFetch, usePoll } from '~/composables/useApi'
 const dp = ref({})
 const dpErr = ref('')
 const { refresh: refreshDp } = usePoll(async () => {
-  dp.value = await apiFetch('/api/network/dataplane')
-  dpErr.value = ''
+  try {
+    dp.value = await apiFetch('/api/network/dataplane')
+    dpErr.value = ''
+  } catch (e) {
+    dpErr.value = e.message
+    throw e // rethrow so usePoll's error backoff kicks in
+  }
 }, 4000)
 refreshDp()
 

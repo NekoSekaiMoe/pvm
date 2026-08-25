@@ -11,7 +11,7 @@
       </div>
       <div class="input-group" style="align-items:center;">
         <label class="muted" style="font-size:0.85rem;white-space:nowrap;" title="UML kernel fast seccomp userspace mode (security.uml_seccomp)">uml_seccomp</label>
-        <select v-model="seccompSelect" aria-label="UML seccomp mode" style="background:rgba(0,0,0,0.3);color:white;border:1px solid var(--glass-border);padding:0.75rem;border-radius:0.5rem;flex:0.3;">
+        <select v-model="seccompSelect" aria-label="UML seccomp mode" :disabled="!!specPath" :title="specPath ? 'spec file mode: set security.uml_seccomp inside the file' : 'UML seccomp mode'" style="background:rgba(0,0,0,0.3);color:white;border:1px solid var(--glass-border);padding:0.75rem;border-radius:0.5rem;flex:0.3;">
           <option value="off">off (default)</option>
           <option value="auto">auto</option>
           <option value="on">on</option>
@@ -260,9 +260,16 @@ const specError = ref('')
 const seccompSelect = ref('off')
 const specWithSeccomp = (content) => {
   if (seccompSelect.value === 'off') return content
-  if (/^\s*uml_seccomp\s*=/m.test(content)) return content // explicit setting wins
   const line = `uml_seccomp = "${seccompSelect.value}"`
-  if (/^\s*\[security\]\s*$/m.test(content)) {
+  const secHeader = content.match(/^\s*\[security\]\s*$/m)
+  if (secHeader) {
+    const after = content.slice(secHeader.index + secHeader[0].length)
+    const nextTable = after.match(/^\s*\[[^\]]*\]\s*$/m)
+    const secBody = nextTable ? after.slice(0, nextTable.index) : after
+    // Only a uml_seccomp INSIDE [security] is an explicit override; the
+    // same key in any other table is unrelated and must not suppress
+    // the injection.
+    if (/^\s*uml_seccomp\s*=/m.test(secBody)) return content
     return content.replace(/^(\s*\[security\]\s*)$/m, `$1\n${line}`)
   }
   return content.trimEnd() + `\n\n[security]\n${line}\n`
@@ -271,7 +278,7 @@ const specWithSeccomp = (content) => {
 const validateSpec = async () => {
   fingerprint.value = ''; specError.value = ''
   try {
-    const body = specPath.value ? { path: specPath.value } : { content: specWithSeccomp(toml.value) }
+    const body = specPath.value ? { path: specPath.value } : { content: specWithSeccomp(toml.value) } // specPath mode: server reads the file; the seccomp selector does not apply
     const r = await apiFetch('/api/tasks/load-spec', { method: 'POST', body })
     fingerprint.value = r.fingerprint
   } catch (e) { specError.value = e.message }

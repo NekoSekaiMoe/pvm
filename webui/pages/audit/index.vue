@@ -57,12 +57,17 @@ const loadPolicy = async () => {
   catch (e) { policyError.value = e.message }
 }
 const togglePolicy = async (ev) => {
+  const next = ev.target.checked
   policyBusy.value = true; policyError.value = ''
   try {
-    policy.value = await apiFetch('/api/audit/redaction-policy', { method: 'PUT', body: { enabled: ev.target.checked } })
+    policy.value = await apiFetch('/api/audit/redaction-policy', { method: 'PUT', body: { enabled: next } })
   } catch (e) {
     policyError.value = e.message
-    ev.target.checked = policy.value ? policy.enabled : !ev.target.checked
+    // Roll back from the server-known state (policy is a ref — read
+    // .value), not from the uncommitted checkbox: showing "redaction
+    // off" while the server still scrubs would misrepresent the
+    // security posture.
+    ev.target.checked = policy.value ? policy.value.enabled : !next
   } finally { policyBusy.value = false }
 }
 onMounted(loadPolicy)
