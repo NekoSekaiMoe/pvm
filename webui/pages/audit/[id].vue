@@ -1,13 +1,13 @@
 <template>
   <div>
-    <h1>Audit</h1>
+    <h1>{{ t('pages.audit.title') }}</h1>
     <p class="muted">Tamper-evident ledger (plan.md §14). Records live outside the sandbox; the agent cannot rewrite its own history.</p>
 
     <div class="glass-card">
       <div class="input-group">
-        <input v-model="taskId" placeholder="Task ID" @keyup.enter="load" />
-        <button class="btn btn-primary" @click="load">Load Ledger</button>
-        <button class="btn btn-primary" @click="verify" :disabled="!records">Verify Chain</button>
+        <input v-model="taskId" :placeholder="t('pages.audit.taskIdPh')" @keyup.enter="load" />
+        <button class="btn btn-primary" @click="load">{{ t('pages.audit.btnLoadLedger') }}</button>
+        <button class="btn btn-primary" @click="verify" :disabled="!records">{{ t('pages.audit.btnVerify') }}</button>
       </div>
       <div v-if="verifyResult" class="callout" :class="verifyResult.valid ? 'ok' : 'err'">
         <strong>{{ verifyResult.valid ? 'Chain intact.' : 'TAMPER DETECTED.' }}</strong>
@@ -35,7 +35,7 @@
       </div>
     </div>
     <div v-else-if="loaded && records && records.length === 0" class="callout warn">
-      Ledger for <strong>{{ taskId }}</strong> is empty.
+      {{ t('pages.audit.emptyLedger', { id: taskId }) }}
     </div>
     <div v-if="error" class="callout err">{{ error }}</div>
   </div>
@@ -45,7 +45,9 @@
 import { ref, onMounted } from 'vue'
 import { useRoute } from 'vue-router'
 import { apiFetch } from '~/composables/useApi'
+import { useI18n } from '~/composables/useI18n'
 
+const { t } = useI18n()
 const route = useRoute()
 const taskId = ref(route.params.id || '')
 const records = ref(null)
@@ -55,7 +57,7 @@ const error = ref('')
 
 const load = async () => {
   error.value = ''; verifyResult.value = null; loaded.value = true
-  if (!taskId.value) { error.value = 'enter a task id'; return }
+  if (!taskId.value) { error.value = t('pages.audit.errTaskId'); return }
   try { records.value = await apiFetch(`/api/audit/${encodeURIComponent(taskId.value)}`) }
   catch (e) { error.value = e.message; records.value = null }
 }

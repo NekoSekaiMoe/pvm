@@ -1,12 +1,12 @@
 <template>
   <div>
-    <h1>Policy</h1>
+    <h1>{{ t('pages.policy.title') }}</h1>
     <p class="muted">Tool/Policy Gateway rules (plan.md §6). First match wins; a default-deny catch-all is auto-appended.</p>
 
     <div class="glass-card">
       <div class="input-group">
         <input v-model="task" placeholder="Task ID" @keyup.enter="load" />
-        <button class="btn btn-primary" @click="load">View Rules</button>
+        <button class="btn btn-primary" @click="load">{{ t('pages.policy.btnView') }}</button>
       </div>
       <div v-if="error" class="callout err">{{ error }}</div>
     </div>
@@ -43,7 +43,7 @@
         <input v-model="probe.name" placeholder="tool name" />
         <input v-model="probe.args" placeholder='args JSON: {"path":"/etc/hosts"}' />
       </div>
-      <button class="btn btn-primary" @click="probeCall">Run via /api/exec</button>
+      <button class="btn btn-primary" @click="probeCall">{{ t('pages.policy.btnRun') }}</button>
       <div v-if="probeResult !== null" class="callout" :class="probeOk ? 'ok' : 'err'" style="margin-top:0.75rem;">
         <pre class="mono" style="white-space:pre-wrap;margin:0;">{{ JSON.stringify(probeResult, null, 2) }}</pre>
       </div>
@@ -54,6 +54,9 @@
 <script setup>
 import { ref } from 'vue'
 import { apiFetch } from '~/composables/useApi'
+import { useI18n } from '~/composables/useI18n'
+
+const { t } = useI18n()
 
 const task = ref('')
 const rules = ref(null)

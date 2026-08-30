@@ -21,6 +21,10 @@ nuxt_bin.nuxt(
             "pages/**",
             "composables/**",
             "assets/**",
+            # locale dictionaries imported by composables/useI18n.js via
+            # ~/locales/{en,zh} — without this entry the bazel sandbox
+            # omits the directory and vite fails with ENOENT.
+            "locales/**",
         ],
     ),
     args = ["generate"],

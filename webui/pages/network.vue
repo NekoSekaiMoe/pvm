@@ -1,19 +1,18 @@
 <template>
   <div>
-    <h1>Network &amp; Egress Security</h1>
+    <h1>{{ t('pages.network.title') }}</h1>
     <p class="muted">L7 egress gateway, DNS-learned allowlists and eBPF TC data plane (bridge default, bridgeless `tc` opt-in).</p>
 
     <!-- Live: TC/eBPF dataplane posture -->
     <div class="glass-card">
-      <h3>TC/eBPF Data Plane <span v-if="dpErr" class="pill deny">unreachable</span></h3>
+      <h3>TC/eBPF Data Plane <span v-if="dpErr" class="pill deny">{{ t('pages.network.unreachable') }}</span></h3>
       <p class="muted" style="margin-bottom:1rem;">
         Bridgeless dataplane posture from <code>GET /api/network/dataplane</code>.
         Default mode: <code>{{ dp.mode_default ?? '—' }}</code>;
         gateway device: <code>{{ gwDevice }}</code>.
       </p>
       <div v-if="tasksWithDp.length === 0" class="muted" style="font-size:0.85rem;">
-        No task currently runs the bridgeless <code>tc</code> dataplane (tasks on the default
-        <code>bridge</code> plane do not appear here).
+        {{ t('pages.network.emptyDp') }}
       </div>
       <div v-else class="table-container">
         <table>
@@ -50,7 +49,7 @@
           <option value="" disabled>— select task —</option>
           <option v-for="t in taskOptions" :key="t.id" :value="t.id">{{ t.id }}</option>
         </select>
-        <button class="btn" @click="refreshLearned" :disabled="!dnsTask">Refresh</button>
+        <button class="btn" @click="refreshLearned" :disabled="!dnsTask">{{ t('pages.network.btnRefresh') }}</button>
       </div>
 
       <div v-if="learnErr" class="callout err">{{ learnErr }}</div>
@@ -67,7 +66,7 @@
                 <td class="mono">{{ e.ip }}</td>
                 <td>{{ e.remaining_sec }}s</td>
                 <td>
-                  <button class="btn" style="font-size:0.72rem;padding:0.25rem 0.5rem;" @click="dropLearned(e.domain)">Drop</button>
+                  <button class="btn" style="font-size:0.72rem;padding:0.25rem 0.5rem;" @click="dropLearned(e.domain)">{{ t('pages.network.btnDrop') }}</button>
                 </td>
               </tr>
             </tbody>
@@ -79,7 +78,7 @@
 
         <div class="form-row" style="margin-top:0.75rem;">
           <input v-model="promoteDomain" placeholder="promote domain e.g. api.github.com" class="mono" />
-          <button class="btn btn-primary" @click="promote" :disabled="!dnsTask || !promoteDomain">Promote &amp; Learn</button>
+          <button class="btn btn-primary" @click="promote" :disabled="!dnsTask || !promoteDomain">{{ t('pages.network.btnPromote') }}</button>
         </div>
         <div v-if="promoteMsg" class="callout ok">{{ promoteMsg }}</div>
         <div v-if="promoteErr" class="callout err">{{ promoteErr }}</div>
@@ -117,6 +116,9 @@
 <script setup>
 import { ref, computed, watch } from 'vue'
 import { apiFetch, usePoll } from '~/composables/useApi'
+import { useI18n } from '~/composables/useI18n'
+
+const { t } = useI18n()
 
 // --- TC/eBPF dataplane posture (global view, polled) ---
 const dp = ref({})

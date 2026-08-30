@@ -1,6 +1,6 @@
 <template>
   <div>
-    <h1>Identity &amp; Credential Broker</h1>
+    <h1>{{ t('pages.identity.title') }}</h1>
     <p class="muted">Credential Broker (plan.md §4). Mints short-lived, scope-bounded HMAC tokens so long-lived credentials never enter the guest.</p>
 
     <div class="glass-card">
@@ -43,4 +43,7 @@
 </template>
 
 <script setup>
+import { useI18n } from '~/composables/useI18n'
+
+const { t } = useI18n()
 </script>

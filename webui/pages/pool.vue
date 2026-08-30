@@ -1,6 +1,6 @@
 <template>
   <div>
-    <h1>Pool &amp; Quota</h1>
+    <h1>{{ t('pages.pool.title') }}</h1>
     <p class="muted">Warm pool + per-tenant quota (plan.md §12). Shared read-only images, never shared task identity or writable state.</p>
 
     <div class="stat-grid">
@@ -22,7 +22,7 @@
       </div>
       <div class="input-group">
         <input v-model.number="warmN" type="number" min="1" max="100" placeholder="count" style="flex:0.3" />
-        <button class="btn btn-primary" @click="doWarm">Warm {{ warmN }} sandbox(es)</button>
+        <button class="btn btn-primary" @click="doWarm">{{ t('pages.pool.btnWarm', { n: warmN }) }}</button>
       </div>
       <div v-if="warmMsg" class="callout ok">{{ warmMsg }}</div>
       <div v-if="warmErr" class="callout err">{{ warmErr }}</div>
@@ -40,7 +40,7 @@
       </div>
       <div class="input-group">
         <input v-model.number="quota.MaxTasksPerHour" type="number" placeholder="max tasks / hour" />
-        <button class="btn btn-primary" @click="setQuota">Apply Quota</button>
+        <button class="btn btn-primary" @click="setQuota">{{ t('pages.pool.btnApplyQuota') }}</button>
       </div>
       <div v-if="quotaMsg" class="callout ok">{{ quotaMsg }}</div>
       <div v-if="quotaErr" class="callout err">{{ quotaErr }}</div>
@@ -53,6 +53,9 @@
 <script setup>
 import { ref } from 'vue'
 import { apiFetch, usePoll } from '~/composables/useApi'
+import { useI18n } from '~/composables/useI18n'
+
+const { t } = useI18n()
 
 const stats = ref({})
 const error = ref(null)

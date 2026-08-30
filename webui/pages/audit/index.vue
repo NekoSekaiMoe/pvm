@@ -1,6 +1,6 @@
 <template>
   <div>
-    <h1>Audit</h1>
+    <h1>{{ t('pages.audit.title') }}</h1>
     <p class="muted">Tamper-evident ledger (plan.md §14). Records live outside the sandbox; the agent cannot rewrite its own history.</p>
     <div class="glass-card">
       <h3>Redaction Policy</h3>
@@ -28,7 +28,7 @@
     <div class="glass-card">
       <div class="input-group">
         <input v-model="taskId" placeholder="Task ID (e.g. agent-task)" @keyup.enter="go" />
-        <button class="btn btn-primary" @click="go">Open Ledger</button>
+        <button class="btn btn-primary" @click="go">{{ t('pages.audit.btnOpenLedger') }}</button>
       </div>
       <p class="muted" style="font-size:0.8rem;">Tip: from a task row, click the <em>Audit</em> button to jump straight in.</p>
     </div>
@@ -39,6 +39,9 @@
 import { ref, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { apiFetch } from '~/composables/useApi'
+import { useI18n } from '~/composables/useI18n'
+
+const { t } = useI18n()
 const router = useRouter()
 const taskId = ref('')
 const go = () => {

@@ -2,17 +2,17 @@
   <div>
     <div class="toolbar">
       <div>
-        <h1>Persistent Volumes</h1>
+        <h1>{{ t('pages.volumes.title') }}</h1>
         <p class="muted">Storage volume registry (plan.md §11). Mountable into sandboxes via hostfs/virtio drivers.</p>
       </div>
-      <button class="btn btn-primary" @click="showCreateModal = true">+ Create Volume</button>
+      <button class="btn btn-primary" @click="showCreateModal = true">{{ t('pages.volumes.btnCreate') }}</button>
     </div>
 
     <!-- Volumes Table -->
     <div class="glass-card">
       <div class="toolbar">
-        <input v-model="searchQuery" placeholder="Search volumes..." class="search-input" />
-        <span class="muted" style="font-size:0.875rem;">Total: {{ filteredVolumes.length }} volume(s)</span>
+        <input v-model="searchQuery" :placeholder="t('pages.volumes.searchPh')" class="search-input" />
+        <span class="muted" style="font-size:0.875rem;">{{ t('pages.volumes.totalVolumes', { n: filteredVolumes.length }) }}</span>
       </div>
 
       <div class="table-container">
@@ -40,21 +40,21 @@
               <td class="timeline-meta">{{ fmt(v.created_at) }}</td>
               <td>
                 <button class="btn btn-primary" style="font-size:0.75rem;padding:0.3rem 0.5rem;margin-right:0.3rem;" @click="snapshotVolumePrompt(v.volume_id)">
-                  📸 Snapshot
+                  {{ t('pages.volumes.btnSnapshot') }}
                 </button>
                 <button class="btn btn-primary" style="font-size:0.75rem;padding:0.3rem 0.5rem;margin-right:0.3rem;" @click="cloneVolumePrompt(v.volume_id)">
-                  🐑 Clone
+                  {{ t('pages.volumes.btnClone') }}
                 </button>
                 <button class="btn btn-primary" style="font-size:0.75rem;padding:0.3rem 0.5rem;margin-right:0.3rem;background:var(--accent);" @click="rollbackVolumePrompt(v.volume_id)">
-                  ↩ Rollback
+                  {{ t('pages.volumes.btnRollback') }}
                 </button>
-                <button class="btn btn-danger" style="font-size:0.75rem;padding:0.3rem 0.5rem;" @click="deleteVolume(v.volume_id)" :disabled="v.refcount > 0" :title="v.refcount > 0 ? 'Cannot delete mounted volume' : 'Delete volume'">
-                  Delete
+                <button class="btn btn-danger" style="font-size:0.75rem;padding:0.3rem 0.5rem;" @click="deleteVolume(v.volume_id)" :disabled="v.refcount > 0" :title="v.refcount > 0 ? 'Cannot delete mounted volume' : t('pages.volumes.deleteTitle')">
+                  {{ t('pages.volumes.btnDelete') }}
                 </button>
               </td>
             </tr>
             <tr v-if="filteredVolumes.length === 0">
-              <td colspan="6" class="muted" style="text-align:center;padding:2rem;">No persistent volumes found.</td>
+              <td colspan="6" class="muted" style="text-align:center;padding:2rem;">{{ t('pages.volumes.empty') }}</td>
             </tr>
           </tbody>
         </table>
@@ -64,7 +64,7 @@
     <!-- Snapshot Modal -->
     <div v-if="snapshotModalVolume" ref="snapshotModalEl" class="modal-backdrop" role="dialog" aria-modal="true" tabindex="-1" @keydown.esc="snapshotModalVolume = null">
       <div class="modal-box">
-        <h3>Snapshot Volume — {{ snapshotModalVolume }}</h3>
+        <h3>{{ t('pages.volumes.snapTitle') }} — {{ snapshotModalVolume }}</h3>
         <p class="muted" style="font-size:0.85rem;margin-bottom:1rem;">Branch an instant Copy-on-Write snapshot of this volume (stored as snap-&lt;name&gt;.qcow2 by the cow engine).</p>
 
         <div class="form-row full">
@@ -76,8 +76,8 @@
         <div v-if="snapshotSuccess" class="callout allow" style="color:var(--success, #4ade80);background:rgba(74,222,128,0.1);padding:0.75rem;border-radius:0.5rem;margin-top:1rem;">{{ snapshotSuccess }}</div>
 
         <div style="display:flex;justify-content:flex-end;gap:1rem;margin-top:1.5rem;">
-          <button class="btn btn-danger" @click="snapshotModalVolume = null">Close</button>
-          <button class="btn btn-primary" @click="executeSnapshotVolume">Create Snapshot</button>
+          <button class="btn btn-danger" @click="snapshotModalVolume = null">{{ t('common.close') }}</button>
+          <button class="btn btn-primary" @click="executeSnapshotVolume">{{ t('pages.volumes.btnCreateSnap') }}</button>
         </div>
       </div>
     </div>
@@ -85,7 +85,7 @@
     <!-- Clone Modal -->
     <div v-if="cloneModalVolume" ref="cloneModalEl" class="modal-backdrop" role="dialog" aria-modal="true" tabindex="-1" @keydown.esc="cloneModalVolume = null">
       <div class="modal-box">
-        <h3>Clone Volume — {{ cloneModalVolume }}</h3>
+        <h3>{{ t('pages.volumes.cloneTitle') }} — {{ cloneModalVolume }}</h3>
         <p class="muted" style="font-size:0.85rem;margin-bottom:1rem;">Create an instant Copy-on-Write branch of this persistent volume.</p>
         
         <div class="form-row full">
@@ -97,8 +97,8 @@
         <div v-if="cloneSuccess" class="callout allow" style="color:var(--success, #4ade80);background:rgba(74,222,128,0.1);padding:0.75rem;border-radius:0.5rem;margin-top:1rem;">{{ cloneSuccess }}</div>
 
         <div style="display:flex;justify-content:flex-end;gap:1rem;margin-top:1.5rem;">
-          <button class="btn btn-danger" @click="cloneModalVolume = null">Close</button>
-          <button class="btn btn-primary" @click="executeCloneVolume">Clone</button>
+          <button class="btn btn-danger" @click="cloneModalVolume = null">{{ t('common.close') }}</button>
+          <button class="btn btn-primary" @click="executeCloneVolume">{{ t('pages.volumes.btnClone') }}</button>
         </div>
       </div>
     </div>
@@ -106,7 +106,7 @@
     <!-- Rollback Modal -->
     <div v-if="rollbackModalVolume" ref="rollbackModalEl" class="modal-backdrop" role="dialog" aria-modal="true" tabindex="-1" @keydown.esc="rollbackModalVolume = null">
       <div class="modal-box">
-        <h3>Rollback Volume — {{ rollbackModalVolume }}</h3>
+        <h3>{{ t('pages.volumes.rollbackTitle') }} — {{ rollbackModalVolume }}</h3>
         <p class="muted" style="font-size:0.85rem;margin-bottom:1rem;">Restore volume to a previously created snapshot point.</p>
         
         <div class="form-row full">
@@ -121,14 +121,14 @@
             </button>
           </div>
         </div>
-        <p v-else-if="!rollbackSnapshotsLoading" class="muted" style="font-size:0.8rem;">No snapshots found for this volume — create one with the 📸 Snapshot action first.</p>
+        <p v-else-if="!rollbackSnapshotsLoading" class="muted" style="font-size:0.8rem;">{{ t('pages.volumes.noSnaps') }}</p>
 
         <div v-if="rollbackError" class="callout err">{{ rollbackError }}</div>
         <div v-if="rollbackSuccess" class="callout allow" style="color:var(--success, #4ade80);background:rgba(74,222,128,0.1);padding:0.75rem;border-radius:0.5rem;margin-top:1rem;">{{ rollbackSuccess }}</div>
 
         <div style="display:flex;justify-content:flex-end;gap:1rem;margin-top:1.5rem;">
-          <button class="btn btn-danger" @click="rollbackModalVolume = null">Close</button>
-          <button class="btn btn-primary" @click="executeRollbackVolume">Rollback</button>
+          <button class="btn btn-danger" @click="rollbackModalVolume = null">{{ t('common.close') }}</button>
+          <button class="btn btn-primary" @click="executeRollbackVolume">{{ t('pages.volumes.btnRollback') }}</button>
         </div>
       </div>
     </div>
@@ -136,7 +136,7 @@
     <!-- Create Modal -->
     <div v-if="showCreateModal" class="modal-backdrop">
       <div class="modal-box">
-        <h3>Create Persistent Volume</h3>
+        <h3>{{ t('pages.volumes.createTitle') }}</h3>
         <p class="muted" style="font-size:0.85rem;margin-bottom:1rem;">Register a storage volume backed by builtin hostfs or external driver plugin.</p>
         
         <div class="form-row full">
@@ -163,8 +163,8 @@
         <div v-if="errorMsg" class="callout err">{{ errorMsg }}</div>
 
         <div style="display:flex;justify-content:flex-end;gap:1rem;margin-top:1.5rem;">
-          <button class="btn btn-danger" @click="showCreateModal = false">Cancel</button>
-          <button class="btn btn-primary" @click="createVolume">Create</button>
+          <button class="btn btn-danger" @click="showCreateModal = false">{{ t('common.cancel') }}</button>
+          <button class="btn btn-primary" @click="createVolume">{{ t('pages.volumes.btnCreateVol') }}</button>
         </div>
       </div>
     </div>
@@ -174,6 +174,9 @@
 <script setup>
 import { ref, computed, nextTick } from 'vue'
 import { apiFetch, usePoll } from '~/composables/useApi'
+import { useI18n } from '~/composables/useI18n'
+
+const { t } = useI18n()
 
 const volumes = ref([])
 const searchQuery = ref('')

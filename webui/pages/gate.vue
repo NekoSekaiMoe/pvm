@@ -1,6 +1,6 @@
 <template>
   <div>
-    <h1>Artifact Gate Verification</h1>
+    <h1>{{ t('pages.gate.title') }}</h1>
     <p class="muted">Release verification gate (plan.md §7). Scans diffs, build logs, execution traces, and declared files for credentials before release.</p>
 
     <!-- Presets -->
@@ -8,9 +8,9 @@
       <div class="toolbar">
         <h3>Sample Verification Scenarios</h3>
         <div style="display:flex;gap:0.5rem;flex-wrap:wrap;">
-          <button class="btn btn-primary" @click="loadPreset('clean')">Clean Release (PASS)</button>
-          <button class="btn btn-danger" @click="loadPreset('aws_leak')">Leaked AWS Key (FAIL)</button>
-          <button class="btn btn-danger" @click="loadPreset('token_leak')">Leaked GitHub Token (FAIL)</button>
+          <button class="btn btn-primary" @click="loadPreset('clean')">{{ t('pages.gate.btnClean') }}</button>
+          <button class="btn btn-danger" @click="loadPreset('aws_leak')">{{ t('pages.gate.btnAws') }}</button>
+          <button class="btn btn-danger" @click="loadPreset('token_leak')">{{ t('pages.gate.btnToken') }}</button>
         </div>
       </div>
     </div>
@@ -55,7 +55,7 @@
 
       <div style="margin-top:1rem;">
         <button class="btn btn-primary" @click="runVerify" :disabled="verifying">
-          {{ verifying ? 'Verifying...' : 'Run Gate Verification' }}
+          {{ verifying ? t('pages.gate.btnRunning') : t('pages.gate.btnRun') }}
         </button>
       </div>
 
@@ -65,9 +65,9 @@
     <!-- Results Display -->
     <div v-if="verdict" class="glass-card">
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem;">
-        <h3>Verification Verdict</h3>
+        <h3>{{ t('pages.gate.verdictTitle') }}</h3>
         <span class="pill" :class="verdict.passed ? 'allow' : 'deny'" style="font-size:1rem;padding:0.4rem 1rem;">
-          {{ verdict.passed ? 'PASS - RELEASE PERMITTED' : 'FAIL - RELEASE BLOCKED' }}
+          {{ verdict.passed ? t('pages.gate.pass') : t('pages.gate.fail') }}
         </span>
       </div>
 
@@ -75,7 +75,7 @@
         <strong>Canonical Artifact Hash:</strong> <span class="mono">{{ verdict.hash }}</span>
       </div>
 
-      <h4 style="margin:1rem 0 0.5rem;">Pipeline Steps:</h4>
+      <h4 style="margin:1rem 0 0.5rem;">{{ t('pages.gate.steps') }}</h4>
       <div class="table-container">
         <table>
           <thead>
@@ -100,6 +100,9 @@
 <script setup>
 import { ref } from 'vue'
 import { apiFetch } from '~/composables/useApi'
+import { useI18n } from '~/composables/useI18n'
+
+const { t } = useI18n()
 
 const bundle = ref({
   task_id: 'task-clean',

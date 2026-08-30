@@ -1,6 +1,6 @@
 <template>
   <div>
-    <h1>Ephemeral Sandboxes</h1>
+    <h1>{{ t('pages.ephemeral.title') }}</h1>
     <p class="muted">
       Non-persistent task sandboxes (<span class="mono">workspace.ephemeral</span>): the rootfs boots
       read-only (kernel <span class="mono">ro</span> + read-only block backend), no qcow2 overlay is
@@ -64,7 +64,7 @@
             <label class="check"><input type="checkbox" v-model="v.readOnly" /> ro</label>
             <button class="btn btn-danger" style="font-size:0.75rem;padding:0.3rem 0.6rem;" @click="form.volumes.splice(i, 1)">✕</button>
           </div>
-          <button class="btn btn-primary" style="font-size:0.8rem;" @click="form.volumes.push({ name: '', path: '', readOnly: false })">+ Volume</button>
+          <button class="btn btn-primary" style="font-size:0.8rem;" @click="form.volumes.push({ name: '', path: '', readOnly: false })">{{ t('pages.ephemeral.btnAddVolume') }}</button>
         </div>
       </div>
     </div>
@@ -74,15 +74,15 @@
       <div class="toolbar">
         <h3>Generated TaskSpec (TOML)</h3>
         <div class="input-group">
-          <button class="btn btn-primary" @click="validate">Validate / Fingerprint</button>
-          <button class="btn btn-primary" @click="copyToml">Copy TOML</button>
+          <button class="btn btn-primary" @click="validate">{{ t('pages.ephemeral.btnValidate') }}</button>
+          <button class="btn btn-primary" @click="copyToml">{{ t('pages.ephemeral.btnCopyToml') }}</button>
         </div>
       </div>
       <textarea class="mono" :value="toml" rows="22" readonly spellcheck="false"></textarea>
       <div v-if="fingerprint" class="callout ok">
-        <strong>Valid.</strong> Fingerprint: <span class="mono">{{ fingerprint }}</span>
+        <strong>{{ t('pages.ephemeral.valid') }}</strong> Fingerprint: <span class="mono">{{ fingerprint }}</span>
       </div>
-      <div v-if="specError" class="callout err"><strong>Invalid:</strong> {{ specError }}</div>
+      <div v-if="specError" class="callout err"><strong>{{ t('pages.ephemeral.invalid') }}</strong> {{ specError }}</div>
     </div>
 
     <!-- Launch cheatsheet -->
@@ -113,6 +113,9 @@ curl -X POST "$PVM_API/api/containers/start" \
 <script setup>
 import { ref, computed } from 'vue'
 import { apiFetch } from '~/composables/useApi'
+import { useI18n } from '~/composables/useI18n'
+
+const { t } = useI18n()
 
 const form = ref({
   caller: 'alice',

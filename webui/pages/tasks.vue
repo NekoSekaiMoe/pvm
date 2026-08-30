@@ -1,44 +1,44 @@
 <template>
   <div>
-    <h1>Task Sandboxes</h1>
-    <p class="muted">Lifecycle FSM (plan.md §8). Tasks move through Pending → Provisioning → Ready → Running ↔ Suspended → Review → Completed.</p>
+    <h1>{{ t('pages.tasks.title') }}</h1>
+    <p class="muted">{{ t('pages.tasks.subtitle') }}</p>
 
     <!-- Launch from TaskSpec -->
     <div class="glass-card">
-      <h3>Launch from TaskSpec (TOML)</h3>
+      <h3>{{ t('pages.tasks.specTitle') }}</h3>
       <div class="form-row full">
         <textarea v-model="toml" placeholder="version = 1&#10;caller = 'alice'&#10;[runtime]&#10;name = 't1'&#10;memory = '512M'&#10;..."></textarea>
       </div>
       <div class="input-group" style="align-items:center;">
         <label class="muted" style="font-size:0.85rem;white-space:nowrap;" title="UML kernel fast seccomp userspace mode (security.uml_seccomp)">uml_seccomp</label>
-        <select v-model="seccompSelect" aria-label="UML seccomp mode" :disabled="!!specPath" :title="specPath ? 'spec file mode: set security.uml_seccomp inside the file' : 'UML seccomp mode'" style="background:rgba(0,0,0,0.3);color:white;border:1px solid var(--glass-border);padding:0.75rem;border-radius:0.5rem;flex:0.3;">
+        <select v-model="seccompSelect" aria-label="UML seccomp mode" :disabled="!!specPath" :title="specPath ? t('pages.tasks.seccompFileModeTitle') : t('pages.tasks.seccompModeTitle')" style="background:rgba(0,0,0,0.3);color:white;border:1px solid var(--glass-border);padding:0.75rem;border-radius:0.5rem;flex:0.3;">
           <option value="off">off (default)</option>
           <option value="auto">auto</option>
           <option value="on">on</option>
         </select>
         <span class="muted" style="font-size:0.75rem;">
-          on/auto: fast syscall path; guest kernel integrity weakened (audit-recorded). Injected into <span class="mono">[security]</span> on validate; an explicit <span class="mono">uml_seccomp</span> in the TOML always wins.
+          {{ t('pages.tasks.seccompHint') }} <span class="mono">[security]</span> {{ t('pages.tasks.seccompHint2') }} <span class="mono">uml_seccomp</span> {{ t('pages.tasks.seccompHint3') }}
         </span>
       </div>
       <div class="input-group">
-        <input v-model="specPath" placeholder="Optional: path to ./uml/agentpvm.toml on server" />
-        <button class="btn btn-primary" @click="validateSpec">Validate / Fingerprint</button>
-        <button class="btn btn-primary" @click="launchSpec" :disabled="!fingerprint">Launch</button>
+        <input v-model="specPath" :placeholder="t('pages.tasks.specPathPh')" />
+        <button class="btn btn-primary" @click="validateSpec">{{ t('pages.tasks.btnValidate') }}</button>
+        <button class="btn btn-primary" @click="launchSpec" :disabled="!fingerprint">{{ t('pages.tasks.btnLaunch') }}</button>
       </div>
       <div v-if="fingerprint" class="callout ok">
-        <strong>Valid.</strong> Fingerprint: <span class="mono">{{ fingerprint }}</span>
+        <strong>{{ t('pages.tasks.valid') }}</strong> {{ t('pages.tasks.fingerprint') }} <span class="mono">{{ fingerprint }}</span>
       </div>
-      <div v-if="specError" class="callout err"><strong>Invalid:</strong> {{ specError }}</div>
+      <div v-if="specError" class="callout err"><strong>{{ t('pages.tasks.invalid') }}</strong> {{ specError }}</div>
     </div>
 
     <!-- Task table -->
     <div class="glass-card">
       <!-- Status Tabs -->
       <div class="tabs">
-        <button 
-          v-for="s in ['all', 'running', 'suspended', 'provisioning', 'ready', 'review', 'completed', 'failed', 'quarantined']" 
-          :key="s" 
-          class="tab" 
+        <button
+          v-for="s in ['all', 'running', 'suspended', 'provisioning', 'ready', 'review', 'completed', 'failed', 'quarantined']"
+          :key="s"
+          class="tab"
           :class="{ active: currentFilter === s }"
           @click="currentFilter = s"
         >
@@ -47,71 +47,71 @@
       </div>
 
       <div class="toolbar">
-        <input v-model="searchQuery" placeholder="Search tasks by ID, tenant, or fingerprint..." class="search-input" />
-        <span class="muted" style="font-size:0.875rem;">Total: {{ filteredTasks.length }} task(s)</span>
+        <input v-model="searchQuery" :placeholder="t('pages.tasks.searchPh')" class="search-input" />
+        <span class="muted" style="font-size:0.875rem;">{{ t('pages.tasks.totalTasks', { n: filteredTasks.length }) }}</span>
       </div>
 
       <div class="table-container">
         <table>
           <thead>
             <tr>
-              <th>Task ID</th>
-              <th>Tenant</th>
-              <th>Status</th>
-              <th>PID</th>
-              <th>Started</th>
-              <th>Spec FP</th>
-              <th>Lifecycle Controls</th>
-              <th>Inspect</th>
+              <th>{{ t('pages.tasks.colId') }}</th>
+              <th>{{ t('pages.tasks.colTenant') }}</th>
+              <th>{{ t('pages.tasks.colStatus') }}</th>
+              <th>{{ t('pages.tasks.colPid') }}</th>
+              <th>{{ t('pages.tasks.colStarted') }}</th>
+              <th>{{ t('pages.tasks.colFp') }}</th>
+              <th>{{ t('pages.tasks.colLifecycle') }}</th>
+              <th>{{ t('pages.tasks.colInspect') }}</th>
             </tr>
           </thead>
           <tbody>
-            <tr v-for="t in filteredTasks" :key="t.id">
-              <td class="mono"><strong>{{ t.id }}</strong></td>
-              <td>{{ t.tenant || '—' }}</td>
+            <tr v-for="task in filteredTasks" :key="task.id">
+              <td class="mono"><strong>{{ task.id }}</strong></td>
+              <td>{{ task.tenant || '—' }}</td>
               <td>
-                <span class="badge" :class="t.status">{{ t.status }}</span>
-                <span class="badge" :class="'seccomp-' + seccompMode(t)" :title="seccompTip(t)" style="margin-left:0.4rem;font-size:0.7rem;">seccomp:{{ seccompMode(t) }}</span>
+                <span class="badge" :class="task.status">{{ task.status }}</span>
+                <span class="badge" :class="'seccomp-' + seccompMode(task)" :title="seccompTip(task)" style="margin-left:0.4rem;font-size:0.7rem;">seccomp:{{ seccompMode(task) }}</span>
               </td>
-              <td>{{ t.pid || '—' }}</td>
-              <td class="timeline-meta">{{ fmt(t.started_at) }}</td>
-              <td class="mono" :title="t.spec_fingerprint">{{ short(t.spec_fingerprint) }}</td>
+              <td>{{ task.pid || '—' }}</td>
+              <td class="timeline-meta">{{ fmt(task.started_at) }}</td>
+              <td class="mono" :title="task.spec_fingerprint">{{ short(task.spec_fingerprint) }}</td>
               <td>
                 <!-- Pause Button for Running -->
-                <button 
-                  v-if="t.status === 'running'" 
-                  class="btn btn-danger" 
+                <button
+                  v-if="task.status === 'running'"
+                  class="btn btn-danger"
                   style="font-size:0.75rem;padding:0.3rem 0.6rem;margin-right:0.3rem;"
-                  @click="pauseTask(t.id)"
+                  @click="pauseTask(task.id)"
                 >
-                  ⏸ Pause
+                  {{ t('pages.tasks.btnPause') }}
                 </button>
                 <!-- Resume Button for Suspended -->
-                <button 
-                  v-if="t.status === 'suspended'" 
-                  class="btn btn-primary" 
+                <button
+                  v-if="task.status === 'suspended'"
+                  class="btn btn-primary"
                   style="font-size:0.75rem;padding:0.3rem 0.6rem;margin-right:0.3rem;background:var(--success);"
-                  @click="resumeTask(t.id)"
+                  @click="resumeTask(task.id)"
                 >
-                  ▶ Resume
+                  {{ t('pages.tasks.btnResume') }}
                 </button>
-                <button class="btn btn-primary" @click="showTransitions(t)" style="font-size:0.75rem;padding:0.3rem 0.6rem;margin-right:0.3rem;">
-                  FSM
+                <button class="btn btn-primary" @click="showTransitions(task)" style="font-size:0.75rem;padding:0.3rem 0.6rem;margin-right:0.3rem;">
+                  {{ t('pages.tasks.btnFsm') }}
                 </button>
-                <button class="btn btn-primary" @click="openSnapshotModal(t)" style="font-size:0.75rem;padding:0.3rem 0.6rem;margin-right:0.3rem;">
-                  📸 Snaps
+                <button class="btn btn-primary" @click="openSnapshotModal(task)" style="font-size:0.75rem;padding:0.3rem 0.6rem;margin-right:0.3rem;">
+                  {{ t('pages.tasks.btnSnaps') }}
                 </button>
-                <button class="btn btn-primary" @click="cloneTaskPrompt(t.id)" style="font-size:0.75rem;padding:0.3rem 0.6rem;">
-                  🐑 Clone
+                <button class="btn btn-primary" @click="cloneTaskPrompt(task.id)" style="font-size:0.75rem;padding:0.3rem 0.6rem;">
+                  {{ t('pages.tasks.btnClone') }}
                 </button>
               </td>
               <td>
-                <NuxtLink :to="`/audit/${t.id}`" class="btn btn-primary" style="font-size:0.75rem;padding:0.3rem 0.5rem;text-decoration:none;margin-right:0.3rem;">Audit</NuxtLink>
-                <NuxtLink :to="`/logs/${t.id}`" class="btn btn-primary" style="font-size:0.75rem;padding:0.3rem 0.5rem;text-decoration:none;">Logs</NuxtLink>
+                <NuxtLink :to="`/audit/${task.id}`" class="btn btn-primary" style="font-size:0.75rem;padding:0.3rem 0.5rem;text-decoration:none;margin-right:0.3rem;">{{ t('pages.tasks.btnAudit') }}</NuxtLink>
+                <NuxtLink :to="`/logs/${task.id}`" class="btn btn-primary" style="font-size:0.75rem;padding:0.3rem 0.5rem;text-decoration:none;">{{ t('pages.tasks.btnLogs') }}</NuxtLink>
               </td>
             </tr>
             <tr v-if="filteredTasks.length === 0">
-              <td colspan="8" class="muted" style="text-align:center;padding:2rem;">No tasks match filter.</td>
+              <td colspan="8" class="muted" style="text-align:center;padding:2rem;">{{ t('pages.tasks.empty') }}</td>
             </tr>
           </tbody>
         </table>
@@ -121,28 +121,28 @@
     <!-- Transition modal -->
     <div v-if="selected" class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="fsm-modal-title" @keydown.esc="selected = null">
       <div class="modal-box">
-        <h3 id="fsm-modal-title">FSM Transitions — {{ selected.id }}</h3>
+        <h3 id="fsm-modal-title">{{ t('pages.tasks.fsmTitle', { id: selected.id }) }}</h3>
         <p class="muted" style="margin-bottom:1rem;font-size:0.85rem;">
-          UML seccomp: <span class="badge" :class="'seccomp-' + seccompMode(selected)" :title="seccompTip(selected)">{{ seccompMode(selected) }}</span>
-          <span v-if="seccompMode(selected) !== 'off'"> — fast syscall path; guest kernel integrity weakened</span>
+          {{ t('pages.tasks.fsmSeccompPrefix') }} <span class="badge" :class="'seccomp-' + seccompMode(selected)" :title="seccompTip(selected)">{{ seccompMode(selected) }}</span>
+          <span v-if="seccompMode(selected) !== 'off'">{{ t('pages.tasks.fsmSeccompWarn') }}</span>
         </p>
         <div class="timeline">
           <div v-for="(tr, i) in selected.transitions || []" :key="i" class="timeline-item">
             <span class="badge" :class="tr.to">{{ tr.to }}</span>
-            <span class="muted"> from </span>
+            <span class="muted"> {{ t('pages.tasks.fsmFrom') }} </span>
             <span class="badge" :class="tr.from">{{ tr.from }}</span>
             <span class="pill allow"> {{ tr.actor }}</span>
             <div class="timeline-meta">{{ fmt(tr.at) }} — {{ tr.reason }}</div>
           </div>
-          <div v-if="!selected.transitions || selected.transitions.length === 0" class="muted">No transitions recorded.</div>
+          <div v-if="!selected.transitions || selected.transitions.length === 0" class="muted">{{ t('pages.tasks.fsmNoTransitions') }}</div>
         </div>
         <div class="input-group" style="margin-top:1.5rem;">
           <select v-model="newTo" aria-label="Target State" style="background:rgba(0,0,0,0.3);color:white;border:1px solid var(--glass-border);padding:0.75rem;border-radius:0.5rem;flex:0.6;">
             <option v-for="s in states" :key="s" :value="s">{{ s }}</option>
           </select>
-          <input v-model="newReason" placeholder="transition reason" aria-label="Transition Reason" />
-          <button class="btn btn-primary" @click="transition(selected.id)">Apply</button>
-          <button class="btn btn-danger" @click="selected = null">Close</button>
+          <input v-model="newReason" :placeholder="t('pages.tasks.fsmReasonPh')" aria-label="Transition Reason" />
+          <button class="btn btn-primary" @click="transition(selected.id)">{{ t('pages.tasks.btnApply') }}</button>
+          <button class="btn btn-danger" @click="selected = null">{{ t('common.close') }}</button>
         </div>
         <div v-if="transError" class="callout err" style="margin-top:1rem;">{{ transError }}</div>
       </div>
@@ -151,12 +151,12 @@
     <!-- Snapshot modal -->
     <div v-if="snapModalTask" ref="snapModalBackdrop" class="modal-backdrop" tabindex="-1" role="dialog" aria-modal="true" aria-labelledby="snap-modal-title" @keydown.esc="snapModalTask = null">
       <div class="modal-box">
-        <h3 id="snap-modal-title">Event Snapshots — {{ snapModalTask.id }}</h3>
-        
+        <h3 id="snap-modal-title">{{ t('pages.tasks.snapTitle', { id: snapModalTask.id }) }}</h3>
+
         <!-- Take Snapshot -->
         <div class="input-group" style="margin-top:1rem;margin-bottom:1.5rem;">
-          <input v-model="snapEventId" placeholder="Event ID (e.g. step_042)" style="flex:0.6;" />
-          <button class="btn btn-primary" @click="takeSnapshot(snapModalTask.id)">Take Snapshot</button>
+          <input v-model="snapEventId" :placeholder="t('pages.tasks.snapEventPh')" style="flex:0.6;" />
+          <button class="btn btn-primary" @click="takeSnapshot(snapModalTask.id)">{{ t('pages.tasks.btnTakeSnap') }}</button>
         </div>
 
         <!-- Snapshots List -->
@@ -164,10 +164,10 @@
           <table>
             <thead>
               <tr>
-                <th>Snapshot ID</th>
-                <th>Event ID</th>
-                <th>Created</th>
-                <th>Action</th>
+                <th>{{ t('pages.tasks.snapColId') }}</th>
+                <th>{{ t('pages.tasks.snapColEvent') }}</th>
+                <th>{{ t('pages.tasks.snapColCreated') }}</th>
+                <th>{{ t('pages.tasks.snapColAction') }}</th>
               </tr>
             </thead>
             <tbody>
@@ -177,12 +177,12 @@
                 <td class="timeline-meta">{{ fmt(s.created_at) }}</td>
                 <td>
                   <button class="btn btn-primary" style="font-size:0.75rem;padding:0.2rem 0.5rem;background:var(--accent);" @click="rollbackToSnap(snapModalTask.id, s.id)">
-                    ↩ Rollback
+                    {{ t('pages.tasks.btnRollback') }}
                   </button>
                 </td>
               </tr>
               <tr v-if="taskSnapshots.length === 0">
-                <td colspan="4" class="muted" style="text-align:center;padding:1rem;">No event snapshots found.</td>
+                <td colspan="4" class="muted" style="text-align:center;padding:1rem;">{{ t('pages.tasks.snapEmpty') }}</td>
               </tr>
             </tbody>
           </table>
@@ -191,7 +191,7 @@
         <div v-if="snapError" class="callout err" style="margin-top:1rem;">{{ snapError }}</div>
 
         <div style="display:flex;justify-content:flex-end;margin-top:1.5rem;">
-          <button class="btn btn-danger" @click="snapModalTask = null">Close</button>
+          <button class="btn btn-danger" @click="snapModalTask = null">{{ t('common.close') }}</button>
         </div>
       </div>
     </div>
@@ -201,6 +201,9 @@
 <script setup>
 import { ref, computed, nextTick } from 'vue'
 import { apiFetch, usePoll } from '~/composables/useApi'
+import { useI18n } from '~/composables/useI18n'
+
+const { t } = useI18n()
 
 const tasks = ref([])
 const currentFilter = ref('all')
@@ -215,14 +218,14 @@ const { refresh } = usePoll(async () => {
 const filteredTasks = computed(() => {
   let list = tasks.value
   if (currentFilter.value !== 'all') {
-    list = list.filter(t => t.status === currentFilter.value)
+    list = list.filter(tk => tk.status === currentFilter.value)
   }
   if (searchQuery.value) {
     const q = searchQuery.value.toLowerCase()
-    list = list.filter(t => 
-      (t.id && t.id.toLowerCase().includes(q)) ||
-      (t.tenant && t.tenant.toLowerCase().includes(q)) ||
-      (t.spec_fingerprint && t.spec_fingerprint.toLowerCase().includes(q))
+    list = list.filter(tk =>
+      (tk.id && tk.id.toLowerCase().includes(q)) ||
+      (tk.tenant && tk.tenant.toLowerCase().includes(q)) ||
+      (tk.spec_fingerprint && tk.spec_fingerprint.toLowerCase().includes(q))
     )
   }
   return list
@@ -285,7 +288,7 @@ const validateSpec = async () => {
 }
 
 const launchSpec = () => {
-  alert(`TaskSpec validated (fp ${fingerprint.value.slice(0,12)}).\n\nTo launch, run:\n  agentpvm run -config <(echo "$TOML")\n\n(or save to uml/agentpvm.toml and run agentpvm run)`)
+  alert(t('pages.tasks.launchAlert', { fp: fingerprint.value.slice(0, 12) }))
 }
 
 const pauseTask = async (id) => {
@@ -293,7 +296,7 @@ const pauseTask = async (id) => {
     await apiFetch(`/api/tasks/${encodeURIComponent(id)}/pause`, { method: 'POST' })
     refresh()
   } catch (e) {
-    alert(`Pause error: ${e.message}`)
+    alert(t('pages.tasks.errPause', { msg: e.message }))
   }
 }
 
@@ -302,13 +305,13 @@ const resumeTask = async (id) => {
     await apiFetch(`/api/tasks/${encodeURIComponent(id)}/resume`, { method: 'POST' })
     refresh()
   } catch (e) {
-    alert(`Resume error: ${e.message}`)
+    alert(t('pages.tasks.errResume', { msg: e.message }))
   }
 }
 
 // Clone
 const cloneTaskPrompt = async (id) => {
-  const newID = prompt(`Enter new task ID to clone ${id} into:`, `${id}-cloned`)
+  const newID = prompt(t('pages.tasks.clonePrompt', { id }), `${id}-cloned`)
   if (!newID) return
   try {
     await apiFetch(`/api/tasks/${encodeURIComponent(id)}/clone`, {
@@ -317,7 +320,7 @@ const cloneTaskPrompt = async (id) => {
     })
     refresh()
   } catch (e) {
-    alert(`Clone error: ${e.message}`)
+    alert(t('pages.tasks.errClone', { msg: e.message }))
   }
 }
 
@@ -329,15 +332,15 @@ const snapError = ref('')
 
 const snapModalBackdrop = ref(null)
 
-const openSnapshotModal = async (t) => {
-  snapModalTask.value = t
+const openSnapshotModal = async (task) => {
+  snapModalTask.value = task
   snapError.value = ''
   snapEventId.value = `step_${Date.now().toString().slice(-4)}`
   await nextTick()
   if (snapModalBackdrop.value) {
     snapModalBackdrop.value.focus()
   }
-  await loadSnapshots(t.id)
+  await loadSnapshots(task.id)
 }
 
 const loadSnapshots = async (id) => {
@@ -362,7 +365,7 @@ const takeSnapshot = async (id) => {
 }
 
 const rollbackToSnap = async (id, snapId) => {
-  if (!confirm(`Are you sure you want to rollback ${id} to snapshot ${snapId}?`)) return
+  if (!confirm(t('pages.tasks.confirmRollback', { id, snapId }))) return
   snapError.value = ''
   try {
     await apiFetch(`/api/tasks/${encodeURIComponent(id)}/rollback`, {
@@ -370,7 +373,7 @@ const rollbackToSnap = async (id, snapId) => {
       body: { snapshot_id: snapId }
     })
     refresh()
-    alert(`Successfully rolled back to ${snapId}`)
+    alert(t('pages.tasks.rollbackOk', { snapId }))
   } catch (e) {
     snapError.value = e.message
   }
@@ -383,8 +386,8 @@ const newTo = ref('provisioning')
 const newReason = ref('')
 const transError = ref('')
 
-const showTransitions = async (t) => {
-  selected.value = await apiFetch(`/api/tasks/${t.id}`)
+const showTransitions = async (task) => {
+  selected.value = await apiFetch(`/api/tasks/${task.id}`)
   transError.value = ''
 }
 const transition = async (id) => {
@@ -404,11 +407,11 @@ const short = (h) => h ? h.slice(0, 12) : '—'
 
 // security.uml_seccomp badge (off=neutral, auto=info, on=warning). The task
 // state/detail carries a security section; absent means the spec default.
-const seccompMode = (t) => (t && t.security && t.security.uml_seccomp) || 'off'
-const seccompTip = (t) => {
-  const m = seccompMode(t)
-  if (m === 'on') return 'uml_seccomp=on — fast syscall path; guest kernel integrity weakened'
-  if (m === 'auto') return 'uml_seccomp=auto — fast syscall path when supported; guest kernel integrity weakened (silent ptrace fallback possible)'
-  return 'uml_seccomp=off — default; full guest kernel integrity'
+const seccompMode = (task) => (task && task.security && task.security.uml_seccomp) || 'off'
+const seccompTip = (task) => {
+  const m = seccompMode(task)
+  if (m === 'on') return t('pages.tasks.seccompTipOn')
+  if (m === 'auto') return t('pages.tasks.seccompTipAuto')
+  return t('pages.tasks.seccompTipOff')
 }
 </script>

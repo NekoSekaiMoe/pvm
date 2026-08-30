@@ -1,12 +1,12 @@
 <template>
   <div>
-    <h1>Base Image Management</h1>
-    <p class="muted">Pull and synthesize ext4 rootfs images from Docker registries.</p>
+    <h1>{{ t('pages.images.title') }}</h1>
+    <p class="muted">{{ t('pages.images.subtitle') }}</p>
 
     <!-- Quick Presets -->
     <div class="glass-card">
-      <h3>Quick Pull Presets</h3>
-      <p class="muted" style="margin-bottom:1rem;">Click any popular base image to pre-populate:</p>
+      <h3>{{ t('pages.images.presetsTitle') }}</h3>
+      <p class="muted" style="margin-bottom:1rem;">{{ t('pages.images.presetsHint') }}</p>
       
       <div style="display:flex;gap:0.5rem;flex-wrap:wrap;">
         <button class="btn btn-primary" style="font-size:0.85rem;" @click="selectPreset('alpine:3.19')">Alpine 3.19</button>
@@ -19,13 +19,13 @@
     
     <!-- Custom Pull Card -->
     <div class="glass-card">
-      <h3>Pull Custom Docker Image</h3>
-      <p class="muted" style="margin-bottom:1rem;">Exports layers via <code>crane</code> into a standalone ext4 block device image.</p>
+      <h3>{{ t('pages.images.customTitle') }}</h3>
+      <p class="muted" style="margin-bottom:1rem;">{{ t('pages.images.customHint') }}</p>
       
       <div class="input-group">
-        <input v-model="imageName" placeholder="Image Name (e.g. alpine:latest, golang:1.22-alpine)" @keyup.enter="pullImage" />
+        <input v-model="imageName" :placeholder="t('pages.images.namePh')" @keyup.enter="pullImage" />
         <button class="btn btn-primary" @click="pullImage" :disabled="pulling">
-          {{ pulling ? 'Pulling & Synthesizing Ext4...' : 'Pull Image' }}
+          {{ pulling ? t('pages.images.btnPulling') : t('pages.images.btnPull') }}
         </button>
       </div>
       
@@ -38,6 +38,9 @@
 
 <script setup>
 import { ref } from 'vue'
+import { useI18n } from '~/composables/useI18n'
+
+const { t } = useI18n()
 
 const imageName = ref('alpine:3.19')
 const pulling = ref(false)
@@ -51,7 +54,7 @@ const selectPreset = (img) => {
 const pullImage = async () => {
   if (!imageName.value) return
   pulling.value = true
-  message.value = 'Contacting Docker registry and exporting rootfs layers...'
+  message.value = t('pages.images.msgPulling')
   isError.value = false
   
   try {
@@ -62,14 +65,14 @@ const pullImage = async () => {
     })
     
     if (res.ok) {
-      message.value = `Successfully pulled and generated rootfs for ${imageName.value}!`
+      message.value = t('pages.images.msgDone', { img: imageName.value })
     } else {
       const err = await res.json()
-      message.value = `Error: ${err.error || res.statusText}`
+      message.value = t('pages.images.msgErr', { msg: err.error || res.statusText })
       isError.value = true
     }
   } catch (e) {
-    message.value = `Network error: ${e.message}`
+    message.value = t('pages.images.msgNetErr', { msg: e.message })
     isError.value = true
   } finally {
     pulling.value = false
