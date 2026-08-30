@@ -189,6 +189,11 @@ const build = ref(null)
 const buildError = ref('')
 const showBuildLog = ref(false)
 let buildTimer = null
+// Polling generation token: clearTimeout cannot cancel an in-flight
+// apiFetch. Every stop/start invalidates older epochs so a late response
+// from a previous build neither writes stale state nor re-arms the timer
+// (it must not stop a NEWER build's polling either).
+let buildPollEpoch = 0
 
 const buildDone = computed(() => build.value && (build.value.phase === 'done' || build.value.phase === 'READY'))
 const buildFailed = computed(() => build.value && (build.value.phase === 'failed' || build.value.phase === 'FAILED'))
@@ -199,11 +204,13 @@ const buildPillClass = computed(() => {
 })
 
 const stopBuildPolling = () => {
+  buildPollEpoch++
   if (buildTimer) { clearTimeout(buildTimer); buildTimer = null }
 }
 
 const startBuildPolling = (id) => {
   stopBuildPolling()
+  const epoch = buildPollEpoch
   buildId.value = id
   build.value = { phase: 'queued', pct: 0, log_tail: '' }
   buildError.value = ''
@@ -214,12 +221,14 @@ const startBuildPolling = (id) => {
   // concurrent requests; repeated failures end the poll instead of hitting
   // a stuck/removed template every 1.5s forever.
   const tick = async () => {
+    if (epoch !== buildPollEpoch) return
     if (typeof document !== 'undefined' && document.hidden) {
       buildTimer = setTimeout(tick, 1500)
       return
     }
     try {
       const r = await apiFetch(`/api/templates/${encodeURIComponent(id)}/build`)
+      if (epoch !== buildPollEpoch) return
       build.value = r || {}
       buildError.value = ''
       fails = 0
@@ -229,6 +238,7 @@ const startBuildPolling = (id) => {
         return
       }
     } catch (e) {
+      if (epoch !== buildPollEpoch) return
       // Transient errors surface as a warning line but keep the poll alive;
       // a stuck/removed template ends the poll after repeated failures.
       buildError.value = e.message
@@ -237,6 +247,7 @@ const startBuildPolling = (id) => {
         return
       }
     }
+    if (epoch !== buildPollEpoch) return
     buildTimer = setTimeout(tick, 1500)
   }
   buildTimer = setTimeout(tick, 1500)

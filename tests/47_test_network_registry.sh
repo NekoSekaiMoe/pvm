@@ -39,12 +39,14 @@ SUB_B=$(jq -r '.networks[] | select(.name=="regnet-b") | .subnet' "$PVM_STATE_RO
 
 echo "--- 2. re-creating an existing name fails loudly (no silent dup bridge)"
 # SetupBridge's ip link add is not idempotent by design: a re-create must
-# fail with the RTNETLINK "File exists" error instead of silently adding a
-# second bridge — and the registry must keep the recorded subnet intact.
+# fail at the bridge step instead of silently adding a second bridge — and
+# the registry must keep the recorded subnet intact. Note: umlctl's
+# execRun discards child stderr, so ip's "RTNETLINK answers: File exists"
+# never reaches the log — assert on umlctl's own bridge error line.
 if "$TMP/umlctl" network create regnet-a &>"$TMP/a2.log"; then
     fail "re-create of an existing bridge must fail"
 fi
-grep -q "File exists" "$TMP/a2.log" || fail "re-create must surface the existing device: $(cat "$TMP/a2.log")"
+grep -q "failed to add bridge regnet-a" "$TMP/a2.log" || fail "re-create must fail at the bridge step: $(cat "$TMP/a2.log")"
 SUB_A2=$(jq -r '.networks[] | select(.name=="regnet-a") | .subnet' "$PVM_STATE_ROOT/networks.json")
 [ "$SUB_A2" = "$SUB_A" ] || fail "failed re-create must keep the recorded subnet: $SUB_A -> $SUB_A2"
 
