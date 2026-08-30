@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -344,12 +345,22 @@ func TestAPI_TemplateCreate_IsPending(t *testing.T) {
 	if out["status"] != "PENDING" {
 		t.Fatalf("created template status = %v, want PENDING", out["status"])
 	}
+	tplID := fmt.Sprint(out["template_id"])
 
 	// The store enforces aliases-on-READY: claiming an alias at creation of
 	// a (still PENDING) template must be a 400, not a silent success.
 	resp, out = doJSON(t, "POST", base, "/api/templates", map[string]string{"image_ref": "alpine:3", "alias": "nope"})
 	if resp.StatusCode != 400 {
 		t.Fatalf("alias at creation must be rejected for PENDING template, got %d body=%v", resp.StatusCode, out)
+	}
+
+	// The create-time build goroutine must converge BEFORE the test's
+	// TempDir cleanup, otherwise its build.json writes race the cleanup
+	// ("directory not empty"). Wait on the builder's own progress files
+	// (same store root as the server's), bounded.
+	store := template.NewStore("")
+	if _, err := template.DefaultBuilder().Wait(store, tplID, 10*time.Second); err != nil {
+		t.Fatalf("builder wait: %v", err)
 	}
 }
 

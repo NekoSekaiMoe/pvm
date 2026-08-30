@@ -1,0 +1,49 @@
+# agentpvm-api.service — PVM control-plane API server (Echo, /api + E2B compat).
+# Install to /etc/systemd/system/ and manage via systemctl(1).
+# Requires: /etc/pvm/pvm.env (see deploy/install.sh) and the UML kernel at
+# the path referenced by PVM_KERNEL (default ./bin/linux relative to WorkingDirectory).
+
+[Unit]
+Description=PVM agent sandbox — API server (:8080)
+Documentation=file:///home/user/repo/pvm/docs/DEPLOY.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Running as a dedicated unprivileged user is strongly recommended.
+# Create it with:  useradd --system --home /var/lib/pvm --shell /usr/sbin/nologin pvm
+# and chown -R pvm:pvm /var/lib/pvm. Comment out User=/Group= to run as the
+# invoking user instead (NOT recommended for production).
+User=pvm
+Group=pvm
+EnvironmentFile=/etc/pvm/pvm.env
+WorkingDirectory=/var/lib/pvm
+ExecStart=/usr/local/bin/agentpvm api -port 8080
+Restart=on-failure
+RestartSec=2
+
+# --- Hardening (see systemd.exec(5)) ---
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/pvm
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+RestrictNamespaces=true
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target

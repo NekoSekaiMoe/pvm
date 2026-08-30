@@ -67,6 +67,10 @@ type EgressRule struct {
 	Port   int
 	Allow  *bool
 	Inject *EgressInject
+	// MITM opts the rule into TLS interception: CONNECT traffic for the
+	// matched host is terminated with an egress-CA leaf so Inject can run
+	// on the plaintext. Requires the gateway CA (EnableMITM).
+	MITM *bool
 }
 
 // EgressInject mirrors spec.EgressInject.
@@ -74,6 +78,9 @@ type EgressInject struct {
 	Header string
 	Format string // e.g. "Bearer ${SECRET}"
 	Secret string
+	// AllowPlainHTTP permits attaching this secret on plaintext HTTP
+	// upstreams (CubeSandbox #726 semantics). Default false: HTTPS only.
+	AllowPlainHTTP bool
 }
 
 // Decision is the outcome for a request.
@@ -100,6 +107,8 @@ type Gateway struct {
 	bytesOutMu sync.Mutex
 	server     *http.Server
 	listener   net.Listener
+	// mitmCA signs interception leaves when rules opt in (see mitm.go).
+	mitmCA *CA
 	// transport is the shared upstream transport (SSRF-checked dialer,
 	// keep-alives ON). Created lazily so a bare &Gateway{} (unit tests) works.
 	transport *http.Transport
@@ -199,6 +208,18 @@ func (g *Gateway) SetPolicy(task string, p *Policy) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.policies[task] = p
+}
+
+// PolicySnapshot returns a copy of the task's current policy (zero value
+// when none registered). Introspection for the API layer and incident tests.
+func (g *Gateway) PolicySnapshot(task string) Policy {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if p, ok := g.policies[task]; ok && p != nil {
+		cp := *p
+		return cp
+	}
+	return Policy{}
 }
 
 // AttachLedger wires a fallback audit ledger so every egress decision is
@@ -407,6 +428,22 @@ func (g *Gateway) handleConnect(w http.ResponseWriter, r *http.Request, task str
 			http.Error(w, "egress: port not allowed", http.StatusForbidden)
 			return
 		}
+	}
+	// MITM dispatch: a rule opting into interception takes over the
+	// connection (TLS termination + L7 pipeline + re-encrypt upstream) —
+	// the raw tunnel below never sees it.
+	if g.ruleMITM(r.Host, pol) != nil {
+		hj, ok := w.(http.Hijacker)
+		if !ok {
+			http.Error(w, "hijack unsupported", http.StatusInternalServerError)
+			return
+		}
+		clientConn, brw, herr := hj.Hijack()
+		if herr != nil {
+			return
+		}
+		g.serveMITM(clientConn, brw, task, r.Host, pol)
+		return
 	}
 	targetConn, err := net.DialTimeout("tcp", r.Host, 10*time.Second)
 	if err != nil {
@@ -879,7 +916,21 @@ func (g *Gateway) ApplyInject(outReq *http.Request, v requestView, pol *Policy) 
 		return
 	}
 	if !strings.EqualFold(v.scheme, "https") {
-		return // plaintext request: never attach credentials
+		// Plaintext request: credentials are attached ONLY when the rule
+		// explicitly opts in (AllowPlainHTTP). The CubeSandbox boundary is
+		// "the sandbox never sees the secret"; the wire risk proxy→upstream
+		// is accepted by operators who set this flag (internal HTTP
+		// services, sidecar meshes).
+		plainOK := false
+		for _, r := range pol.Rules {
+			if ruleMatches(r, v) && r.Inject != nil && r.Inject.AllowPlainHTTP {
+				plainOK = true
+				break
+			}
+		}
+		if !plainOK {
+			return
+		}
 	}
 	for _, r := range pol.Rules {
 		if !ruleMatches(r, v) {

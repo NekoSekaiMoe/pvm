@@ -14,6 +14,17 @@ type ContextKey string
 
 const (
 	KeyJailEnv ContextKey = "jail_env"
+	// KeyConsoleTee carries an optional io.Writer (a console.Session) that
+	// receives a copy of every guest stdout/stderr byte alongside the console
+	// log file. This is how the console exec/PTY layer observes guest output
+	// without touching the copy-to-log path.
+	KeyConsoleTee ContextKey = "console_tee"
+	// KeyStdoutWriter / KeyStderrWriter carry optional per-stream writers
+	// (e.g. separate rotating console.out.log / console.err.log). When set
+	// they REPLACE the plain logFile for that stream; the logFile still
+	// receives the combined stream, preserving console.log semantics.
+	KeyStdoutWriter ContextKey = "stdout_writer"
+	KeyStderrWriter ContextKey = "stderr_writer"
 	// KeyExtraFiles carries host-side pre-opened files (tap fd, ...) that
 	// must be inherited by the workload. Entry i becomes fd 3+i in the
 	// direct child (os/exec.ExtraFiles contract) and survives the jail
@@ -33,17 +44,22 @@ const (
 type Process struct {
 	Cmd *exec.Cmd
 	wg  sync.WaitGroup
+	// Stdin is the host-side write end of the guest console stdin pipe,
+	// non-nil only when the launcher owns the console (logFile mode). It is
+	// consumed by the console session layer; closing it signals EOF to the
+	// guest exactly like a detached terminal.
+	Stdin io.WriteCloser
 }
 
 // Launcher defines how to launch a UML kernel.
 type Launcher interface {
-	Start(ctx context.Context, kernel string, args []string, logFile *os.File) (int, *Process, error)
+	Start(ctx context.Context, kernel string, args []string, log io.Writer) (int, *Process, error)
 	Wait(p *Process) error
 }
 
 type DefaultLauncher struct{}
 
-func (l *DefaultLauncher) Start(ctx context.Context, kernel string, args []string, logFile *os.File) (int, *Process, error) {
+func (l *DefaultLauncher) Start(ctx context.Context, kernel string, args []string, log io.Writer) (int, *Process, error) {
 	cmd := exec.CommandContext(ctx, kernel, args...)
 	if files, ok := ctx.Value(KeyExtraFiles).([]*os.File); ok && len(files) > 0 {
 		cmd.ExtraFiles = files
@@ -74,10 +90,29 @@ func (l *DefaultLauncher) Start(ctx context.Context, kernel string, args []strin
 		io.Copy(dst, src)
 	}
 
-	if logFile != nil {
+	if log != nil {
+		// Console ownership mode: guest stdin becomes a pipe the host can
+		// write marker/exec scripts into, and output fans out to both the
+		// console log and the optional console session tee.
+		stdin, serr := cmd.StdinPipe()
+		if serr != nil {
+			return 0, nil, serr
+		}
+		p.Stdin = stdin
+		var out, errW io.Writer = log, log
+		if tee, ok := ctx.Value(KeyConsoleTee).(io.Writer); ok && tee != nil {
+			out = io.MultiWriter(out, tee)
+			errW = io.MultiWriter(errW, tee)
+		}
+		if w, ok := ctx.Value(KeyStdoutWriter).(io.Writer); ok && w != nil {
+			out = io.MultiWriter(w, out)
+		}
+		if w, ok := ctx.Value(KeyStderrWriter).(io.Writer); ok && w != nil {
+			errW = io.MultiWriter(w, errW)
+		}
 		p.wg.Add(2)
-		go copyLine(logFile, stdout)
-		go copyLine(logFile, stderr)
+		go copyLine(out, stdout)
+		go copyLine(errW, stderr)
 	} else {
 		cmd.Stdin = os.Stdin
 		p.wg.Add(2)

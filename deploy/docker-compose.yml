@@ -1,0 +1,66 @@
+# PVM docker-compose deployment.
+#   cp deploy/.env.example deploy/.env   # set API_SECRET
+#   docker compose -f deploy/docker-compose.yml --env-file deploy/.env up -d
+#
+# Single image, two services (api :8080, webui :3000). All mutable state is
+# persisted on the host under /var/lib/pvm (bind mount, shared by both
+# services so the WebUI reads the same state root).
+
+name: pvm
+
+x-pvm-common: &pvm-common
+  build:
+    context: .
+    dockerfile: deploy/Dockerfile
+    args:
+      # CI pre-builds the WebUI into webui/.output; set WEBAUI_PREBUILT=1 to
+      # reuse it and skip the Node/pnpm stage entirely.
+      WEBUI_PREBUILT: "0"
+  image: pvm/agentpvm:latest
+  restart: on-failure
+  environment:
+    # API_SECRET is interpolated from the --env-file (deploy/.env).
+    API_SECRET: ${API_SECRET:?set API_SECRET in deploy/.env (see deploy/.env.example)}
+    # Paths that must match the container layout.
+    PVM_STATE_ROOT: /var/lib/pvm/state
+    PVM_AUDIT_ROOT: /var/lib/pvm/audit
+    PVM_CGROUP_ROOT: /var/lib/pvm/cgroup
+  volumes:
+    - /var/lib/pvm:/var/lib/pvm
+
+services:
+  api:
+    <<: *pvm-common
+    container_name: pvm-api
+    command: ["api", "-port", "8080"]
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+    # The UML kernel needs a handful of otherwise-restricted privileges.
+    # Keep them; sandbox isolation is provided by UML itself, not by the
+    # container runtime.
+    security_opt:
+      - seccomp:unconfined
+    cap_add:
+      - NET_ADMIN
+
+  webui:
+    <<: *pvm-common
+    container_name: pvm-webui
+    command: ["webui", "--port", "3000"]
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "3000:3000"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 5s

@@ -69,6 +69,9 @@ type Record struct {
 	Reason   string      `json:"reason,omitempty"`
 	PrevHash string      `json:"prev_hash"`
 	ThisHash string      `json:"hash"`
+	// Sig is the base64 ed25519 signature over ThisHash, present when the
+	// audit root arms signing (PVM_AUDIT_SIGNING=1 or an existing key).
+	Sig string `json:"sig,omitempty"`
 }
 
 // File names inside a task's audit directory.
@@ -111,6 +114,11 @@ func WithRedactor(r Redactor) Option {
 	return func(l *Ledger) { l.redactor = r }
 }
 
+// rootDir is the audit root owning this ledger (signing key location):
+// one key per deployment root, NOT per task — every ledger in the root is
+// verifiable against the same public key.
+func (l *Ledger) rootDir() string { return LedgerRoot }
+
 // Open returns (creating if needed) the ledger for a task.
 func Open(task string, opts ...Option) (*Ledger, error) {
 	if !taskIDRegex.MatchString(task) {
@@ -135,6 +143,10 @@ func Open(task string, opts ...Option) (*Ledger, error) {
 	// Best-effort tightening of pre-existing files created by older versions
 	// with looser modes.
 	_ = os.Chmod(l.path, 0600)
+	// Online monitor: track this ledger for periodic re-verification and
+	// (once per process) start the sweep loop.
+	registerLedger(l)
+	StartOnlineVerify(0)
 	_ = os.Chmod(l.headPath, 0600)
 	if err := l.loadTail(); err != nil {
 		return nil, err
@@ -290,6 +302,11 @@ func (l *Ledger) Append(r Record) error {
 	}
 	r.PrevHash = l.lastHash
 	r.ThisHash = hashRecord(r, l.lastHash)
+	// Signature over the chained digest: arming is per audit-root
+	// (PVM_AUDIT_SIGNING=1 or an existing key). Unsigned ledgers skip.
+	if signer := SignerForRoot(l.rootDir()); signer != nil {
+		r.Sig = signer.Sign(r.ThisHash)
+	}
 
 	// Encode to memory first so the exact byte count is known: the in-memory
 	// readOffset watermark must advance by precisely what was written, or the
@@ -467,6 +484,14 @@ func (l *Ledger) Verify() (int, error) {
 		want := hashRecord(rec, prev)
 		if rec.ThisHash != want {
 			return count, fmt.Errorf("audit: broken chain at seq %d: record tampered", rec.Seq)
+		}
+		// Signature check: armed roots reject invalid/absent signatures on
+		// records (a legacy unsigned record fails loudly once signing is on —
+		// the operator flipped the switch and must re-baseline).
+		if signer := SignerForRoot(l.rootDir()); signer != nil {
+			if !signer.Verify(rec.ThisHash, rec.Sig) {
+				return count, fmt.Errorf("audit: bad signature at seq %d", rec.Seq)
+			}
 		}
 		prev = rec.ThisHash
 		count++

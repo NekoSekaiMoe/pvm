@@ -61,10 +61,16 @@ type Broker struct {
 	// Kept in sync on every insert/remove so expiry cleanup (which knows only
 	// the token id from the JWT payload) can locate the owning task in O(1)
 	// instead of scanning every task's token set.
-	taskByToken  map[string]string
-	ledger       *audit.Ledger
-	store        SecretStore
-	defaultTTL   time.Duration
+	taskByToken map[string]string
+	ledger      *audit.Ledger
+	store       SecretStore
+	defaultTTL  time.Duration
+
+	// revokedTasks denies every token minted for a task, even ones whose ids
+	// the in-memory index lost across a restart; mirrored to disk by
+	// PersistRevocations. revPath is empty until persistence is enabled.
+	revokedTasks map[string]struct{}
+	revPath      string
 }
 
 // SecretStore maps a capability string (e.g. "repo:read") to the actual
@@ -99,6 +105,7 @@ func NewBroker(key []byte, store SecretStore, ledger *audit.Ledger, defaultTTL t
 	return &Broker{
 		signingKey:   key,
 		revoked:      make(map[string]struct{}),
+		revokedTasks: make(map[string]struct{}),
 		activeByTask: make(map[string]map[string]struct{}),
 		taskByToken:  make(map[string]string),
 		ledger:       ledger,
@@ -184,8 +191,13 @@ func (b *Broker) Validate(tokStr string) (*Token, error) {
 	}
 	b.mu.RLock()
 	_, revoked := b.revoked[tok.ID]
+	task, linked := b.taskByToken[tok.ID]
+	_, taskRevoked := b.revokedTasks[task]
 	b.mu.RUnlock()
 	if revoked {
+		return nil, ErrRevoked
+	}
+	if linked && taskRevoked {
 		return nil, ErrRevoked
 	}
 	if time.Now().After(tok.Exp) {
@@ -243,6 +255,7 @@ func (b *Broker) Revoke(tokenID string) {
 		}
 		delete(b.taskByToken, tokenID)
 	}
+	b.persistRevLocked()
 	b.mu.Unlock()
 	if b.ledger != nil {
 		if err := b.ledger.Append(audit.Record{
@@ -272,6 +285,9 @@ func (b *Broker) RevokeAllForTask(taskID string) int {
 	}
 	// Drop the task's live set; remaining ids are now only in `revoked`.
 	delete(b.activeByTask, taskID)
+	// Task-wide gate: even tokens whose ids were lost (restart) stay denied.
+	b.revokedTasks[taskID] = struct{}{}
+	b.persistRevLocked()
 	b.mu.Unlock()
 
 	if b.ledger != nil {

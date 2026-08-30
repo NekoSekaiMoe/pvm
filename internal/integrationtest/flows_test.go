@@ -7,6 +7,7 @@ package integrationtest
 import (
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -23,11 +24,11 @@ import (
 	"uml-container/internal/container"
 	"uml-container/internal/identity"
 	"uml-container/internal/incident"
+	"uml-container/internal/jail"
 	"uml-container/internal/network/egress"
 	"uml-container/internal/policy"
 	"uml-container/internal/pool"
 	"uml-container/internal/spec"
-	"uml-container/internal/jail"
 	"uml-container/internal/state"
 	"uml-container/internal/uml"
 )
@@ -66,7 +67,8 @@ func setupIsolatedRoots(t *testing.T) {
 // noOpLauncher is a tracking launcher that never blocks.
 type noOpLauncher struct{ args []string }
 
-func (l *noOpLauncher) Start(ctx context.Context, kernel string, args []string, logFile *os.File) (int, *uml.Process, error) {
+func (l *noOpLauncher) Start(ctx context.Context, kernel string, args []string, log io.Writer) (int, *uml.Process, error) {
+	_ = log
 	l.args = args
 	return 4242, &uml.Process{}, nil
 }

@@ -1,0 +1,45 @@
+# agentpvm-webui.service — PVM WebUI (embedded Nuxt 3 SPA served from the
+# agentpvm binary; it shares the same server as the API but on :3000).
+# Install to /etc/systemd/system/. Requires /etc/pvm/pvm.env.
+
+[Unit]
+Description=PVM agent sandbox — WebUI server (:3000)
+Documentation=file:///home/user/repo/pvm/docs/DEPLOY.md
+After=network-online.target agentpvm-api.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Optional: run as a dedicated unprivileged user (see agentpvm-api.service).
+User=pvm
+Group=pvm
+EnvironmentFile=/etc/pvm/pvm.env
+WorkingDirectory=/var/lib/pvm
+ExecStart=/usr/local/bin/agentpvm webui --port 3000
+Restart=on-failure
+RestartSec=2
+
+# --- Hardening (see systemd.exec(5)) ---
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/pvm
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+RestrictNamespaces=true
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target

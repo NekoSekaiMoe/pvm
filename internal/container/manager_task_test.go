@@ -2,6 +2,7 @@ package container
 
 import (
 	"context"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -21,7 +22,7 @@ type trackingLauncher struct {
 	pid    int
 }
 
-func (t *trackingLauncher) Start(ctx context.Context, kernel string, args []string, logFile *os.File) (int, *uml.Process, error) {
+func (t *trackingLauncher) Start(ctx context.Context, kernel string, args []string, logFile io.Writer) (int, *uml.Process, error) {
 	t.kernel = kernel
 	t.args = args
 	return 999, &uml.Process{}, nil

@@ -2,6 +2,7 @@ package container
 
 import (
 	"context"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -29,7 +30,7 @@ type mockLauncher struct {
 	lastArgs   []string
 }
 
-func (m *mockLauncher) Start(ctx context.Context, kernel string, args []string, logFile *os.File) (int, *uml.Process, error) {
+func (m *mockLauncher) Start(ctx context.Context, kernel string, args []string, logFile io.Writer) (int, *uml.Process, error) {
 	m.lastKernel = kernel
 	m.lastArgs = args
 	return 12345, &uml.Process{}, nil

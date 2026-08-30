@@ -7,6 +7,7 @@
 package pool
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -53,10 +54,45 @@ type Sandbox struct {
 
 // Quota is a tenant's resource ceiling (plan.md §12.3).
 type Quota struct {
-	MaxConcurrent   int
-	MaxCPU          int
-	MaxMemoryMB     int
-	MaxTasksPerHour int
+	MaxConcurrent   int `json:"max_concurrent"`
+	MaxCPU          int `json:"max_cpu"`
+	MaxMemoryMB     int `json:"max_memory_mb"`
+	MaxTasksPerHour int `json:"max_tasks_per_hour"`
+}
+
+// UnmarshalJSON accepts BOTH the snake_case names (SDK / new clients) and
+// the historical PascalCase field names (pre-tag API contract the shell
+// suites pin): Go's decoder only case-folds UNtagged fields, so without
+// this shim the old shape would silently bind zero values.
+func (q *Quota) UnmarshalJSON(data []byte) error {
+	var both struct {
+		MaxConcurrent         int  `json:"max_concurrent"`
+		MaxCPU                int  `json:"max_cpu"`
+		MaxMemoryMB           int  `json:"max_memory_mb"`
+		MaxTasksPerHour       int  `json:"max_tasks_per_hour"`
+		LegacyMaxConcurrent   *int `json:"MaxConcurrent"`
+		LegacyMaxCPU          *int `json:"MaxCPU"`
+		LegacyMaxMemoryMB     *int `json:"MaxMemoryMB"`
+		LegacyMaxTasksPerHour *int `json:"MaxTasksPerHour"`
+	}
+	if err := json.Unmarshal(data, &both); err != nil {
+		return err
+	}
+	q.MaxConcurrent, q.MaxCPU, q.MaxMemoryMB, q.MaxTasksPerHour =
+		both.MaxConcurrent, both.MaxCPU, both.MaxMemoryMB, both.MaxTasksPerHour
+	if both.LegacyMaxConcurrent != nil {
+		q.MaxConcurrent = *both.LegacyMaxConcurrent
+	}
+	if both.LegacyMaxCPU != nil {
+		q.MaxCPU = *both.LegacyMaxCPU
+	}
+	if both.LegacyMaxMemoryMB != nil {
+		q.MaxMemoryMB = *both.LegacyMaxMemoryMB
+	}
+	if both.LegacyMaxTasksPerHour != nil {
+		q.MaxTasksPerHour = *both.LegacyMaxTasksPerHour
+	}
+	return nil
 }
 
 // DefaultQuota is a sane starter quota.
@@ -91,6 +127,9 @@ type Manager struct {
 	// discarded those Destroyer errors and silently leaked the sandbox.
 	// Guarded by m.mu.
 	pendingCleanups map[string]string // sandbox ID -> cleanup reason
+
+	// persistPath mirrors pool+quota state to disk when non-empty.
+	persistPath string
 
 	// cleanupSweeping marks an in-flight RetryCleanups sweep so concurrent
 	// sweeps serialize instead of running Destroyer twice on the same
@@ -132,6 +171,7 @@ func (m *Manager) SetQuota(tenant string, q Quota) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.quotas[tenant] = q
+	m.persistLocked()
 }
 
 // Warm pre-creates N sandboxes from a template so claims don't pay cold start.
@@ -175,6 +215,7 @@ func (m *Manager) Warm(tmpl Template, n int) int {
 			State:     SandboxReady,
 			CreatedAt: m.now(),
 		})
+		m.persistLocked()
 		m.mu.Unlock()
 		created++
 	}
@@ -290,6 +331,7 @@ func (m *Manager) claim(tenant string, tmpl Template, taskID string, logs *[]dec
 		sb.MemMB = wantMB
 		sb.ClaimedAt = now
 		m.accountClaim(tenant, tmpl.CPU, wantMB, now)
+		m.persistLocked()
 		recordDecision(logs, tenant, "claimed-warm", true)
 		id := sb.ID
 		m.mu.Unlock()
@@ -356,6 +398,7 @@ func (m *Manager) claim(tenant string, tmpl Template, taskID string, logs *[]dec
 	sb := &Sandbox{ID: id, Template: tmpl.Name, State: SandboxClaimed, TaskID: taskID, Tenant: tenant, CPU: tmpl.CPU, MemMB: wantMB, CreatedAt: now, ClaimedAt: now}
 	m.pool = append(m.pool, sb)
 	m.accountClaim(tenant, tmpl.CPU, wantMB, now)
+	m.persistLocked()
 	recordDecision(logs, tenant, "created-on-demand", true)
 	m.mu.Unlock()
 	return id, nil
@@ -481,12 +524,14 @@ func (m *Manager) Release(id string, recycle bool) error {
 			s.CPU = 0
 			s.MemMB = 0
 			s.ClaimedAt = time.Time{}
+			m.persistLocked()
 			m.mu.Unlock()
 			return nil
 		}
 		// Destroyer is an external call; do NOT keep m.mu held across it.
 		// Snapshot the fields we need, drop the entry, then destroy.
 		m.pool = append(m.pool[:i], m.pool[i+1:]...)
+		m.persistLocked()
 		destroyer := m.Destroyer
 		m.mu.Unlock()
 		if destroyer != nil {

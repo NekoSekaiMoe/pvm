@@ -80,6 +80,8 @@ func main() {
 		approvalCmd(os.Args[2:])
 	case "pool":
 		poolCmd(os.Args[2:])
+	case "template":
+		templateCmd(os.Args[2:])
 	default:
 		fmt.Println("Unknown command:", cmd)
 		os.Exit(1)

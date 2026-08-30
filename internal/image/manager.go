@@ -87,6 +87,10 @@ func splitHostPortRight(s string) (host, port string) {
 // is a registry only when it contains a "." or ":" or equals "localhost";
 // otherwise the reference uses the default registry (docker.io).
 func registryHost(imageRef string) string {
+	// Strip an explicit scheme first: "http://host/img" must yield
+	// "host", not "http:" (the first path segment would otherwise look
+	// like a registry with a port).
+	imageRef = strings.TrimPrefix(strings.TrimPrefix(imageRef, "http://"), "https://")
 	i := strings.IndexByte(imageRef, '/')
 	if i < 0 {
 		// No slash: the whole ref is <repo>[:<tag>] against the default
@@ -109,6 +113,16 @@ func registryHost(imageRef string) string {
 func imageName(imageRef string) string {
 	sum := sha256.Sum256([]byte(imageRef))
 	return hex.EncodeToString(sum[:]) + ".img"
+}
+
+// StorePath returns the on-disk ext4 path a Pull of imageRef produces (or
+// would reuse). Template builds bind this path into ImagePath once the
+// pull/verify phase completes.
+func StorePath(imageRef string) (string, error) {
+	if strings.TrimSpace(imageRef) == "" {
+		return "", fmt.Errorf("image: empty reference")
+	}
+	return filepath.Join(DefaultDir, imageName(imageRef)), nil
 }
 
 // DefaultDir is the on-disk root under which pulled images live. The API
@@ -190,7 +204,15 @@ func Pull(imageRef string) error {
 
 	fmt.Printf("Exporting docker image %s...\n", imageRef)
 
-	img, err := crane.Pull(imageRef)
+	// Fail-fast disk pre-check (statfs × safety margin): the build's peak
+	// usage is base image + layer tar + extracted rootfs; running out mid-
+	// pull leaves a half-populated store the rename-fast-path would trust.
+	if err := checkDiskHeadroom(imgDir, 500<<20); err != nil {
+		cleanup()
+		return err
+	}
+
+	img, err := crane.Pull(imageRef, cranePullOptions(imageRef)...)
 	if err != nil {
 		cleanup()
 		return fmt.Errorf("crane pull failed: %v", err)

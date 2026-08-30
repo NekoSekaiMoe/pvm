@@ -54,6 +54,11 @@ type Ticket struct {
 	State     State                  `json:"state"`
 	DecidedBy string                 `json:"decided_by,omitempty"`
 	DecidedAt time.Time              `json:"decided_at,omitempty"`
+	// Consumed records that the single authorized execution attempt backed
+	// by this ticket already ran (policy gateway "Allow once").
+	Consumed bool       `json:"consumed,omitempty"`
+	EditedBy string     `json:"edited_by,omitempty"`
+	EditedAt *time.Time `json:"edited_at,omitempty"`
 }
 
 // Manager is the in-memory ticket store. (MVP: process-local. A real deployment
@@ -63,6 +68,9 @@ type Manager struct {
 	tickets map[string]*Ticket
 	ledger  *audit.Ledger
 	now     func() time.Time
+
+	persistPath string
+	webhookURL  string
 }
 
 // NewManager constructs a ticket store.
@@ -122,6 +130,9 @@ func (m *Manager) Create(t Ticket) (string, error) {
 	}
 	t.ID = id
 	m.tickets[id] = &t
+	cp := t
+	m.persistLocked()
+	m.notify("create", cp)
 
 	if m.ledger != nil {
 		if err := m.ledger.Append(audit.Record{
@@ -160,6 +171,9 @@ func (m *Manager) Decide(id string, approved bool, by string) error {
 	}
 	t.DecidedBy = by
 	t.DecidedAt = m.now()
+	cp := *t
+	m.persistLocked()
+	m.notify("decide", cp)
 
 	if m.ledger != nil {
 		dec := audit.DecisionApprove

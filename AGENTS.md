@@ -6,14 +6,17 @@ Contributor guide for **PVM** (`uml-container`), a User-Mode Linux (UML) contain
 
 - `cmd/` — entry points: `umlctl` (thin UML container launcher: start/image/logs/ps/network; supports `-config` for launch fields only), `agentpvm` (the real agent sandbox: run/api/webui/snapshot/cow/cgroup/network + new gate/approval/pool subcommands).
 - `internal/` — core Go packages:
-  - **Launch & runtime**: `uml/` (kernel launcher), `container/` (`Start` legacy + `StartTask` TaskSpec-driven), `vhost/`, `image/`, `filesystem/`, `cow/` (qcow2 block-level CoW).
-  - **Control plane (plan.md §3-§11)**: `spec/` (TaskSpec + TOML), `state/` (lifecycle FSM), `audit/` (tamper-evident ledger), `identity/` (Credential Broker), `network/egress/` (L7 proxy) + `network/` (bridge/TAP/eBPF), `policy/` (Tool Gateway), `artifact/` (Artifact Gate), `approval/` (human tickets), `incident/` (Incident Controller), `pool/` (Warm Pool + Quota).
-  - `api/` (E2B-compatible REST server, Echo; `/api/exec` is the Tool Gateway), `config/`, `log/`, `cgroup/`, `snapshot/`, `ebpf/`, `pkg/`.
+  - **Launch & runtime**: `uml/` (kernel launcher + console stdin/tee), `container/` (`Start` legacy + `StartTask` TaskSpec-driven), `vhost/`, `image/`, `filesystem/`, `cow/` (qcow2 block-level CoW), `console/` (guest console sessions: marker exec, PTY, ring buffer), `logx/` (rotating console logs).
+  - **Control plane (plan.md §3-§11)**: `spec/` (TaskSpec + TOML), `state/` (lifecycle FSM), `audit/` (tamper-evident ledger + ed25519 signing + online verify), `identity/` (Credential Broker, persistent keys + refresh), `network/egress/` (L7 proxy + opt-in MITM credential injection) + `network/` (bridge/TAP/eBPF + persistent subnet registry), `policy/` (Tool Gateway + executors), `artifact/` (Artifact Gate: replay/tests/declare verifiers), `approval/` (human tickets, persistent + webhook), `incident/` (Incident Controller + REST sensors), `pool/` (Warm Pool + Quota, persistent factory).
+  - **envd compat**: `api/envd.go` — :49982 version websocket + :49983 Connect-JSON (`process.Process`, `filesystem.Filesystem`, `/files`).
+  - **Observability**: `metrics/` (Prometheus text registry: `/metrics`, `/healthz`, `/version`, opt-in pprof).
+  - `api/` (E2B-compatible REST server, Echo; `/api/exec` is the Tool Gateway), `config/`, `log/`, `cgroup/`, `snapshot/` (+CRIU memory capture), `template/` (build pipeline PENDING→READY), `volume/`, `filesystem/`, `pkg/`.
 - `bpf/` — eBPF C sources (`egress.c`: SSRF IP-floor); compiled into `internal/network/` via `bpf2go`.
 - `uml/agentpvm.toml` — default TaskSpec consumed by `agentpvm run` when no `-config` is given.
-- `webui/` — Nuxt 3 frontend, embedded into the Go binary via `webui/embed.go`.
+- `webui/` — Nuxt 3 frontend (i18n en/zh + assistant console), embedded into the Go binary via `webui/embed.go`.
+- `deploy/` — systemd units, docker-compose, Dockerfile, one-shot installer (+ `docs/DEPLOY.md`); `Makefile` — dev targets (`test-safe` runs the CI-safe suites); `api/openapi.yaml` — OpenAPI 3.1 spec; `sdk/go/` — official Go SDK.
 - `scripts/` — kernel build and integration/perf test shell scripts.
-- `tests/` — numbered end-to-end shell suites (`01_test_e2b_api.sh` … `09_test_cgroup_limits.sh`). Suites `05`–`08` are CI-safe (no UML kernel/root needed); `09` additionally requires root + a kernel rebuilt with `CONFIG_MEMCG`/`CONFIG_CGROUP_PIDS` (guest-side limit enforcement); `01`–`04` exercise kernel-adjacent paths.
+- `tests/` — numbered end-to-end shell suites (`01_test_e2b_api.sh` … `52_test_registry_policy.sh`). Suites `05`–`08`, `10`–`46`, `48`–`52` are CI-safe (no UML kernel/root needed); `47` requires root (bridge setup); `09` additionally requires root + a kernel rebuilt with `CONFIG_MEMCG`/`CONFIG_CGROUP_PIDS` (guest-side limit enforcement); `01`–`04` exercise kernel-adjacent paths.
 - `*_test.go` — Go unit tests colocated with their packages.
 
 ## Build, Test, and Development Commands

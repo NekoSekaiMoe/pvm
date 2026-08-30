@@ -1,0 +1,1943 @@
+openapi: 3.1.0
+info:
+  title: PVM Agent Sandbox API
+  version: 1.0.0
+  description: |
+    Control-plane REST surface of PVM (`uml-container`), a User-Mode Linux
+    agent-sandbox manager. Covers the `/api` surface (Bearer auth via
+    `API_SECRET`), the E2B-compatible root surface (`X-API-KEY` or Bearer),
+    unauthenticated observability endpoints (`/healthz`, `/version`),
+    `/metrics`, and the envd Connect-JSON compatibility service on :49983.
+    The envd WebSocket version service (:49982) speaks a 5-byte envelope
+    frame codec (1 flags + 4 len BE + JSON; end-stream flag 0x02) and is not
+    expressible as an OpenAPI path; see the `envd` tag descriptions below.
+  license:
+    name: Repo license
+externalDocs:
+  description: Deployment guide
+  url: https://example.invalid/docs/DEPLOY.md
+
+servers:
+  - url: http://localhost:8080
+    description: API server (agentpvm api)
+  - url: http://localhost:3000
+    description: WebUI server (agentpvm webui; same routes)
+  - url: http://localhost:49983
+    description: envd Connect-JSON compatibility (no auth per E2B semantics)
+
+security:
+  - bearerAuth: []
+
+tags:
+  - { name: observability }
+  - { name: containers }
+  - { name: tasks }
+  - { name: files }
+  - { name: exec }
+  - { name: audit }
+  - { name: approvals }
+  - { name: policy }
+  - { name: pool }
+  - { name: gate }
+  - { name: volumes }
+  - { name: templates }
+  - { name: egress }
+  - { name: network }
+  - { name: identity }
+  - { name: incidents }
+  - { name: e2b }
+  - { name: envd }
+
+paths:
+  # ---------------------------------------------------------------- observability
+  /healthz:
+    get:
+      tags: [observability]
+      summary: Liveness probe (no auth)
+      security: []
+      responses:
+        "200":
+          description: Service is up
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, uptime_seconds]
+                properties:
+                  status: { type: string, const: ok }
+                  uptime_seconds: { type: integer, format: int64 }
+
+  /version:
+    get:
+      tags: [observability]
+      summary: Build/version info (no auth)
+      security: []
+      responses:
+        "200":
+          description: Version payload
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/VersionInfo" }
+
+  /metrics:
+    get:
+      tags: [observability]
+      summary: Prometheus text metrics
+      description: Bearer auth by default; set `PVM_METRICS_NOAUTH=1` to disable auth.
+      responses:
+        "200":
+          description: Prometheus exposition text
+          content:
+            text/plain:
+              schema: { type: string }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  # ---------------------------------------------------------------- containers
+  /api/containers:
+    get:
+      tags: [containers]
+      summary: List containers
+      responses:
+        "200":
+          description: Container list
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Container" }
+
+  /api/containers/start:
+    post:
+      tags: [containers]
+      summary: Start a UML container
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [rootfs]
+              properties:
+                name: { type: string, description: 'defaults to "web-container"; must match ^[a-zA-Z0-9_-]+$' }
+                rootfs: { type: string, description: absolute path to ext4 rootfs image inside the image root }
+                mem: { type: string, description: e.g. "512M"; default "512M" }
+                cpu: { type: integer, minimum: 0, maximum: 1024, default: 0 }
+                ephemeral: { type: boolean, default: false, description: mount rootfs read-only }
+      responses:
+        "200":
+          description: Started
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, const: started }
+                  name: { type: string }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "500": { $ref: "#/components/responses/Error" }
+
+  /api/containers/{id}/logs:
+    get:
+      tags: [containers]
+      summary: Read container logs
+      parameters:
+        - { $ref: "#/components/parameters/IdPath" }
+        - { name: tail, in: query, schema: { type: integer }, description: trailing lines }
+      responses:
+        "200":
+          description: Log text
+          content:
+            text/plain:
+              schema: { type: string }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/containers/{id}:
+    delete:
+      tags: [containers]
+      summary: Stop and remove a container
+      parameters: [{ $ref: "#/components/parameters/IdPath" }]
+      responses:
+        "200":
+          description: Removed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, const: removed }
+                  name: { type: string }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/containers/{id}/snapshot:
+    post:
+      tags: [containers]
+      summary: Snapshot a container
+      parameters: [{ $ref: "#/components/parameters/IdPath" }]
+      responses:
+        "200": { $ref: "#/components/responses/OkJson" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/containers/{id}/restore:
+    post:
+      tags: [containers]
+      summary: Restore a container from snapshot
+      parameters: [{ $ref: "#/components/parameters/IdPath" }]
+      responses:
+        "200": { $ref: "#/components/responses/OkJson" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/containers/{id}/clone:
+    post:
+      tags: [containers]
+      summary: Clone a container (block-level CoW)
+      parameters: [{ $ref: "#/components/parameters/IdPath" }]
+      responses:
+        "200": { $ref: "#/components/responses/OkJson" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/containers/{id}/rollback:
+    post:
+      tags: [containers]
+      summary: Roll a container back to a snapshot
+      parameters:
+        - { $ref: "#/components/parameters/IdPath" }
+        - { name: snap, in: query, schema: { type: string } }
+      responses:
+        "200": { $ref: "#/components/responses/OkJson" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/images/pull:
+    post:
+      tags: [containers]
+      summary: Pull a docker image and convert to ext4 rootfs
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [image]
+              properties:
+                image: { type: string, description: docker image ref }
+                name: { type: string, description: output rootfs name }
+      responses:
+        "200": { $ref: "#/components/responses/OkJson" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "500": { $ref: "#/components/responses/Error" }
+
+  # ---------------------------------------------------------------- tasks
+  /api/tasks:
+    get:
+      tags: [tasks]
+      summary: List all tasks with FSM state
+      responses:
+        "200":
+          description: Task list
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/TaskState" }
+
+  /api/tasks/{id}:
+    get:
+      tags: [tasks]
+      summary: Get one task (unique id prefix accepted)
+      parameters:
+        - { $ref: "#/components/parameters/TaskIdPath" }
+      responses:
+        "200":
+          description: Task state
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TaskState" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/tasks/{id}/transition:
+    post:
+      tags: [tasks]
+      summary: Drive a lifecycle FSM transition
+      parameters: [{ $ref: "#/components/parameters/TaskIdPath" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [to]
+              properties:
+                to:
+                  type: string
+                  enum: [PENDING, RUNNING, SUSPENDED, STOPPED, FAILED, COMPLETED]
+                actor: { type: string }
+                reason: { type: string }
+      responses:
+        "200":
+          description: Updated state
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TaskState" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /api/tasks/load-spec:
+    post:
+      tags: [tasks]
+      summary: Validate a TaskSpec TOML without launching
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                path: { type: string, description: path to a .toml file on the host }
+                content: { type: string, description: inline TOML }
+      responses:
+        "200": { $ref: "#/components/responses/OkJson" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+
+  /api/tasks/{id}/console:
+    get:
+      tags: [tasks]
+      summary: Recent console output (ring buffer tail)
+      parameters: [{ $ref: "#/components/parameters/TaskIdPath" }]
+      responses:
+        "200":
+          description: Console tail
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tail: { type: string }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/tasks/{id}/metrics:
+    get:
+      tags: [tasks]
+      summary: Per-task runtime metrics
+      parameters: [{ $ref: "#/components/parameters/TaskIdPath" }]
+      responses:
+        "200":
+          description: Metrics payload
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  net_tx_bytes: { type: integer, format: int64 }
+                  net_rx_bytes: { type: integer, format: int64 }
+                  egress_denied_total: { type: integer, format: int64 }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/tasks/{id}/pause:
+    post:
+      tags: [tasks]
+      summary: Pause (suspend) a running task
+      parameters: [{ $ref: "#/components/parameters/TaskIdPath" }]
+      responses:
+        "200": { $ref: "#/components/responses/OkJson" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /api/tasks/{id}/resume:
+    post:
+      tags: [tasks]
+      summary: Resume a suspended task
+      parameters: [{ $ref: "#/components/parameters/TaskIdPath" }]
+      responses:
+        "200": { $ref: "#/components/responses/OkJson" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /api/tasks/{id}/snapshots:
+    get:
+      tags: [tasks]
+      summary: List task snapshots
+      parameters: [{ $ref: "#/components/parameters/TaskIdPath" }]
+      responses:
+        "200":
+          description: Snapshot list
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Snapshot" }
+    post:
+      tags: [tasks]
+      summary: Create a task snapshot
+      parameters: [{ $ref: "#/components/parameters/TaskIdPath" }]
+      responses:
+        "201":
+          description: Created snapshot
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Snapshot" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/tasks/{id}/snapshots/{snapId}:
+    get:
+      tags: [tasks]
+      summary: Get one snapshot
+      parameters:
+        - { $ref: "#/components/parameters/TaskIdPath" }
+        - { $ref: "#/components/parameters/SnapIdPath" }
+      responses:
+        "200":
+          description: Snapshot
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Snapshot" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [tasks]
+      summary: Delete a snapshot
+      parameters:
+        - { $ref: "#/components/parameters/TaskIdPath" }
+        - { $ref: "#/components/parameters/SnapIdPath" }
+      responses:
+        "200": { $ref: "#/components/responses/OkJson" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/tasks/{id}/clone:
+    post:
+      tags: [tasks]
+      summary: Clone a task
+      parameters: [{ $ref: "#/components/parameters/TaskIdPath" }]
+      responses:
+        "200": { $ref: "#/components/responses/OkJson" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/tasks/{id}/rollback:
+    post:
+      tags: [tasks]
+      summary: Roll a task back to a snapshot
+      parameters:
+        - { $ref: "#/components/parameters/TaskIdPath" }
+        - { name: snap, in: query, schema: { type: string } }
+      responses:
+        "200": { $ref: "#/components/responses/OkJson" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  # ---------------------------------------------------------------- files
+  /api/tasks/{id}/files/list:
+    get:
+      tags: [files]
+      summary: List workspace directory entries
+      parameters:
+        - { $ref: "#/components/parameters/TaskIdPath" }
+        - { $ref: "#/components/parameters/FilePathQuery" }
+      responses:
+        "200":
+          description: Entries
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/FileInfo" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/tasks/{id}/files/stat:
+    get:
+      tags: [files]
+      summary: Stat a workspace file
+      parameters:
+        - { $ref: "#/components/parameters/TaskIdPath" }
+        - { $ref: "#/components/parameters/FilePathQuery" }
+      responses:
+        "200":
+          description: File info
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/FileInfo" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/tasks/{id}/files/read:
+    get:
+      tags: [files]
+      summary: Read a workspace file (binary body)
+      parameters:
+        - { $ref: "#/components/parameters/TaskIdPath" }
+        - { $ref: "#/components/parameters/FilePathQuery" }
+      responses:
+        "200":
+          description: Raw file bytes
+          content:
+            application/octet-stream:
+              schema: { type: string, format: binary }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/tasks/{id}/files/write:
+    put:
+      tags: [files]
+      summary: Write a workspace file (binary body)
+      parameters:
+        - { $ref: "#/components/parameters/TaskIdPath" }
+        - { $ref: "#/components/parameters/FilePathQuery" }
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema: { type: string, format: binary }
+      responses:
+        "200": { $ref: "#/components/responses/OkJson" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/tasks/{id}/files/mkdir:
+    post:
+      tags: [files]
+      summary: Create a directory in the workspace
+      parameters: [{ $ref: "#/components/parameters/TaskIdPath" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PathBody" }
+      responses:
+        "200": { $ref: "#/components/responses/OkJson" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+
+  /api/tasks/{id}/files/remove:
+    post:
+      tags: [files]
+      summary: Remove a workspace file/directory
+      parameters: [{ $ref: "#/components/parameters/TaskIdPath" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: "#/components/schemas/PathBody"
+                - type: object
+                  properties:
+                    recursive: { type: boolean, default: false }
+      responses:
+        "200": { $ref: "#/components/responses/OkJson" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/tasks/{id}/files/rename:
+    post:
+      tags: [files]
+      summary: Rename/move a workspace entry
+      parameters: [{ $ref: "#/components/parameters/TaskIdPath" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [path, to]
+              properties:
+                path: { type: string }
+                to: { type: string }
+      responses:
+        "200": { $ref: "#/components/responses/OkJson" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/tasks/{id}/files/watch:
+    get:
+      tags: [files]
+      summary: Long-poll workspace change events
+      parameters:
+        - { $ref: "#/components/parameters/TaskIdPath" }
+        - { $ref: "#/components/parameters/FilePathQuery" }
+        - { name: since, in: query, schema: { type: integer, format: int64, default: 0 } }
+      responses:
+        "200":
+          description: Change events
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    op: { type: string, enum: [create, write, remove, rename, chmod] }
+                    path: { type: string }
+                    ts: { type: integer, format: int64 }
+
+  # ---------------------------------------------------------------- exec
+  /api/exec:
+    post:
+      tags: [exec]
+      summary: Tool Gateway exec
+      description: |
+        Executes `"name arg=val ..."` through the per-task policy gateway.
+        Task id comes from `?task=` or the `X-Task-Id` header.
+        A policy denial that requires human approval returns 202 with
+        `{"status":"approval_required"}`.
+      parameters:
+        - { name: task, in: query, schema: { type: string } }
+        - { name: X-Task-Id, in: header, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [command]
+              properties:
+                command: { type: string, description: '"name arg=val arg2 ..."' }
+      responses:
+        "200":
+          description: Tool result
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ToolResult" }
+        "202":
+          description: Approval required
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, const: approval_required }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  # ---------------------------------------------------------------- audit
+  /api/audit/{id}:
+    get:
+      tags: [audit]
+      summary: Read a task's audit ledger
+      parameters: [{ $ref: "#/components/parameters/IdPath" }]
+      responses:
+        "200":
+          description: Ledger events
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/AuditEvent" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/audit/{id}/verify:
+    get:
+      tags: [audit]
+      summary: Verify ledger hash chain (and ed25519 record signatures when a key is present)
+      parameters: [{ $ref: "#/components/parameters/IdPath" }]
+      responses:
+        "200":
+          description: Verification result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  valid: { type: boolean }
+                  checked: { type: integer }
+                  signatures: { type: string, enum: [none, verified, failed] }
+
+  /api/audit/redaction-policy:
+    get:
+      tags: [audit]
+      summary: Read the redaction policy
+      responses:
+        "200": { $ref: "#/components/responses/OkJson" }
+    put:
+      tags: [audit]
+      summary: Update the redaction policy
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                patterns:
+                  type: array
+                  items: { type: string }
+                mode: { type: string, enum: [redact, block, allow] }
+      responses:
+        "200": { $ref: "#/components/responses/OkJson" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+
+  # ---------------------------------------------------------------- approvals
+  /api/approvals:
+    get:
+      tags: [approvals]
+      summary: List pending approval tickets
+      parameters:
+        - { name: task, in: query, schema: { type: string } }
+        - { name: all, in: query, schema: { type: string, enum: ["1"] }, description: include decided tickets }
+      responses:
+        "200":
+          description: Tickets
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Ticket" }
+    post:
+      tags: [approvals]
+      summary: Create an approval ticket
+      description: Server notifies `PVM_APPROVAL_WEBHOOK_URL` when configured; tickets persist across restarts.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/Ticket" }
+      responses:
+        "200":
+          description: Ticket id
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: { type: string }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /api/approvals/{id}/decide:
+    post:
+      tags: [approvals]
+      summary: Approve or reject a ticket
+      parameters: [{ $ref: "#/components/parameters/IdPath" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [approved]
+              properties:
+                approved: { type: boolean }
+                by: { type: string }
+      responses:
+        "200":
+          description: Decided ticket
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Ticket" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /api/approvals/{id}/edit:
+    post:
+      tags: [approvals]
+      summary: Edit a pending ticket's params (returns it to pending)
+      parameters: [{ $ref: "#/components/parameters/IdPath" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                params:
+                  type: object
+                  additionalProperties: true
+                reason: { type: string }
+      responses:
+        "200":
+          description: Updated ticket
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Ticket" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  # ---------------------------------------------------------------- policy
+  /api/policy/{task}:
+    get:
+      tags: [policy]
+      summary: Read compiled tool rules for a task
+      parameters: [{ $ref: "#/components/parameters/TaskPath" }]
+      responses:
+        "200":
+          description: Rules
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/ToolRule" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    post:
+      tags: [policy]
+      summary: Register/update compiled tool rules for a task
+      parameters: [{ $ref: "#/components/parameters/TaskPath" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: array
+              items: { $ref: "#/components/schemas/ToolRule" }
+      responses:
+        "200": { $ref: "#/components/responses/OkJson" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+
+  # ---------------------------------------------------------------- pool
+  /api/pool/stats:
+    get:
+      tags: [pool]
+      summary: Warm pool stats
+      responses:
+        "200":
+          description: Stats
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ready: { type: integer }
+                  claimed: { type: integer }
+                  total: { type: integer }
+
+  /api/pool/warm:
+    post:
+      tags: [pool]
+      summary: Pre-create warm sandboxes
+      description: "Real warm: state-recorded sandboxes, kernel-attached when available. Pool + quota persist across restarts."
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, count]
+              properties:
+                name: { type: string, description: template alias }
+                count: { type: integer, minimum: 1, maximum: 100 }
+                template: { type: object, additionalProperties: true }
+      responses:
+        "200":
+          description: Created count
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  created: { type: integer }
+        "400": { $ref: "#/components/responses/BadRequest" }
+
+  /api/pool/quota:
+    get:
+      tags: [pool]
+      summary: Read per-tenant quota
+      parameters:
+        - { name: tenant, in: query, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: Quota
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Quota" }
+    put:
+      tags: [pool]
+      summary: Update per-tenant quota
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/QuotaRequest" }
+      responses:
+        "200": { $ref: "#/components/responses/OkJson" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+    post:
+      tags: [pool]
+      summary: Set per-tenant quota
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/QuotaRequest" }
+      responses:
+        "200": { $ref: "#/components/responses/OkJson" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+
+  # ---------------------------------------------------------------- gate
+  /api/gate/verify:
+    post:
+      tags: [gate]
+      summary: Run the Artifact Gate on a bundle
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: artifact.Bundle JSON
+              properties:
+                task_id: { type: string }
+                hash: { type: string }
+                signatures:
+                  type: array
+                  items: { type: string }
+      responses:
+        "200":
+          description: Verdict (per-step pass/fail + hash)
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "400": { $ref: "#/components/responses/BadRequest" }
+
+  # ---------------------------------------------------------------- volumes
+  /api/volumes:
+    get:
+      tags: [volumes]
+      summary: List volumes
+      responses:
+        "200":
+          description: Volume list
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Volume" }
+    post:
+      tags: [volumes]
+      summary: Create a volume
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string }
+                driver: { type: string, default: "qcow2" }
+                size_mb: { type: integer, default: 256 }
+      responses:
+        "201":
+          description: Created volume
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Volume" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /api/volumes/{id}:
+    get:
+      tags: [volumes]
+      summary: Get a volume
+      parameters: [{ $ref: "#/components/parameters/IdPath" }]
+      responses:
+        "200":
+          description: Volume
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Volume" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [volumes]
+      summary: Delete a volume (refcount must be 0)
+      parameters: [{ $ref: "#/components/parameters/IdPath" }]
+      responses:
+        "200": { $ref: "#/components/responses/OkJson" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /api/volumes/{id}/clone:
+    post:
+      tags: [volumes]
+      summary: Clone a volume
+      parameters: [{ $ref: "#/components/parameters/IdPath" }]
+      responses:
+        "201":
+          description: Cloned volume
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Volume" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/volumes/{id}/rollback:
+    post:
+      tags: [volumes]
+      summary: Roll a volume back to a snapshot
+      parameters:
+        - { $ref: "#/components/parameters/IdPath" }
+        - { name: snap, in: query, required: true, schema: { type: string } }
+      responses:
+        "200": { $ref: "#/components/responses/OkJson" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/volumes/{id}/snapshots:
+    get:
+      tags: [volumes]
+      summary: List volume snapshots
+      parameters: [{ $ref: "#/components/parameters/IdPath" }]
+      responses:
+        "200":
+          description: Snapshots
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Snapshot" }
+    post:
+      tags: [volumes]
+      summary: Snapshot a volume
+      parameters: [{ $ref: "#/components/parameters/IdPath" }]
+      responses:
+        "201":
+          description: Created snapshot
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Snapshot" }
+
+  /api/volumes/{id}/snapshots/{snap}:
+    delete:
+      tags: [volumes]
+      summary: Delete a volume snapshot
+      parameters:
+        - { $ref: "#/components/parameters/IdPath" }
+        - { $ref: "#/components/parameters/SnapIdPath" }
+      responses:
+        "200": { $ref: "#/components/responses/OkJson" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  # ---------------------------------------------------------------- templates
+  /api/templates:
+    get:
+      tags: [templates]
+      summary: List templates
+      responses:
+        "200":
+          description: Template list
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Template" }
+    post:
+      tags: [templates]
+      summary: Register a template (image pull → ext4 build pipeline)
+      description: Lifecycle PENDING → BUILDING → READY|FAILED; a template may serve launches only once READY.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [image_ref]
+              properties:
+                image_ref: { type: string, description: docker image ref }
+                alias: { type: string }
+      responses:
+        "201":
+          description: Created template (PENDING)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Template" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /api/templates/{id}:
+    get:
+      tags: [templates]
+      summary: Get a template
+      parameters: [{ $ref: "#/components/parameters/IdPath" }]
+      responses:
+        "200":
+          description: Template
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Template" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [templates]
+      summary: Delete a template
+      parameters: [{ $ref: "#/components/parameters/IdPath" }]
+      responses:
+        "200": { $ref: "#/components/responses/OkJson" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/templates/{id}/alias:
+    post:
+      tags: [templates]
+      summary: Assign an alias to a template
+      parameters: [{ $ref: "#/components/parameters/IdPath" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [alias]
+              properties:
+                alias: { type: string }
+      responses:
+        "200": { $ref: "#/components/responses/OkJson" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /api/templates/{id}/build:
+    get:
+      tags: [templates]
+      summary: Poll build progress
+      parameters:
+        - { $ref: "#/components/parameters/IdPath" }
+        - { name: wait, in: query, schema: { type: string, enum: ["1"] }, description: long-poll until terminal phase }
+      responses:
+        "200":
+          description: Build progress
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/BuildProgress" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/templates/{id}/rebuild:
+    post:
+      tags: [templates]
+      summary: Re-run the build for a FAILED template
+      parameters: [{ $ref: "#/components/parameters/IdPath" }]
+      responses:
+        "202": { $ref: "#/components/responses/OkJson" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  # ---------------------------------------------------------------- egress
+  /api/egress/{task}/learned:
+    get:
+      tags: [egress]
+      summary: List DNS-learned domains for a task
+      parameters: [{ $ref: "#/components/parameters/TaskPath" }]
+      responses:
+        "200":
+          description: Learned domains
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { type: string }
+    delete:
+      tags: [egress]
+      summary: Drop one learned domain
+      parameters:
+        - { $ref: "#/components/parameters/TaskPath" }
+        - { name: host, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { $ref: "#/components/responses/OkJson" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/egress/{task}/allow:
+    post:
+      tags: [egress]
+      summary: Promote a learned domain to allowed
+      parameters: [{ $ref: "#/components/parameters/TaskPath" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [host]
+              properties:
+                host: { type: string }
+      responses:
+        "200": { $ref: "#/components/responses/OkJson" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/egress/{task}/policy:
+    get:
+      tags: [egress]
+      summary: Read the L7 egress policy for a task
+      parameters: [{ $ref: "#/components/parameters/TaskPath" }]
+      responses:
+        "200":
+          description: Egress policy
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/EgressPolicy" }
+    put:
+      tags: [egress]
+      summary: Replace the L7 egress policy for a task
+      parameters: [{ $ref: "#/components/parameters/TaskPath" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/EgressPolicy" }
+      responses:
+        "200": { $ref: "#/components/responses/OkJson" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+    delete:
+      tags: [egress]
+      summary: Remove the L7 egress policy for a task
+      parameters: [{ $ref: "#/components/parameters/TaskPath" }]
+      responses:
+        "200": { $ref: "#/components/responses/OkJson" }
+
+  # ---------------------------------------------------------------- network
+  /api/network/dataplane:
+    get:
+      tags: [network]
+      summary: Global TC/eBPF dataplane status
+      responses:
+        "200": { $ref: "#/components/responses/OkJson" }
+
+  /api/network/dataplane/{task}:
+    get:
+      tags: [network]
+      summary: Per-task TC/eBPF dataplane status
+      parameters: [{ $ref: "#/components/parameters/TaskPath" }]
+      responses:
+        "200": { $ref: "#/components/responses/OkJson" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  # ---------------------------------------------------------------- identity
+  /api/identity/{task}/tokens:
+    post:
+      tags: [identity]
+      summary: Mint a scoped credential token for a task
+      parameters: [{ $ref: "#/components/parameters/TaskPath" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [scopes]
+              properties:
+                scopes:
+                  type: array
+                  items: { type: string }
+                ttl: { type: string, default: "30m", description: Go duration }
+      responses:
+        "200":
+          description: Minted token
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/IdentityToken" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+
+  /api/identity/refresh:
+    post:
+      tags: [identity]
+      summary: Rotate a token (revokes the old one)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token]
+              properties:
+                token: { type: string }
+      responses:
+        "200":
+          description: New token
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/IdentityToken" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /api/identity/{task}/revoke:
+    post:
+      tags: [identity]
+      summary: Revoke tokens for a task (one or all)
+      parameters: [{ $ref: "#/components/parameters/TaskPath" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                token: { type: string }
+                all: { type: boolean, default: false }
+      responses:
+        "200":
+          description: Revocation count
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  revoked: { type: integer }
+
+  # ---------------------------------------------------------------- incidents
+  /api/incidents:
+    get:
+      tags: [incidents]
+      summary: List handled incidents (from audit events)
+      responses:
+        "200":
+          description: Incidents
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Incident" }
+
+  /api/incidents/{task}/report:
+    post:
+      tags: [incidents]
+      summary: Report an incident for a task (may trigger revocation)
+      parameters: [{ $ref: "#/components/parameters/TaskPath" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [severity, kind]
+              properties:
+                severity: { type: string, enum: [critical, high, medium, low] }
+                kind: { type: string }
+                detail: { type: string }
+      responses:
+        "200":
+          description: Recorded incident
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Incident" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+
+  # ---------------------------------------------------------------- e2b compat
+  /sandboxes:
+    get:
+      tags: [e2b]
+      summary: E2B compat — list sandboxes
+      security: [{ apiKeyAuth: [] }, { bearerAuth: [] }]
+      responses:
+        "200":
+          description: Sandbox list
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Sandbox" }
+    post:
+      tags: [e2b]
+      summary: E2B compat — create a sandbox
+      security: [{ apiKeyAuth: [] }, { bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                template_id: { type: string }
+                metadata: { type: object, additionalProperties: true }
+                timeout: { type: integer, description: seconds }
+      responses:
+        "200":
+          description: Created sandbox
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Sandbox" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /sandboxes/{sandboxID}:
+    delete:
+      tags: [e2b]
+      summary: E2B compat — delete a sandbox
+      security: [{ apiKeyAuth: [] }, { bearerAuth: [] }]
+      parameters:
+        - { name: sandboxID, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { $ref: "#/components/responses/OkJson" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /sandboxes/{sandboxID}/refreshes:
+    post:
+      tags: [e2b]
+      summary: E2B compat — extend a sandbox deadline
+      security: [{ apiKeyAuth: [] }, { bearerAuth: [] }]
+      parameters:
+        - { name: sandboxID, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [duration]
+              properties:
+                duration: { type: integer, description: seconds to add }
+      responses:
+        "200":
+          description: New deadline
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  sandboxID: { type: string }
+                  expires_at: { type: string, format: date-time }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  # ---------------------------------------------------------------- envd compat
+  /process.Process/Start:
+    post:
+      tags: [envd]
+      summary: envd compat — start a process in the sandbox
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [cmd]
+              properties:
+                cmd: { type: array, items: { type: string } }
+                cwd: { type: string }
+                envs:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      key: { type: string }
+                      value: { type: string }
+      responses:
+        "200": { $ref: "#/components/responses/OkJson" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+
+  /process.Process/Get:
+    post:
+      tags: [envd]
+      summary: envd compat — get process info by handle
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [handle]
+              properties:
+                handle: { type: string }
+      responses:
+        "200": { $ref: "#/components/responses/OkJson" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /process.Process/Wait:
+    post:
+      tags: [envd]
+      summary: envd compat — wait for process exit
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [handle]
+              properties:
+                handle: { type: string }
+      responses:
+        "200":
+          description: Exit info
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  exitCode: { type: integer }
+                  exited: { type: boolean }
+
+  /process.Process/Kill:
+    post:
+      tags: [envd]
+      summary: envd compat — kill a process
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [handle]
+              properties:
+                handle: { type: string }
+      responses:
+        "200": { $ref: "#/components/responses/OkJson" }
+
+  /process.Process/SendStdin:
+    post:
+      tags: [envd]
+      summary: envd compat — write stdin to a process
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [handle, data]
+              properties:
+                handle: { type: string }
+                data: { type: string, contentEncoding: base64 }
+      responses:
+        "200": { $ref: "#/components/responses/OkJson" }
+
+  /process.Process/List:
+    post:
+      tags: [envd]
+      summary: envd compat — list processes
+      security: []
+      responses:
+        "200": { $ref: "#/components/responses/OkJson" }
+
+  /process.Process/Connect:
+    post:
+      tags: [envd]
+      summary: envd compat — attach to an existing process
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [handle]
+              properties:
+                handle: { type: string }
+      responses:
+        "200": { $ref: "#/components/responses/OkJson" }
+
+  /filesystem.Filesystem/List:
+    post:
+      tags: [envd]
+      summary: envd compat — list a directory
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [path]
+              properties:
+                path: { type: string }
+      responses:
+        "200": { $ref: "#/components/responses/OkJson" }
+
+  /filesystem.Filesystem/Stat:
+    post:
+      tags: [envd]
+      summary: envd compat — stat a path
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [path]
+              properties:
+                path: { type: string }
+      responses:
+        "200": { $ref: "#/components/responses/OkJson" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /filesystem.Filesystem/Read:
+    post:
+      tags: [envd]
+      summary: envd compat — read a file (base64 body)
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [path]
+              properties:
+                path: { type: string }
+      responses:
+        "200": { $ref: "#/components/responses/OkJson" }
+
+  /filesystem.Filesystem/Write:
+    post:
+      tags: [envd]
+      summary: envd compat — write a file (base64 body)
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [path, data]
+              properties:
+                path: { type: string }
+                data: { type: string, contentEncoding: base64 }
+      responses:
+        "200": { $ref: "#/components/responses/OkJson" }
+
+  /filesystem.Filesystem/Mkdir:
+    post:
+      tags: [envd]
+      summary: envd compat — create a directory
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [path]
+              properties:
+                path: { type: string }
+      responses:
+        "200": { $ref: "#/components/responses/OkJson" }
+
+  /filesystem.Filesystem/Remove:
+    post:
+      tags: [envd]
+      summary: envd compat — remove a path
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [path]
+              properties:
+                path: { type: string }
+                recursive: { type: boolean, default: false }
+      responses:
+        "200": { $ref: "#/components/responses/OkJson" }
+
+  /filesystem.Filesystem/Rename:
+    post:
+      tags: [envd]
+      summary: envd compat — rename a path
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [from, to]
+              properties:
+                from: { type: string }
+                to: { type: string }
+      responses:
+        "200": { $ref: "#/components/responses/OkJson" }
+
+  /filesystem.Filesystem/WatchDir:
+    post:
+      tags: [envd]
+      summary: envd compat — watch a directory (streamed frames)
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [path]
+              properties:
+                path: { type: string }
+      responses:
+        "200":
+          description: Streamed watch events (5-byte envelope + JSON frames)
+          content:
+            application/json:
+              schema: { $ref: "#/components/responses/OkJson" }
+
+  /files:
+    get:
+      tags: [envd]
+      summary: envd compat — raw file download (envd redirect style)
+      security: []
+      parameters:
+        - { name: path, in: query, required: true, schema: { type: string } }
+        - { name: username, in: query, schema: { type: string } }
+      responses:
+        "200":
+          description: Raw file bytes
+          content:
+            application/octet-stream:
+              schema: { type: string, format: binary }
+        "404": { $ref: "#/components/responses/NotFound" }
+    put:
+      tags: [envd]
+      summary: envd compat — raw file upload
+      security: []
+      parameters:
+        - { name: path, in: query, required: true, schema: { type: string } }
+        - { name: username, in: query, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema: { type: string, format: binary }
+      responses:
+        "200": { $ref: "#/components/responses/OkJson" }
+
+# ============================================================================ components
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: Bearer token; the token is the controller's API_SECRET.
+    apiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-KEY
+      description: E2B SDK-style API key header; value is the API_SECRET.
+
+  parameters:
+    IdPath:
+      name: id
+      in: path
+      required: true
+      schema: { type: string }
+      description: Resource id (^[a-zA-Z0-9_-]+$).
+    TaskIdPath:
+      name: id
+      in: path
+      required: true
+      schema: { type: string }
+      description: Task id; a unique prefix is accepted (short id).
+    TaskPath:
+      name: task
+      in: path
+      required: true
+      schema: { type: string }
+      description: Task id or unique prefix.
+    SnapIdPath:
+      name: snapId
+      in: path
+      required: true
+      schema: { type: string }
+    FilePathQuery:
+      name: path
+      in: query
+      required: true
+      schema: { type: string }
+      description: Path relative to the task workspace (hostfs dir).
+
+  responses:
+    BadRequest:
+      description: Malformed request
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Unauthorized:
+      description: Missing or invalid credentials
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Forbidden:
+      description: Policy denial
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Conflict:
+      description: State conflict
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Error:
+      description: Server error
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    OkJson:
+      description: JSON status payload
+      content:
+        application/json:
+          schema:
+            type: object
+            additionalProperties: true
+
+  schemas:
+    Error:
+      type: object
+      required: [message]
+      properties:
+        message:
+          type: string
+          description: Human-readable error text.
+
+    VersionInfo:
+      type: object
+      properties:
+        version: { type: string }
+        commit: { type: string }
+        goos: { type: string }
+        goarch: { type: string }
+
+    Container:
+      type: object
+      properties:
+        id: { type: string }
+        name: { type: string }
+        state: { type: string }
+        memory_bytes: { type: integer, format: int64 }
+        cpu: { type: integer }
+        ephemeral: { type: boolean }
+
+    TaskState:
+      type: object
+      properties:
+        id: { type: string }
+        status: { type: string }
+        actor: { type: string }
+        reason: { type: string }
+        history:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+
+    Snapshot:
+      type: object
+      properties:
+        id: { type: string }
+        task_id: { type: string }
+        created_at: { type: string, format: date-time }
+        size_bytes: { type: integer, format: int64 }
+
+    FileInfo:
+      type: object
+      properties:
+        name: { type: string }
+        path: { type: string }
+        size: { type: integer, format: int64 }
+        mode: { type: string }
+        is_dir: { type: boolean }
+        mod_time: { type: string, format: date-time }
+
+    PathBody:
+      type: object
+      required: [path]
+      properties:
+        path: { type: string }
+
+    ToolResult:
+      type: object
+      additionalProperties: true
+      description: Opaque tool result from the policy gateway.
+
+    ToolRule:
+      type: object
+      properties:
+        tool: { type: string }
+        effect: { type: string, enum: [allow, deny, approval] }
+        params:
+          type: object
+          additionalProperties: true
+        reason: { type: string }
+
+    AuditEvent:
+      type: object
+      properties:
+        seq: { type: integer }
+        ts: { type: string, format: date-time }
+        kind: { type: string }
+        payload:
+          type: object
+          additionalProperties: true
+        prev_hash: { type: string }
+        hash: { type: string }
+
+    Ticket:
+      type: object
+      properties:
+        id: { type: string }
+        task: { type: string }
+        tool: { type: string }
+        params:
+          type: object
+          additionalProperties: true
+        status: { type: string, enum: [pending, approved, rejected] }
+        deadline: { type: string, format: date-time }
+        decided_by: { type: string }
+
+    Quota:
+      type: object
+      properties:
+        maxConcurrent: { type: integer }
+        maxCPU: { type: integer }
+        maxMemoryMB: { type: integer }
+        maxTasksPerHour: { type: integer }
+
+    QuotaRequest:
+      type: object
+      required: [tenant]
+      properties:
+        tenant: { type: string }
+        quota: { $ref: "#/components/schemas/Quota" }
+
+    Volume:
+      type: object
+      properties:
+        volume_id: { type: string }
+        name: { type: string }
+        driver: { type: string }
+        refcount: { type: integer }
+        created_at: { type: string, format: date-time }
+
+    Template:
+      type: object
+      properties:
+        template_id: { type: string }
+        alias: { type: string }
+        image_ref: { type: string }
+        status: { type: string, enum: [PENDING, BUILDING, READY, FAILED] }
+        kind: { type: string }
+        created_at: { type: string, format: date-time }
+
+    BuildProgress:
+      type: object
+      properties:
+        phase: { type: string, enum: [queued, pull, extract, mkfs, copy, done, failed] }
+        pct: { type: integer, minimum: 0, maximum: 100 }
+        log_tail: { type: string }
+
+    EgressPolicy:
+      type: object
+      properties:
+        rules:
+          type: array
+          items:
+            type: object
+            properties:
+              host: { type: string }
+              port: { type: integer }
+              action: { type: string, enum: [allow, deny, intercept] }
+              mitm: { type: boolean, description: HTTPS interception for inject/audit }
+        default_action: { type: string, enum: [allow, deny] }
+
+    IdentityToken:
+      type: object
+      properties:
+        token: { type: string }
+        expires_at: { type: string, format: date-time }
+
+    Incident:
+      type: object
+      properties:
+        id: { type: string }
+        task: { type: string }
+        severity: { type: string, enum: [critical, high, medium, low] }
+        kind: { type: string }
+        detail: { type: string }
+        ts: { type: string, format: date-time }
+        actions:
+          type: array
+          items: { type: string }
+
+    Sandbox:
+      type: object
+      properties:
+        sandboxID: { type: string }
+        templateID: { type: string }
+        clientID: { type: string }
+        started_at: { type: string, format: date-time }
+        ends_at: { type: string, format: date-time }

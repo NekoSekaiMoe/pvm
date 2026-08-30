@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -371,7 +372,7 @@ type fakeLauncher struct {
 	starts int // number of Start invocations (fail-closed tests assert zero)
 }
 
-func (f *fakeLauncher) Start(ctx context.Context, kernel string, args []string, logFile *os.File) (int, *uml.Process, error) {
+func (f *fakeLauncher) Start(ctx context.Context, kernel string, args []string, log io.Writer) (int, *uml.Process, error) {
 	f.starts++
 	return 99999, &uml.Process{}, nil
 }

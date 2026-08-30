@@ -208,12 +208,18 @@ func (c *Client) doJSON(ctx context.Context, method, path string, body any, out 
 		return err
 	}
 	defer resp.Body.Close()
+	return decodeInto(resp, out)
+}
+
+// decodeInto is the shared response path: bounded reads, surfaced error
+// bodies, empty-2xx tolerance.
+func decodeInto(resp *http.Response, out any) error {
 	// Bound every body read so a hostile endpoint cannot stream unbounded
 	// bytes into memory (error messages included).
 	respBody := io.LimitReader(resp.Body, maxResponseBodyBytes)
 	if resp.StatusCode >= 400 {
 		b, _ := io.ReadAll(respBody)
-		return fmt.Errorf("sdk: %s %s -> %d: %s", method, path, resp.StatusCode, string(b))
+		return fmt.Errorf("sdk: %s %s -> %d: %s", resp.Request.Method, resp.Request.URL.Path, resp.StatusCode, string(b))
 	}
 	if out != nil {
 		// Decode returns io.EOF for an empty (2xx) body — treat that as a
@@ -225,4 +231,46 @@ func (c *Client) doJSON(ctx context.Context, method, path string, body any, out 
 	}
 	io.Copy(io.Discard, respBody)
 	return nil
+}
+
+// bytesOrNil adapts a marshalled body to io.Reader for the e2b helpers.
+func bytesOrNil(raw []byte, body any) io.Reader {
+	if body == nil {
+		return nil
+	}
+	return bytes.NewReader(raw)
+}
+
+// marshalJSON is the nil-safe marshal used by hand-built requests.
+func marshalJSON(v any) ([]byte, error) { return json.Marshal(v) }
+
+// readerOrNil wraps marshalled bytes (nil body stays nil).
+func readerOrNil(raw []byte) io.Reader {
+	if raw == nil {
+		return nil
+	}
+	return bytes.NewReader(raw)
+}
+
+// fetchText GETs a text endpoint (metrics) with a bounded read and the
+// standard auth header.
+func (c *Client) fetchText(ctx context.Context, path string) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.cfg.APIURL+path, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+c.cfg.APIKey)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	b, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBodyBytes))
+	if err != nil {
+		return "", err
+	}
+	if resp.StatusCode >= 400 {
+		return "", fmt.Errorf("sdk: GET %s -> %d: %s", path, resp.StatusCode, string(b))
+	}
+	return string(b), nil
 }

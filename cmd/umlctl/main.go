@@ -292,17 +292,29 @@ func main() {
 				os.Exit(1)
 			}
 			if subcmd == "create" {
-				// TODO(subnet-design): the gateway/subnet is hardcoded until a
-				// subnet allocator exists; concurrent bridges on distinct
-				// subnets need an allocation scheme first.
-				err := network.SetupBridge(name, "", "10.0.0.1/24")
+				// Subnet allocation: the persistent registry picks the next free
+				// /24 from the pool (default 10.64.0.0/12), skipping host nets.
+				// When the registry is unavailable (read-only state root) fall
+				// back to the historical default so create keeps working.
+				gwCIDR := "10.0.0.1/24"
+				if reg, rerr := network.LoadNetworkRegistry(os.Getenv("PVM_STATE_ROOT")); rerr == nil {
+					if allocated, aerr := reg.Allocate(name); aerr == nil {
+						gwCIDR = allocated
+					} else {
+						fmt.Printf("Warning: subnet allocation failed (%v); using %s\n", aerr, gwCIDR)
+					}
+				}
+				err := network.SetupBridge(name, "", gwCIDR)
 				if err != nil {
 					fmt.Printf("Error creating network: %v\n", err)
 					os.Exit(1)
 				} else {
-					fmt.Printf("Network %s created.\n", name)
+					fmt.Printf("Network %s created on %s.\n", name, gwCIDR)
 				}
 			} else if subcmd == "rm" {
+				if reg, rerr := network.LoadNetworkRegistry(os.Getenv("PVM_STATE_ROOT")); rerr == nil {
+					reg.Release(name)
+				}
 				err := network.DeleteBridge(name, "")
 				if err != nil {
 					fmt.Printf("Error deleting network: %v\n", err)

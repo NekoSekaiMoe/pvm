@@ -31,19 +31,19 @@ import (
 // Bundle is the evidence package the agent submits alongside a success claim.
 type Bundle struct {
 	TaskID    string            `json:"task_id"`
-	Diff      string            `json:"diff"`        // unified diff text
-	BuildLog  string            `json:"build_log"`   // build/run output
-	Trace     []string          `json:"trace"`       // tool-call trace summary
-	Files     map[string][]byte `json:"files"`       // declared output files
-	ClaimedOK bool              `json:"claimed_ok"`  // agent's own claim
+	Diff      string            `json:"diff"`       // unified diff text
+	BuildLog  string            `json:"build_log"`  // build/run output
+	Trace     []string          `json:"trace"`      // tool-call trace summary
+	Files     map[string][]byte `json:"files"`      // declared output files
+	ClaimedOK bool              `json:"claimed_ok"` // agent's own claim
 }
 
 // Verdict is the gate's decision.
 type Verdict struct {
 	Passed  bool              `json:"passed"`
-	Hash    string            `json:"hash"`     // sha256 of the canonical bundle
-	Reasons []string          `json:"reasons"`  // why it failed (empty on pass)
-	Step    map[string]string `json:"step"`     // per-step status
+	Hash    string            `json:"hash"`    // sha256 of the canonical bundle
+	Reasons []string          `json:"reasons"` // why it failed (empty on pass)
+	Step    map[string]string `json:"step"`    // per-step status
 }
 
 // Verifier is one check in the four-step pipeline. Returns ok + a reason
@@ -56,20 +56,37 @@ type Verifier interface {
 // Gate runs the verifier pipeline.
 type Gate struct {
 	verifiers []Verifier
-	ledger    *audit.Ledger
-	mu        sync.Mutex
+	// advisory names verifiers whose failure is recorded but does not fail
+	// the release (e.g. secret_scan when spec.artifacts.block_secrets=false).
+	advisory map[string]bool
+	ledger   *audit.Ledger
+	mu       sync.Mutex
 }
 
 // NewGate assembles a gate with the default verifiers plus any extras.
 func NewGate(ledger *audit.Ledger, extra ...Verifier) *Gate {
-	g := &Gate{ledger: ledger}
+	g := &Gate{ledger: ledger, advisory: map[string]bool{}}
 	// default pipeline order matches plan.md §7.3
 	g.verifiers = append(g.verifiers,
-		&HashVerifier{},        // step 4 (computed first so later steps can cite it)
-		&SecretScanVerifier{},  // step 3
+		&HashVerifier{},       // step 4 (computed first so later steps can cite it)
+		&SecretScanVerifier{}, // step 3
 	)
 	g.verifiers = append(g.verifiers, extra...) // steps 1 & 2 injected here
 	return g
+}
+
+// AddVerifier appends pipeline steps (used by FromSpec).
+func (g *Gate) AddVerifier(vs ...Verifier) {
+	g.mu.Lock()
+	g.verifiers = append(g.verifiers, vs...)
+	g.mu.Unlock()
+}
+
+// SetAdvisory marks a verifier's failures as non-blocking.
+func (g *Gate) SetAdvisory(name string) {
+	g.mu.Lock()
+	g.advisory[name] = true
+	g.mu.Unlock()
 }
 
 // Verify runs every verifier; the bundle passes only if ALL pass. The verdict
@@ -80,11 +97,18 @@ func (g *Gate) Verify(b *Bundle) *Verdict {
 	v := &Verdict{Step: map[string]string{}, Passed: true}
 	v.Hash = hashBundle(b)
 
+	advisory := make(map[string]bool, len(g.advisory))
+	for k, v := range g.advisory {
+		advisory[k] = v
+	}
 	for _, ver := range g.verifiers {
 		ok, reason := ver.Verify(b)
-		if ok {
+		switch {
+		case ok:
 			v.Step[ver.Name()] = "pass"
-		} else {
+		case advisory[ver.Name()]:
+			v.Step[ver.Name()] = "advisory: " + reason
+		default:
 			v.Step[ver.Name()] = "fail: " + reason
 			v.Passed = false
 			v.Reasons = append(v.Reasons, ver.Name()+": "+reason)

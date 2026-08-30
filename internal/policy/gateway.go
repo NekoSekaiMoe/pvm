@@ -55,6 +55,15 @@ type Gateway struct {
 	// performs the actual work (e.g. git push, file read) using broker-scoped
 	// credentials, and returns a sanitized summary. nil = dry-run mode.
 	Executor func(req ToolRequest) (ToolResponse, error)
+
+	// ApprovalCheck closes the approval loop: when an APPROVE-class request
+	// arrives, the gateway asks whether an approved, not-yet-consumed ticket
+	// matches (task, tool, params). If yes, the request executes once and
+	// OnApproved consumes the ticket. nil = approval never auto-clears.
+	ApprovalCheck func(req ToolRequest) (ticketID string, approved bool)
+	// OnApproved is invoked after an approval-backed execution attempt to
+	// consume the ticket (one approval == one attempt).
+	OnApproved func(ticketID string)
 }
 
 // Rule is a compiled ToolRule (from spec.ToolRule).
@@ -144,6 +153,30 @@ func (g *Gateway) Execute(req ToolRequest) (ToolResponse, error) {
 		g.audit(req, audit.DecisionDeny, "denied by rule: "+rule.Reason)
 		return ToolResponse{OK: false, Reason: "denied: " + rule.Reason}, ErrDenied
 	case ActionApprove:
+		// Approval closure: an approved, unconsumed ticket for exactly this
+		// (task, tool, params) unlocks ONE execution attempt; the ticket is
+		// consumed afterwards regardless of executor outcome (plan.md §10
+		// "Allow once"). Without a matching ticket the request still pauses
+		// behind ErrApprovalRequired.
+		if g.ApprovalCheck != nil {
+			if ticketID, ok := g.ApprovalCheck(req); ok {
+				defer func() {
+					if g.OnApproved != nil {
+						g.OnApproved(ticketID)
+					}
+				}()
+				g.audit(req, audit.DecisionAllow, "unlocked by approved ticket "+ticketID)
+				if g.Executor == nil {
+					return ToolResponse{OK: true, Summary: fmt.Sprintf("%s: simulated (no executor), unlocked by ticket %s", req.Name, ticketID)}, nil
+				}
+				resp, err := g.Executor(req)
+				if err != nil {
+					g.audit(req, audit.DecisionDeny, "executor error (approved): "+err.Error())
+					return ToolResponse{}, err
+				}
+				return sanitize(resp), nil
+			}
+		}
 		// Don't execute yet; surface the approval ticket.
 		g.audit(req, audit.DecisionApprove, "approval required: "+rule.Reason)
 		return ToolResponse{OK: false, Reason: "approval required"}, ErrApprovalRequired

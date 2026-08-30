@@ -65,30 +65,30 @@ const DefaultMaxRetries = 2
 // control plane wraps. umlctl consumes a subset (Runtime/Workspace/Kernel/Init
 // + Network tap); agentpvm consumes the whole thing.
 type TaskSpec struct {
-	Version int `toml:"version"` // schema version; must equal SpecVersion
+	Version int `toml:"version" json:"version"` // schema version; must equal SpecVersion
 
 	// --- identity (plan.md §3) ---
 	// Caller is the human/service that authorized this task. Required.
 	// Tenant scopes the task for multi-tenant quota segregation (plan.md §12).
-	Caller   string   `toml:"caller"`
-	Tenant   string   `toml:"tenant"`
-	Identity Identity `toml:"identity"`
+	Caller   string   `toml:"caller" json:"caller"`
+	Tenant   string   `toml:"tenant" json:"tenant"`
+	Identity Identity `toml:"identity" json:"identity"`
 
 	// --- runtime / sandbox shape ---
-	Runtime   RuntimeSpec   `toml:"runtime"`
-	Workspace WorkspaceSpec `toml:"workspace"`
-	Kernel    KernelSpec    `toml:"kernel"`
+	Runtime   RuntimeSpec   `toml:"runtime" json:"runtime"`
+	Workspace WorkspaceSpec `toml:"workspace" json:"workspace"`
+	Kernel    KernelSpec    `toml:"kernel" json:"kernel"`
 
 	// --- control planes ---
-	Network   NetworkSpec   `toml:"network"`
-	Tools     []ToolRule    `toml:"tools"`
-	Budget    BudgetSpec    `toml:"budget"`
-	Approval  ApprovalSpec  `toml:"approval"`
-	Artifacts ArtifactsSpec `toml:"artifacts"`
-	Lifecycle LifecycleSpec `toml:"lifecycle"`
+	Network   NetworkSpec   `toml:"network" json:"network"`
+	Tools     []ToolRule    `toml:"tools" json:"tools"`
+	Budget    BudgetSpec    `toml:"budget" json:"budget"`
+	Approval  ApprovalSpec  `toml:"approval" json:"approval"`
+	Artifacts ArtifactsSpec `toml:"artifacts" json:"artifacts"`
+	Lifecycle LifecycleSpec `toml:"lifecycle" json:"lifecycle"`
 
 	// --- volumes (Cube parity: per-sandbox persistent mounts) ---
-	Volumes []VolumeMount `toml:"volumes"`
+	Volumes []VolumeMount `toml:"volumes" json:"volumes"`
 
 	// --- security & isolation policy ---
 	Security SecuritySpec `toml:"security" json:"security"`
@@ -100,38 +100,38 @@ type TaskSpec struct {
 type Identity struct {
 	// Scope is a list of capability strings the minted token carries, e.g.
 	// "repo:read", "db:write:payments". Empty = no capabilities.
-	Scope []string `toml:"scope"`
+	Scope []string `toml:"scope" json:"scope"`
 	// TTL is how long the broker-issued token stays valid.
-	TTL string `toml:"ttl"`
+	TTL string `toml:"ttl" json:"ttl"`
 }
 
 // RuntimeSpec selects the UML sandbox shape.
 type RuntimeSpec struct {
 	// Name is the human-readable task name (also used as container id prefix
 	// when none is given on the CLI).
-	Name string `toml:"name"`
+	Name string `toml:"name" json:"name"`
 	// CPU is the cgroup v2 cpu.max quota (in "millicpu"/1000; 1000 = 1 full
 	// CPU). 0 = unlimited.
-	CPU int `toml:"cpu"`
+	CPU int `toml:"cpu" json:"cpu"`
 	// Memory is the cgroup v2 memory.max, e.g. "512M", "2G".
-	Memory string `toml:"memory"`
+	Memory string `toml:"memory" json:"memory"`
 	// CPUModel pins the UML skas/tt mode; empty = kernel default.
-	CPUModel string `toml:"cpu_model"`
+	CPUModel string `toml:"cpu_model" json:"cpu_model"`
 }
 
 // WorkspaceSpec describes the filesystem layout.
 type WorkspaceSpec struct {
 	// BaseImage is the read-only backing image shared by many sandboxes.
-	BaseImage string `toml:"base_image"`
+	BaseImage string `toml:"base_image" json:"base_image"`
 	// Overlay is the per-sandbox qcow2 CoW path. If empty, a path under the
 	// container state dir is synthesized at start time.
-	Overlay string `toml:"overlay"`
+	Overlay string `toml:"overlay" json:"overlay"`
 	// Init is the ABSOLUTE in-guest init path (the kernel command line's
 	// init=... must be absolute), e.g. "/init.sh", "/sbin/init".
-	Init string `toml:"init"`
+	Init string `toml:"init" json:"init"`
 	// ExtraEnv is injected into the guest via the init contract. Values here
 	// are NOT secrets — secrets come from the Credential Broker at runtime.
-	ExtraEnv map[string]string `toml:"extra_env"`
+	ExtraEnv map[string]string `toml:"extra_env" json:"extra_env"`
 
 	// CompactOnExit rebuilds the per-task qcow2 overlay in place right after
 	// the sandbox exits: only allocated clusters are rewritten, zero clusters
@@ -141,7 +141,7 @@ type WorkspaceSpec struct {
 	// meaningful on the vhost path (use_vhost_blk=true); the ubd path mounts
 	// the base directly and has no overlay to compact. Non-fatal: a compact
 	// failure is logged + audited but does not flip a clean task to Failed.
-	CompactOnExit bool `toml:"compact_on_exit"`
+	CompactOnExit bool `toml:"compact_on_exit" json:"compact_on_exit"`
 
 	// Ephemeral makes the sandbox's disk writes non-persistent: the root
 	// filesystem is mounted read-only (kernel cmdline "ro" instead of "rw",
@@ -154,13 +154,13 @@ type WorkspaceSpec struct {
 	// mounts are user intent and are NOT discarded. Mutually exclusive with
 	// compact_on_exit (nothing to compact) and workspace.overlay (no overlay
 	// is ever created).
-	Ephemeral bool `toml:"ephemeral"`
+	Ephemeral bool `toml:"ephemeral" json:"ephemeral"`
 }
 
 // KernelSpec selects the UML kernel binary and its launch mode.
 type KernelSpec struct {
 	// Path to the UML kernel binary.
-	Path string `toml:"path"`
+	Path string `toml:"path" json:"path"`
 	// Virtio is retained for TOML compatibility but no longer selects the
 	// network transport. Historically it was a single switch that wired BOTH
 	// the block device (virtio_uml / vhost-user-blk) AND the network device.
@@ -169,14 +169,14 @@ type KernelSpec struct {
 	// transport — the only UML net transport left in Linux >= 6.16; legacy
 	// eth0=tuntap was removed upstream). New code should use UseVhostBlk
 	// directly; this field has no effect on networking.
-	Virtio bool `toml:"virtio"`
+	Virtio bool `toml:"virtio" json:"virtio"`
 	// UseVhostBlk serves the block device over vhost-user-blk. The agent
 	// path always creates a qcow2 CoW overlay per task (the backing image
 	// may be raw or qcow2; sniffed by cow.CreateOverlay), so this MUST be
 	// true for `agentpvm run`. The default backend is the pure-Go server
 	// (internal/vhost/vu); PVM_VHOST_BACKEND=qemu falls back to
 	// qemu-storage-daemon.
-	UseVhostBlk bool `toml:"use_vhost_blk"`
+	UseVhostBlk bool `toml:"use_vhost_blk" json:"use_vhost_blk"`
 }
 
 // NetworkSpec is the per-task network policy (plan.md §4). The egress allowlist
@@ -185,50 +185,50 @@ type KernelSpec struct {
 type NetworkSpec struct {
 	// Enabled turns on networking at all. When false, the sandbox gets no TAP
 	// and no proxy — fully isolated.
-	Enabled bool `toml:"enabled"`
+	Enabled bool `toml:"enabled" json:"enabled"`
 	// Bridge is the host bridge name to attach the TAP to.
-	Bridge string `toml:"bridge"`
+	Bridge string `toml:"bridge" json:"bridge"`
 	// GatewayIP is the bridge CIDR, e.g. "10.0.0.1/24".
-	GatewayIP string `toml:"gateway_ip"`
+	GatewayIP string `toml:"gateway_ip" json:"gateway_ip"`
 	// GuestIP optionally pins the guest's IPv4 address inside the bridge
 	// subnet. Empty = the host IPAM allocates one (starting at offset .100)
 	// and hands it to the guest via the pvm_ip= kernel parameter. When both
 	// guest_ip and gateway_ip are set, guest_ip must lie inside the gateway
 	// subnet and differ from the gateway address.
-	GuestIP string `toml:"guest_ip"`
+	GuestIP string `toml:"guest_ip" json:"guest_ip"`
 	// TAP is the host TAP device name. If empty, derived from the task name.
-	TAP string `toml:"tap"`
+	TAP string `toml:"tap" json:"tap"`
 	// EgressAllowDomains is the L7 allowlist applied by the proxy.
-	EgressAllowDomains []string `toml:"egress_allow_domains"`
+	EgressAllowDomains []string `toml:"egress_allow_domains" json:"egress_allow_domains"`
 	// EgressBlockDomains is an explicit denylist (takes precedence over allow).
-	EgressBlockDomains []string `toml:"egress_block_domains"`
+	EgressBlockDomains []string `toml:"egress_block_domains" json:"egress_block_domains"`
 	// MaxRequestBodyBytes caps HTTP request bodies leaving the sandbox. 0 = no cap.
-	MaxRequestBodyBytes int64 `toml:"max_request_body_bytes"`
+	MaxRequestBodyBytes int64 `toml:"max_request_body_bytes" json:"max_request_body_bytes"`
 	// QoSRate is a tc tbf rate, e.g. "10mbit". Empty = no shaping.
-	QoSRate string `toml:"qos_rate"`
+	QoSRate string `toml:"qos_rate" json:"qos_rate"`
 	// EgressRules is the extended L7 rule set (Cube parity: docs/guide/security-proxy.md).
 	// When non-empty, rule decisions take precedence over the flat allow/block
 	// domain allowlist; the deny list is always evaluated first at the gateway
 	// and can never be overridden by a rule.
-	EgressRules []EgressRule `toml:"egress_rules"`
+	EgressRules []EgressRule `toml:"egress_rules" json:"egress_rules"`
 
 	// DNSLearnEnabled turns on DNS-learned domain egress (todo.md P1-B,
 	// CubeVS dns_allow/dns_query_track parity): a per-task UDP DNS proxy
 	// snoops resolver responses and inserts the resolved public IPs of
 	// ALLOWLISTED domains into the task's eBPF whitelist map with a TTL, so
 	// the IP-floor admits exactly the addresses the guest actually resolved.
-	DNSLearnEnabled bool `toml:"dns_learn_enabled"`
+	DNSLearnEnabled bool `toml:"dns_learn_enabled" json:"dns_learn_enabled"`
 	// LearnTTL caps how long a learned IP stays whitelisted (Go duration,
 	// default DefaultLearnTTL). The effective per-entry lifetime is
 	// min(DNS TTL, learn_ttl) so a short-lived DNS answer never lingers.
-	LearnTTL string `toml:"learn_ttl"`
+	LearnTTL string `toml:"learn_ttl" json:"learn_ttl"`
 	// DNSUpstream is the resolver the DNS proxy forwards to, "IP" or
 	// "IP:port". Empty = the host's first /etc/resolv.conf nameserver.
-	DNSUpstream string `toml:"dns_upstream"`
+	DNSUpstream string `toml:"dns_upstream" json:"dns_upstream"`
 	// MaxLearnedEntries bounds the per-task learned IP set (default
 	// DefaultMaxLearnedEntries) so a hostile guest cannot exhaust eBPF map
 	// capacity or host memory by flooding distinct allowlisted lookups.
-	MaxLearnedEntries int `toml:"max_learned_entries"`
+	MaxLearnedEntries int `toml:"max_learned_entries" json:"max_learned_entries"`
 
 	// Dataplane selects the packet data plane (todo.md P2, CubeVS parity):
 	//   "bridge" (default) — TAP enslaved to a Linux bridge; the guest IP
@@ -241,7 +241,7 @@ type NetworkSpec struct {
 	//     session table. bridge/gateway_ip/guest_ip are IGNORED in tc mode
 	//     (pvm_ip=169.254.68.6 and egress_proxy=169.254.68.5:<port> are
 	//     injected instead). IPv4 TCP/UDP only; ICMP is dropped.
-	Dataplane string `toml:"dataplane"`
+	Dataplane string `toml:"dataplane" json:"dataplane"`
 }
 
 // Dataplane mode values for NetworkSpec.Dataplane.
@@ -263,6 +263,10 @@ type EgressRule struct {
 	Port   int           `toml:"port" json:"port"`     // 1..65535, 0 = default 80/443
 	Allow  *bool         `toml:"allow" json:"allow"`   // nil = allow=true
 	Inject *EgressInject `toml:"inject" json:"inject"`
+	// MITM opts the rule into TLS interception so Inject can run on HTTPS
+	// traffic (egress CA terminates the guest's TLS; the guest rootfs must
+	// trust the CA). Mirrors CubeSgress L7 inject-on-HTTPS.
+	MITM *bool `toml:"mitm" json:"mitm"`
 }
 
 // EgressInject mirrors Cube's Inject{header, format, secret} for credential injection.
@@ -270,6 +274,10 @@ type EgressInject struct {
 	Header string `toml:"header" json:"header"`
 	Format string `toml:"format" json:"format"` // e.g. "Bearer ${SECRET}", default "${SECRET}"
 	Secret string `toml:"secret" json:"secret"`
+	// AllowPlainHTTP attaches the secret even on plaintext HTTP upstreams
+	// (CubeSandbox #726 semantics; the boundary is that the sandbox never
+	// sees it). Default false: HTTPS only.
+	AllowPlainHTTP bool `toml:"allow_plain_http" json:"allow_plain_http"`
 }
 
 // ToolRule is one row of the tool gateway decision matrix (plan.md §6.2).
@@ -277,26 +285,26 @@ type EgressInject struct {
 // first match wins. A default-deny catch-all is auto-appended.
 type ToolRule struct {
 	// Name matches the tool name (exact, or "*" for wildcard).
-	Name string `toml:"name"`
+	Name string `toml:"name" json:"name"`
 	// Action is one of: allow, constrain, approve, deny.
-	Action string `toml:"action"`
+	Action string `toml:"action" json:"action"`
 	// Effect records what the rule governs — informational, used in audit.
-	Effect string `toml:"effect"`
+	Effect string `toml:"effect" json:"effect"`
 	// Reason is surfaced to the agent on deny/approve.
-	Reason string `toml:"reason"`
+	Reason string `toml:"reason" json:"reason"`
 }
 
 // BudgetSpec is the hard resource/cost ceiling (plan.md §9.2 Budget).
 type BudgetSpec struct {
 	// MaxWallTime is the absolute wall-clock cap; on expiry the lifecycle FSM
 	// moves the task to Destroy with reason "timeout".
-	MaxWallTime string `toml:"max_wall_time"`
+	MaxWallTime string `toml:"max_wall_time" json:"max_wall_time"`
 	// MaxTokens caps total LLM tokens consumed by the agent loop. 0 = unlimited.
-	MaxTokens int `toml:"max_tokens"`
+	MaxTokens int `toml:"max_tokens" json:"max_tokens"`
 	// MaxNetworkMB caps total egress bytes (MB). 0 = unlimited.
-	MaxNetworkMB int `toml:"max_network_mb"`
+	MaxNetworkMB int `toml:"max_network_mb" json:"max_network_mb"`
 	// MaxCostMicroUSD caps total spend in micro-USD. 0 = unlimited.
-	MaxCostMicroUSD int `toml:"max_cost_micro_usd"`
+	MaxCostMicroUSD int `toml:"max_cost_micro_usd" json:"max_cost_micro_usd"`
 }
 
 // ApprovalSpec defines the effect boundary — which tool actions require a human
@@ -304,23 +312,23 @@ type BudgetSpec struct {
 type ApprovalSpec struct {
 	// RequiredFor lists tool actions that must pause for approval:
 	// any of "send","delete","write-prod","pay","deploy","prod".
-	RequiredFor []string `toml:"required_for"`
+	RequiredFor []string `toml:"required_for" json:"required_for"`
 	// Notify is where approval requests are sent (currently logged + queued;
 	// reserved for webhooks/IM).
-	Notify string `toml:"notify"`
+	Notify string `toml:"notify" json:"notify"`
 	// Timeout is how long an approval may pend before auto-deny.
-	Timeout string `toml:"timeout"`
+	Timeout string `toml:"timeout" json:"timeout"`
 }
 
 // ArtifactsSpec declares the sandbox's outputs (plan.md §5.3, §7).
 // Only declared outputs may leave the sandbox; everything else stays inside.
 type ArtifactsSpec struct {
 	// Declared is the list of guest paths treated as outputs (diff/build/report).
-	Declared []string `toml:"declared"`
+	Declared []string `toml:"declared" json:"declared"`
 	// RequireTestsPassed gates release on a green verifier run.
-	RequireTestsPassed bool `toml:"require_tests_passed"`
+	RequireTestsPassed bool `toml:"require_tests_passed" json:"require_tests_passed"`
 	// BlockSecrets blocks release if a declared artifact diff contains secrets.
-	BlockSecrets bool `toml:"block_secrets"`
+	BlockSecrets bool `toml:"block_secrets" json:"block_secrets"`
 }
 
 // VolumeMount declares one persistent volume attachment. Mirrors
@@ -432,20 +440,20 @@ func ValidateMountPath(path string) error {
 // LifecycleSpec is the task lifecycle policy (plan.md §8, §11).
 type LifecycleSpec struct {
 	// Paused starts the task in Suspended state (checkpoint-on-start).
-	Paused bool `toml:"paused"`
+	Paused bool `toml:"paused" json:"paused"`
 	// MaxRetries is how many times the FSM may auto-retry Failed -> Provisioning.
-	MaxRetries int `toml:"max_retries"`
+	MaxRetries int `toml:"max_retries" json:"max_retries"`
 	// OnAnomaly is the incident posture: "pause" (default) or "terminate".
-	OnAnomaly string `toml:"on_anomaly"`
+	OnAnomaly string `toml:"on_anomaly" json:"on_anomaly"`
 	// TTL is the task's overall lifetime; on expiry the task is Destroyed.
-	TTL string `toml:"ttl"`
+	TTL string `toml:"ttl" json:"ttl"`
 	// IdleTimeout triggers AutoPause: after this much idle time the task is
 	// frozen (cgroup freeze) and moved to Suspended. Empty = disabled.
 	// Mirrors CubeSandbox docs/guide/lifecycle.md: timeout + on_timeout=pause.
-	IdleTimeout string `toml:"idle_timeout"`
+	IdleTimeout string `toml:"idle_timeout" json:"idle_timeout"`
 	// AutoResume re-arms a Suspended task on the next API activity (any
 	// /exec, /tasks/:id/*). Mirrors Cube's auto_resume.
-	AutoResume bool `toml:"auto_resume"`
+	AutoResume bool `toml:"auto_resume" json:"auto_resume"`
 }
 
 // --- loading & validation ---

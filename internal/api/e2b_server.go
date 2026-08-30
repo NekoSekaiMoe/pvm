@@ -97,6 +97,34 @@ func NewE2BServer() (*echo.Echo, error) {
 	// /sandboxes routes so official E2B SDKs can drive PVM.
 	registerE2BCompat(e, apiSecretBytes, autoMgr)
 
+	// Observability: /healthz, /version, /metrics (+opt-in pprof).
+	registerObservability(e, apiSecretBytes)
+
+	// Console tail + approval edit + approval persistence/webhook.
+	registerExecRuntimeExtras(api)
+	initApprovalPersistence()
+	// Credential broker REST surface (mint/refresh/revoke).
+	registerIdentityAPI(api)
+
+	// Incident controller REST surface (report + list).
+	registerIncidentAPI(api)
+
+	// Warm pool persistence + real (state-recorded) factory.
+	initPoolRuntime()
+
+	// Deadline executor: refresh deadlines, lifecycle TTL, network budget.
+	startWatchdog()
+
+	// Per-task metrics view (net bytes, limits, deadlines).
+	registerWatchdogAPI(api)
+
+	// envd-compatible data plane (:49982 ws + :49983 Connect-JSON).
+	if os.Getenv("PVM_ENVD_ENABLED") == "1" {
+		if err := StartEnvdListeners(); err != nil {
+			return nil, err
+		}
+	}
+
 	// Per-task policy gateways registered by the controller / agentpvm run.
 	// /api/exec and /api/policy/:task both read from the SAME global registry
 	// (RegisterPolicyGateway writes here too), so a gateway registered by
@@ -396,12 +424,19 @@ func NewE2BServer() (*echo.Echo, error) {
 		if gw == nil {
 			return c.JSON(http.StatusForbidden, map[string]string{"error": "no policy gateway registered for task"})
 		}
+		metricExecRequests.Inc(taskID)
+		ensureGatewayRuntime(gw, taskID)
 		resp, err := gw.Execute(treq)
 		if err != nil {
-			// approval-required is a 202, not a hard error
+			// approval-required is a 202, not a hard error. Ticket creation
+			// stays with the caller (the operator/SDK binds the evidence
+			// fields: target/why/rollback) — deciding ANY ticket matching
+			// (task, tool, params) unlocks one retry via the gateway's
+			// ApprovalCheck closure.
 			if errors.Is(err, policyErrApproval()) {
 				return c.JSON(http.StatusAccepted, map[string]interface{}{"status": "approval_required"})
 			}
+			metricExecDenied.Inc(taskID)
 			return c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
 		}
 		return c.JSON(http.StatusOK, resp)
@@ -428,6 +463,11 @@ func NewE2BServer() (*echo.Echo, error) {
 		id := c.Param("id")
 		if !idRegex.MatchString(id) {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid task id"})
+		}
+		// Short-id resolution: a unique prefix of the canonical id also
+		// addresses the task (mirrors the E2B sandbox route semantics).
+		if resolved, rerr := resolveTaskID(id); rerr == nil {
+			id = resolved
 		}
 		st, err := state.LoadState(id)
 		if err != nil {
@@ -961,8 +1001,14 @@ func NewE2BServer() (*echo.Echo, error) {
 		if err != nil {
 			l = nil // degrade to no-ledger; gate still runs
 		}
-		g := artifact.NewGate(l)
+		// Spec-bound gate: when the task's canonical spec.json exists, its
+		// artifacts policy (require_tests_passed / block_secrets / declared)
+		// binds the pipeline instead of the bare default gate.
+		g := artifact.FromSpec(loadTaskSpec(b.TaskID), l)
 		v := g.Verify(&b)
+		// Sensor: gate failures feed the incident controller (§11 anomaly
+		// sources include the artifact plane).
+		gateSensor(b.TaskID, v)
 		return c.JSON(http.StatusOK, v)
 	})
 
@@ -1354,6 +1400,17 @@ func NewE2BServer() (*echo.Echo, error) {
 		if err != nil {
 			return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		}
+		// Auto-start the build pipeline: PENDING records no longer rot —
+		// creation kicks the async pull/verify that flips READY/FAILED. The
+		// 201 body still reports the creation state (PENDING); poll
+		// GET /templates/:id/build for progress.
+		go func() {
+			if err := template.DefaultBuilder().Start(tmplStore, rec.TemplateID); err != nil {
+				// Best-effort at create time (e.g. image_ref classes needing
+				// root): the record stays PENDING and /rebuild retries.
+				fmt.Fprintf(os.Stderr, "template build start failed for %s: %v\n", rec.TemplateID, err)
+			}
+		}()
 		return c.JSON(http.StatusCreated, got)
 	})
 	api.GET("/templates", func(c echo.Context) error {
@@ -1432,6 +1489,59 @@ func NewE2BServer() (*echo.Echo, error) {
 		}
 		return c.JSON(http.StatusOK, rec)
 	})
+
+	// GET /templates/:id/build — pipeline progress (poll; ?wait=1s long-poll).
+	api.GET("/templates/:id/build", func(c echo.Context) error {
+		resolved, err := tmplStore.ResolveIdentifier(c.Param("id"))
+		if err != nil {
+			if errors.Is(err, template.ErrNotFound) {
+				return c.JSON(http.StatusNotFound, map[string]string{"error": err.Error()})
+			}
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+		}
+		b := template.DefaultBuilder()
+		var st *template.BuildStatus
+		if w := c.QueryParam("wait"); w != "" {
+			d, perr := time.ParseDuration(w)
+			if perr != nil || d <= 0 || d > 2*time.Minute {
+				d = 30 * time.Second
+			}
+			st, err = b.Wait(tmplStore, resolved, d)
+		} else {
+			st, err = b.Status(tmplStore, resolved)
+		}
+		if err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		}
+		return c.JSON(http.StatusOK, st)
+	})
+
+	// POST /templates/:id/rebuild — re-run the pipeline for PENDING/FAILED.
+	api.POST("/templates/:id/rebuild", func(c echo.Context) error {
+		resolved, err := tmplStore.ResolveIdentifier(c.Param("id"))
+		if err != nil {
+			if errors.Is(err, template.ErrNotFound) {
+				return c.JSON(http.StatusNotFound, map[string]string{"error": err.Error()})
+			}
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+		}
+		rec, err := tmplStore.Get(resolved)
+		if err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		}
+		if rec.Status == "READY" {
+			return c.JSON(http.StatusConflict, map[string]string{"error": "template is READY; nothing to rebuild"})
+		}
+		// Re-arm as PENDING then start.
+		if err := tmplStore.Update(resolved, func(r *template.Record) error { r.Status = "PENDING"; return nil }); err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		}
+		if err := template.DefaultBuilder().Start(tmplStore, resolved); err != nil {
+			return c.JSON(http.StatusConflict, map[string]string{"error": err.Error()})
+		}
+		return c.JSON(http.StatusAccepted, map[string]string{"status": "build_started", "id": resolved})
+	})
+
 	api.DELETE("/templates/:id", func(c echo.Context) error {
 		id := c.Param("id")
 		// Resolve aliases to template ids first (mirrors GET /templates/:id).
@@ -1768,6 +1878,14 @@ func parseExecCommand(cmd string) (policy.ToolRequest, error) {
 	positional := 0
 	for _, p := range parts[1:] {
 		if i := strings.IndexByte(p, '='); i > 0 {
+			// effect=... declares the request's intended effect domain
+			// (read/write/prod/...) instead of riding as an opaque arg — it
+			// is EXCLUDED from Args so approval tickets bind only the real
+			// parameters.
+			if p[:i] == "effect" {
+				req.Effect = p[i+1:]
+				continue
+			}
 			req.Args[p[:i]] = p[i+1:]
 		} else {
 			req.Args[fmt.Sprintf("arg%d", positional)] = p

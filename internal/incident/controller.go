@@ -30,30 +30,30 @@ import (
 type Severity string
 
 const (
-	SeverityLow      Severity = "low"       // weirdness, retry-able
-	SeverityMedium   Severity = "medium"    // logic error, needs human
-	SeverityHigh     Severity = "high"      // suspected exfiltration
-	SeverityCritical Severity = "critical"  // confirmed attack
+	SeverityLow      Severity = "low"      // weirdness, retry-able
+	SeverityMedium   Severity = "medium"   // logic error, needs human
+	SeverityHigh     Severity = "high"     // suspected exfiltration
+	SeverityCritical Severity = "critical" // confirmed attack
 )
 
 // Anomaly is a signal from a sensor (egress gateway, tool gateway, budget).
 type Anomaly struct {
-	TaskID    string
-	Severity  Severity
-	Signal    string // e.g. "egress:blocked-domain-attempt", "budget:exceeded"
-	Detail    string
-	At        time.Time
+	TaskID   string
+	Severity Severity
+	Signal   string // e.g. "egress:blocked-domain-attempt", "budget:exceeded"
+	Detail   string
+	At       time.Time
 }
 
 // Action is the controller's response.
 type Action string
 
 const (
-	ActionNone      Action = "none"
-	ActionBlock     Action = "block"      // network + new tools
-	ActionRevoke    Action = "revoke"     // identities
-	ActionPause     Action = "pause"      // freeze runtime
-	ActionTerminate Action = "terminate"  // kill + cleanup
+	ActionNone       Action = "none"
+	ActionBlock      Action = "block"      // network + new tools
+	ActionRevoke     Action = "revoke"     // identities
+	ActionPause      Action = "pause"      // freeze runtime
+	ActionTerminate  Action = "terminate"  // kill + cleanup
 	ActionQuarantine Action = "quarantine" // move to Quarantined state
 )
 
@@ -75,10 +75,10 @@ type Hooks struct {
 
 // Controller is the incident response orchestrator.
 type Controller struct {
-	hooks  Hooks
-	ledger *audit.Ledger
-	broker *identity.Broker
-	mu     sync.Mutex
+	hooks   Hooks
+	ledger  *audit.Ledger
+	broker  *identity.Broker
+	mu      sync.Mutex
 	handled map[string]int // task -> count of incidents (for escalation)
 }
 

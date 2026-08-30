@@ -79,6 +79,25 @@ func CreateEventSnapshot(taskID, eventID, auditHash string, metadata map[string]
 		return nil, fmt.Errorf("snapshot: create target snap dir: %w", err)
 	}
 
+	// 0. Memory state (CRIU): a Running guest with a live pid gets a
+	// checkpoint-and-continue dump; without criu the snapshot proceeds with
+	// memory_state=degraded — disk + FSM only, restore boots fresh.
+	if metadata == nil {
+		metadata = map[string]string{}
+	} else {
+		metadata = copyMeta(metadata)
+	}
+	if st.PID > 0 && st.Status == state.StatusRunning {
+		if err := DumpMemory(st.PID, MemoryImagesDir(targetDir), true); err == nil {
+			metadata["memory_state"] = string(MemoryFull)
+		} else {
+			metadata["memory_state"] = string(MemoryDegraded)
+			metadata["memory_error"] = err.Error()
+		}
+	} else {
+		metadata["memory_state"] = string(MemoryNotAttempt)
+	}
+
 	// 1. Snapshot state.json
 	stateSrc := filepath.Join(dir, "state.json")
 	if data, err := os.ReadFile(stateSrc); err == nil {

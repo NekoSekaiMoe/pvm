@@ -5,7 +5,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 )
 
 // CreateExt4Image creates a new file and formats it as ext4.
@@ -26,18 +25,19 @@ func CreateExt4Image(path string, sizeMb int) error {
 	}
 	f.Close()
 
-	// Create sparse file or zero-filled. CombinedOutput captures dd's stderr
-	// (e.g. "no space left on device") so the failure is diagnosable; the
-	// message is distinct from the O_EXCL creation error above.
-	cmd := exec.Command("dd", "if=/dev/zero", fmt.Sprintf("of=%s", path), "bs=1M", fmt.Sprintf("count=%d", sizeMb))
-	if out, err := cmd.CombinedOutput(); err != nil {
+	// Sparse allocation: ftruncate creates a hole-punched file — mkfs.ext4
+	// works on it and only the written blocks consume disk (a 500MB base
+	// image holding a 40MB rootfs consumes ~40MB, not 500MB). dd was the
+	// previous behavior; a fill is only needed for raw device targets, not
+	// filesystem images.
+	if err := os.Truncate(path, int64(sizeMb)<<20); err != nil {
 		os.Remove(path)
-		return fmt.Errorf("dd failed to fill image %q (output: %s): %w", path, strings.TrimSpace(string(out)), err)
+		return fmt.Errorf("failed to allocate sparse image %q: %w", path, err)
 	}
 
 	// Format as ext4
-	cmd = exec.Command("mkfs.ext4", "-F", path)
-	if err := cmd.Run(); err != nil {
+	mk := exec.Command("mkfs.ext4", "-F", path)
+	if err := mk.Run(); err != nil {
 		os.Remove(path)
 		return fmt.Errorf("failed to format as ext4: %v", err)
 	}

@@ -16,7 +16,9 @@
 2. **凭证隔离与防泄露**：长效 Secret 永不注入沙箱，仅下发短期 HMAC 凭证，并在宿主机代理层按需附带凭据。
 3. **出站网络与 SSRF 防御**：L7 HTTP/HTTPS 域名白名单 + eBPF TC 底层硬阻断（私网 RFC1918、回环 127.0.0.0/8、云元数据 169.254.169.254）。
 4. **轻量级容器与快照**：纯 Go 原生 qcow2 驱动实现秒级 CoW 差异盘、原位压缩与快照归档，无外部重型依赖。
-5. **人机协同治理与审计**：高危动作（支付/外发/部署）自动拦截进审批流，全程记录基于 SHA-256 默克尔哈希链的防篡改审计日志。
+5. **人机协同治理与审计**：高危动作（支付/外发/部署）自动拦截进审批流，全程记录基于 SHA-256 哈希链 + ed25519 签名的防篡改审计日志（`PVM_AUDIT_SIGNING=1`），后台在线校验异常即刻上报指标。
+6. **E2B drop-in 数据面**：envd 兼容服务（:49982 版本 WS + :49983 Connect-JSON：`process.Process` / `filesystem.Filesystem` / `/files`），官方 E2B SDK 的 `connect()` 就绪探测与命令/文件/PTY 接口可直接对话 pvm。
+7. **运维平面**：`/metrics`(Prometheus) / `/healthz` / `/version` / 可选 pprof；deploy/ 提供 systemd、docker-compose 与一键安装脚本；sdk/go 为官方 Go SDK（E2B 生命周期 + 治理面全量封装）。
 
 ---
 
@@ -74,17 +76,20 @@ PVM 将 Nuxt 3 前端静态资源直接内嵌至 Go 二进制中，一条命令�
 |:---|:---|
 | `agentpvm run [-config <spec.toml>]` | 启动 TaskSpec 驱动的加固 Agent 沙箱 |
 | `agentpvm webui [--port 3000]` | 启动嵌入式 Nuxt 3 Web 仪表盘与 REST API 服务 |
-| `agentpvm api [-port 8080]` | 启动 E2B 兼容的 REST API 服务端 |
+| `agentpvm api [-port 8080]` | 启动 E2B 兼容的 REST API 服务端（可选 `PVM_ENVD_ENABLED=1` 同步拉起 envd 兼容面 :49982/:49983） |
+| `agentpvm template watch <id|alias>` | 跟踪模板构建进度（phase + 百分比 + 日志尾部） |
 | `agentpvm cow -compact <overlay.qcow2>` | 原位压缩 qcow2 差异盘并释放零簇 |
 | `agentpvm snapshot [export\|import]` | 归档导出或解包还原容器状态 |
 | `umlctl start -name <id> -rootfs <img.img>` | 启动独立轻量 UML 容器 |
+| `umlctl image pull <docker-image|http://reg/img>` | 拉取镜像构建 ext4 底盘（支持私有 HTTP registry，见 `PVM_REGISTRY_INSECURE`） |
+| `umlctl network create <name>` | 创建网桥（持久化子网分配器自动划分子网） |
 | `umlctl ps` / `umlctl logs <id>` | 查看容器运行状态与控制台日志 |
 
 ---
 
 ## 🧪 自动化测试
 
-仓库提供完善的单元测试与 35 个 CI-Safe 端到端 Shell 测试套件（套件 `05`–`08` 与 `10`–`22` 为 CI-Safe 无特权测试，`01`–`04` 与 `09` 需 Kernel/Root 支持）：
+仓库提供完善的单元测试与 52 套端到端 Shell 测试（套件 `05`–`08`、`10`–`46`、`48`–`52` 为 CI-Safe 无特权测试；`01`–`04`、`09` 需 Kernel/Root；`47` 需 root 网桥权限）：
 
 ```bash
 # 运行 Go 单元测试与对抗安全测试

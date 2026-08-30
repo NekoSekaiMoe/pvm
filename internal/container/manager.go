@@ -9,16 +9,20 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 	"uml-container/internal/audit"
 	"uml-container/internal/cgroup"
 	"uml-container/internal/config"
+	"uml-container/internal/console"
 	"uml-container/internal/cow"
+	"uml-container/internal/fsjson"
 	"uml-container/internal/identity"
 	"uml-container/internal/jail"
 	"uml-container/internal/lifecycle"
 	"uml-container/internal/log"
+	"uml-container/internal/logx"
 	"uml-container/internal/network"
 	"uml-container/internal/network/dnslearn"
 	"uml-container/internal/network/egress"
@@ -157,7 +161,37 @@ type Booted struct {
 	// logFile is the console log created during Boot (nil in interactive
 	// mode). The launcher only writes to it via copy goroutines drained by
 	// Wait; ownership of closing it stays with WaitExit / Boot error paths.
-	logFile *os.File
+	logFile io.WriteCloser
+	// consoleOut/consoleErr are the rotating per-stream logs; closed with
+	// logFile in WaitExit / Boot error paths.
+	consoleOut io.WriteCloser
+	consoleErr io.WriteCloser
+}
+
+// closeConsoleLogs closes every console writer (idempotent, nil-safe).
+func (b *Booted) closeConsoleLogs() {
+	if b.logFile != nil {
+		_ = b.logFile.Close()
+		b.logFile = nil
+	}
+	if b.consoleOut != nil {
+		_ = b.consoleOut.Close()
+		b.consoleOut = nil
+	}
+	if b.consoleErr != nil {
+		_ = b.consoleErr.Close()
+		b.consoleErr = nil
+	}
+}
+
+// closeWriters is the free-function form for Boot's error paths (before a
+// Booted exists).
+func closeWriters(ws ...io.WriteCloser) {
+	for _, w := range ws {
+		if w != nil {
+			_ = w.Close()
+		}
+	}
 }
 
 // Start is the legacy entry point used by umlctl. It boots a UML kernel with
@@ -213,12 +247,18 @@ func (m *Manager) Boot(ctx context.Context, cfg *config.ContainerConfig) (*Boote
 		return nil, err
 	}
 
-	var logFile *os.File
+	var logFile io.WriteCloser
+	var consoleOut, consoleErr io.WriteCloser
 	if interactive, _ := ctx.Value(KeyInteractive).(bool); !interactive {
-		e := setupConsoleFile(cfg.ID, &logFile)
+		lf, outW, errW, e := setupConsoleWriters(cfg.ID)
 		if e != nil {
 			return nil, e
 		}
+		logFile, consoleOut, consoleErr = lf, outW, errW
+		// Per-stream rotating logs (console.out.log / console.err.log) ride
+		// alongside the combined console.log.
+		ctx = context.WithValue(ctx, uml.KeyStdoutWriter, consoleOut)
+		ctx = context.WithValue(ctx, uml.KeyStderrWriter, consoleErr)
 	}
 
 	st, err := state.LoadState(cfg.ID)
@@ -238,9 +278,7 @@ func (m *Manager) Boot(ctx context.Context, cfg *config.ContainerConfig) (*Boote
 
 	secRep, secErr := jail.CheckSecurity(cfg.AllowInsecureDegraded, true, true)
 	if secErr != nil {
-		if logFile != nil {
-			_ = logFile.Close()
-		}
+		closeWriters(logFile, consoleOut, consoleErr)
 		st.Status = state.StatusExited
 		state.SaveState(cfg.ID, st)
 		return nil, secErr
@@ -260,9 +298,7 @@ func (m *Manager) Boot(ctx context.Context, cfg *config.ContainerConfig) (*Boote
 		UIDRangeSize:          uidRange,
 	})
 	if jailErr != nil {
-		if logFile != nil {
-			_ = logFile.Close()
-		}
+		closeWriters(logFile, consoleOut, consoleErr)
 		st.Status = state.StatusExited
 		state.SaveState(cfg.ID, st)
 		return nil, jailErr
@@ -290,12 +326,21 @@ func (m *Manager) Boot(ctx context.Context, cfg *config.ContainerConfig) (*Boote
 		ctx = context.WithValue(ctx, uml.KeyJailEnv, jailEnv)
 	}
 
+	// Console session: capture guest output into a ring buffer (for exec,
+	// PTY and /console tail) and give the launcher a stdin pipe handle so
+	// the host can drive the guest shell with marker scripts.
+	var consoleSession *console.Session
+	if logFile != nil {
+		consoleSession = console.Default().Attach(cfg.ID)
+		ctx = context.WithValue(ctx, uml.KeyConsoleTee, consoleSession)
+	}
 	pid, p, err := m.Launcher.Start(ctx, cfg.Kernel, args, logFile)
 	st.PID = pid
 	if err != nil {
-		if logFile != nil {
-			_ = logFile.Close()
+		if consoleSession != nil {
+			console.Default().Detach(cfg.ID)
 		}
+		closeWriters(logFile, consoleOut, consoleErr)
 		// The process never started, so nothing pivot_rooted into the jail:
 		// release it here (on success WaitExit owns the cleanup).
 		if jailEnv != nil {
@@ -321,12 +366,13 @@ func (m *Manager) Boot(ctx context.Context, cfg *config.ContainerConfig) (*Boote
 				_ = p.Cmd.Process.Kill()
 				_ = m.Launcher.Wait(p)
 			}
+			if consoleSession != nil {
+				console.Default().Detach(cfg.ID)
+			}
 			if jailEnv != nil {
 				_ = jailEnv.Cleanup()
 			}
-			if logFile != nil {
-				_ = logFile.Close()
-			}
+			closeWriters(logFile, consoleOut, consoleErr)
 			st.Status = state.StatusExited
 			state.SaveState(cfg.ID, st)
 			return nil, fmt.Errorf(
@@ -350,8 +396,11 @@ func (m *Manager) Boot(ctx context.Context, cfg *config.ContainerConfig) (*Boote
 		m.OnProvisioned(cfg.ID, pid, "")
 	}
 
+	if consoleSession != nil && p.Stdin != nil {
+		consoleSession.SetStdin(p.Stdin)
+	}
 	booted = true
-	return &Booted{Process: p, jail: jailEnv, logFile: logFile}, nil
+	return &Booted{Process: p, jail: jailEnv, logFile: logFile, consoleOut: consoleOut, consoleErr: consoleErr}, nil
 }
 
 // WaitExit blocks until a Booted process exits, records the terminal legacy
@@ -366,12 +415,12 @@ func (m *Manager) WaitExit(id string, b *Booted) error {
 	}
 	// Start allocates the container's host uid range, stop releases it.
 	defer m.releaseUIDRange(id)
+	// The console session dies with the guest: wake every tail/exec waiter.
+	defer console.Default().Detach(id)
 	err := m.Launcher.Wait(b.Process)
-	// Wait drained the log-copy goroutines; the console log can be closed
-	// now that the process lifecycle is complete.
-	if b.logFile != nil {
-		_ = b.logFile.Close()
-	}
+	// Wait drained the log-copy goroutines; the console log set can be
+	// closed now that the process lifecycle is complete.
+	b.closeConsoleLogs()
 	st, lerr := state.LoadState(id)
 	if lerr == nil && st != nil {
 		if err != nil {
@@ -400,6 +449,13 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 	}
 	if taskID == "" {
 		return fmt.Errorf("container: no task id (spec.runtime.name empty and no id given)")
+	}
+	// Persist the canonical spec next to the state: the artifact gate, TTL
+	// watchdog and other control planes re-read it (spec.json, atomic write).
+	if dir, derr := state.ContainerDir(taskID); derr == nil {
+		if mkerr := os.MkdirAll(dir, 0o700); mkerr == nil {
+			_ = fsjson.Write(filepath.Join(dir, "spec.json"), s)
+		}
 	}
 	// Defense in depth: validate taskID before it reaches the filesystem. The
 	// caller (agentpvm) already enforces this, but StartTask is a public entry
@@ -859,7 +915,7 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 			// Also wire the full L7 rule so the gateway can enforce method/path/scheme and inject credentials.
 			var inj *egress.EgressInject
 			if r.Inject != nil {
-				inj = &egress.EgressInject{Header: r.Inject.Header, Format: r.Inject.Format, Secret: r.Inject.Secret}
+				inj = &egress.EgressInject{Header: r.Inject.Header, Format: r.Inject.Format, Secret: r.Inject.Secret, AllowPlainHTTP: r.Inject.AllowPlainHTTP}
 			}
 			pol.Rules = append(pol.Rules, egress.EgressRule{
 				Name:   r.Name,
@@ -871,6 +927,7 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 				Port:   r.Port,
 				Allow:  r.Allow,
 				Inject: inj,
+				MITM:   r.MITM,
 			})
 		}
 		m.Egress.SetPolicy(taskID, pol)
@@ -1252,17 +1309,29 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 	// to os.DevNull instead of letting the launcher fall back to the host's
 	// os.Stdin/os.Stdout (which would leak guest output into the daemon's
 	// terminal). Interactive mode (explicit KeyInteractive) is unchanged.
-	var logFile *os.File
+	var logFile io.WriteCloser
 	if interactive, _ := ctx.Value(KeyInteractive).(bool); !interactive {
-		if e := setupConsoleFile(taskID, &logFile); e != nil {
+		lf, outW, errW, e := setupConsoleWriters(taskID)
+		if e != nil {
 			cleanupVolumes()
 			_ = st.Transition(state.StatusFailed, state.ActorController, "console log setup failed: "+e.Error())
 			state.SaveState(taskID, st)
 			return e
 		}
-	}
-	if logFile != nil {
-		defer logFile.Close()
+		logFile = lf
+		ctx = context.WithValue(ctx, uml.KeyStdoutWriter, outW)
+		ctx = context.WithValue(ctx, uml.KeyStderrWriter, errW)
+		defer func() {
+			_ = lf.Close()
+			_ = outW.Close()
+			_ = errW.Close()
+		}()
+	} else {
+		defer func() {
+			if logFile != nil {
+				_ = logFile.Close()
+			}
+		}()
 	}
 
 	// Ready: sandbox process about to start.
@@ -1517,6 +1586,59 @@ func setupConsoleFile(containerID string, dst **os.File) error {
 	log.Default().Warnf("console log unavailable for %s (%v); routing guest output to %s", containerID, err, os.DevNull)
 	*dst = null
 	return nil
+}
+
+// logMaxBytesFromEnv / logKeepFromEnv read the rotation policy. Defaults in
+// internal/logx (8 MiB × 3).
+func logMaxBytesFromEnv() int64 {
+	if v := os.Getenv("PVM_LOG_MAX_BYTES"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+			return n
+		}
+	}
+	return 0
+}
+
+func logKeepFromEnv() int {
+	if v := os.Getenv("PVM_LOG_KEEP"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return 0
+}
+
+// setupConsoleWriters opens the rotating console log set for containerID:
+// the combined console.log (rotated; replaces the unbounded plain file) plus
+// per-stream console.out.log / console.err.log. On failure it degrades to
+// DevNull for the affected writers — the boot must survive a read-only log
+// dir, mirroring setupConsoleFile's fallback contract.
+func setupConsoleWriters(containerID string) (combined, stdoutW, stderrW io.WriteCloser, err error) {
+	dir, derr := state.ContainerDir(containerID)
+	if derr != nil {
+		return nil, nil, nil, derr
+	}
+	logDir := filepath.Join(dir, "logs")
+	max, keep := logMaxBytesFromEnv(), logKeepFromEnv()
+
+	open := func(name string) io.WriteCloser {
+		r, rerr := logx.NewRotator(filepath.Join(logDir, name), max, keep)
+		if rerr != nil {
+			log.Default().Warnf("console log %s unavailable for %s (%v); routing that stream to %s", name, containerID, rerr, os.DevNull)
+			null, _ := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+			return null
+		}
+		return r
+	}
+
+	// Honor the hardened log dir contract from log.SetupConsoleLog.
+	if mkErr := os.MkdirAll(logDir, 0o700); mkErr == nil {
+		_ = os.Chmod(logDir, 0o700)
+	}
+	combined = open("console.log")
+	stdoutW = open("console.out.log")
+	stderrW = open("console.err.log")
+	return combined, stdoutW, stderrW, nil
 }
 
 // kernelFieldRe rejects characters that would break out of a single UML
