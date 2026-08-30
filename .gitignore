@@ -28,3 +28,6 @@ internal/network/bpf_bpfeb.go
 internal/network/bpf_bpfeb.o
 internal/network/bpf_bpfel.go
 internal/network/bpf_bpfel.o
+
+Makefile
+scripts/*.py

@@ -38,7 +38,7 @@ preflight() {
   if command -v go >/dev/null 2>&1; then
     local minor
     minor="$(go version | sed -n 's/.*go1\.\([0-9]*\).*/\1/p')"
-    if [[ "$minor" =~ ^[0-9]+$ ]] && [[ "$minor" -lt 22 ]]; then
+    if [[ "$minor" =~ ^[0-9]+$ ]] && [[ "$minor" -lt 23 ]]; then
       warn "go 1.$minor found; the build needs go 1.23+ — install a newer toolchain or prebuild binaries"
       ok=0
     else
@@ -170,8 +170,24 @@ If CI already built webui/.output:
 EOF
 }
 
+# usage echoes the Usage block from the script header.
+usage() {
+  cat <<'EOF'
+install.sh — idempotent bare-metal installer for PVM (agentpvm).
+
+Usage:
+  ./deploy/install.sh                 # install into /usr/local/bin + systemd
+  PREFIX=/opt/pvm ./deploy/install.sh # custom install prefix
+  ./deploy/install.sh --uninstall     # remove binaries, units, env file
+  ./deploy/install.sh --docker        # print docker compose instructions
+  ./deploy/install.sh --help          # show this help
+EOF
+}
+
 case "${1:-}" in
   --uninstall) do_uninstall ;;
   --docker)    do_docker ;;
-  *)           do_install ;;
+  "")          do_install ;;
+  -h|--help)   usage ;;
+  *)           err "unknown option: $1 (try --help)"; exit 2 ;;
 esac

@@ -3,7 +3,7 @@
 ARG WEBUI_PREBUILT=0
 
 # ---------- Stage 1: WebUI (skippable) ----------
-FROM golang:1.23 AS webui
+FROM ghcr.io/pnpm/pnpm:latest AS webui
 ARG WEBUI_PREBUILT
 RUN if [ "$WEBUI_PREBUILT" = "1" ]; then echo "webui prebuilt, skipping"; exit 0; fi; \
     corepack enable && corepack prepare pnpm@latest --activate

@@ -5,7 +5,7 @@
 
 [Unit]
 Description=PVM agent sandbox — API server (:8080)
-Documentation=file:///home/user/repo/pvm/docs/DEPLOY.md
+Documentation=https://github.com/NekoSekaiMoe/pvm/blob/main/docs/DEPLOY.md
 After=network-online.target
 Wants=network-online.target
 
