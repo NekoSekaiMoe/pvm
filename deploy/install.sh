@@ -23,6 +23,25 @@ log()  { printf '\033[1;32m[install]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[warn]\033[0m %s\n' "$*"; }
 err()  { printf '\033[1;31m[error]\033[0m %s\n' "$*" >&2; }
 
+# Re-read operator-customized roots from an existing env file instead of
+# silently reverting to defaults/idiomatic-shell env: parse ONLY the three
+# PVM_*_ROOT keys, never source or execute the file (it also holds API_SECRET
+# and may be root-owned 0600). Values found here win over the environment.
+load_env_file() {
+  [[ -f "$ENV_FILE" ]] || return 0
+  local key val
+  while IFS='=' read -r key val; do
+    key="${key//[[:space:]]/}"
+    val="${val%\"}"; val="${val#\"}"; val="${val%\'}"; val="${val#\'}"
+    case "$key" in
+      PVM_STATE_ROOT)  STATE_ROOT="$val" ;;
+      PVM_AUDIT_ROOT)  AUDIT_ROOT="$val" ;;
+      PVM_CGROUP_ROOT) CGROUP_ROOT="$val" ;;
+    esac
+  done < "$ENV_FILE"
+  log "roots from $ENV_FILE: state=$STATE_ROOT audit=$AUDIT_ROOT cgroup=$CGROUP_ROOT"
+}
+
 need_root() {
   if [[ "$(id -u)" -ne 0 ]]; then
     err "this mode must run as root (systemd unit + /usr/local/bin install)"
@@ -110,6 +129,7 @@ write_env_file() {
 do_install() {
   need_root
   preflight
+  load_env_file
   write_env_file
 
   mkdir -p "$STATE_ROOT" "$AUDIT_ROOT" "$CGROUP_ROOT" /var/lib/pvm/bin

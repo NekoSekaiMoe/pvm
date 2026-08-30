@@ -342,3 +342,23 @@ func TestMarkConsumedRollsBackWhenPersistFails(t *testing.T) {
 		t.Fatal("ticket must remain approved-unconsumed after the rolled-back burn")
 	}
 }
+
+// TestEnablePersistenceReadErrorDoesNotClobber: when the store path exists
+// but cannot be READ (EISDIR here; EACCES in production), EnablePersistence
+// must fail instead of "recovering" into an empty store — the persist that
+// follows would atomically replace the unreadable file and permanently
+// delete every pending/approved ticket (same policy as identity/persist.go).
+func TestEnablePersistenceReadErrorDoesNotClobber(t *testing.T) {
+	m := NewManager(nil)
+	if err := m.EnablePersistence(t.TempDir()); err == nil {
+		t.Fatal("EnablePersistence must fail when the store cannot be read")
+	}
+	// Retry on a good path still works and really writes.
+	good := filepath.Join(t.TempDir(), "approvals.json")
+	if err := m.EnablePersistence(good); err != nil {
+		t.Fatalf("re-enable on a good path: %v", err)
+	}
+	if _, err := os.Stat(good); err != nil {
+		t.Fatalf("good store not written: %v", err)
+	}
+}

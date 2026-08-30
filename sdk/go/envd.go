@@ -17,6 +17,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 )
 
@@ -103,10 +104,17 @@ func NewEnvdClient(host string, task string) *EnvdClient {
 // withDefaultEnvdPort appends DefaultEnvdPort unless host already carries
 // an explicit port. net.SplitHostPort accepts "host:port" and "[v6]:port"
 // (a bracketed literal like "[::1]" reports a missing port, so it gains
-// ":49983" and stays properly bracketed).
+// ":49983" and stays properly bracketed). A BARE IPv6 literal ("::1") must
+// be bracketed before the port is appended — "::1:49983" is not a valid
+// authority — so strip any existing brackets and re-add them via
+// net.JoinHostPort (which alone would double-bracket "[::1]").
 func withDefaultEnvdPort(host string) string {
 	if _, _, err := net.SplitHostPort(host); err == nil {
 		return host // caller-supplied port wins
+	}
+	if strings.ContainsRune(host, ':') {
+		bare := strings.TrimSuffix(strings.TrimPrefix(host, "["), "]")
+		return net.JoinHostPort(bare, fmt.Sprint(DefaultEnvdPort))
 	}
 	return host + ":" + fmt.Sprint(DefaultEnvdPort)
 }

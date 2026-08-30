@@ -115,27 +115,44 @@ func (r *NetworkRegistry) withFlock(fn func() (string, error)) (string, error) {
 	}
 	defer lf.Close()
 	// Another process may have persisted changes since THIS process loaded
-	// the registry — rebuild memory state from the file before mutating.
-	r.reloadLocked()
+	// the registry — rebuild memory state from the file before mutating. A
+	// failed reload aborts the mutation: proceeding would let persistLocked
+	// atomically replace a valid (merely unreadable) registry with state
+	// derived from an empty map, and subnets could be handed out twice.
+	if err := r.reloadLocked(); err != nil {
+		return "", err
+	}
 	return fn()
 }
 
-// reloadLocked replaces in-memory records with the file's contents. Empty
-// or missing files leave the map empty (fresh registry).
-func (r *NetworkRegistry) reloadLocked() {
-	r.nets = map[string]NetworkRecord{}
+// reloadLocked replaces in-memory records with the file's contents. A
+// missing or empty file is a fresh registry (empty map). Any other read or
+// parse error KEEPS the previous in-memory state and returns the error so
+// the caller can refuse to mutate — never proceed with cleared state.
+func (r *NetworkRegistry) reloadLocked() error {
 	raw, err := os.ReadFile(r.path)
-	if err != nil || len(raw) == 0 {
-		return
+	if err != nil {
+		if os.IsNotExist(err) {
+			r.nets = map[string]NetworkRecord{}
+			return nil
+		}
+		return fmt.Errorf("network registry: read %s: %w", r.path, err)
+	}
+	if len(raw) == 0 {
+		r.nets = map[string]NetworkRecord{}
+		return nil
 	}
 	var dump struct {
 		Networks []NetworkRecord `json:"networks"`
 	}
-	if json.Unmarshal(raw, &dump) == nil {
-		for _, n := range dump.Networks {
-			r.nets[n.Name] = n
-		}
+	if err := json.Unmarshal(raw, &dump); err != nil {
+		return fmt.Errorf("network registry: parse %s: %w", r.path, err)
 	}
+	r.nets = map[string]NetworkRecord{}
+	for _, n := range dump.Networks {
+		r.nets[n.Name] = n
+	}
+	return nil
 }
 
 // Allocate reserves the next free /24 for name and returns its gateway CIDR

@@ -973,7 +973,9 @@ func NewE2BServer() (*echo.Echo, error) {
 		if req.Quota.MaxConcurrent < 0 || req.Quota.MaxCPU < 0 || req.Quota.MaxMemoryMB < 0 || req.Quota.MaxTasksPerHour < 0 {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": "quota limits cannot be negative"})
 		}
-		currentPool().SetQuota(req.Tenant, req.Quota)
+		if err := currentPool().SetQuota(req.Tenant, req.Quota); err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		}
 		return c.JSON(http.StatusOK, map[string]string{"status": "ok"})
 	})
 

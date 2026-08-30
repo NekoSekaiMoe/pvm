@@ -64,3 +64,45 @@ func TestRegistryReleaseRollsBackWhenPersistFails(t *testing.T) {
 		t.Fatalf("restored record = %+v, want subnet 10.0.0.1/24", rec)
 	}
 }
+
+// TestRegistryReloadFailureAbortsMutation: a registry file that exists but
+// cannot be parsed must ABORT Allocate/Release instead of proceeding with
+// cleared in-memory state — persistLocked would otherwise overwrite the
+// (unreadable but valid) registry with an empty one and the same /24 could
+// be allocated to two bridges after a restart.
+func TestRegistryReloadFailureAbortsMutation(t *testing.T) {
+	stateRoot := t.TempDir()
+	r, err := LoadNetworkRegistry(stateRoot)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if _, err := r.Allocate("br0"); err != nil {
+		t.Fatalf("healthy Allocate: %v", err)
+	}
+	storePath := filepath.Join(stateRoot, "networks.json")
+	corrupt := []byte("{definitely not json")
+	if err := os.WriteFile(storePath, corrupt, 0o600); err != nil {
+		t.Fatalf("plant corrupt store: %v", err)
+	}
+
+	if _, err := r.Allocate("br1"); err == nil {
+		t.Fatal("Allocate must fail when the registry cannot be reloaded")
+	}
+	if _, ok := r.Get("br1"); ok {
+		t.Fatal("Allocate ran its callback despite the failed reload")
+	}
+	if err := r.Release("br0"); err == nil {
+		t.Fatal("Release must fail when the registry cannot be reloaded")
+	}
+	if _, ok := r.Get("br0"); !ok {
+		t.Fatal("Release dropped a record despite the failed reload")
+	}
+	// The corrupt file must be intact, not overwritten with empty state.
+	raw, err := os.ReadFile(storePath)
+	if err != nil {
+		t.Fatalf("read store: %v", err)
+	}
+	if string(raw) != string(corrupt) {
+		t.Fatalf("corrupt registry was overwritten: %q", raw)
+	}
+}

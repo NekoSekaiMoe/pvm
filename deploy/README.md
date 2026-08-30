@@ -35,7 +35,7 @@ sudo systemctl enable --now agentpvm-api agentpvm-webui
 
 | 命令 | 作用 |
 |---|---|
-| `./deploy/install.sh --uninstall` | 移除二进制、systemd 单元与 env 文件 |
+| `./deploy/install.sh --uninstall` | 移除二进制与 systemd 单元（保留 `/etc/pvm/pvm.env` 与状态数据） |
 | `./deploy/install.sh --docker` | 打印 Docker Compose 用法 |
 | `./deploy/install.sh --help` | 帮助 |
 
@@ -50,7 +50,7 @@ docker compose -f deploy/docker-compose.yml up -d
 `webui`（:3000）。容器内 UML 内核需要 `NET_ADMIN` 与非限制 seccomp——沙箱隔离由
 UML 自身提供，不依赖容器运行时。
 
-CI 已把 WebUI 预生成到 `webui/.output` 时，设 `WEBAUI_PREBUILT=1` 构建参数可跳过
+CI 已把 WebUI 预生成到 `webui/.output` 时，设 `WEBUI_PREBUILT=1` 构建参数可跳过
 Node/pnpm 阶段。
 
 ## 3. 手动

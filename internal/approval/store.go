@@ -50,6 +50,12 @@ func (m *Manager) EnablePersistence(path string) error {
 				m.tickets[t.ID] = &t
 			}
 		}
+	} else if err != nil && !os.IsNotExist(err) {
+		// EACCES and friends: the file exists but cannot be read. The store
+		// may hold pending/approved tickets, and the persist below would
+		// atomically replace it with an empty one — refuse instead (same
+		// policy as internal/identity/persist.go).
+		return fmt.Errorf("approval: read store: %w", err)
 	}
 	if err := m.persistLocked(); err != nil {
 		return fmt.Errorf("approval: initial persist: %w", err)

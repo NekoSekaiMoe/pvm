@@ -8,8 +8,7 @@ COPY webui/ /src/webui/
 ARG WEBUI_PREBUILT
 RUN if [ "$WEBUI_PREBUILT" = "1" ]; then echo "webui prebuilt, skipping"; exit 0; fi; \
       cd /src/webui && pnpm install --frozen-lockfile || pnpm install; \
-      cd /src/webui && pnpm run generate; \
-    fi
+      cd /src/webui && pnpm run generate
 
 # ---------- Stage 2: Go build ----------
 FROM golang:1.23 AS build

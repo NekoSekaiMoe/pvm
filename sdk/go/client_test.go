@@ -750,3 +750,29 @@ func TestEnvdClient_RedirectRejected(t *testing.T) {
 		})
 	}
 }
+
+// TestWithDefaultEnvdPortIPv6 pins the IPv6 authority handling: a BARE
+// literal ("::1") must be bracketed before the port is appended ("::1:49983"
+// is not a valid authority), while an already-bracketed literal must NOT be
+// double-bracketed (the naive net.JoinHostPort fix would produce
+// "[[::1]]:49983").
+func TestWithDefaultEnvdPortIPv6(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"::1", "[::1]:49983"},
+		{"[::1]", "[::1]:49983"},
+		{"fe80::1", "[fe80::1]:49983"},
+		{"localhost", "localhost:49983"},
+		{"127.0.0.1", "127.0.0.1:49983"},
+		{"127.0.0.1:1234", "127.0.0.1:1234"},
+		{"[::1]:1234", "[::1]:1234"},
+	}
+	for _, c := range cases {
+		if got := withDefaultEnvdPort(c.in); got != c.want {
+			t.Errorf("withDefaultEnvdPort(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+	// Loopback IPv6 stays http and yields a usable base URL.
+	if c := NewEnvdClient("::1", "t1"); c.base != "http://[::1]:49983" {
+		t.Fatalf("NewEnvdClient(\"::1\") base = %q, want http://[::1]:49983", c.base)
+	}
+}

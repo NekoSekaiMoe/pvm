@@ -262,6 +262,9 @@ func (g *Gateway) serveMITM(clientConn net.Conn, brw *bufio.ReadWriter, task, ho
 			// ledger) — a silent 403 inside the tunnel would be invisible.
 			g.record(task, req, DecisionBlock, "mitm: blocked by rule")
 			writeMITMError(writer, http.StatusForbidden, "egress: blocked by rule")
+			if !drainRejectedBody(req) {
+				return // body too large to skip — kill the tunnel, not the framing
+			}
 			continue
 		}
 		if d == DecisionReview && pol.ReviewHook != nil {
@@ -269,6 +272,9 @@ func (g *Gateway) serveMITM(clientConn net.Conn, brw *bufio.ReadWriter, task, ho
 			if !allow {
 				g.record(task, req, DecisionBlock, "mitm review denied: "+reason)
 				writeMITMError(writer, http.StatusForbidden, "egress: review denied")
+				if !drainRejectedBody(req) {
+					return
+				}
 				continue
 			}
 		}
@@ -278,6 +284,9 @@ func (g *Gateway) serveMITM(clientConn net.Conn, brw *bufio.ReadWriter, task, ho
 		if !methodAllowed(req.Method, pol.AllowedMethods) {
 			g.record(task, req, DecisionBlock, "mitm: method "+req.Method+" not allowed")
 			writeMITMError(writer, http.StatusMethodNotAllowed, "egress: method not allowed")
+			if !drainRejectedBody(req) {
+				return
+			}
 			continue
 		}
 		// Size cap on the request body. ContentLength is -1 for chunked
@@ -290,6 +299,9 @@ func (g *Gateway) serveMITM(clientConn net.Conn, brw *bufio.ReadWriter, task, ho
 			if req.ContentLength > pol.MaxRequestBody {
 				g.record(task, req, DecisionBlock, fmt.Sprintf("mitm: request body %d > %d", req.ContentLength, pol.MaxRequestBody))
 				writeMITMError(writer, http.StatusRequestEntityTooLarge, "egress: request too large")
+				if !drainRejectedBody(req) {
+					return
+				}
 				continue
 			}
 			bodyLimiter = &io.LimitedReader{R: req.Body, N: pol.MaxRequestBody + 1}
@@ -302,22 +314,29 @@ func (g *Gateway) serveMITM(clientConn net.Conn, brw *bufio.ReadWriter, task, ho
 		outReq, oerr := http.NewRequest(req.Method, req.URL.String(), body)
 		if oerr != nil {
 			writeMITMError(writer, http.StatusBadGateway, "egress: bad request")
+			if !drainRejectedBody(req) {
+				return
+			}
 			continue
 		}
 		outReq.Header = stripInternalHeaders(req.Header.Clone())
 		resp, terr := g.transportForTask(task, stripPortMITM(host)).RoundTrip(outReq)
 		if terr != nil {
 			writeMITMError(writer, http.StatusBadGateway, "egress: upstream error: "+terr.Error())
+			if !drainRejectedBody(req) {
+				return
+			}
 			continue
 		}
 		if bodyLimiter != nil && bodyLimiter.N <= 0 {
 			// Chunked body exceeded the cap: the bytes were already forwarded
 			// (as in handleHTTP), but the sandbox must not receive the
-			// upstream's answer to an over-limit request.
+			// upstream's answer to an over-limit request. The client may still
+			// be mid-body, so the tunnel cannot be framed safely — close it.
 			resp.Body.Close()
 			g.record(task, req, DecisionBlock, "mitm: chunked request body exceeded cap")
 			writeMITMError(writer, http.StatusRequestEntityTooLarge, "egress: request too large")
-			continue
+			return
 		}
 		// Size cap on the response body (truncation, like handleHTTP). Fix
 		// the advertised length when truncating so the framing the client
@@ -338,6 +357,25 @@ func (g *Gateway) serveMITM(clientConn net.Conn, brw *bufio.ReadWriter, task, ho
 func writeMITMError(w *bufio.Writer, code int, msg string) {
 	fmt.Fprintf(w, "HTTP/1.1 %d %s\r\nContent-Length: %d\r\nContent-Type: text/plain\r\nConnection: keep-alive\r\n\r\n%s", code, http.StatusText(code), len(msg), msg)
 	w.Flush()
+}
+
+// mitmDrainCap bounds how much of a rejected request's body is skipped to
+// keep the tunnel framed. Anything larger is not worth skipping: the
+// connection is closed instead and the client retries on a fresh tunnel.
+const mitmDrainCap = 64 << 10
+
+// drainRejectedBody consumes the inner request's body after a mid-tunnel
+// rejection so the next http.ReadRequest on the same keep-alive connection
+// cannot parse leftover body bytes as a new request (framing desync).
+// Returns false when the body exceeded the drain cap and the caller must
+// close the connection instead of continuing the loop.
+func drainRejectedBody(req *http.Request) bool {
+	if req.Body == nil || req.Body == http.NoBody {
+		return true
+	}
+	n, _ := io.Copy(io.Discard, io.LimitReader(req.Body, mitmDrainCap+1))
+	_ = req.Body.Close()
+	return n <= mitmDrainCap
 }
 
 // prefixedConn serves buffered pre-handshake bytes (see serveMITM) before

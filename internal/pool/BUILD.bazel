@@ -16,7 +16,10 @@ go_library(
 
 go_test(
     name = "pool_test",
-    srcs = ["manager_test.go"],
+    srcs = [
+        "manager_test.go",
+        "persist_rollback_test.go",
+    ],
     embed = [":pool"],
     deps = ["//internal/audit"],
 )

@@ -298,3 +298,36 @@ func TestMITM_HostHeaderIsNotTrusted(t *testing.T) {
 		t.Fatalf("honest-Host /admin status = %d, want 403", resp.StatusCode)
 	}
 }
+
+// TestMITM_RejectedRequestKeepsTunnelFramed: a rejected inner request must
+// have its body drained (or the tunnel closed) before the next request is
+// read — otherwise http.ReadRequest parses the leftover body bytes as a new
+// request line and the keep-alive tunnel desyncs.
+func TestMITM_RejectedRequestKeepsTunnelFramed(t *testing.T) {
+	env := newMITMEnv(t, &Policy{
+		AllowedMethods: []string{http.MethodGet},
+		Rules:          []EgressRule{mitmAllowRule("127.0.0.1")},
+	}, "hello")
+	c := mitmTunnel(t, env)
+	defer c.Close()
+
+	// 1) POST is outside the allowlist: rejected while a body is attached.
+	resp := mitmRoundTrip(t, c, http.MethodPost, "/submit", "", "LEFTOVER-BODY-BYTES")
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Fatalf("rejected request status = %d, want %d", resp.StatusCode, http.StatusMethodNotAllowed)
+	}
+
+	// 2) A second request on the SAME keep-alive tunnel must still parse
+	// and proxy: this is exactly what breaks without the drain.
+	resp2 := mitmRoundTrip(t, c, http.MethodGet, "/ok", "", "")
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("follow-up request status = %d, want 200 (tunnel desynced)", resp2.StatusCode)
+	}
+	b, _ := io.ReadAll(resp2.Body)
+	if string(b) != "hello" {
+		t.Fatalf("follow-up body = %q, want %q", b, "hello")
+	}
+}
