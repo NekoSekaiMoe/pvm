@@ -1,0 +1,8 @@
+load("@rules_go//go:def.bzl", "go_library")
+
+go_library(
+    name = "console",
+    srcs = ["console.go"],
+    importpath = "uml-container/internal/console",
+    visibility = ["//:__subpackages__"],
+)

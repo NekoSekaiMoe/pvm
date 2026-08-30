@@ -2,7 +2,10 @@ load("@rules_go//go:def.bzl", "go_binary", "go_library", "go_test")
 
 go_library(
     name = "agentpvm_lib",
-    srcs = ["main.go"],
+    srcs = [
+        "main.go",
+        "template_cli.go",
+    ],
     importpath = "uml-container/cmd/agentpvm",
     visibility = ["//visibility:private"],
     deps = [

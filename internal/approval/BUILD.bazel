@@ -4,11 +4,15 @@ go_library(
     name = "approval",
     srcs = [
         "manager.go",
+        "store.go",
         "util.go",
     ],
     importpath = "uml-container/internal/approval",
     visibility = ["//:__subpackages__"],
-    deps = ["//internal/audit"],
+    deps = [
+        "//internal/audit",
+        "//internal/fsjson",
+    ],
 )
 
 go_test(

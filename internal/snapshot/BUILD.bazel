@@ -5,6 +5,7 @@ go_library(
     srcs = [
         "clone.go",
         "clone_refs.go",
+        "criu.go",
         "delete_guard.go",
         "event.go",
         "rollback.go",

@@ -2,7 +2,13 @@ load("@rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
     name = "go",
-    srcs = ["client.go"],
+    srcs = [
+        "client.go",
+        "envd.go",
+        "planes.go",
+        "sandbox.go",
+        "tasks.go",
+    ],
     importpath = "uml-container/sdk/go",
     visibility = ["//visibility:public"],
 )

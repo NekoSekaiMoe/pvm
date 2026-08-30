@@ -2,10 +2,16 @@ load("@rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
     name = "identity",
-    srcs = ["broker.go"],
+    srcs = [
+        "broker.go",
+        "persist.go",
+    ],
     importpath = "uml-container/internal/identity",
     visibility = ["//:__subpackages__"],
-    deps = ["//internal/audit"],
+    deps = [
+        "//internal/audit",
+        "//internal/fsjson",
+    ],
 )
 
 go_test(

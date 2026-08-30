@@ -2,10 +2,16 @@ load("@rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
     name = "artifact",
-    srcs = ["gate.go"],
+    srcs = [
+        "gate.go",
+        "verifiers.go",
+    ],
     importpath = "uml-container/internal/artifact",
     visibility = ["//:__subpackages__"],
-    deps = ["//internal/audit"],
+    deps = [
+        "//internal/audit",
+        "//internal/spec",
+    ],
 )
 
 go_test(

@@ -5,10 +5,14 @@ go_library(
     srcs = [
         "ledger.go",
         "redact.go",
+        "signing.go",
     ],
     importpath = "uml-container/internal/audit",
     visibility = ["//:__subpackages__"],
-)
+    deps = [
+        "//internal/fsjson",
+        "//internal/metrics",
+    ],
 
 go_test(
     name = "audit_test",

@@ -70,6 +70,7 @@ go_library(
         "filter.go",
         "ipam.go",
         "policy.go",
+        "registry.go",
         "tap.go",
     ] + select({
         # generated bindings carry their own //go:build constraints; each
@@ -113,6 +114,7 @@ go_library(
     importpath = "uml-container/internal/network",
     visibility = ["//:__subpackages__"],
     deps = [
+        "//internal/fsjson",
         "@com_github_cilium_ebpf//:ebpf",
         "@com_github_vishvananda_netlink//:netlink",
         "@org_golang_x_sys//unix",

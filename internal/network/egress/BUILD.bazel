@@ -2,7 +2,10 @@ load("@rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
     name = "egress",
-    srcs = ["gateway.go"],
+    srcs = [
+        "gateway.go",
+        "mitm.go",
+    ],
     importpath = "uml-container/internal/network/egress",
     visibility = ["//:__subpackages__"],
     deps = ["//internal/audit"],

@@ -1,0 +1,8 @@
+load("@rules_go//go:def.bzl", "go_library")
+
+go_library(
+    name = "logx",
+    srcs = ["rotate.go"],
+    importpath = "uml-container/internal/logx",
+    visibility = ["//:__subpackages__"],
+)
