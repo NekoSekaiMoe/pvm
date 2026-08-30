@@ -147,8 +147,15 @@ func (c *Client) RebuildTemplate(ctx context.Context, id string) error {
 	return c.doJSON(ctx, http.MethodPost, "/api/templates/"+url.PathEscape(id)+"/rebuild", nil, nil)
 }
 
-// WaitForTemplateReady polls the build endpoint until done/failed.
+// WaitForTemplateReady polls the build endpoint until done/failed. The
+// timeout bounds the whole wait — not just the space between responses —
+// by deriving a cancellable context that is threaded into every poll.
 func (c *Client) WaitForTemplateReady(ctx context.Context, id string, timeout time.Duration) (*TemplateBuildStatus, error) {
+	if timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
 	deadline := time.Now().Add(timeout)
 	for {
 		st, err := c.TemplateBuildStatus(ctx, id)
@@ -161,6 +168,10 @@ func (c *Client) WaitForTemplateReady(ctx context.Context, id string, timeout ti
 		if time.Now().After(deadline) {
 			return st, fmt.Errorf("sdk: template %s still %s after %s", id, st.Phase, timeout)
 		}
-		time.Sleep(300 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(300 * time.Millisecond):
+		}
 	}
 }

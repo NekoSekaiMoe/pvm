@@ -76,7 +76,10 @@ func TestSandboxLifecycle(t *testing.T) {
 		}
 	}))
 	defer ts.Close()
-	c := NewClient(Config{APIURL: ts.URL, APIKey: "k"})
+	c, err := NewClient(Config{APIURL: ts.URL, APIKey: "k"})
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	list, err := c.ListSandboxes(context.Background())
 	if err != nil || len(list) != 1 || list[0].SandboxID != "sb-1" {
@@ -114,7 +117,10 @@ func TestExecApprovalSentinel(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(ExecResult{OK: true, Summary: "ran"})
 	}))
 	defer ts.Close()
-	c := NewClient(Config{APIURL: ts.URL, APIKey: "k"})
+	c, err := NewClient(Config{APIURL: ts.URL, APIKey: "k"})
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	res, err := c.Exec(context.Background(), "t-9", "deploy env=prod")
 	if err == nil || res != nil {

@@ -43,6 +43,10 @@ type artifactVerdictView = artifact.Verdict
 var (
 	globalIncidentMu sync.RWMutex
 	globalIncident   *incident.Controller
+	// Root the cached controller was built against. Tests swap
+	// PVM_STATE_ROOT (and state.RootDir) between cases; a stale controller
+	// would keep a broker writing revocations into a deleted temp dir.
+	globalIncidentRoot string
 
 	// Egress gateway registry: per-task gateways started by the controller
 	// (agentpvm run) register here so the incident BlockNetwork hook and the
@@ -59,6 +63,7 @@ var (
 func RegisterIncidentController(c *incident.Controller) {
 	globalIncidentMu.Lock()
 	globalIncident = c
+	globalIncidentRoot = state.RootDir
 	globalIncidentMu.Unlock()
 }
 
@@ -76,17 +81,22 @@ func egressFor(taskID string) *egress.Gateway {
 	return globalEgressGateways[taskID]
 }
 
-// currentIncident lazily builds the default in-process controller.
+// currentIncident lazily builds the default in-process controller. The
+// cache (including injected controllers) is keyed to the CURRENT state root
+// like CurrentIdentity, so a root swap between tests never serves a
+// controller bound to a stale (possibly deleted) state directory.
 func currentIncident() *incident.Controller {
 	globalIncidentMu.RLock()
-	c := globalIncident
+	c, cachedRoot := globalIncident, globalIncidentRoot
 	globalIncidentMu.RUnlock()
-	if c != nil {
+	if c != nil && cachedRoot == state.RootDir {
 		return c
 	}
 	globalIncidentMu.Lock()
 	defer globalIncidentMu.Unlock()
-	if globalIncident != nil {
+	// Re-check BOTH slots: an injected or previously built controller is
+	// only valid while the state root is unchanged.
+	if globalIncident != nil && globalIncidentRoot == state.RootDir {
 		return globalIncident
 	}
 	broker, _ := CurrentIdentity()
@@ -150,6 +160,7 @@ func currentIncident() *incident.Controller {
 			return err
 		},
 	})
+	globalIncidentRoot = state.RootDir
 	return globalIncident
 }
 

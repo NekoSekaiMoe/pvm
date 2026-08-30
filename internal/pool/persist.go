@@ -24,6 +24,58 @@ type poolFile struct {
 	SavedAt  time.Time        `json:"saved_at"`
 }
 
+// persistSnapshot captures the pre-restore manager state so a failed
+// EnablePersistence can roll the restore back atomically: without it, a
+// first-persist failure would leave restored pool entries and rebuilt quota
+// counters in memory, and a later retry on the same path would append the
+// same sandboxes twice and double the counters.
+type persistSnapshot struct {
+	poolLen  int
+	quotas   map[string]Quota
+	capacity int
+	running  map[string]int
+	cpu      map[string]int
+	memMB    map[string]int
+	hourly   map[string][]time.Time
+}
+
+func (m *Manager) snapshotLocked() persistSnapshot {
+	q := make(map[string]Quota, len(m.quotas))
+	for k, v := range m.quotas {
+		q[k] = v
+	}
+	r := make(map[string]int, len(m.running))
+	for k, v := range m.running {
+		r[k] = v
+	}
+	cp := make(map[string]int, len(m.cpu))
+	for k, v := range m.cpu {
+		cp[k] = v
+	}
+	mm := make(map[string]int, len(m.memMB))
+	for k, v := range m.memMB {
+		mm[k] = v
+	}
+	h := make(map[string][]time.Time, len(m.hourly))
+	for k, v := range m.hourly {
+		h[k] = append([]time.Time(nil), v...)
+	}
+	return persistSnapshot{
+		poolLen: len(m.pool), quotas: q, capacity: m.capacity,
+		running: r, cpu: cp, memMB: mm, hourly: h,
+	}
+}
+
+func (m *Manager) restoreLocked(s persistSnapshot) {
+	m.pool = m.pool[:s.poolLen]
+	m.quotas = s.quotas
+	m.capacity = s.capacity
+	m.running = s.running
+	m.cpu = s.cpu
+	m.memMB = s.memMB
+	m.hourly = s.hourly
+}
+
 // EnablePersistence loads state from path and mirrors every mutation back.
 func (m *Manager) EnablePersistence(path string) error {
 	if path == "" {
@@ -34,7 +86,14 @@ func (m *Manager) EnablePersistence(path string) error {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	// Idempotency guard: a second EnablePersistence would re-append the
+	// same sandboxes and double the rebuilt quota counters, letting one
+	// ready sandbox be claimed twice. One Manager, one store.
+	if m.persistPath != "" {
+		return fmt.Errorf("pool: persistence already enabled (%s); re-enabling would duplicate restored sandboxes", m.persistPath)
+	}
 	m.persistPath = path
+	snap := m.snapshotLocked()
 	raw, err := os.ReadFile(path)
 	if err == nil && len(raw) > 0 {
 		var pf poolFile
@@ -64,15 +123,33 @@ func (m *Manager) EnablePersistence(path string) error {
 			}
 		}
 	} else if err != nil && !os.IsNotExist(err) {
+		// Clear persistPath before failing: leaving it set would poison the
+		// idempotency guard (a later EnablePersistence with a VALID path is
+		// rejected) and keep every mutation writing to the unreadable path.
+		m.persistPath = ""
 		return fmt.Errorf("pool: read store: %w", err)
 	}
-	m.persistLocked()
+	if err := m.persistLocked(); err != nil {
+		// Fall back to pure in-memory mode, matching the comment above: the
+		// caller asked for durable state and the very first snapshot could
+		// not be written — keeping persistPath set would make every later
+		// mutation fail the same way while still pretending to be durable.
+		// The restore is rolled back too, so a retry after the storage issue
+		// is fixed cannot duplicate the restored sandboxes or quota counters.
+		m.restoreLocked(snap)
+		m.persistPath = ""
+		return fmt.Errorf("pool: initial persist: %w", err)
+	}
 	return nil
 }
 
-func (m *Manager) persistLocked() {
+// persistLocked mirrors the manager state to the store file. Errors are
+// returned, not logged: mutation callers decide whether a failed mirror is
+// fatal (EnablePersistence refuses durability and falls back to memory) or
+// just observable (logged and the in-memory mutation stands).
+func (m *Manager) persistLocked() error {
 	if m.persistPath == "" {
-		return
+		return nil
 	}
 	pf := poolFile{
 		Pool:     make([]Sandbox, 0, len(m.pool)),
@@ -86,6 +163,7 @@ func (m *Manager) persistLocked() {
 		}
 	}
 	if err := fsjson.Write(m.persistPath, pf); err != nil {
-		log.Printf("pool: persist to %s failed: %v", m.persistPath, err)
+		return fmt.Errorf("persist to %s: %w", m.persistPath, err)
 	}
+	return nil
 }

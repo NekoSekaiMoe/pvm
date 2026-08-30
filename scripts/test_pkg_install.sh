@@ -100,8 +100,18 @@ ping -c 2 -W 3 8.8.8.8 2>&1 || echo "(ICMP echo unreachable — expected on Azur
 echo "--- end guest net diag ---"
 
 # 4) 真正的安装步骤（保留成功标记）；apk 是动态 ELF，如果上面失败了这里也会失败
-apk update \
-  && apk add fastfetch \
+# apk retries: the Alpine CDN occasionally drops a single package fetch
+# ("TLS: unspecified error", seen on GitHub runners) with everything else
+# healthy; a bare `apk add` then fails the whole suite. Retry a few times
+# before giving up.
+APK_OK=0
+apk update || apk update || exit 1
+for attempt in 1 2 3; do
+    if apk add fastfetch; then APK_OK=1; break; fi
+    echo "apk add fastfetch failed (attempt $attempt/3); retrying after backoff"
+    sleep 3
+ done
+[ "$APK_OK" = "1" ] \
   && fastfetch \
   && echo "PKG_INSTALL_SUCCESS"
 

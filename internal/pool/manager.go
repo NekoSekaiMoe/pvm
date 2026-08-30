@@ -166,12 +166,24 @@ func NewManager(capacity int, ledger *audit.Ledger) *Manager {
 	}
 }
 
-// SetQuota installs a per-tenant quota.
-func (m *Manager) SetQuota(tenant string, q Quota) {
+// SetQuota installs a per-tenant quota. An error is returned when the
+// change cannot be persisted; the in-memory quota is rolled back so memory
+// mirrors the store — callers must surface the failure, otherwise a restart
+// silently resurrects the old quota.
+func (m *Manager) SetQuota(tenant string, q Quota) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	prev, had := m.quotas[tenant]
 	m.quotas[tenant] = q
-	m.persistLocked()
+	if err := m.persistLocked(); err != nil {
+		if had {
+			m.quotas[tenant] = prev
+		} else {
+			delete(m.quotas, tenant)
+		}
+		return fmt.Errorf("pool: quota persist: %w", err)
+	}
+	return nil
 }
 
 // Warm pre-creates N sandboxes from a template so claims don't pay cold start.
@@ -215,7 +227,16 @@ func (m *Manager) Warm(tmpl Template, n int) int {
 			State:     SandboxReady,
 			CreatedAt: m.now(),
 		})
-		m.persistLocked()
+		if err := m.persistLocked(); err != nil {
+			// Roll the append back and tear the sandbox down: Factory built
+			// it, but a sandbox the store never accepted would be lost on
+			// restart and silently skew the capacity invariant.
+			m.pool = m.pool[:len(m.pool)-1]
+			m.mu.Unlock()
+			log.Printf("pool: warm persist failed, discarding sandbox %s: %v", id, err)
+			m.destroy(id, "warm persist failed")
+			break
+		}
 		m.mu.Unlock()
 		created++
 	}
@@ -331,7 +352,17 @@ func (m *Manager) claim(tenant string, tmpl Template, taskID string, logs *[]dec
 		sb.MemMB = wantMB
 		sb.ClaimedAt = now
 		m.accountClaim(tenant, tmpl.CPU, wantMB, now)
-		m.persistLocked()
+		if err := m.persistLocked(); err != nil {
+			// Roll the claim back so memory mirrors the durable store: the
+			// sandbox returns to ready and the quota counters are undone.
+			m.rollbackClaimLocked(tenant, tmpl.CPU, wantMB, now)
+			sb.State = SandboxReady
+			sb.TaskID, sb.Tenant, sb.CPU, sb.MemMB = "", "", 0, 0
+			sb.ClaimedAt = time.Time{}
+			recordDecision(logs, tenant, "claimed-warm persist failed", false)
+			m.mu.Unlock()
+			return "", fmt.Errorf("pool: claim persist: %w", err)
+		}
 		recordDecision(logs, tenant, "claimed-warm", true)
 		id := sb.ID
 		m.mu.Unlock()
@@ -398,7 +429,17 @@ func (m *Manager) claim(tenant string, tmpl Template, taskID string, logs *[]dec
 	sb := &Sandbox{ID: id, Template: tmpl.Name, State: SandboxClaimed, TaskID: taskID, Tenant: tenant, CPU: tmpl.CPU, MemMB: wantMB, CreatedAt: now, ClaimedAt: now}
 	m.pool = append(m.pool, sb)
 	m.accountClaim(tenant, tmpl.CPU, wantMB, now)
-	m.persistLocked()
+	if err := m.persistLocked(); err != nil {
+		// Roll the on-demand claim back: pop the entry, undo the counters,
+		// and tear down the Factory-created sandbox — it must not run when
+		// the store never recorded its claim.
+		m.pool = m.pool[:len(m.pool)-1]
+		m.rollbackClaimLocked(tenant, tmpl.CPU, wantMB, now)
+		recordDecision(logs, tenant, "created-on-demand persist failed", false)
+		m.mu.Unlock()
+		m.destroy(id, "claim persist failed")
+		return "", fmt.Errorf("pool: claim persist: %w", err)
+	}
 	recordDecision(logs, tenant, "created-on-demand", true)
 	m.mu.Unlock()
 	return id, nil
@@ -518,20 +559,37 @@ func (m *Manager) Release(id string, recycle bool) error {
 		m.releaseQuotaLocked(s)
 
 		if recycle {
+			prev := *s // snapshot for rollback if the persist below fails
 			s.State = SandboxReady
 			s.TaskID = ""
 			s.Tenant = ""
 			s.CPU = 0
 			s.MemMB = 0
 			s.ClaimedAt = time.Time{}
-			m.persistLocked()
+			if err := m.persistLocked(); err != nil {
+				// Restore the claimed state and the counters the release had
+				// already taken: the store still lists the sandbox as claimed,
+				// so memory must mirror it.
+				*s = prev
+				m.rollbackReleaseLocked(prev.Tenant, prev.CPU, prev.MemMB)
+				m.mu.Unlock()
+				return fmt.Errorf("pool: release persist: %w", err)
+			}
 			m.mu.Unlock()
 			return nil
 		}
 		// Destroyer is an external call; do NOT keep m.mu held across it.
 		// Snapshot the fields we need, drop the entry, then destroy.
 		m.pool = append(m.pool[:i], m.pool[i+1:]...)
-		m.persistLocked()
+		if err := m.persistLocked(); err != nil {
+			// Re-insert the entry and the released counters: the store file
+			// still lists the sandbox, so memory must keep it too — and the
+			// destroyer must not run for a sandbox the registry still owns.
+			m.pool = append(m.pool[:i], append([]*Sandbox{s}, m.pool[i:]...)...)
+			m.rollbackReleaseLocked(s.Tenant, s.CPU, s.MemMB)
+			m.mu.Unlock()
+			return fmt.Errorf("pool: release persist: %w", err)
+		}
 		destroyer := m.Destroyer
 		m.mu.Unlock()
 		if destroyer != nil {
@@ -569,6 +627,46 @@ func (m *Manager) releaseQuotaLocked(s *Sandbox) {
 	if m.memMB[tenant] < 0 {
 		m.memMB[tenant] = 0
 	}
+}
+
+// rollbackClaimLocked is the exact inverse of accountClaim — including the
+// hourly start entry — used when a claim is rolled back because its persist
+// failed. (releaseQuotaLocked models a REAL release, where the task start
+// still counts against the hourly rate, so it deliberately keeps hourly.)
+func (m *Manager) rollbackClaimLocked(tenant string, cpu, memMB int, at time.Time) {
+	if tenant == "" {
+		return
+	}
+	if m.running[tenant] > 0 {
+		m.running[tenant]--
+	}
+	m.cpu[tenant] -= cpu
+	if m.cpu[tenant] < 0 {
+		m.cpu[tenant] = 0
+	}
+	m.memMB[tenant] -= memMB
+	if m.memMB[tenant] < 0 {
+		m.memMB[tenant] = 0
+	}
+	hs := m.hourly[tenant]
+	for i := len(hs) - 1; i >= 0; i-- {
+		if hs[i].Equal(at) {
+			m.hourly[tenant] = append(hs[:i], hs[i+1:]...)
+			break
+		}
+	}
+}
+
+// rollbackReleaseLocked undoes releaseQuotaLocked — the three live counters,
+// NOT the hourly entry (a real release keeps it, so its rollback must too) —
+// used when a release is rolled back because its persist failed.
+func (m *Manager) rollbackReleaseLocked(tenant string, cpu, memMB int) {
+	if tenant == "" {
+		return
+	}
+	m.running[tenant]++
+	m.cpu[tenant] += cpu
+	m.memMB[tenant] += memMB
 }
 
 // Stats returns pool occupancy for observability.

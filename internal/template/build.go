@@ -241,7 +241,10 @@ func (b *Builder) run(s *Store, id, imageRef string) {
 			return
 		}
 		b.log(s, id, "rootfs path verified ("+fmt.Sprint(fi.Size())+" bytes)")
-		_ = s.Update(id, func(r *Record) error { r.ImagePath = imageRef; return nil })
+		if err := s.Update(id, func(r *Record) error { r.ImagePath = imageRef; return nil }); err != nil {
+			fail("persist image path: %v", err)
+			return
+		}
 		b.finish(s, id)
 		return
 	}
@@ -258,14 +261,25 @@ func (b *Builder) run(s *Store, id, imageRef string) {
 		fail("resolve store path: %v", err)
 		return
 	}
-	_ = s.Update(id, func(r *Record) error { r.ImagePath = storePath; return nil })
+	if err := s.Update(id, func(r *Record) error { r.ImagePath = storePath; return nil }); err != nil {
+		fail("persist image path: %v", err)
+		return
+	}
 	b.finish(s, id)
 }
 
 func (b *Builder) finish(s *Store, id string) {
+	// Persist READY BEFORE reporting PhaseDone: a Wait() caller must never
+	// observe a done build.json whose record is still PENDING or lacks
+	// ImagePath — using that template would fail downstream.
+	if err := s.Update(id, func(r *Record) error { r.Status = "READY"; return nil }); err != nil {
+		metricTemplateBuilds.Inc("failed")
+		b.progress(s, id, BuildStatus{Phase: PhaseFailed, Pct: 100, Error: fmt.Sprintf("persist READY record: %v", err), UpdatedAt: time.Now().UTC()}, "failed")
+		_ = s.Update(id, func(r *Record) error { r.Status = "FAILED"; return nil })
+		return
+	}
 	metricTemplateBuilds.Inc("done")
 	b.progress(s, id, BuildStatus{Phase: PhaseDone, Pct: 100, UpdatedAt: time.Now().UTC()}, "done")
-	_ = s.Update(id, func(r *Record) error { r.Status = "READY"; return nil })
 	b.log(s, id, "template READY")
 }
 

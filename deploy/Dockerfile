@@ -3,15 +3,12 @@
 ARG WEBUI_PREBUILT=0
 
 # ---------- Stage 1: WebUI (skippable) ----------
-FROM golang:1.23 AS webui
+FROM ghcr.io/pnpm/pnpm:latest AS webui
+COPY webui/ /src/webui/
 ARG WEBUI_PREBUILT
 RUN if [ "$WEBUI_PREBUILT" = "1" ]; then echo "webui prebuilt, skipping"; exit 0; fi; \
-    corepack enable && corepack prepare pnpm@latest --activate
-COPY webui/ /src/webui/
-RUN if [ "$WEBUI_PREBUILT" != "1" ]; then \
       cd /src/webui && pnpm install --frozen-lockfile || pnpm install; \
-      cd /src/webui && pnpm run generate; \
-    fi
+      cd /src/webui && pnpm run generate
 
 # ---------- Stage 2: Go build ----------
 FROM golang:1.23 AS build

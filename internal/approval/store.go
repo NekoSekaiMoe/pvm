@@ -50,14 +50,26 @@ func (m *Manager) EnablePersistence(path string) error {
 				m.tickets[t.ID] = &t
 			}
 		}
+	} else if err != nil && !os.IsNotExist(err) {
+		// EACCES and friends: the file exists but cannot be read. The store
+		// may hold pending/approved tickets, and the persist below would
+		// atomically replace it with an empty one — refuse instead (same
+		// policy as internal/identity/persist.go).
+		return fmt.Errorf("approval: read store: %w", err)
 	}
-	m.persistLocked()
+	if err := m.persistLocked(); err != nil {
+		return fmt.Errorf("approval: initial persist: %w", err)
+	}
 	return nil
 }
 
-func (m *Manager) persistLocked() {
+// persistLocked writes the ticket store durably. Callers decide how to
+// surface failures: ClaimFor REFUSES a claim when this fails (an
+// unpersisted consume could replay after restart), while edit/expire paths
+// only log (they are advisory state transitions).
+func (m *Manager) persistLocked() error {
 	if m.persistPath == "" {
-		return
+		return nil
 	}
 	out := struct {
 		Tickets []Ticket `json:"tickets"`
@@ -66,8 +78,9 @@ func (m *Manager) persistLocked() {
 		out.Tickets = append(out.Tickets, *t)
 	}
 	if err := fsjson.Write(m.persistPath, out); err != nil {
-		log.Printf("approval: persist to %s failed: %v", m.persistPath, err)
+		return fmt.Errorf("approval: persist to %s: %w", m.persistPath, err)
 	}
+	return nil
 }
 
 // EnableWebhook registers a best-effort HTTP JSON notification endpoint.
@@ -140,8 +153,9 @@ func (m *Manager) Edit(id string, params map[string]interface{}, reason, by stri
 }
 
 // ApprovedFor returns the id of an approved, unconsumed ticket matching
-// (task, tool, params) — the gateway's one-shot unlock. ok=false when no
-// ticket clears.
+// (task, tool, params) WITHOUT consuming it — an existence probe for UIs
+// and tests. The gateway's one-shot unlock must use ClaimFor, which finds,
+// consumes and persists atomically.
 func (m *Manager) ApprovedFor(taskID, tool string, params map[string]interface{}) (string, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -154,14 +168,54 @@ func (m *Manager) ApprovedFor(taskID, tool string, params map[string]interface{}
 	return "", false
 }
 
+// ClaimFor atomically finds AND consumes an approved, unconsumed ticket
+// matching (task, tool, params). Find + consume + persist happen under one
+// critical section, so two concurrent executions can never both unlock on
+// the same ticket. When persistence is enabled and the consume cannot be
+// written, the claim is REFUSED (ok=false) — an unpersisted consume could
+// replay the ticket after a restart.
+func (m *Manager) ClaimFor(taskID, tool string, params map[string]interface{}) (string, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, t := range m.tickets {
+		if t.TaskID == taskID && t.Tool == tool && t.State == StateApproved &&
+			!t.Consumed && sameParams(t.Params, params) {
+			t.Consumed = true
+			if err := m.persistLocked(); err != nil {
+				// Roll the in-memory consume back: the durable store stays the
+				// authority and the caller must not execute on this ticket.
+				t.Consumed = false
+				log.Printf("approval: refusing claim on %s: %v", t.ID, err)
+				return "", false
+			}
+			return t.ID, true
+		}
+	}
+	return "", false
+}
+
 // MarkConsumed burns an approved ticket after its one execution attempt.
+// The gateway path uses ClaimFor instead (atomic); this stays for API
+// compatibility and manual burns, so the signature stays void. Like
+// ClaimFor, the in-memory consume is rolled back when the durable write
+// fails: the persisted file is what a restart replays, so a memory-only
+// consume would make the ticket look burned in-process while remaining
+// claimable after a restart — the same replay hazard ClaimFor refuses.
 func (m *Manager) MarkConsumed(id string) {
 	m.mu.Lock()
+	defer m.mu.Unlock()
+	var touched *Ticket
+	var prev bool
 	if t, ok := m.tickets[id]; ok && t.State == StateApproved {
+		touched, prev = t, t.Consumed
 		t.Consumed = true
 	}
-	m.persistLocked()
-	m.mu.Unlock()
+	if err := m.persistLocked(); err != nil {
+		if touched != nil {
+			touched.Consumed = prev // memory must mirror the file, not run ahead of it
+		}
+		log.Printf("approval: mark-consumed persist failed: %v", err)
+	}
 }
 
 // ExpirePending flips tickets whose deadline passed to StateExpired and
@@ -178,7 +232,9 @@ func (m *Manager) ExpirePending() int {
 		}
 	}
 	if n > 0 {
-		m.persistLocked()
+		if err := m.persistLocked(); err != nil {
+			log.Printf("approval: expire persist failed: %v", err)
+		}
 	}
 	return n
 }

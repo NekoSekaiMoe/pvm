@@ -43,6 +43,7 @@ type Token struct {
 	ID     string    `json:"id"`
 	Caller string    `json:"caller"`
 	Tenant string    `json:"tenant"`
+	Task   string    `json:"task,omitempty"` // signed into the payload so task-wide revocation survives restarts
 	Scope  []string  `json:"scope"`
 	Exp    time.Time `json:"exp"`
 }
@@ -130,6 +131,7 @@ func (b *Broker) Mint(caller, tenant, taskID string, scope []string, ttl time.Du
 		ID:     id,
 		Caller: caller,
 		Tenant: tenant,
+		Task:   taskID,
 		Scope:  append([]string{}, scope...),
 		Exp:    time.Now().Add(ttl).UTC(),
 	}
@@ -193,11 +195,18 @@ func (b *Broker) Validate(tokStr string) (*Token, error) {
 	_, revoked := b.revoked[tok.ID]
 	task, linked := b.taskByToken[tok.ID]
 	_, taskRevoked := b.revokedTasks[task]
+	// The reverse index is memory-only; after a restart only the signed
+	// Task claim can tell us which task a token belongs to. Without this
+	// check RevokeAllForTask would stop covering pre-restart tokens.
+	payloadTaskRevoked := false
+	if tok.Task != "" {
+		_, payloadTaskRevoked = b.revokedTasks[tok.Task]
+	}
 	b.mu.RUnlock()
 	if revoked {
 		return nil, ErrRevoked
 	}
-	if linked && taskRevoked {
+	if (linked && taskRevoked) || payloadTaskRevoked {
 		return nil, ErrRevoked
 	}
 	if time.Now().After(tok.Exp) {
@@ -242,8 +251,10 @@ func (b *Broker) RequireScope(tokStr string, required ...string) (*Token, error)
 }
 
 // Revoke adds a token id to the revocation set. Used by the incident
-// controller (plan.md §11 REVOKE).
-func (b *Broker) Revoke(tokenID string) {
+// controller (plan.md §11 REVOKE). The in-memory revocation ALWAYS takes
+// effect; a non-nil return means the durable mirror could not be written —
+// surface it (the revocation would vanish after a restart otherwise).
+func (b *Broker) Revoke(tokenID string) error {
 	b.mu.Lock()
 	b.revoked[tokenID] = struct{}{}
 	if task, ok := b.taskByToken[tokenID]; ok {
@@ -255,7 +266,7 @@ func (b *Broker) Revoke(tokenID string) {
 		}
 		delete(b.taskByToken, tokenID)
 	}
-	b.persistRevLocked()
+	perr := b.persistRevLocked()
 	b.mu.Unlock()
 	if b.ledger != nil {
 		if err := b.ledger.Append(audit.Record{
@@ -268,14 +279,18 @@ func (b *Broker) Revoke(tokenID string) {
 			log.Printf("identity: failed to audit token revoke %s: %v", tokenID, err)
 		}
 	}
+	return perr
 }
 
 // RevokeAllForTask revokes every token minted for taskID in one shot. This is
 // the bulk-revoke path the incident controller uses to "切断所有权限"
 // (plan.md §11). It walks the in-memory live-token index populated at Mint
 // time and moves each id into the revocation set; Validate() will then reject
-// all of them with ErrRevoked. Returns the number of tokens revoked.
-func (b *Broker) RevokeAllForTask(taskID string) int {
+// all of them with ErrRevoked. Tokens minted BEFORE a restart are covered by
+// the task-wide gate (revokedTasks) matched against the signed Task claim.
+// Returns the number of tokens revoked; a non-nil error means the durable
+// mirror could not be written (the in-memory revocation stands).
+func (b *Broker) RevokeAllForTask(taskID string) (int, error) {
 	b.mu.Lock()
 	ids := make([]string, 0, len(b.activeByTask[taskID]))
 	for id := range b.activeByTask[taskID] {
@@ -287,7 +302,7 @@ func (b *Broker) RevokeAllForTask(taskID string) int {
 	delete(b.activeByTask, taskID)
 	// Task-wide gate: even tokens whose ids were lost (restart) stay denied.
 	b.revokedTasks[taskID] = struct{}{}
-	b.persistRevLocked()
+	perr := b.persistRevLocked()
 	b.mu.Unlock()
 
 	if b.ledger != nil {
@@ -302,7 +317,7 @@ func (b *Broker) RevokeAllForTask(taskID string) int {
 			log.Printf("identity: failed to audit bulk revoke for task %s: %v", taskID, err)
 		}
 	}
-	return len(ids)
+	return len(ids), perr
 }
 
 // LookupSecret exposes the long-lived material for a capability to a HOST-side

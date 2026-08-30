@@ -10,6 +10,7 @@ import (
 	"github.com/labstack/echo/v4"
 
 	"uml-container/internal/network/egress"
+	"uml-container/internal/state"
 )
 
 func TestIncidentReportAndList(t *testing.T) {
@@ -64,6 +65,9 @@ func TestIncidentReportAndList(t *testing.T) {
 
 func TestIncidentEgressDenyAll(t *testing.T) {
 	t.Setenv("PVM_STATE_ROOT", t.TempDir())
+	// The env var is only resolved at package init; swap the package var so
+	// CurrentIdentity/currentIncident rebuild against a live directory.
+	state.RootDir = t.TempDir()
 	// A registered gateway gets deny-alled by a high-severity incident.
 	g := egress.NewGateway()
 	RegisterEgressGateway("t-egress", g)

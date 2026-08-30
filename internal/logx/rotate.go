@@ -61,10 +61,12 @@ func (r *Rotator) Write(p []byte) (int, error) {
 		return 0, os.ErrClosed
 	}
 	if r.written+int64(len(p)) > r.maxBytes {
-		if err := r.rotateLocked(); err != nil {
-			// Rotation failure must not lose the log line: fall through and
-			// keep writing to the current file.
-			_ = err
+		if err := r.rotateLocked(); err != nil && r.f == nil {
+			// Rotation failed AFTER the old handle was closed (r.f == nil):
+			// report the error instead of panicking on the nil handle. The
+			// caller can retry once the underlying issue (permissions, disk)
+			// is fixed; this line is lost, the process is not.
+			return 0, err
 		}
 	}
 	n, err := r.f.Write(p)

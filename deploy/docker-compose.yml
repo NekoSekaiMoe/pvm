@@ -10,7 +10,7 @@ name: pvm
 
 x-pvm-common: &pvm-common
   build:
-    context: .
+    context: ..
     dockerfile: deploy/Dockerfile
     args:
       # CI pre-builds the WebUI into webui/.output; set WEBAUI_PREBUILT=1 to

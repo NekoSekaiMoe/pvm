@@ -12,7 +12,10 @@ TMP="$(mktemp -d)"
 SRV=""
 trap 'kill "$SRV" 2>/dev/null || true; rm -rf "$TMP"' EXIT
 
-PORT=42380
+# 18181, not 42380: 42380 sits inside the kernel ephemeral port range
+# (32768-60999) and can collide with a runner's outgoing connection source
+# port at bind time (see the note in 27_test_event_snapshot_clone_rollback.sh).
+PORT=18181
 SECRET="test-sec-webui-$$"
 export API_SECRET="$SECRET"
 export PVM_STATE_ROOT="$TMP/containers"

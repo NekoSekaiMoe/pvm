@@ -91,17 +91,22 @@ func (g *Gate) SetAdvisory(name string) {
 
 // Verify runs every verifier; the bundle passes only if ALL pass. The verdict
 // (with the bound hash) is recorded in the audit ledger regardless of outcome.
-// Verifiers don't share state, so they run WITHOUT the gate lock; only the
-// ledger write takes g.mu (and even that is bounded by the ledger's own lock).
+// Verifiers don't share state, so they run WITHOUT the gate lock; the advisory
+// and verifier snapshots are taken under g.mu, and even the ledger write is
+// bounded by the ledger's own lock.
 func (g *Gate) Verify(b *Bundle) *Verdict {
 	v := &Verdict{Step: map[string]string{}, Passed: true}
 	v.Hash = hashBundle(b)
 
+	g.mu.Lock()
 	advisory := make(map[string]bool, len(g.advisory))
-	for k, v := range g.advisory {
-		advisory[k] = v
+	for k, av := range g.advisory {
+		advisory[k] = av
 	}
-	for _, ver := range g.verifiers {
+	verifiers := make([]Verifier, len(g.verifiers))
+	copy(verifiers, g.verifiers)
+	g.mu.Unlock()
+	for _, ver := range verifiers {
 		ok, reason := ver.Verify(b)
 		switch {
 		case ok:

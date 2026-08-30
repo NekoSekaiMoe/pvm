@@ -305,6 +305,48 @@ func TestStartTask(t *testing.T) {
 	}
 }
 
+func TestStartTask_InvalidSpecRejectedBeforePersist(t *testing.T) {
+	m, _ := newTestManager(t)
+
+	// Happy-path control: a VALID spec must still persist spec.json (the
+	// validation/persistence reorder must not drop persistence).
+	if err := m.StartTask(context.Background(), "task-ok", minimalSpec(testBaseImage(t))); err != nil {
+		t.Fatalf("valid spec: %v", err)
+	}
+	okDir, err := state.ContainerDir("task-ok")
+	if err != nil {
+		t.Fatalf("container dir: %v", err)
+	}
+	if _, serr := os.Stat(filepath.Join(okDir, "spec.json")); serr != nil {
+		t.Fatalf("valid spec must persist spec.json: %v", serr)
+	}
+
+	// Regression (validation was AFTER persistence): a spec that Validate
+	// rejects (here: negative runtime.memory, a pure spec-layer check that
+	// needs no kernel) must fail StartTask BEFORE anything touches the disk
+	// — no task dir, hence no spec.json either.
+	bad := minimalSpec("")
+	bad.Runtime.Memory = "-512M" // parseMem parses it to -512; Validate rejects
+	err = m.StartTask(context.Background(), "task-bad", bad)
+	if err == nil || !strings.Contains(err.Error(), "invalid task spec") {
+		t.Fatalf("want invalid-task-spec error, got: %v", err)
+	}
+	badDir, derr := state.ContainerDir("task-bad")
+	if derr != nil {
+		t.Fatalf("container dir: %v", derr)
+	}
+	if _, serr := os.Stat(badDir); !os.IsNotExist(serr) {
+		t.Errorf("task dir %s created despite invalid spec (stat err = %v); validation must precede MkdirAll", badDir, serr)
+	}
+	if _, serr := os.Stat(filepath.Join(badDir, "spec.json")); !os.IsNotExist(serr) {
+		t.Errorf("spec.json written despite invalid spec (stat err = %v)", serr)
+	}
+	// The rejected task must leave no state file behind either.
+	if st, lerr := state.LoadState("task-bad"); lerr == nil && st != nil {
+		t.Errorf("state recorded for rejected spec: %+v", st)
+	}
+}
+
 func TestStartTask_RecordsAuditAndFingerprint(t *testing.T) {
 	m, _ := newTestManager(t)
 	s := minimalSpec(testBaseImage(t))

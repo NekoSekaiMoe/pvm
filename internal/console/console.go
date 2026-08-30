@@ -348,6 +348,12 @@ func (s *Session) OpenPTY(id string) *PTY { return &PTY{session: s, id: id} }
 
 // Send writes user input to the guest console.
 func (p *PTY) Send(input []byte) error {
+	p.mu.Lock()
+	closed := p.closed
+	p.mu.Unlock()
+	if closed {
+		return io.ErrClosedPipe
+	}
 	w := p.session.Stdin()
 	if w == nil {
 		return ErrNoStdin
@@ -359,7 +365,9 @@ func (p *PTY) Send(input []byte) error {
 // Resize is a no-op for the fixed console (kept for envd API parity).
 func (p *PTY) Resize(rows, cols int) error { return nil }
 
-// Kill closes the PTY handle (the console itself stays attached).
+// Kill closes the PTY handle: subsequent Send/Tail calls fail with
+// io.ErrClosedPipe (the console session itself stays attached for other
+// handles).
 func (p *PTY) Kill() {
 	p.mu.Lock()
 	p.closed = true
@@ -368,6 +376,12 @@ func (p *PTY) Kill() {
 
 // Tail streams new console output by polling the ring buffer.
 func (p *PTY) Tail(ctx context.Context, since int, maxWait time.Duration) ([]byte, int, error) {
+	p.mu.Lock()
+	closed := p.closed
+	p.mu.Unlock()
+	if closed {
+		return nil, since, io.ErrClosedPipe
+	}
 	chunk, err := p.session.waitTailSince(ctx, since, maxWait)
 	if err != nil {
 		return nil, since, err

@@ -105,6 +105,10 @@ type Gateway struct {
 	ledgers    map[string]*audit.Ledger // per-task ledgers (take precedence)
 	bytesOut   map[string]*int64
 	bytesOutMu sync.Mutex
+	bytesIn    map[string]*int64 // download direction (upstream→sandbox)
+	bytesInMu  sync.Mutex
+	denied     map[string]*int64 // DecisionBlock count per task
+	deniedMu   sync.Mutex
 	server     *http.Server
 	listener   net.Listener
 	// mitmCA signs interception leaves when rules opt in (see mitm.go).
@@ -190,6 +194,8 @@ func NewGateway() *Gateway {
 		policies: make(map[string]*Policy),
 		ledgers:  make(map[string]*audit.Ledger),
 		bytesOut: make(map[string]*int64),
+		bytesIn:  make(map[string]*int64),
+		denied:   make(map[string]*int64),
 	}
 }
 
@@ -625,7 +631,8 @@ func (g *Gateway) handleHTTP(w http.ResponseWriter, r *http.Request, task string
 	respN, _ := io.Copy(w, src)
 	// Bill the request-body bytes (sandbox → upstream), NOT respN: the
 	// response flows downstream and is the same direction the CONNECT
-	// tunnel leaves unbilled.
+	// tunnel leaves unbilled. It is still accounted as rx for metrics.
+	g.addRxBytes(task, respN)
 	g.addBytes(task, reqBytes.total())
 	g.record(task, r, DecisionAllow, fmt.Sprintf("%s %s -> %d (req %dB, resp %dB)", r.Method, v.host, resp.StatusCode, reqBytes.total(), respN))
 }
@@ -915,37 +922,39 @@ func (g *Gateway) ApplyInject(outReq *http.Request, v requestView, pol *Policy) 
 	if len(pol.Rules) == 0 {
 		return
 	}
-	if !strings.EqualFold(v.scheme, "https") {
-		// Plaintext request: credentials are attached ONLY when the rule
-		// explicitly opts in (AllowPlainHTTP). The CubeSandbox boundary is
-		// "the sandbox never sees the secret"; the wire risk proxy→upstream
-		// is accepted by operators who set this flag (internal HTTP
-		// services, sidecar meshes).
-		plainOK := false
-		for _, r := range pol.Rules {
-			if ruleMatches(r, v) && r.Inject != nil && r.Inject.AllowPlainHTTP {
-				plainOK = true
-				break
-			}
+	// The FIRST fully matching rule owns the request end-to-end — including
+	// the plaintext opt-in. A later rule's AllowPlainHTTP must never license
+	// injecting the first rule's secret over cleartext, and the first rule's
+	// opt-out must not be overridden by a later, broader rule.
+	var owner *EgressRule
+	for i := range pol.Rules {
+		if ruleMatches(pol.Rules[i], v) {
+			owner = &pol.Rules[i]
+			break
 		}
-		if !plainOK {
+	}
+	if owner == nil {
+		return
+	}
+	if !strings.EqualFold(v.scheme, "https") {
+		// Plaintext request: credentials are attached ONLY when the OWNING
+		// rule explicitly opts in (AllowPlainHTTP). The CubeSandbox boundary
+		// is "the sandbox never sees the secret"; the wire risk proxy→
+		// upstream is accepted by operators who set this flag (internal HTTP
+		// services, sidecar meshes).
+		if owner.Inject == nil || !owner.Inject.AllowPlainHTTP {
 			return
 		}
 	}
-	for _, r := range pol.Rules {
-		if !ruleMatches(r, v) {
-			continue
+	if owner.Inject != nil && owner.Inject.Header != "" && owner.Inject.Secret != "" && (owner.Allow == nil || *owner.Allow) {
+		format := owner.Inject.Format
+		if format == "" {
+			format = "${SECRET}"
 		}
-		if r.Inject != nil && r.Inject.Header != "" && r.Inject.Secret != "" && (r.Allow == nil || *r.Allow) {
-			format := r.Inject.Format
-			if format == "" {
-				format = "${SECRET}"
-			}
-			val := strings.ReplaceAll(format, "${SECRET}", r.Inject.Secret)
-			outReq.Header.Set(r.Inject.Header, val)
-		}
-		return // first fully matching rule wins, like CubeEgress
+		val := strings.ReplaceAll(format, "${SECRET}", owner.Inject.Secret)
+		outReq.Header.Set(owner.Inject.Header, val)
 	}
+	// owner is the first fully matching rule, like CubeEgress
 }
 
 // domainMatches supports exact and "*.suffix" wildcard.
@@ -1015,6 +1024,8 @@ func pipe(dst, src net.Conn, task string, g *Gateway, bill bool) {
 	n, _ := io.Copy(dst, src)
 	if bill {
 		g.addBytes(task, n)
+	} else {
+		g.addRxBytes(task, n)
 	}
 }
 
@@ -1038,6 +1049,52 @@ func (g *Gateway) BytesUsed(task string) int64 {
 	g.bytesOutMu.Lock()
 	defer g.bytesOutMu.Unlock()
 	if p, ok := g.bytesOut[task]; ok {
+		return atomic.LoadInt64(p)
+	}
+	return 0
+}
+
+// addRxBytes accumulates downstream (upstream→sandbox) bytes per task —
+// reported through /api/tasks/{id}/metrics as net_rx_bytes. It never feeds
+// budget enforcement, which is upload-direction only.
+func (g *Gateway) addRxBytes(task string, n int64) {
+	g.bytesInMu.Lock()
+	p, ok := g.bytesIn[task]
+	if !ok {
+		p = new(int64)
+		g.bytesIn[task] = p
+	}
+	g.bytesInMu.Unlock()
+	atomic.AddInt64(p, n)
+}
+
+// BytesRx returns total downstream bytes delivered to a task's sandbox.
+func (g *Gateway) BytesRx(task string) int64 {
+	g.bytesInMu.Lock()
+	defer g.bytesInMu.Unlock()
+	if p, ok := g.bytesIn[task]; ok {
+		return atomic.LoadInt64(p)
+	}
+	return 0
+}
+
+// addDenied counts one blocked request for the task.
+func (g *Gateway) addDenied(task string) {
+	g.deniedMu.Lock()
+	p, ok := g.denied[task]
+	if !ok {
+		p = new(int64)
+		g.denied[task] = p
+	}
+	g.deniedMu.Unlock()
+	atomic.AddInt64(p, 1)
+}
+
+// BytesDenied returns how many requests the gateway blocked for this task.
+func (g *Gateway) BytesDenied(task string) int64 {
+	g.deniedMu.Lock()
+	defer g.deniedMu.Unlock()
+	if p, ok := g.denied[task]; ok {
 		return atomic.LoadInt64(p)
 	}
 	return 0
@@ -1072,6 +1129,9 @@ func (g *Gateway) policy(task string) *Policy {
 }
 
 func (g *Gateway) record(task string, r *http.Request, d Decision, reason string) {
+	if d == DecisionBlock {
+		g.addDenied(task)
+	}
 	// Pick the task-specific ledger when one is registered, falling back to
 	// the gateway-wide ledger. This keeps multi-task traffic attributed to
 	// the right task instead of the controller's default. Both reads happen

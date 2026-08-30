@@ -2,9 +2,12 @@ package approval
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
-
 	"uml-container/internal/audit"
 )
 
@@ -250,5 +253,112 @@ func TestCreate_DedupNestedParams(t *testing.T) {
 	}
 	if _, err := m.Create(Ticket{TaskID: "t", Tool: "deploy", Params: params}); err != ErrAlreadyPending {
 		t.Errorf("expected ErrAlreadyPending, got %v", err)
+	}
+}
+
+// TestClaimFor_ConcurrentClaimsConsumeOnce is the PR #22 review regression:
+// find+consume+persist must be atomic so concurrent gateway executions can
+// never both unlock on the same approved ticket.
+func TestClaimFor_ConcurrentClaimsConsumeOnce(t *testing.T) {
+	m := NewManager(tmpLedger(t))
+	id, err := m.Create(Ticket{
+		TaskID:   "t-race",
+		Tool:     "push",
+		Params:   map[string]interface{}{"ref": "main"},
+		Deadline: time.Now().Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if err := m.Decide(id, true, "operator"); err != nil {
+		t.Fatalf("decide: %v", err)
+	}
+
+	var (
+		wg      sync.WaitGroup
+		winners int64
+	)
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, ok := m.ClaimFor("t-race", "push", map[string]interface{}{"ref": "main"}); ok {
+				atomic.AddInt64(&winners, 1)
+			}
+		}()
+	}
+	wg.Wait()
+	if winners != 1 {
+		t.Fatalf("exactly one concurrent claim must win, got %d", winners)
+	}
+	if _, ok := m.ApprovedFor("t-race", "push", map[string]interface{}{"ref": "main"}); ok {
+		t.Fatal("claimed ticket must not remain claimable")
+	}
+}
+
+// TestMarkConsumedRollsBackWhenPersistFails: a consume that cannot be
+// persisted must not stick in memory either — the store file is what a
+// restart replays, so a memory-only burn would make the ticket look spent
+// in-process while still consumable after a restart (the replay hazard
+// ClaimFor refuses). The store is broken by replacing the file with a
+// directory: fsjson's atomic rename onto a directory fails (EISDIR).
+func TestMarkConsumedRollsBackWhenPersistFails(t *testing.T) {
+	m := NewManager(nil)
+	path := filepath.Join(t.TempDir(), "approvals.json")
+	if err := m.EnablePersistence(path); err != nil {
+		t.Fatalf("enable persistence: %v", err)
+	}
+	id, err := m.Create(Ticket{
+		TaskID:   "t1",
+		Tool:     "deploy",
+		Target:   "prod",
+		Params:   map[string]interface{}{"ref": "v1"},
+		Why:      "ship the fix",
+		Rollback: "kubectl rollout undo",
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if err := m.Decide(id, true, "alice"); err != nil {
+		t.Fatalf("decide: %v", err)
+	}
+
+	if err := os.Remove(path); err != nil {
+		t.Fatalf("remove store: %v", err)
+	}
+	if err := os.Mkdir(path, 0o700); err != nil {
+		t.Fatalf("plant broken store: %v", err)
+	}
+
+	m.MarkConsumed(id)
+	got, err := m.Get(id)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.Consumed {
+		t.Fatal("MarkConsumed left Consumed=true in memory after a failed persist (rollback missing)")
+	}
+	if !m.IsApproved("t1", "deploy", map[string]interface{}{"ref": "v1"}) {
+		t.Fatal("ticket must remain approved-unconsumed after the rolled-back burn")
+	}
+}
+
+// TestEnablePersistenceReadErrorDoesNotClobber: when the store path exists
+// but cannot be READ (EISDIR here; EACCES in production), EnablePersistence
+// must fail instead of "recovering" into an empty store — the persist that
+// follows would atomically replace the unreadable file and permanently
+// delete every pending/approved ticket (same policy as identity/persist.go).
+func TestEnablePersistenceReadErrorDoesNotClobber(t *testing.T) {
+	m := NewManager(nil)
+	if err := m.EnablePersistence(t.TempDir()); err == nil {
+		t.Fatal("EnablePersistence must fail when the store cannot be read")
+	}
+	// Retry on a good path still works and really writes.
+	good := filepath.Join(t.TempDir(), "approvals.json")
+	if err := m.EnablePersistence(good); err != nil {
+		t.Fatalf("re-enable on a good path: %v", err)
+	}
+	if _, err := os.Stat(good); err != nil {
+		t.Fatalf("good store not written: %v", err)
 	}
 }

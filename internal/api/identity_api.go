@@ -41,7 +41,9 @@ func CurrentIdentity() (*identity.Broker, error) {
 	}
 	globalIdentityMu.Lock()
 	defer globalIdentityMu.Unlock()
-	if globalIdentity != nil {
+	// Re-check BOTH cache slots: an injected or previously built broker is
+	// only valid while the state root is unchanged (see RegisterIdentityManager).
+	if globalIdentity != nil && globalIdentityRoot == state.RootDir {
 		return globalIdentity, nil
 	}
 	keyPath := filepath.Join(state.RootDir, "identity.key")
@@ -63,10 +65,13 @@ func CurrentIdentity() (*identity.Broker, error) {
 	return b, nil
 }
 
-// RegisterIdentityManager lets the controller inject its own broker.
+// RegisterIdentityManager lets the controller inject its own broker. The
+// injection is keyed to the CURRENT state root like the built-in cache so a
+// later root swap (tests, re-init) does not serve the stale injected broker.
 func RegisterIdentityManager(b *identity.Broker) {
 	globalIdentityMu.Lock()
 	globalIdentity = b
+	globalIdentityRoot = state.RootDir
 	globalIdentityMu.Unlock()
 }
 
@@ -150,10 +155,26 @@ func registerIdentityAPI(api *echo.Group) {
 		}
 		n := 0
 		if req.All {
-			n = b.RevokeAllForTask(task)
+			var rerr error
+			n, rerr = b.RevokeAllForTask(task)
+			if rerr != nil {
+				// Revoked in memory, but the durable mirror failed: surface it —
+				// reporting success would let the revocation vanish on restart.
+				return c.JSON(http.StatusInternalServerError, map[string]string{"error": rerr.Error()})
+			}
 		} else if req.Token != "" {
 			if tok, verr := b.Validate(req.Token); verr == nil {
-				b.Revoke(tok.ID)
+				// The signed Task claim must match the path task: without this
+				// check, task B's operator could revoke task A's credentials via
+				// /identity/B/revoke while the metric blamed task B.
+				if tok.Task != "" && tok.Task != task {
+					return c.JSON(http.StatusForbidden, map[string]string{
+						"error": "token belongs to task " + tok.Task + ", not " + task,
+					})
+				}
+				if rerr := b.Revoke(tok.ID); rerr != nil {
+					return c.JSON(http.StatusInternalServerError, map[string]string{"error": rerr.Error()})
+				}
 				n = 1
 			} else {
 				return c.JSON(http.StatusConflict, map[string]string{"error": verr.Error()})

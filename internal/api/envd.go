@@ -22,6 +22,7 @@ package api
 import (
 	"bufio"
 	"crypto/sha1"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
@@ -32,6 +33,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -53,31 +55,64 @@ var metricEnvdRequests = metrics.Counter("pvm_envd_requests_total", "envd-compat
 // StartEnvdListeners brings up the two listeners. Called by NewE2BServer
 // when PVM_ENVD_ENABLED=1; errors are fatal (a half-up envd breaks SDK
 // readiness worse than no envd).
+//
+// Exposure control (the envd plane can exec commands and read/write task
+// workspaces, so it must never be anonymous):
+//   - listeners bind 127.0.0.1 by default; set PVM_ENVD_ADDR to expose them
+//     on another interface (e.g. 0.0.0.0 for remote SDKs);
+//   - when API_SECRET is set (the same secret protecting /api), every envd
+//     request must carry "Authorization: Bearer <API_SECRET>". Keep the
+//     secret set whenever PVM_ENVD_ADDR leaves loopback.
 func StartEnvdListeners() error {
 	rpcPort := envdPortFromEnv("PVM_ENVD_PORT", envdDefaultPort)
 	wsPort := envdPortFromEnv("PVM_ENVD_WS_PORT", envdDefaultWSPort)
-
-	rpcLn, err := net.Listen("tcp", fmt.Sprintf(":%d", rpcPort))
-	if err != nil {
-		return fmt.Errorf("envd: rpc listen :%d: %w", rpcPort, err)
+	host := os.Getenv("PVM_ENVD_ADDR")
+	if host == "" {
+		host = "127.0.0.1"
 	}
-	wsLn, err := net.Listen("tcp", fmt.Sprintf(":%d", wsPort))
+
+	rpcLn, err := net.Listen("tcp", net.JoinHostPort(host, strconv.Itoa(rpcPort)))
+	if err != nil {
+		return fmt.Errorf("envd: rpc listen %s:%d: %w", host, rpcPort, err)
+	}
+	wsLn, err := net.Listen("tcp", net.JoinHostPort(host, strconv.Itoa(wsPort)))
 	if err != nil {
 		rpcLn.Close()
-		return fmt.Errorf("envd: ws listen :%d: %w", wsPort, err)
+		return fmt.Errorf("envd: ws listen %s:%d: %w", host, wsPort, err)
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/process.Process/", envdProcess)
-	mux.HandleFunc("/filesystem.Filesystem/", envdFilesystem)
-	mux.HandleFunc("/files", envdRawFiles)
+	mux.HandleFunc("/process.Process/", envdAuth(envdProcess))
+	mux.HandleFunc("/filesystem.Filesystem/", envdAuth(envdFilesystem))
+	mux.HandleFunc("/files", envdAuth(envdRawFiles))
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprintf(w, `{"status":"ok","service":"envd"}`)
 	})
 	go func() { _ = http.Serve(rpcLn, mux) }()
-	go func() { _ = http.Serve(wsLn, http.HandlerFunc(envdVersionWS)) }()
+	go func() { _ = http.Serve(wsLn, envdAuth(http.HandlerFunc(envdVersionWS))) }()
 	return nil
+}
+
+// envdAuth enforces the shared API_SECRET bearer token when configured.
+// Without a secret the plane stays open (legacy local-only mode) — but the
+// listeners default to loopback, so remote exposure requires both opt-ins.
+func envdAuth(next http.HandlerFunc) http.HandlerFunc {
+	secret := os.Getenv("API_SECRET")
+	if secret == "" {
+		return next
+	}
+	return func(w http.ResponseWriter, r *http.Request) {
+		auth := r.Header.Get("Authorization")
+		const prefix = "Bearer "
+		if !strings.HasPrefix(auth, prefix) || subtle.ConstantTimeCompare([]byte(strings.TrimPrefix(auth, prefix)), []byte(secret)) != 1 {
+			metricEnvdRequests.Inc("unauthorized")
+			w.Header().Set("WWW-Authenticate", "Bearer")
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next(w, r)
+	}
 }
 
 func envdPortFromEnv(key string, def int) int {
@@ -158,7 +193,11 @@ func writeWSFrame(w io.Writer, opcode byte, payload []byte) {
 	w.Write(payload)
 }
 
-// readWSFrame reads one client frame (masked).
+// readWSFrame reads one client frame (masked). Client-declared lengths are
+// capped: a hostile peer must not be able to turn a 64-bit length into a
+// huge allocation (or a negative int) before any message-level check runs.
+const envdMaxWSFrame = 8 << 20
+
 func readWSFrame(r *bufio.Reader) (opcode byte, payload []byte, err error) {
 	var h [2]byte
 	if _, err = io.ReadFull(r, h[:]); err != nil {
@@ -179,7 +218,11 @@ func readWSFrame(r *bufio.Reader) (opcode byte, payload []byte, err error) {
 		if _, err = io.ReadFull(r, ext[:]); err != nil {
 			return
 		}
-		length = int(binary.BigEndian.Uint64(ext[:]))
+		u := binary.BigEndian.Uint64(ext[:])
+		if u > envdMaxWSFrame {
+			return 0, nil, fmt.Errorf("envd: ws frame too large (%d bytes, max %d)", u, envdMaxWSFrame)
+		}
+		length = int(u)
 	}
 	var mask [4]byte
 	if masked {
@@ -261,19 +304,38 @@ func taskWorkspace(taskID string) (string, error) {
 }
 
 // fenceJoin joins rel under root, rejecting traversal and symlink escapes.
+// When the target does not exist yet (the create/move cases), EvalSymlinks
+// cannot resolve the leaf — so the DEEPEST EXISTING ancestor is resolved and
+// fenced instead: a workspace symlink pointing outside ("link/new-file")
+// is caught at the link, not after MkdirAll/Create followed it out.
 func fenceJoin(root, rel string) (string, error) {
 	rel = strings.TrimPrefix(rel, "/")
 	p := filepath.Join(root, filepath.Clean("/"+rel))
 	if p != root && !strings.HasPrefix(p, root+string(filepath.Separator)) {
 		return "", fmt.Errorf("path escapes workspace")
 	}
-	if resolved, err := filepath.EvalSymlinks(p); err == nil {
-		if resolved != root && !strings.HasPrefix(resolved, root+string(filepath.Separator)) {
-			// A symlink inside the workspace pointing out: refuse.
-			if rr, rerr := filepath.EvalSymlinks(root); rerr == nil && !strings.HasPrefix(resolved, rr+string(filepath.Separator)) {
+	rootResolved, rerr := filepath.EvalSymlinks(root)
+	if rerr != nil {
+		return "", fmt.Errorf("resolve workspace: %w", rerr)
+	}
+	// Walk up from p to the deepest existing path; fence whatever resolves.
+	probe := p
+	for {
+		resolved, err := filepath.EvalSymlinks(probe)
+		if err == nil {
+			if resolved != rootResolved && !strings.HasPrefix(resolved, rootResolved+string(filepath.Separator)) {
 				return "", fmt.Errorf("symlink escapes workspace")
 			}
+			break
 		}
+		if !os.IsNotExist(err) {
+			return "", fmt.Errorf("resolve %s: %w", probe, err)
+		}
+		parent := filepath.Dir(probe)
+		if parent == probe {
+			return "", fmt.Errorf("path escapes workspace") // hit filesystem root without meeting an existing dir
+		}
+		probe = parent
 	}
 	return p, nil
 }

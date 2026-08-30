@@ -4,7 +4,7 @@
 # Usage:
 #   ./deploy/install.sh                 # install into /usr/local/bin + systemd
 #   PREFIX=/opt/pvm ./deploy/install.sh # custom install prefix
-#   ./deploy/install.sh --uninstall     # remove binaries, units, env file
+#   ./deploy/install.sh --uninstall     # remove binaries and units (keeps /etc/pvm/pvm.env and state data)
 #   ./deploy/install.sh --docker        # print docker compose instructions
 #
 # No docker required. All checks are offline.
@@ -23,6 +23,25 @@ log()  { printf '\033[1;32m[install]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[warn]\033[0m %s\n' "$*"; }
 err()  { printf '\033[1;31m[error]\033[0m %s\n' "$*" >&2; }
 
+# Re-read operator-customized roots from an existing env file instead of
+# silently reverting to defaults/idiomatic-shell env: parse ONLY the three
+# PVM_*_ROOT keys, never source or execute the file (it also holds API_SECRET
+# and may be root-owned 0600). Values found here win over the environment.
+load_env_file() {
+  [[ -f "$ENV_FILE" ]] || return 0
+  local key val
+  while IFS='=' read -r key val; do
+    key="${key//[[:space:]]/}"
+    val="${val%\"}"; val="${val#\"}"; val="${val%\'}"; val="${val#\'}"
+    case "$key" in
+      PVM_STATE_ROOT)  STATE_ROOT="$val" ;;
+      PVM_AUDIT_ROOT)  AUDIT_ROOT="$val" ;;
+      PVM_CGROUP_ROOT) CGROUP_ROOT="$val" ;;
+    esac
+  done < "$ENV_FILE"
+  log "roots from $ENV_FILE: state=$STATE_ROOT audit=$AUDIT_ROOT cgroup=$CGROUP_ROOT"
+}
+
 need_root() {
   if [[ "$(id -u)" -ne 0 ]]; then
     err "this mode must run as root (systemd unit + /usr/local/bin install)"
@@ -38,7 +57,7 @@ preflight() {
   if command -v go >/dev/null 2>&1; then
     local minor
     minor="$(go version | sed -n 's/.*go1\.\([0-9]*\).*/\1/p')"
-    if [[ "$minor" =~ ^[0-9]+$ ]] && [[ "$minor" -lt 22 ]]; then
+    if [[ "$minor" =~ ^[0-9]+$ ]] && [[ "$minor" -lt 23 ]]; then
       warn "go 1.$minor found; the build needs go 1.23+ — install a newer toolchain or prebuild binaries"
       ok=0
     else
@@ -110,10 +129,19 @@ write_env_file() {
 do_install() {
   need_root
   preflight
+  load_env_file
   write_env_file
 
   mkdir -p "$STATE_ROOT" "$AUDIT_ROOT" "$CGROUP_ROOT" /var/lib/pvm/bin
   chown -R pvm:pvm /var/lib/pvm
+  # custom roots outside /var/lib/pvm need explicit ownership so User=pvm can write
+  local d
+  for d in "$STATE_ROOT" "$AUDIT_ROOT" "$CGROUP_ROOT"; do
+    case "$d" in
+      /var/lib/pvm|/var/lib/pvm/*) ;;
+      *) chown -R pvm:pvm "$d" ;;
+    esac
+  done
   chmod 0700 /var/lib/pvm "$STATE_ROOT" "$AUDIT_ROOT"
 
   if command -v go >/dev/null 2>&1; then
@@ -128,6 +156,20 @@ do_install() {
     log "installing systemd units"
     install -m 0644 "$REPO_ROOT/deploy/systemd/agentpvm-api.service"   "$UNIT_DIR/"
     install -m 0644 "$REPO_ROOT/deploy/systemd/agentpvm-webui.service" "$UNIT_DIR/"
+    # patch ReadWritePaths in the installed copies when custom roots live outside /var/lib/pvm
+    local rwp="/var/lib/pvm"
+    for d in "$STATE_ROOT" "$AUDIT_ROOT" "$CGROUP_ROOT"; do
+      case "$d" in
+        /var/lib/pvm|/var/lib/pvm/*) ;;
+        *) rwp="$rwp $d" ;;
+      esac
+    done
+    if [[ "$rwp" != "/var/lib/pvm" ]]; then
+      for d in "$UNIT_DIR/agentpvm-api.service" "$UNIT_DIR/agentpvm-webui.service"; do
+        sed -i "s|^ReadWritePaths=.*|ReadWritePaths=$rwp|" "$d"
+      done
+      log "patched ReadWritePaths in installed units: $rwp"
+    fi
     systemctl daemon-reload
     systemctl enable agentpvm-api.service agentpvm-webui.service
     log "enabled agentpvm-api.service agentpvm-webui.service (not started — run: systemctl start agentpvm-api agentpvm-webui)"
@@ -170,8 +212,24 @@ If CI already built webui/.output:
 EOF
 }
 
+# usage echoes the Usage block from the script header.
+usage() {
+  cat <<'EOF'
+install.sh — idempotent bare-metal installer for PVM (agentpvm).
+
+Usage:
+  ./deploy/install.sh                 # install into /usr/local/bin + systemd
+  PREFIX=/opt/pvm ./deploy/install.sh # custom install prefix
+  ./deploy/install.sh --uninstall     # remove binaries and units (keeps /etc/pvm/pvm.env and state data)
+  ./deploy/install.sh --docker        # print docker compose instructions
+  ./deploy/install.sh --help          # show this help
+EOF
+}
+
 case "${1:-}" in
   --uninstall) do_uninstall ;;
   --docker)    do_docker ;;
-  *)           do_install ;;
+  "")          do_install ;;
+  -h|--help)   usage ;;
+  *)           err "unknown option: $1 (try --help)"; exit 2 ;;
 esac

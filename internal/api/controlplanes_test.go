@@ -283,3 +283,75 @@ func TestAPI_EmptyListsAreArraysNotNull(t *testing.T) {
 		})
 	}
 }
+
+// --- /api/identity/:task/revoke (single-token authorization) ---
+
+// mintToken mints a token for task via the REST API and returns its string.
+func mintToken(t *testing.T, base, task string) string {
+	t.Helper()
+	resp, out := doJSON(t, "POST", base, "/api/identity/"+task+"/tokens", map[string]interface{}{
+		"scopes": []string{"repo:read"}, "caller": "test", "ttl": "1h",
+	})
+	if resp.StatusCode != 200 {
+		t.Fatalf("mint for %s: status=%d out=%v", task, resp.StatusCode, out)
+	}
+	tok, _ := out["token"].(string)
+	if tok == "" {
+		t.Fatal("mint response missing token")
+	}
+	return tok
+}
+
+// TestAPI_Identity_RevokeRejectsForeignTaskToken is the cross-task revoke
+// regression: the single-token branch validated the bearer but never checked
+// the token's signed Task claim against the path task, so task B's operator
+// could revoke task A's credentials via /identity/B/revoke (with the revoked
+// metric mislabeled as task B).
+func TestAPI_Identity_RevokeRejectsForeignTaskToken(t *testing.T) {
+	base := bootServer(t)
+	tokA := mintToken(t, base, "task-A")
+
+	resp, out := doJSON(t, "POST", base, "/api/identity/task-B/revoke", map[string]interface{}{
+		"token": tokA,
+	})
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("revoking task-A token via task-B path: status=%d out=%v, want 403", resp.StatusCode, out)
+	}
+	if msg, _ := out["error"].(string); !strings.Contains(msg, "task-A") {
+		t.Errorf("403 error should name the owning task, got %q", msg)
+	}
+
+	// The token must be untouched: still valid against the same broker.
+	b, err := CurrentIdentity()
+	if err != nil {
+		t.Fatalf("current identity: %v", err)
+	}
+	if _, err := b.Validate(tokA); err != nil {
+		t.Fatalf("foreign-task revoke must NOT invalidate the token, got %v", err)
+	}
+}
+
+// TestAPI_Identity_RevokeOwnTaskToken covers the happy path: revoking a
+// token through its own task's endpoint succeeds and the token dies.
+func TestAPI_Identity_RevokeOwnTaskToken(t *testing.T) {
+	base := bootServer(t)
+	tokA := mintToken(t, base, "task-A")
+
+	resp, out := doJSON(t, "POST", base, "/api/identity/task-A/revoke", map[string]interface{}{
+		"token": tokA,
+	})
+	if resp.StatusCode != 200 {
+		t.Fatalf("revoke own token: status=%d out=%v", resp.StatusCode, out)
+	}
+	if revoked, _ := out["revoked"].(float64); revoked != 1 {
+		t.Errorf("revoked = %v, want 1", out["revoked"])
+	}
+
+	b, err := CurrentIdentity()
+	if err != nil {
+		t.Fatalf("current identity: %v", err)
+	}
+	if _, err := b.Validate(tokA); err == nil {
+		t.Fatal("token must be invalid after revoking via its own task endpoint")
+	}
+}

@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -292,13 +293,20 @@ func main() {
 				os.Exit(1)
 			}
 			if subcmd == "create" {
-				// Subnet allocation: the persistent registry picks the next free
-				// /24 from the pool (default 10.64.0.0/12), skipping host nets.
-				// When the registry is unavailable (read-only state root) fall
-				// back to the historical default so create keeps working.
-				gwCIDR := "10.0.0.1/24"
+				// Subnet allocation: prefer the historical default 10.0.0.0/24 so
+				// guests with baked-in 10.0.0.x addressing (scripts/test_pkg_install.sh,
+				// tests/04) keep their gateway; when that /24 is already taken by
+				// another registered network or the host, the registry draws the
+				// next free /24 from the pool (default 10.64.0.0/12), skipping host
+				// nets. Falls back to the historical default when the registry is
+				// unavailable (read-only state root).
+				gwCIDR := network.DefaultBridgeCIDR
 				if reg, rerr := network.LoadNetworkRegistry(os.Getenv("PVM_STATE_ROOT")); rerr == nil {
-					if allocated, aerr := reg.Allocate(name); aerr == nil {
+					var want *net.IPNet
+					if _, n, perr := net.ParseCIDR(network.DefaultBridgeCIDR); perr == nil {
+						want = n
+					}
+					if allocated, aerr := reg.AllocatePreferred(name, want); aerr == nil {
 						gwCIDR = allocated
 					} else {
 						fmt.Printf("Warning: subnet allocation failed (%v); using %s\n", aerr, gwCIDR)
@@ -313,7 +321,12 @@ func main() {
 				}
 			} else if subcmd == "rm" {
 				if reg, rerr := network.LoadNetworkRegistry(os.Getenv("PVM_STATE_ROOT")); rerr == nil {
-					reg.Release(name)
+					// A failed release means the reservation lives on in the
+					// store file and would reappear after a restart — warn, but
+					// still honor the user's primary intent (delete the bridge).
+					if rerr := reg.Release(name); rerr != nil {
+						fmt.Printf("Warning: subnet registry release failed: %v\n", rerr)
+					}
 				}
 				err := network.DeleteBridge(name, "")
 				if err != nil {

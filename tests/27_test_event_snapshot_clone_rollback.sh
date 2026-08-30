@@ -12,7 +12,11 @@ TMP="$(mktemp -d)"
 SRV=""
 trap 'kill "$SRV" 2>/dev/null || true; rm -rf "$TMP"' EXIT
 
-PORT=41890
+# 18180, not 41890: ports inside the kernel's ephemeral range (ip_local_port_range,
+# 32768-60999) can collide with any outgoing connection's source port on a busy
+# CI runner — suite 27 once failed with "bind: address already in use" because
+# an unrelated socket landed on 41890. Stay in the 18xxx family, below the range.
+PORT=18180
 SECRET="test-sec-snap-$$"
 export API_SECRET="$SECRET"
 export PVM_STATE_ROOT="$TMP/containers"

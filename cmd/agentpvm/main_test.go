@@ -187,3 +187,61 @@ func TestRulesFromSpec(t *testing.T) {
 		t.Errorf("rulesFromSpec(nil) has %d rules, want 0", len(got))
 	}
 }
+
+// TestWatchStateChanged pins the template-watch repaint rule: the watcher
+// must repaint whenever phase, percent, or log tail changes — not only on
+// phase transitions (a long-running phase would otherwise stream updates
+// invisibly).
+func TestWatchStateChanged(t *testing.T) {
+	var s watchState
+
+	// First frame always repaints.
+	if !s.changed(watchFrame{Phase: "building", Pct: 10, LogTail: "step 1"}) {
+		t.Fatal("first frame must repaint")
+	}
+	// Identical frame: no repaint.
+	if s.changed(watchFrame{Phase: "building", Pct: 10, LogTail: "step 1"}) {
+		t.Fatal("unchanged frame must not repaint")
+	}
+	// Same phase, same tail, new percent: repaint.
+	if !s.changed(watchFrame{Phase: "building", Pct: 20, LogTail: "step 1"}) {
+		t.Fatal("percent change must repaint")
+	}
+	// Same phase, same percent, new tail: repaint.
+	if !s.changed(watchFrame{Phase: "building", Pct: 20, LogTail: "step 2"}) {
+		t.Fatal("log-tail change must repaint")
+	}
+	// Phase change: repaint.
+	if !s.changed(watchFrame{Phase: "done", Pct: 100, LogTail: "step 2"}) {
+		t.Fatal("phase change must repaint")
+	}
+	// Zero-value frame after a non-zero one is still a change.
+	if !s.changed(watchFrame{}) {
+		t.Fatal("transition to zero frame must repaint")
+	}
+}
+
+// TestRenderBar verifies the progress-bar rendering, including the clamp
+// that keeps a hostile pct > 100 from panicking strings.Repeat.
+func TestRenderBar(t *testing.T) {
+	tests := []struct {
+		name  string
+		pct   int
+		phase string
+		want  string
+	}{
+		{"zero", 0, "building", "[" + strings.Repeat("░", 20) + "]   0%  building"},
+		{"half", 50, "building", "[" + strings.Repeat("█", 10) + strings.Repeat("░", 10) + "]  50%  building"},
+		{"full", 100, "done", "[" + strings.Repeat("█", 20) + "] 100%  done"},
+		{"over 100 clamped", 250, "done", "[" + strings.Repeat("█", 20) + "] 100%  done"},
+		{"negative clamped", -5, "building", "[" + strings.Repeat("░", 20) + "]   0%  building"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := renderBar(watchFrame{Phase: tt.phase, Pct: tt.pct})
+			if got != tt.want {
+				t.Fatalf("renderBar(pct=%d) = %q, want %q", tt.pct, got, tt.want)
+			}
+		})
+	}
+}

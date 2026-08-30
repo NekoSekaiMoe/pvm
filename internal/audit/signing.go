@@ -17,6 +17,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -46,32 +47,99 @@ func LoadOrCreateSigner(dir string) (*Signer, error) {
 		return nil, fmt.Errorf("audit signing: %w", err)
 	}
 	keyPath := filepath.Join(dir, signingKeyFile)
-	if raw, err := os.ReadFile(keyPath); err == nil {
-		block, _ := pem.Decode(raw)
-		if block == nil || block.Type != "ED25519 PRIVATE KEY" {
-			return nil, fmt.Errorf("audit signing: malformed %s", signingKeyFile)
-		}
-		priv := ed25519.PrivateKey(block.Bytes)
-		if len(priv) != ed25519.PrivateKeySize {
-			return nil, fmt.Errorf("audit signing: bad key size")
-		}
-		return &Signer{priv: priv, pub: priv.Public().(ed25519.PublicKey)}, nil
-	} else if !os.IsNotExist(err) {
+	if s, err := loadSignerFile(keyPath); err == nil {
+		return s, nil
+	} else if os.IsNotExist(err) {
+		// No key yet — create one below.
+	} else if errors.Is(err, errMalformedSignerKey) {
+		// The file exists but does not parse. Usually permanent corruption,
+		// but during a concurrent first boot it can be the winner's
+		// half-written PEM caught between the O_EXCL create and the finished
+		// write. Fall through to the create path: O_EXCL fails with IsExist
+		// and adoption retries with backoff, so a permanently corrupt key
+		// still errors — only after the bounded retry budget.
+	} else {
 		return nil, fmt.Errorf("audit signing: %w", err)
 	}
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		return nil, err
 	}
-	if err := os.WriteFile(keyPath,
-		pem.EncodeToMemory(&pem.Block{Type: "ED25519 PRIVATE KEY", Bytes: priv}), 0o600); err != nil {
+	// O_CREATE|O_EXCL: two processes enabling signing for the same root on
+	// first boot must not each generate a key and overwrite the other —
+	// their ledgers would then carry signatures verifiable only by one of
+	// the keys. The loser of the race reloads the winner's key instead.
+	kf, err := os.OpenFile(keyPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		if os.IsExist(err) {
+			// Lost the race: adopt the winner's key. Between the winner's
+			// O_EXCL create and the completed write the file can read back
+			// empty or half-written PEM, so adoption retries with backoff
+			// instead of failing (or recursing just once).
+			return adoptWinnerSigner(keyPath)
+		}
 		return nil, err
 	}
-	if err := os.WriteFile(filepath.Join(dir, signingPubFile),
-		pem.EncodeToMemory(&pem.Block{Type: "ED25519 PUBLIC KEY", Bytes: pub}), 0o644); err != nil {
+	if _, err := kf.Write(pem.EncodeToMemory(&pem.Block{Type: "ED25519 PRIVATE KEY", Bytes: priv})); err != nil {
+		kf.Close()
+		_ = os.Remove(keyPath) // never leave a truncated key behind
 		return nil, err
 	}
+	if err := kf.Close(); err != nil {
+		_ = os.Remove(keyPath)
+		return nil, err
+	}
+	// Public key is best-effort: it only fails with the private key if we
+	// just created the latter, so O_EXCL is enough (a stale .pub from an
+	// interrupted older write must not mask the fresh key).
+	_ = os.WriteFile(filepath.Join(dir, signingPubFile),
+		pem.EncodeToMemory(&pem.Block{Type: "ED25519 PUBLIC KEY", Bytes: pub}), 0o644)
 	return &Signer{priv: priv, pub: pub}, nil
+}
+
+// errMalformedSignerKey marks "key file exists but does not parse" —
+// either permanent corruption or a concurrent writer's half-written PEM.
+var errMalformedSignerKey = errors.New("audit signing: malformed key")
+
+// loadSignerFile reads and parses the signer key at keyPath, distinguishing
+// not-exist (the caller may create the key) from malformed (half-written or
+// corrupt — surfaced via errMalformedSignerKey, never silently replaced).
+// Read errors are returned raw so os.IsNotExist keeps working at call sites.
+func loadSignerFile(keyPath string) (*Signer, error) {
+	raw, err := os.ReadFile(keyPath)
+	if err != nil {
+		return nil, err
+	}
+	var priv ed25519.PrivateKey
+	if block, _ := pem.Decode(raw); block != nil && block.Type == "ED25519 PRIVATE KEY" {
+		priv = ed25519.PrivateKey(block.Bytes)
+	}
+	if len(priv) != ed25519.PrivateKeySize {
+		return nil, fmt.Errorf("%w: %s", errMalformedSignerKey, keyPath)
+	}
+	return &Signer{priv: priv, pub: priv.Public().(ed25519.PublicKey)}, nil
+}
+
+// adoptWinnerSigner loads a key that a concurrent process is creating via
+// O_EXCL. Right after losing the race the winner's file may read back as
+// empty or half-written PEM, so adoption is a bounded retry (10 attempts
+// spaced 50ms apart) rather than a single read; it gives up with the
+// attempt count instead of looping forever.
+func adoptWinnerSigner(keyPath string) (*Signer, error) {
+	const attempts = 10
+	const delay = 50 * time.Millisecond
+	var lastErr error
+	for i := 0; i < attempts; i++ {
+		if i > 0 {
+			time.Sleep(delay)
+		}
+		s, err := loadSignerFile(keyPath)
+		if err == nil {
+			return s, nil
+		}
+		lastErr = err
+	}
+	return nil, fmt.Errorf("audit signing: could not adopt %s after %d attempts: %w", keyPath, attempts, lastErr)
 }
 
 // Sign returns a base64 signature over hash.
@@ -133,17 +201,32 @@ func VerifySigned(recordRoot string, hash, sig string) bool {
 // --- online monitor ---
 
 // openLedgers tracks every Ledger this process opened so the monitor can
-// re-verify them periodically.
+// re-verify them periodically. Keyed by ledger path so repeated Open calls
+// for the same task replace (rather than accumulate) entries; Close removes
+// the registration.
 var (
 	openLedgersMu sync.Mutex
-	openLedgers   = map[*Ledger]struct{}{}
+	openLedgers   = map[string]*Ledger{}
 )
 
 func registerLedger(l *Ledger) {
 	openLedgersMu.Lock()
-	openLedgers[l] = struct{}{}
+	openLedgers[l.path] = l
 	openLedgersMu.Unlock()
 }
+
+func unregisterLedger(l *Ledger) {
+	openLedgersMu.Lock()
+	if cur, ok := openLedgers[l.path]; ok && cur == l {
+		delete(openLedgers, l.path)
+	}
+	openLedgersMu.Unlock()
+}
+
+// Close unregisters this ledger from the online verification monitor. The
+// ledger file stays on disk; holders should call Close once the task is gone
+// so periodic re-verification does not sweep dead ledgers forever.
+func (l *Ledger) Close() { unregisterLedger(l) }
 
 // StartOnlineVerify launches the periodic re-verification loop (idempotent).
 // A failing ledger is logged and counted; it never panics the process — the
@@ -160,7 +243,7 @@ func StartOnlineVerify(interval time.Duration) {
 			for range t.C {
 				openLedgersMu.Lock()
 				ledgers := make([]*Ledger, 0, len(openLedgers))
-				for l := range openLedgers {
+				for _, l := range openLedgers {
 					ledgers = append(ledgers, l)
 				}
 				openLedgersMu.Unlock()

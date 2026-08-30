@@ -1,7 +1,9 @@
 package network
 
 // registry.go is the persistent network registry (bucket-2 "IPAM 硬编码
-// 子网"): every `umlctl network create` allocates the next free /24 from
+// 子网"): `umlctl network create` prefers the historical default
+// 10.0.0.0/24 (gateway 10.0.0.1, baked into existing guest images) and
+// only draws the next free /24 from the pool when that subnet is taken —
 // the configured pool (PVM_NETWORK_POOL, default 10.64.0.0/12), skipping
 // subnets that overlap the host's own interfaces, and records the mapping
 // durably so a restart never hands the same subnet to two bridges.
@@ -13,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"syscall"
 	"time"
 
 	"uml-container/internal/fsjson"
@@ -64,7 +67,11 @@ func LoadNetworkRegistry(stateRoot string) (*NetworkRegistry, error) {
 	return r, nil
 }
 
-func (r *NetworkRegistry) persistLocked() {
+// persistLocked mirrors the registry to disk. It returns the (wrapped)
+// fsjson error so mutation paths can roll their in-memory change back —
+// the on-disk file is what survives restarts, so memory must never run
+// ahead of a failed write.
+func (r *NetworkRegistry) persistLocked() error {
 	dump := struct {
 		Networks []NetworkRecord `json:"networks"`
 	}{}
@@ -76,7 +83,76 @@ func (r *NetworkRegistry) persistLocked() {
 	for _, n := range names {
 		dump.Networks = append(dump.Networks, r.nets[n])
 	}
-	_ = fsjson.Write(r.path, dump)
+	if err := fsjson.Write(r.path, dump); err != nil {
+		return fmt.Errorf("network registry: persist %s: %w", r.path, err)
+	}
+	return nil
+}
+
+// lockFile takes an exclusive inter-process flock on <path>.lock. The
+// in-process mu alone cannot stop two `umlctl network create` processes
+// from loading the same state, drawing the same /24 and overwriting each
+// other's records — mutation paths hold BOTH locks and re-read the file
+// inside the flock (see withFlock).
+func (r *NetworkRegistry) lockFile() (*os.File, error) {
+	f, err := os.OpenFile(r.path+".lock", os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("network registry: lock file: %w", err)
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("network registry: flock: %w", err)
+	}
+	return f, nil
+}
+
+// withFlock runs fn under the inter-process lock (caller already holds the
+// in-process mu). Closing the lock file releases the flock.
+func (r *NetworkRegistry) withFlock(fn func() (string, error)) (string, error) {
+	lf, err := r.lockFile()
+	if err != nil {
+		return "", err
+	}
+	defer lf.Close()
+	// Another process may have persisted changes since THIS process loaded
+	// the registry — rebuild memory state from the file before mutating. A
+	// failed reload aborts the mutation: proceeding would let persistLocked
+	// atomically replace a valid (merely unreadable) registry with state
+	// derived from an empty map, and subnets could be handed out twice.
+	if err := r.reloadLocked(); err != nil {
+		return "", err
+	}
+	return fn()
+}
+
+// reloadLocked replaces in-memory records with the file's contents. A
+// missing or empty file is a fresh registry (empty map). Any other read or
+// parse error KEEPS the previous in-memory state and returns the error so
+// the caller can refuse to mutate — never proceed with cleared state.
+func (r *NetworkRegistry) reloadLocked() error {
+	raw, err := os.ReadFile(r.path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			r.nets = map[string]NetworkRecord{}
+			return nil
+		}
+		return fmt.Errorf("network registry: read %s: %w", r.path, err)
+	}
+	if len(raw) == 0 {
+		r.nets = map[string]NetworkRecord{}
+		return nil
+	}
+	var dump struct {
+		Networks []NetworkRecord `json:"networks"`
+	}
+	if err := json.Unmarshal(raw, &dump); err != nil {
+		return fmt.Errorf("network registry: parse %s: %w", r.path, err)
+	}
+	r.nets = map[string]NetworkRecord{}
+	for _, n := range dump.Networks {
+		r.nets[n.Name] = n
+	}
+	return nil
 }
 
 // Allocate reserves the next free /24 for name and returns its gateway CIDR
@@ -84,6 +160,52 @@ func (r *NetworkRegistry) persistLocked() {
 func (r *NetworkRegistry) Allocate(name string) (string, error) {
 	r.mu <- struct{}{}
 	defer func() { <-r.mu }()
+	return r.withFlock(func() (string, error) { return r.allocateLocked(name) })
+}
+
+// AllocatePreferred reserves want for name when it is free (or already
+// recorded under the same name); when want is nil, or another registered
+// network or the host already occupies it, allocation falls back to the
+// pool scan exactly like Allocate. This keeps the historical default
+// (10.0.0.0/24, gateway 10.0.0.1 — baked into existing guest images and
+// test fixtures) stable for the first bridge, while still preventing
+// collisions across multiple bridges.
+func (r *NetworkRegistry) AllocatePreferred(name string, want *net.IPNet) (string, error) {
+	r.mu <- struct{}{}
+	defer func() { <-r.mu }()
+	return r.withFlock(func() (string, error) {
+		if rec, ok := r.nets[name]; ok {
+			return rec.Subnet, nil
+		}
+		if want != nil {
+			free := true
+			for _, t := range r.takenSubnetsLocked() {
+				if t.Contains(want.IP) || want.Contains(t.IP) {
+					free = false
+					break
+				}
+			}
+			if free {
+				gw := make(net.IP, 4)
+				copy(gw, want.IP.To4())
+				gw[3] = 1
+				gwCIDR := fmt.Sprintf("%s/24", gw)
+				r.nets[name] = NetworkRecord{Name: name, Subnet: gwCIDR, CreatedAt: time.Now().UTC()}
+				if err := r.persistLocked(); err != nil {
+					// Roll the reservation back: an allocation that cannot be
+					// persisted would silently hand the same subnet to another
+					// bridge after the next reload.
+					delete(r.nets, name)
+					return "", err
+				}
+				return gwCIDR, nil
+			}
+		}
+		return r.allocateLocked(name)
+	})
+}
+
+func (r *NetworkRegistry) allocateLocked(name string) (string, error) {
 	if rec, ok := r.nets[name]; ok {
 		return rec.Subnet, nil
 	}
@@ -105,7 +227,13 @@ func (r *NetworkRegistry) Allocate(name string) (string, error) {
 	gw[3] = 1
 	gwCIDR := fmt.Sprintf("%s/24", gw)
 	r.nets[name] = NetworkRecord{Name: name, Subnet: gwCIDR, CreatedAt: time.Now().UTC()}
-	r.persistLocked()
+	if err := r.persistLocked(); err != nil {
+		// Roll the reservation back: an allocation that cannot be persisted
+		// would silently hand the same subnet to another bridge after the
+		// next reload.
+		delete(r.nets, name)
+		return "", err
+	}
 	return gwCIDR, nil
 }
 
@@ -177,12 +305,26 @@ func orderBinary(v uint32) net.IP {
 	return net.IPv4(byte(v>>24), byte(v>>16), byte(v>>8), byte(v))
 }
 
-// Release forgets name's reservation.
-func (r *NetworkRegistry) Release(name string) {
+// Release forgets name's reservation. It returns an error when the
+// deletion cannot be persisted; the in-memory record is then restored so
+// memory and the durable file stay in sync — callers should surface the
+// failure, since a reservation that lives on in the store file would
+// reappear after the next restart.
+func (r *NetworkRegistry) Release(name string) error {
 	r.mu <- struct{}{}
-	delete(r.nets, name)
-	r.persistLocked()
-	<-r.mu
+	defer func() { <-r.mu }()
+	_, err := r.withFlock(func() (string, error) {
+		rec, existed := r.nets[name]
+		delete(r.nets, name)
+		if err := r.persistLocked(); err != nil {
+			if existed {
+				r.nets[name] = rec // keep memory mirroring the un-deletable file
+			}
+			return "", err
+		}
+		return "", nil
+	})
+	return err
 }
 
 // Get returns name's record.
