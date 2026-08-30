@@ -995,8 +995,10 @@ func NewE2BServer() (*echo.Echo, error) {
 		}
 		// TaskID reaches audit.Open (directory construction): the same
 		// idRegex the /api/audit/:id endpoints enforce. Without it a
-		// "../../..." id writes ledgers outside the audit root.
-		if b.TaskID != "" && !idRegex.MatchString(b.TaskID) {
+		// "../../..." id writes ledgers outside the audit root. An EMPTY id is
+		// rejected too: echo's binder accepts a missing body, and an empty
+		// bundle would sail through the bare gate as passed=true.
+		if b.TaskID == "" || !idRegex.MatchString(b.TaskID) {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid task id"})
 		}
 		l, err := audit.Open(b.TaskID)
