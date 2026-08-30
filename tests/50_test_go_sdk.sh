@@ -60,7 +60,10 @@ func main() {
 	if cfg.APIURL == "" {
 		cfg.APIURL = os.Getenv("PVM_API_URL")
 	}
-	c := sdk.NewClient(cfg)
+	c, err := sdk.NewClient(cfg)
+	if err != nil {
+		fatal("client", err)
+	}
 	ctx := context.Background()
 
 	if err := c.Health(ctx); err != nil {

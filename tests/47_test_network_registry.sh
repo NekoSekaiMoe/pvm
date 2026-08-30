@@ -29,19 +29,19 @@ fi
 echo "--- 1. two networks get distinct subnets"
 "$TMP/umlctl" network create regnet-a &>"$TMP/a.log" || fail "create a: $(cat "$TMP/a.log")"
 "$TMP/umlctl" network create regnet-b &>"$TMP/b.log" || fail "create b: $(cat "$TMP/b.log")"
-SUB_A=$(jq -r '.Networks[] | select(.name=="regnet-a") | .Subnet' "$PVM_STATE_ROOT/networks.json")
-SUB_B=$(jq -r '.Networks[] | select(.name=="regnet-b") | .Subnet' "$PVM_STATE_ROOT/networks.json")
+SUB_A=$(jq -r '.networks[] | select(.name=="regnet-a") | .subnet' "$PVM_STATE_ROOT/networks.json")
+SUB_B=$(jq -r '.networks[] | select(.name=="regnet-b") | .subnet' "$PVM_STATE_ROOT/networks.json")
 [ -n "$SUB_A" ] && [ -n "$SUB_B" ] || fail "registry must record both"
 [ "$SUB_A" != "$SUB_B" ] || fail "subnets must differ: $SUB_A"
 
 echo "--- 2. create is idempotent for the same name"
 "$TMP/umlctl" network create regnet-a &>"$TMP/a2.log" || fail "re-create a"
-SUB_A2=$(jq -r '.Networks[] | select(.name=="regnet-a") | .Subnet' "$PVM_STATE_ROOT/networks.json")
+SUB_A2=$(jq -r '.networks[] | select(.name=="regnet-a") | .subnet' "$PVM_STATE_ROOT/networks.json")
 [ "$SUB_A2" = "$SUB_A" ] || fail "same name must keep its subnet: $SUB_A -> $SUB_A2"
 
 echo "--- 3. rm releases the reservation"
 "$TMP/umlctl" network rm regnet-a &>"$TMP/rm.log" || fail "rm a: $(cat "$TMP/rm.log")"
-if jq -e '.Networks[] | select(.name=="regnet-a")' "$PVM_STATE_ROOT/networks.json" >/dev/null; then
+if jq -e '.networks[] | select(.name=="regnet-a")' "$PVM_STATE_ROOT/networks.json" >/dev/null; then
     fail "rm must release the name"
 fi
 

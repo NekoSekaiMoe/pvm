@@ -74,7 +74,13 @@ echo "$V" | jq -e '.passed == false' >/dev/null || fail "secret must block: $V"
 echo "$V" | jq -e '.step.secret_scan | startswith("fail")' >/dev/null || fail "secret_scan must fail: $V"
 
 echo "--- 3. clean bundle with test evidence passes"
-V=$(gate "{\"task_id\":\"t-gate\",\"claimed_ok\":true,\"build_log\":\"\$ go test ./...\\\nok  pkg  0.1s\\\nPASS\",\"files\":{\"report.md\":\"$(b64 "all good")\"}}")
+# Build the payload with jq so build_log carries REAL newlines: the old
+# inline double-quoted JSON left literal "\\n" sequences, which the loose
+# keyword-based tests_rerun verifier accepted but the strict (spec-bound)
+# terminal-state match rejects — `^ok\s` must anchor on a real line.
+LOG=$(printf '$ go test ./...\nok  pkg  0.1s\nPASS')
+V=$(gate "$(jq -nc --arg log "$LOG" --arg b64 "$(b64 'all good')" \
+    '{task_id:"t-gate",claimed_ok:true,build_log:$log,files:{"report.md":$b64}}')")
 echo "$V" | jq -e '.passed == true' >/dev/null || fail "clean bundle must pass: $V"
 
 echo "--- 4. strict tests: no evidence fails when require_tests_passed=true"

@@ -52,32 +52,34 @@ echo "--- 1. envd healthz answers"
 curl -sf "http://127.0.0.1:$ENVDPORT/healthz" | jq -e '.service == "envd"' >/dev/null || fail "envd healthz"
 
 echo "--- 2. filesystem.Filesystem/MakeDir + ListDir"
+# envd shares the API secret: when API_SECRET is set every envd request
+# (except healthz) must carry the bearer token.
 curl -sf -X POST "http://127.0.0.1:$ENVDPORT/filesystem.Filesystem/MakeDir" \
-    -H "X-Task-Id: t-envd" -H "Content-Type: application/json" \
+    -H "$AUTH" -H "X-Task-Id: t-envd" -H "Content-Type: application/json" \
     -d '{"path":"work"}' | jq -e '.entry.type == "DIRECTORY"' >/dev/null || fail "MakeDir"
 curl -sf -X POST "http://127.0.0.1:$ENVDPORT/filesystem.Filesystem/ListDir" \
-    -H "X-Task-Id: t-envd" -H "Content-Type: application/json" \
+    -H "$AUTH" -H "X-Task-Id: t-envd" -H "Content-Type: application/json" \
     -d '{"path":"."}' | jq -e '.entries[0].name == "work"' >/dev/null || fail "ListDir"
 
 echo "--- 3. raw /files write + read round trip"
 curl -sf -X POST "http://127.0.0.1:$ENVDPORT/files?path=work/notes.txt&username=root" \
-    -H "X-Task-Id: t-envd" -H "Content-Type: application/octet-stream" \
+    -H "$AUTH" -H "X-Task-Id: t-envd" -H "Content-Type: application/octet-stream" \
     --data-binary "envd-body" >/dev/null || fail "raw write"
-BODY=$(curl -sf "http://127.0.0.1:$ENVDPORT/files?path=work/notes.txt&username=root" -H "X-Task-Id: t-envd")
+BODY=$(curl -sf "http://127.0.0.1:$ENVDPORT/files?path=work/notes.txt&username=root" -H "$AUTH" -H "X-Task-Id: t-envd")
 [ "$BODY" = "envd-body" ] || fail "raw read got: $BODY"
 
 echo "--- 4. traversal is neutralized"
-CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:$ENVDPORT/files?path=../../../etc/passwd&username=root" -H "X-Task-Id: t-envd")
+CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:$ENVDPORT/files?path=../../../etc/passwd&username=root" -H "$AUTH" -H "X-Task-Id: t-envd")
 [ "$CODE" = "404" ] || [ "$CODE" = "400" ] || fail "traversal must fail closed, got $CODE"
 
 echo "--- 5. process.Process/Start streams sim output + end + EOS"
 python3 - "$ENVDPORT" <<'PYEOF'
-import socket, struct, sys, json
+import socket, struct, sys, json, os
 port = int(sys.argv[1])
 s = socket.create_connection(("127.0.0.1", port), timeout=10)
 payload = json.dumps({"process": {"cmd": "/bin/bash", "args": ["-l", "-c", "echo envd-ok"], "envs": {}}, "stdin": False}).encode()
 frame = struct.pack(">BI", 0, len(payload)) + payload
-req = b"POST /process.Process/Start HTTP/1.1\r\nHost: x\r\nContent-Type: application/connect+json\r\nX-Task-Id: t-envd\r\nConnect-Protocol-Version: 1\r\nContent-Length: "
+req = b"POST /process.Process/Start HTTP/1.1\r\nHost: x\r\nContent-Type: application/connect+json\r\nX-Task-Id: t-envd\r\nAuthorization: Bearer " + os.environ.get("API_SECRET", "").encode() + b"\r\nConnect-Protocol-Version: 1\r\nContent-Length: "
 req += str(len(frame)).encode() + b"\r\n\r\n" + frame
 s.sendall(req)
 buf = b""
@@ -131,11 +133,11 @@ PYEOF
 
 echo "--- 6. version websocket handshake (49982-equivalent port)"
 python3 - "$WSPORT" <<'PYEOF'
-import socket, base64, hashlib, sys
+import socket, base64, hashlib, sys, os
 port = int(sys.argv[1])
 s = socket.create_connection(("127.0.0.1", port), timeout=10)
 key = base64.b64encode(b"0123456789abcdef").decode()
-s.sendall((f"GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n").encode())
+s.sendall((f"GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nAuthorization: Bearer {os.environ.get('API_SECRET', '')}\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n").encode())
 data = b""
 while b"\r\n\r\n" not in data:
     data += s.recv(4096)

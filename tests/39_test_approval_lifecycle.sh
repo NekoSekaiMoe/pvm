@@ -46,6 +46,14 @@ http.server.HTTPServer(("127.0.0.1", 18040), H).serve_forever()
 PYEOF
 (cd "$TMP" && python3 hook.py &>"$TMP/hook.err" &)
 HOOK_PID=$(pgrep -f "python3 hook.py" | head -1 || true)
+# Webhook delivery is at-most-once (async goroutine, no retry): a POST
+# against a not-yet-listening receiver is dropped for good. CI runners can
+# take >1s to spawn python3, so wait for the socket before starting the
+# API server that will fire the first "create" event.
+for _ in $(seq 1 40); do
+    curl -s -o /dev/null "http://127.0.0.1:$HOOK_PORT/" && break
+    sleep 0.25
+done
 export PVM_APPROVAL_WEBHOOK_URL="http://127.0.0.1:$HOOK_PORT/"
 
 "$TMP/agentpvm" api -port "$PORT" &>"$TMP/server.log" &
