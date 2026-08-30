@@ -171,6 +171,36 @@ func TestSetupBridge_RollbackBeforeRefcount(t *testing.T) {
 	}
 }
 
+// TestSetupBridge_ExistingBridgeFailsNoTeardown locks the re-create
+// contract used by tests/47: `umlctl network create` on an existing bridge
+// fails at `ip link add` (RTNETLINK File exists) and SetupBridge must NOT
+// tear the pre-existing bridge down — it never owned it (bridgeCreated
+// stays false), and it must not touch NAT or the ip_forward refcount.
+func TestSetupBridge_ExistingBridgeFailsNoTeardown(t *testing.T) {
+	resetForwardState(t)
+	stubReadIPForward(t)
+	calls := stubExecRun(t)
+	failOn(t, "ip link add", calls) // the existing-bridge case
+
+	err := SetupBridge("pvmbr0", "", "10.0.0.1/24")
+	if err == nil {
+		t.Fatal("SetupBridge must fail when the bridge already exists")
+	}
+	gotCalls := strings.Join(*calls, "\n")
+	if strings.Contains(gotCalls, "ip link delete") {
+		t.Errorf("failed re-create tore down the pre-existing bridge:\n%s", gotCalls)
+	}
+	if strings.Contains(gotCalls, "iptables") || strings.Contains(gotCalls, "sysctl -w") {
+		t.Errorf("failed re-create touched NAT/ip_forward it never set up:\n%s", gotCalls)
+	}
+	ipForwardMu.Lock()
+	got := ipForwardRefCount
+	ipForwardMu.Unlock()
+	if got != 0 {
+		t.Fatalf("ip_forward refcount = %d, want 0", got)
+	}
+}
+
 // TestSetupBridge_RollbackAfterRefcount asserts that a failure AFTER the
 // refcount increment decrements it exactly once (the old code decremented
 // twice: once via DeleteBridge and once via the ipForwardRegistered branch)
