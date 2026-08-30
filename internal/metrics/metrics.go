@@ -33,6 +33,13 @@ type series struct {
 	values map[string]float64 // rendered label values joined by \xff
 }
 
+// defaultMaxCardinality bounds the number of distinct label combinations per
+// series. Unbounded label values (task ids, hosts, ...) would otherwise grow
+// the registry — and every /metrics scrape — linearly with task churn until
+// the process restarts. Series should still call Delete on cleanup; the cap
+// is the safety net, not the policy.
+const defaultMaxCardinality = 4096
+
 // Registry holds every series created through it. The package-level default
 // registry is what /metrics renders; NewRegistry exists for tests.
 type Registry struct {
@@ -70,8 +77,19 @@ func (s *series) add(delta float64, labelValues []string) {
 		return
 	}
 	s.mu.Lock()
-	s.values[s.key(labelValues)] += delta
+	s.boundedAdd(delta, labelValues)
 	s.mu.Unlock()
+}
+
+// boundedAdd inserts (or updates) a sample while holding s.mu. NEW label
+// combinations beyond defaultMaxCardinality are dropped: counters keep
+// serving existing series and memory stays bounded.
+func (s *series) boundedAdd(delta float64, labelValues []string) {
+	k := s.key(labelValues)
+	if _, ok := s.values[k]; !ok && len(s.values) >= defaultMaxCardinality {
+		return
+	}
+	s.values[k] += delta
 }
 
 func (s *series) set(v float64, labelValues []string) {
@@ -79,7 +97,21 @@ func (s *series) set(v float64, labelValues []string) {
 		return
 	}
 	s.mu.Lock()
-	s.values[s.key(labelValues)] = v
+	k := s.key(labelValues)
+	if _, ok := s.values[k]; !ok && len(s.values) >= defaultMaxCardinality {
+		s.mu.Unlock()
+		return
+	}
+	s.values[k] = v
+	s.mu.Unlock()
+}
+
+func (s *series) delete(labelValues []string) {
+	if len(labelValues) != len(s.labels) {
+		return
+	}
+	s.mu.Lock()
+	delete(s.values, s.key(labelValues))
 	s.mu.Unlock()
 }
 
@@ -93,11 +125,18 @@ func (c CounterHandle) Inc(labelValues ...string) { c.s.add(1, labelValues) }
 // Add adds delta for the given label values.
 func (c CounterHandle) Add(delta float64, labelValues ...string) { c.s.add(delta, labelValues) }
 
+// Delete removes a label combination (call when the labeled task ends so
+// per-task series do not accumulate for the process lifetime).
+func (c CounterHandle) Delete(labelValues ...string) { c.s.delete(labelValues) }
+
 // GaugeHandle is a handle to a gauge series.
 type GaugeHandle struct{ s *series }
 
 // Set stores v for the given label values.
 func (g GaugeHandle) Set(v float64, labelValues ...string) { g.s.set(v, labelValues) }
+
+// Delete removes a label combination (call when the labeled task ends).
+func (g GaugeHandle) Delete(labelValues ...string) { g.s.delete(labelValues) }
 
 // Counter declares (or fetches) a counter on the default registry.
 func Counter(name, help string, labels ...string) CounterHandle {

@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -25,6 +26,9 @@ const (
 	// maxResponseBodyBytes bounds every response body read (error bodies and
 	// JSON decoding alike) so a hostile endpoint cannot exhaust memory.
 	maxResponseBodyBytes = 1 << 20 // 1 MiB
+
+	// maxRedirects bounds redirect chains on top of CheckRedirect.
+	maxRedirects = 10
 )
 
 type Config struct {
@@ -57,18 +61,71 @@ type Client struct {
 	http *http.Client
 }
 
-func NewClient(cfg Config) *Client {
+func NewClient(cfg Config) (*Client, error) {
 	if cfg.APIURL == "" {
 		cfg.APIURL = "http://127.0.0.1:3000"
 	}
 	// Normalize: a trailing slash would produce double slashes in every
 	// joined path (e.g. "http://h:1//api/volumes").
 	cfg.APIURL = strings.TrimRight(cfg.APIURL, "/")
+	u, err := url.Parse(cfg.APIURL)
+	if err != nil {
+		return nil, fmt.Errorf("sdk: invalid API URL %q: %w", cfg.APIURL, err)
+	}
+	// Transport policy: Bearer credentials may only cross the wire as
+	// plaintext http when the target is loopback; anything else must be
+	// https. Validate up front so misconfiguration fails at client
+	// construction, not at first request.
+	if err := requireSecureScheme(u); err != nil {
+		return nil, err
+	}
 	timeout := cfg.Timeout
 	if timeout <= 0 {
 		timeout = DefaultTimeout
 	}
-	return &Client{cfg: cfg, http: &http.Client{Timeout: timeout}}
+	return &Client{
+		cfg: cfg,
+		http: &http.Client{
+			Timeout: timeout,
+			// Re-check every redirect hop: a redirect must not downgrade a
+			// credentialed request to plaintext http on a non-loopback host.
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				if len(via) >= maxRedirects {
+					return fmt.Errorf("sdk: stopped after %d redirects", maxRedirects)
+				}
+				return requireSecureScheme(req.URL)
+			},
+		},
+	}, nil
+}
+
+// isLoopbackHost reports whether hostname (port stripped, brackets kept
+// optional) is loopback: "localhost", any 127.0.0.0/8 address, or ::1.
+func isLoopbackHost(hostname string) bool {
+	h := strings.ToLower(strings.Trim(hostname, "[]"))
+	if h == "localhost" {
+		return true
+	}
+	if ip := net.ParseIP(h); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
+}
+
+// requireSecureScheme enforces the http/https policy for u: plaintext http
+// is only allowed to loopback hosts; non-loopback targets must use https.
+func requireSecureScheme(u *url.URL) error {
+	switch u.Scheme {
+	case "https":
+		return nil
+	case "http":
+		if !isLoopbackHost(u.Hostname()) {
+			return fmt.Errorf("sdk: refusing plaintext http to non-loopback host %q (use https://)", u.Hostname())
+		}
+		return nil
+	default:
+		return fmt.Errorf("sdk: unsupported API URL scheme %q (expected http or https)", u.Scheme)
+	}
 }
 
 func (c *Client) Close() error {

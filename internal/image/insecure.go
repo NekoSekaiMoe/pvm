@@ -9,6 +9,7 @@ package image
 import (
 	"crypto/tls"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -72,12 +73,30 @@ type schemeRewrite struct {
 }
 
 func (s *schemeRewrite) RoundTrip(req *http.Request) (*http.Response, error) {
-	if req.URL.Scheme == "https" && strings.HasPrefix(req.URL.Host, strings.Split(s.host, ":")[0]) {
+	if req.URL.Scheme == "https" && sameRegistryHost(req.URL.Host, s.host) {
 		clone := req.Clone(req.Context())
 		clone.URL.Scheme = "http"
 		req = clone
 	}
 	return s.rt.RoundTrip(req)
+}
+
+// sameRegistryHost compares the request authority against the configured
+// insecure registry EXACTLY (host and port). A HasPrefix check would also
+// accept registry.example.evil — which merely shares a prefix — and ignore
+// port mismatches, silently downgrading unrelated hosts to plaintext.
+func sameRegistryHost(reqHost, configured string) bool {
+	rh, rp := splitHostPort(reqHost)
+	ch, cp := splitHostPort(configured)
+	return strings.EqualFold(rh, ch) && rp == cp
+}
+
+func splitHostPort(hostport string) (string, string) {
+	h, p, err := net.SplitHostPort(hostport)
+	if err != nil {
+		return hostport, ""
+	}
+	return h, p
 }
 
 // checkDiskHeadroom verifies free bytes on the filesystem holding dir are at

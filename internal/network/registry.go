@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"syscall"
 	"time"
 
 	"uml-container/internal/fsjson"
@@ -81,12 +82,61 @@ func (r *NetworkRegistry) persistLocked() {
 	_ = fsjson.Write(r.path, dump)
 }
 
+// lockFile takes an exclusive inter-process flock on <path>.lock. The
+// in-process mu alone cannot stop two `umlctl network create` processes
+// from loading the same state, drawing the same /24 and overwriting each
+// other's records — mutation paths hold BOTH locks and re-read the file
+// inside the flock (see withFlock).
+func (r *NetworkRegistry) lockFile() (*os.File, error) {
+	f, err := os.OpenFile(r.path+".lock", os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("network registry: lock file: %w", err)
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("network registry: flock: %w", err)
+	}
+	return f, nil
+}
+
+// withFlock runs fn under the inter-process lock (caller already holds the
+// in-process mu). Closing the lock file releases the flock.
+func (r *NetworkRegistry) withFlock(fn func() (string, error)) (string, error) {
+	lf, err := r.lockFile()
+	if err != nil {
+		return "", err
+	}
+	defer lf.Close()
+	// Another process may have persisted changes since THIS process loaded
+	// the registry — rebuild memory state from the file before mutating.
+	r.reloadLocked()
+	return fn()
+}
+
+// reloadLocked replaces in-memory records with the file's contents. Empty
+// or missing files leave the map empty (fresh registry).
+func (r *NetworkRegistry) reloadLocked() {
+	r.nets = map[string]NetworkRecord{}
+	raw, err := os.ReadFile(r.path)
+	if err != nil || len(raw) == 0 {
+		return
+	}
+	var dump struct {
+		Networks []NetworkRecord `json:"networks"`
+	}
+	if json.Unmarshal(raw, &dump) == nil {
+		for _, n := range dump.Networks {
+			r.nets[n.Name] = n
+		}
+	}
+}
+
 // Allocate reserves the next free /24 for name and returns its gateway CIDR
 // (the .1 address). Idempotent: an existing name returns its recorded subnet.
 func (r *NetworkRegistry) Allocate(name string) (string, error) {
 	r.mu <- struct{}{}
 	defer func() { <-r.mu }()
-	return r.allocateLocked(name)
+	return r.withFlock(func() (string, error) { return r.allocateLocked(name) })
 }
 
 // AllocatePreferred reserves want for name when it is free (or already
@@ -99,28 +149,30 @@ func (r *NetworkRegistry) Allocate(name string) (string, error) {
 func (r *NetworkRegistry) AllocatePreferred(name string, want *net.IPNet) (string, error) {
 	r.mu <- struct{}{}
 	defer func() { <-r.mu }()
-	if rec, ok := r.nets[name]; ok {
-		return rec.Subnet, nil
-	}
-	if want != nil {
-		free := true
-		for _, t := range r.takenSubnetsLocked() {
-			if t.Contains(want.IP) || want.Contains(t.IP) {
-				free = false
-				break
+	return r.withFlock(func() (string, error) {
+		if rec, ok := r.nets[name]; ok {
+			return rec.Subnet, nil
+		}
+		if want != nil {
+			free := true
+			for _, t := range r.takenSubnetsLocked() {
+				if t.Contains(want.IP) || want.Contains(t.IP) {
+					free = false
+					break
+				}
+			}
+			if free {
+				gw := make(net.IP, 4)
+				copy(gw, want.IP.To4())
+				gw[3] = 1
+				gwCIDR := fmt.Sprintf("%s/24", gw)
+				r.nets[name] = NetworkRecord{Name: name, Subnet: gwCIDR, CreatedAt: time.Now().UTC()}
+				r.persistLocked()
+				return gwCIDR, nil
 			}
 		}
-		if free {
-			gw := make(net.IP, 4)
-			copy(gw, want.IP.To4())
-			gw[3] = 1
-			gwCIDR := fmt.Sprintf("%s/24", gw)
-			r.nets[name] = NetworkRecord{Name: name, Subnet: gwCIDR, CreatedAt: time.Now().UTC()}
-			r.persistLocked()
-			return gwCIDR, nil
-		}
-	}
-	return r.allocateLocked(name)
+		return r.allocateLocked(name)
+	})
 }
 
 func (r *NetworkRegistry) allocateLocked(name string) (string, error) {
@@ -220,8 +272,11 @@ func orderBinary(v uint32) net.IP {
 // Release forgets name's reservation.
 func (r *NetworkRegistry) Release(name string) {
 	r.mu <- struct{}{}
-	delete(r.nets, name)
-	r.persistLocked()
+	_, _ = r.withFlock(func() (string, error) {
+		delete(r.nets, name)
+		r.persistLocked()
+		return "", nil
+	})
 	<-r.mu
 }
 

@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"time"
@@ -57,25 +58,44 @@ func ReadEnvelope(r io.Reader) (flags byte, payload []byte, err error) {
 	return head[0], payload, nil
 }
 
+// maxRunOutputBytes bounds the combined stdout+stderr a single Run may
+// accumulate; past it the stream is aborted instead of growing unbounded.
+// (Each individual frame is additionally capped at 32 MiB by ReadEnvelope.)
+const maxRunOutputBytes = 64 << 20 // 64 MiB
+
 // EnvdClient speaks the Connect-JSON surface of one sandbox.
 type EnvdClient struct {
-	base string // http://host:49983
+	base string // http(s)://host:49983
 	task string // X-Task-Id routing header
 	http *http.Client
 	user string
 }
 
-// NewEnvdClient builds a client for host (default 127.0.0.1).
+// NewEnvdClient builds a client for host (default 127.0.0.1). host may
+// carry a port. Loopback hosts speak plain http (envd convention); anything
+// else is addressed over https so credentials never cross in cleartext.
 func NewEnvdClient(host string, task string) *EnvdClient {
 	if host == "" {
 		host = "127.0.0.1"
 	}
+	scheme := "https"
+	if hostname := envdHostname(host); isLoopbackHost(hostname) {
+		scheme = "http"
+	}
 	return &EnvdClient{
-		base: "http://" + host + ":" + fmt.Sprint(DefaultEnvdPort),
+		base: scheme + "://" + host + ":" + fmt.Sprint(DefaultEnvdPort),
 		task: task,
 		http: &http.Client{Timeout: 120 * time.Second},
 		user: "root",
 	}
+}
+
+// envdHostname strips an optional port from a host[:port] string.
+func envdHostname(host string) string {
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		return h
+	}
+	return host
 }
 
 // CommandResult is one collected run.
@@ -163,6 +183,9 @@ func (e *EnvdClient) Run(ctx context.Context, command string, envs map[string]st
 		}
 		if s := ev.Event.Data.Stderr; s != "" {
 			out.Stderr += decodeB64(s)
+		}
+		if total := len(out.Stdout) + len(out.Stderr); total > maxRunOutputBytes {
+			return nil, fmt.Errorf("envd: run output exceeded limit: %d bytes accumulated (stdout %d + stderr %d) > %d", total, len(out.Stdout), len(out.Stderr), maxRunOutputBytes)
 		}
 		if end := ev.Event.End; end != nil {
 			switch {
@@ -288,7 +311,7 @@ func (e *EnvdClient) WriteFile(ctx context.Context, path string, data []byte) er
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
-		return nil
+		return fmt.Errorf("envd: write %s -> %d", path, resp.StatusCode)
 	}
 	return nil
 }

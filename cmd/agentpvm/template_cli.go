@@ -8,11 +8,54 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"strings"
 	"time"
 )
+
+// watchFrame is one polled build status snapshot.
+type watchFrame struct {
+	Phase   string `json:"phase"`
+	Pct     int    `json:"pct"`
+	LogTail string `json:"log_tail"`
+	Error   string `json:"error"`
+}
+
+// watchState remembers the last frame that was rendered so the watcher
+// repaints whenever phase, percent, or the log tail changes — not only on
+// phase transitions (a long phase would otherwise stream updates silently).
+type watchState struct {
+	started bool
+	phase   string
+	pct     int
+	tail    string
+}
+
+// changed records f and reports whether it differs from the previously
+// recorded frame.
+func (s *watchState) changed(f watchFrame) bool {
+	c := !s.started || f.Phase != s.phase || f.Pct != s.pct || f.LogTail != s.tail
+	s.started = true
+	s.phase, s.pct, s.tail = f.Phase, f.Pct, f.LogTail
+	return c
+}
+
+// renderBar renders the 20-cell progress bar line for f (pct clamped to
+// 0..100 so a hostile server cannot panic strings.Repeat with pct > 100).
+func renderBar(f watchFrame) string {
+	pct := f.Pct
+	if pct < 0 {
+		pct = 0
+	}
+	if pct > 100 {
+		pct = 100
+	}
+	filled := pct / 5
+	bar := strings.Repeat("█", filled) + strings.Repeat("░", 20-filled)
+	return fmt.Sprintf("[%s] %3d%%  %s", bar, pct, f.Phase)
+}
 
 func templateCmd(args []string) {
 	if len(args) < 2 || args[0] != "watch" {
@@ -39,9 +82,8 @@ func templateCmd(args []string) {
 	}
 
 	deadline := time.Now().Add(timeout)
-	lastPhase := ""
+	var state watchState
 	terminal := map[string]bool{"done": true, "failed": true}
-	spnnerPos := 0
 	for {
 		req, _ := http.NewRequest("GET", base+"/api/templates/"+ident+"/build?wait=2s", nil)
 		req.Header.Set("Authorization", "Bearer "+secret)
@@ -50,28 +92,28 @@ func templateCmd(args []string) {
 			fmt.Printf("template watch: %v (is the API running at %s?)\n", err, base)
 			os.Exit(1)
 		}
-		var st struct {
-			Phase   string `json:"phase"`
-			Pct     int    `json:"pct"`
-			LogTail string `json:"log_tail"`
-			Error   string `json:"error"`
-		}
-		jerr := json.NewDecoder(resp.Body).Decode(&st)
+		// Bound the body read: a proxy error page must not stream into the
+		// watcher, and a non-2xx status must abort instead of being decoded
+		// as (garbage) build status.
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
 		resp.Body.Close()
-		if jerr != nil {
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			fmt.Printf("template watch: GET /api/templates/%s/build -> %d: %s\n", ident, resp.StatusCode, strings.TrimSpace(string(body)))
+			os.Exit(1)
+		}
+		var st watchFrame
+		if jerr := json.Unmarshal(body, &st); jerr != nil {
 			fmt.Printf("template watch: bad response: %v\n", jerr)
 			os.Exit(1)
 		}
 
-		if st.Phase != lastPhase {
-			bar := strings.Repeat("█", st.Pct/5) + strings.Repeat("░", 20-st.Pct/5)
-			fmt.Printf("[%s] %3d%%  %s\n", bar, st.Pct, st.Phase)
+		if state.changed(st) {
+			fmt.Println(renderBar(st))
 			if st.LogTail != "" {
 				for _, line := range strings.Split(strings.TrimRight(st.LogTail, "\n"), "\n") {
 					fmt.Printf("    │ %s\n", line)
 				}
 			}
-			lastPhase = st.Phase
 		}
 		if terminal[st.Phase] {
 			if st.Phase == "failed" {
@@ -85,6 +127,5 @@ func templateCmd(args []string) {
 			fmt.Printf("template watch: timeout after %s (phase %s)\n", timeout, st.Phase)
 			os.Exit(1)
 		}
-		spnnerPos++
 	}
 }

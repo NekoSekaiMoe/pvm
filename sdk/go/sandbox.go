@@ -59,6 +59,12 @@ func (c *Client) CreateSandbox(ctx context.Context, opts CreateSandboxOptions) (
 		return nil, fmt.Errorf("sdk: CreateSandbox requires Template or Alias")
 	}
 	if opts.TimeoutSeconds != 0 {
+		// Three-value semantics: 0/unset = server default, NeverTimeout
+		// (-1) = never, N>0 = idle TTL seconds. Anything below the sentinel
+		// is a caller bug — reject before it reaches the query string.
+		if opts.TimeoutSeconds < NeverTimeout {
+			return nil, fmt.Errorf("sdk: TimeoutSeconds %d is invalid (must be 0, %d (NeverTimeout), or positive seconds)", opts.TimeoutSeconds, NeverTimeout)
+		}
 		q.Set("timeout", fmt.Sprint(opts.TimeoutSeconds))
 	}
 	for k, v := range opts.Metadata {

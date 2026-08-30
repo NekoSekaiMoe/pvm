@@ -20,6 +20,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"fmt"
+	"io"
 	"math/big"
 	"net"
 	"net/http"
@@ -210,7 +211,15 @@ func (g *Gateway) serveMITM(clientConn net.Conn, brw *bufio.ReadWriter, task, ho
 	fmt.Fprint(brw, "HTTP/1.1 200 Connection Established\r\n\r\n")
 	brw.Flush()
 
-	tlsConn := tls.Server(clientConn, &tls.Config{
+	// Bytes the guest pipelined past the 200 (an eager ClientHello) are
+	// already sitting in the hijacked bufio.Reader; the TLS server must see
+	// them before reading the raw connection. Mirror the raw-tunnel drain
+	// in handleConnect instead of losing the handshake bytes.
+	tlsSrc := net.Conn(clientConn)
+	if n := brw.Reader.Buffered(); n > 0 {
+		tlsSrc = &prefixedConn{Conn: clientConn, r: io.MultiReader(io.LimitReader(brw.Reader, int64(n)), clientConn)}
+	}
+	tlsConn := tls.Server(tlsSrc, &tls.Config{
 		GetCertificate: func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
 			name := hello.ServerName
 			if name == "" {
@@ -280,6 +289,15 @@ func writeMITMError(w *bufio.Writer, code int, msg string) {
 	fmt.Fprintf(w, "HTTP/1.1 %d %s\r\nContent-Length: %d\r\nContent-Type: text/plain\r\nConnection: keep-alive\r\n\r\n%s", code, http.StatusText(code), len(msg), msg)
 	w.Flush()
 }
+
+// prefixedConn serves buffered pre-handshake bytes (see serveMITM) before
+// delegating reads to the underlying connection.
+type prefixedConn struct {
+	net.Conn
+	r io.Reader
+}
+
+func (p *prefixedConn) Read(b []byte) (int, error) { return p.r.Read(b) }
 
 func contentLengthOf(req *http.Request) int64 {
 	if req.ContentLength > 0 {

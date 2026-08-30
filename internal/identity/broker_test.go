@@ -69,7 +69,9 @@ func TestRevoke(t *testing.T) {
 	}
 	tok, _ := b.Mint("alice", "eng", "task-1", nil, time.Hour)
 	parsed, _ := b.Validate(tok)
-	b.Revoke(parsed.ID)
+	if err := b.Revoke(parsed.ID); err != nil {
+		t.Fatalf("revoke: %v", err)
+	}
 	if _, err := b.Validate(tok); err != ErrRevoked {
 		t.Fatalf("expected ErrRevoked, got %v", err)
 	}
@@ -139,7 +141,10 @@ func TestRevokeAllForTask_RevokesEveryMintedToken(t *testing.T) {
 		}
 	}
 
-	revoked := b.RevokeAllForTask("task-A")
+	revoked, err := b.RevokeAllForTask("task-A")
+	if err != nil {
+		t.Fatalf("revoke all: %v", err)
+	}
 	if revoked != len(toksA) {
 		t.Fatalf("RevokeAllForTask revoked %d, want %d", revoked, len(toksA))
 	}
@@ -160,7 +165,55 @@ func TestRevokeAllForTask_RevokesEveryMintedToken(t *testing.T) {
 // tokens is a benign no-op (returns 0, no audit gymnastics).
 func TestRevokeAllForTask_UnknownTaskIsNoop(t *testing.T) {
 	b, _ := NewBroker(nil, nil, tmpLedger(t), time.Hour)
-	if n := b.RevokeAllForTask("never-heard-of"); n != 0 {
+	if n, err := b.RevokeAllForTask("never-heard-of"); n != 0 || err != nil {
 		t.Errorf("revoking unknown task revoked %d, want 0", n)
+	}
+}
+
+// TestRevokeAllForTask_SurvivesRestart is the PR #22 review regression: the
+// token→task reverse index is memory-only, so a token minted BEFORE a restart
+// must still be denied after restart + RevokeAllForTask — via the signed
+// Task claim, not the lost index.
+func TestRevokeAllForTask_SurvivesRestart(t *testing.T) {
+	dir := t.TempDir()
+	keyPath := dir + "/identity.key"
+	revPath := dir + "/revocations.json"
+
+	key1, err := LoadOrCreateKey(keyPath)
+	if err != nil {
+		t.Fatalf("load key: %v", err)
+	}
+	b1, err := NewBroker(key1, StaticStore{}, tmpLedger(t), time.Hour)
+	if err != nil {
+		t.Fatalf("new broker: %v", err)
+	}
+	tok, err := b1.Mint("alice", "eng", "task-R", nil, time.Hour)
+	if err != nil {
+		t.Fatalf("mint: %v", err)
+	}
+	if err := b1.PersistRevocations(revPath); err != nil {
+		t.Fatalf("persist revocations: %v", err)
+	}
+
+	// Restart: same key material + revocation file, empty in-memory index.
+	key2, err := LoadOrCreateKey(keyPath)
+	if err != nil {
+		t.Fatalf("reload key: %v", err)
+	}
+	b2, err := NewBroker(key2, StaticStore{}, tmpLedger(t), time.Hour)
+	if err != nil {
+		t.Fatalf("new broker 2: %v", err)
+	}
+	if err := b2.PersistRevocations(revPath); err != nil {
+		t.Fatalf("reload revocations: %v", err)
+	}
+	if _, err := b2.Validate(tok); err != nil {
+		t.Fatalf("token must validate before bulk revoke: %v", err)
+	}
+	if _, err := b2.RevokeAllForTask("task-R"); err != nil {
+		t.Fatalf("revoke all: %v", err)
+	}
+	if _, err := b2.Validate(tok); err != ErrRevoked {
+		t.Fatalf("pre-restart token must stay revoked after restart+RevokeAllForTask, got %v", err)
 	}
 }

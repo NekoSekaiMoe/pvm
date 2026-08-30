@@ -111,13 +111,15 @@ func (b *Broker) PersistRevocations(path string) error {
 	} else if err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("identity: read revocations: %w", err)
 	}
-	b.persistRevLocked()
+	if err := b.persistRevLocked(); err != nil {
+		return fmt.Errorf("identity: persist revocations: %w", err)
+	}
 	return nil
 }
 
-func (b *Broker) persistRevLocked() {
+func (b *Broker) persistRevLocked() error {
 	if b.revPath == "" {
-		return
+		return nil
 	}
 	rf := revocationFile{SavedAt: time.Now().UTC()}
 	for id := range b.revoked {
@@ -127,10 +129,12 @@ func (b *Broker) persistRevLocked() {
 		rf.Tasks = append(rf.Tasks, t)
 	}
 	if err := fsjson.Write(b.revPath, rf); err != nil {
-		// A failed persist is logged by fsjson callers; keep going — losing
-		// the mirror temporarily must not break the live revocation path.
-		_ = err
+		// Propagate: callers decide whether a revocation without a durable
+		// mirror is acceptable to report as success (it is NOT — a restart
+		// would resurrect the token otherwise).
+		return fmt.Errorf("identity: write revocations %s: %w", b.revPath, err)
 	}
+	return nil
 }
 
 // Refresh rotates a still-valid token: a new token is minted with the same
@@ -153,6 +157,8 @@ func (b *Broker) Refresh(tokStr string, ttl time.Duration) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	b.Revoke(tok.ID)
+	if rerr := b.Revoke(tok.ID); rerr != nil {
+		return "", rerr
+	}
 	return fresh, nil
 }

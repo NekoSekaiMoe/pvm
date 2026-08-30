@@ -16,7 +16,10 @@ go_library(
 
 go_test(
     name = "artifact_test",
-    srcs = ["gate_test.go"],
+    srcs = [
+        "gate_test.go",
+        "verifiers_test.go",
+    ],
     embed = [":artifact"],
     deps = ["//internal/audit"],
 )

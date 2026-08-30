@@ -185,8 +185,10 @@ func (v *TestsRerunVerifier) Verify(b *Bundle) (bool, string) {
 }
 
 var (
-	testRanRe  = regexp.MustCompile(`(?m)(?:go test|pytest|jest|npm test|cargo test|PASS|OK \(|passed|✓)`)
-	testFailRe = regexp.MustCompile(`(?m)(?:FAIL|FAILURE|failed|✗|panic:)`)
+	testRanRe  = regexp.MustCompile(`(?m)(?:go test|pytest|jest|npm test|cargo test|\bPASS\b|OK \(|\bpassed\b|✓)`)
+	// Failure terminal states or a NON-ZERO failure count. A bare "failed"
+	// keyword would reject healthy summaries like "12 passed, 0 failed".
+	testFailRe = regexp.MustCompile(`(?m)(?:\b(?:FAIL|FAILED|FAILURE)\b|\b[1-9][0-9]*\s+(?:failed|failures?)\b|✗|✕|\bpanic:)`)
 )
 
 func scanTestEvidence(s string) (ran bool, fails int) {

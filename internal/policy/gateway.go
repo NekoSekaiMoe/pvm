@@ -17,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 
 	"uml-container/internal/audit"
 )
@@ -57,13 +58,45 @@ type Gateway struct {
 	Executor func(req ToolRequest) (ToolResponse, error)
 
 	// ApprovalCheck closes the approval loop: when an APPROVE-class request
-	// arrives, the gateway asks whether an approved, not-yet-consumed ticket
-	// matches (task, tool, params). If yes, the request executes once and
-	// OnApproved consumes the ticket. nil = approval never auto-clears.
+	// arrives, the gateway asks for a CLAIM on an approved ticket matching
+	// (task, tool, params). The implementation must find, consume AND durably
+	// persist atomically (see approval.Manager.ClaimFor) so one ticket can
+	// never unlock two concurrent executions. A successful claim consumes
+	// the ticket immediately; nil = approval never auto-clears.
 	ApprovalCheck func(req ToolRequest) (ticketID string, approved bool)
-	// OnApproved is invoked after an approval-backed execution attempt to
-	// consume the ticket (one approval == one attempt).
+	// OnApproved is invoked right after a ticket is claimed (before the
+	// execution attempt). It is a notification/metric hook — consumption is
+	// the claim's job, not this callback's.
 	OnApproved func(ticketID string)
+
+	// runtimeMu guards the three hook fields above: /api/exec wires them
+	// lazily while other requests may already be executing through the
+	// gateway, so nil->non-nil transitions still need synchronization (a
+	// plain field write is a data race against Execute's reads).
+	runtimeMu sync.Mutex
+}
+
+// SetRuntimeOnce atomically fills only the STILL-NIL hook fields. Hooks are
+// never replaced once set, so the first caller's wiring wins.
+func (g *Gateway) SetRuntimeOnce(executor func(ToolRequest) (ToolResponse, error), approvalCheck func(ToolRequest) (string, bool), onApproved func(string)) {
+	g.runtimeMu.Lock()
+	defer g.runtimeMu.Unlock()
+	if g.Executor == nil && executor != nil {
+		g.Executor = executor
+	}
+	if g.ApprovalCheck == nil && approvalCheck != nil {
+		g.ApprovalCheck = approvalCheck
+	}
+	if g.OnApproved == nil && onApproved != nil {
+		g.OnApproved = onApproved
+	}
+}
+
+// runtimeHooks returns a consistent snapshot of the hook fields.
+func (g *Gateway) runtimeHooks() (func(ToolRequest) (ToolResponse, error), func(ToolRequest) (string, bool), func(string)) {
+	g.runtimeMu.Lock()
+	defer g.runtimeMu.Unlock()
+	return g.Executor, g.ApprovalCheck, g.OnApproved
 }
 
 // Rule is a compiled ToolRule (from spec.ToolRule).
@@ -148,28 +181,29 @@ func (g *Gateway) Execute(req ToolRequest) (ToolResponse, error) {
 	if err != nil {
 		return ToolResponse{}, err
 	}
+	executor, approvalCheck, onApproved := g.runtimeHooks()
 	switch act {
 	case ActionDeny:
 		g.audit(req, audit.DecisionDeny, "denied by rule: "+rule.Reason)
 		return ToolResponse{OK: false, Reason: "denied: " + rule.Reason}, ErrDenied
 	case ActionApprove:
 		// Approval closure: an approved, unconsumed ticket for exactly this
-		// (task, tool, params) unlocks ONE execution attempt; the ticket is
-		// consumed afterwards regardless of executor outcome (plan.md §10
-		// "Allow once"). Without a matching ticket the request still pauses
-		// behind ErrApprovalRequired.
-		if g.ApprovalCheck != nil {
-			if ticketID, ok := g.ApprovalCheck(req); ok {
-				defer func() {
-					if g.OnApproved != nil {
-						g.OnApproved(ticketID)
-					}
-				}()
+		// (task, tool, params) unlocks ONE execution attempt. The claim (find
+		// + consume + persist, atomically inside the approval manager)
+		// happens BEFORE the executor runs: two concurrent requests cannot
+		// both claim the same ticket, and a crash mid-execution cannot
+		// resurrect it (plan.md §10 "Allow once"). Without a matching ticket
+		// the request still pauses behind ErrApprovalRequired.
+		if approvalCheck != nil {
+			if ticketID, ok := approvalCheck(req); ok {
+				if onApproved != nil {
+					onApproved(ticketID)
+				}
 				g.audit(req, audit.DecisionAllow, "unlocked by approved ticket "+ticketID)
-				if g.Executor == nil {
+				if executor == nil {
 					return ToolResponse{OK: true, Summary: fmt.Sprintf("%s: simulated (no executor), unlocked by ticket %s", req.Name, ticketID)}, nil
 				}
-				resp, err := g.Executor(req)
+				resp, err := executor(req)
 				if err != nil {
 					g.audit(req, audit.DecisionDeny, "executor error (approved): "+err.Error())
 					return ToolResponse{}, err
@@ -181,7 +215,7 @@ func (g *Gateway) Execute(req ToolRequest) (ToolResponse, error) {
 		g.audit(req, audit.DecisionApprove, "approval required: "+rule.Reason)
 		return ToolResponse{OK: false, Reason: "approval required"}, ErrApprovalRequired
 	case ActionAllow, ActionConstrain:
-		if g.Executor == nil {
+		if executor == nil {
 			// dry-run / sandboxed executor not wired: return a structured
 			// acknowledgment so the agent loop can continue.
 			dec := audit.DecisionAllow
@@ -193,7 +227,7 @@ func (g *Gateway) Execute(req ToolRequest) (ToolResponse, error) {
 		}
 		// CONSTRAIN means writes must land inside the task workspace; the
 		// executor is responsible for enforcing that contract.
-		resp, err := g.Executor(req)
+		resp, err := executor(req)
 		if err != nil {
 			g.audit(req, audit.DecisionDeny, "executor error: "+err.Error())
 			return ToolResponse{}, err

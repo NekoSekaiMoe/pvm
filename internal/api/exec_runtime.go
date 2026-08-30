@@ -33,27 +33,25 @@ var (
 )
 
 // ensureGatewayRuntime attaches the executor + approval closure to a gateway
-// registered elsewhere. Idempotent; safe under concurrent requests because
-// Gateway field writes here only ever transition nil -> non-nil.
+// registered elsewhere. Idempotent; concurrency-safe: the field writes go
+// through Gateway.SetRuntimeOnce, which guards nil->non-nil transitions
+// with the gateway's own lock (plain field writes would race Execute).
 func ensureGatewayRuntime(gw *policy.Gateway, taskID string) {
-	if gw.Executor == nil {
-		if sim, consoleFn := executorBackends(taskID); sim != nil {
-			gw.Executor = sim
-		} else if consoleFn != nil {
-			gw.Executor = consoleFn
-		}
+	var executor func(policy.ToolRequest) (policy.ToolResponse, error)
+	if sim, consoleFn := executorBackends(taskID); sim != nil {
+		executor = sim
+	} else if consoleFn != nil {
+		executor = consoleFn
 	}
-	if gw.ApprovalCheck == nil {
-		gw.ApprovalCheck = func(req policy.ToolRequest) (string, bool) {
-			return currentApprovals().ApprovedFor(taskID, req.Name, req.Args)
-		}
+	// ApprovalCheck CLAIMS the ticket atomically (find + consume + persist
+	// under the approval manager's lock) — see policy.Gateway.Execute.
+	claim := func(req policy.ToolRequest) (string, bool) {
+		return currentApprovals().ClaimFor(taskID, req.Name, req.Args)
 	}
-	if gw.OnApproved == nil {
-		gw.OnApproved = func(ticketID string) {
-			currentApprovals().MarkConsumed(ticketID)
-			metricExecApprovals.Inc(taskID)
-		}
+	onApproved := func(ticketID string) {
+		metricExecApprovals.Inc(ticketID)
 	}
+	gw.SetRuntimeOnce(executor, claim, onApproved)
 }
 
 // executorBackends picks the execution backend for a task: the real guest
@@ -92,15 +90,18 @@ func registerExecRuntimeExtras(api *echo.Group) {
 		var req struct {
 			Params map[string]interface{} `json:"params"`
 			Reason string                 `json:"reason"`
-			By     string                 `json:"by"`
 		}
 		if err := c.Bind(&req); err != nil {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
 		}
-		if req.By == "" {
-			req.By, _ = c.Get("actor").(string)
+		// The editor identity is the AUTHENTICATED actor, never a self-reported
+		// JSON field: EditedBy feeds the audit ledger and webhooks, so letting
+		// the request body name the editor would forge audit attribution.
+		actor, _ := c.Get("actor").(string)
+		if actor == "" {
+			return c.JSON(http.StatusUnauthorized, map[string]string{"error": "missing authenticated actor"})
 		}
-		t, err := currentApprovals().Edit(c.Param("id"), req.Params, req.Reason, req.By)
+		t, err := currentApprovals().Edit(c.Param("id"), req.Params, req.Reason, actor)
 		if err != nil {
 			return c.JSON(http.StatusConflict, map[string]string{"error": err.Error()})
 		}

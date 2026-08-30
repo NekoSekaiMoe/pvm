@@ -18,6 +18,7 @@ go_test(
     name = "policy_test",
     srcs = [
         "edge_test.go",
+        "executor_test.go",
         "gateway_test.go",
     ],
     embed = [":policy"],

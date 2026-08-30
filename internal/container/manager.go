@@ -450,19 +450,26 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 	if taskID == "" {
 		return fmt.Errorf("container: no task id (spec.runtime.name empty and no id given)")
 	}
-	// Persist the canonical spec next to the state: the artifact gate, TTL
-	// watchdog and other control planes re-read it (spec.json, atomic write).
-	if dir, derr := state.ContainerDir(taskID); derr == nil {
-		if mkerr := os.MkdirAll(dir, 0o700); mkerr == nil {
-			_ = fsjson.Write(filepath.Join(dir, "spec.json"), s)
-		}
-	}
-	// Defense in depth: validate taskID before it reaches the filesystem. The
-	// caller (agentpvm) already enforces this, but StartTask is a public entry
-	// point and must not trust its input for path-derivation (audit.Open and
-	// state.ContainerDir both join taskID into host paths).
+	// Defense in depth: validate taskID BEFORE it reaches the filesystem
+	// (audit.Open and state.ContainerDir both join taskID into host paths).
+	// The caller (agentpvm) already enforces this, but StartTask is a public
+	// entry point and must not trust its input for path derivation.
 	if !idRegexp.MatchString(taskID) {
 		return fmt.Errorf("container: invalid task id %q (must match %s)", taskID, idRegexp.String())
+	}
+	// Persist the canonical spec next to the state: the artifact gate, TTL
+	// watchdog and other control planes re-read it (spec.json, atomic write).
+	// A task whose spec cannot be persisted must not start — those planes
+	// would silently run in legacy no-spec mode (no TTL, no budget, no gate).
+	specDir, derr := state.ContainerDir(taskID)
+	if derr != nil {
+		return fmt.Errorf("container: resolve task dir: %w", derr)
+	}
+	if mkerr := os.MkdirAll(specDir, 0o700); mkerr != nil {
+		return fmt.Errorf("container: create task dir: %w", mkerr)
+	}
+	if werr := fsjson.Write(filepath.Join(specDir, "spec.json"), s); werr != nil {
+		return fmt.Errorf("container: persist task spec: %w", werr)
 	}
 	// Full spec validation BEFORE any resource is touched (plan.md §3):
 	// the per-field checks below (mount paths, validateRootfs, TAP charset in
@@ -1374,13 +1381,32 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 		ctx = context.WithValue(ctx, uml.KeyJailEnv, jailEnv)
 	}
 
+	// Console session (non-interactive agent tasks): same binding as the
+	// Boot path. The launcher creates a stdin pipe because logFile != nil,
+	// but without an attached session nothing bridges it — envd SendStdin
+	// finds no session (404) and any guest workload waiting on stdin/EOF
+	// blocks forever. Attach + tee BEFORE Start; SetStdin right after.
+	var consoleSession *console.Session
+	if logFile != nil {
+		consoleSession = console.Default().Attach(taskID)
+		ctx = context.WithValue(ctx, uml.KeyConsoleTee, consoleSession)
+	}
 	pid, p, err := m.Launcher.Start(ctx, s.Kernel.Path, args, logFile)
 	st.PID = pid
 	if err != nil {
+		if consoleSession != nil {
+			console.Default().Detach(taskID)
+		}
 		cleanupVolumes()
 		_ = st.Transition(state.StatusFailed, state.ActorController, "launch failed: "+err.Error())
 		state.SaveState(taskID, st)
 		return err
+	}
+	if consoleSession != nil {
+		consoleSession.SetStdin(p.Stdin)
+		// StartTask blocks until the kernel exits; release the session when
+		// the task is done (mirrors the Boot path's deferred Detach).
+		defer console.Default().Detach(taskID)
 	}
 
 	// Resource limits.

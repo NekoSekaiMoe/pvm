@@ -2,6 +2,8 @@ package approval
 
 import (
 	"errors"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -250,5 +252,45 @@ func TestCreate_DedupNestedParams(t *testing.T) {
 	}
 	if _, err := m.Create(Ticket{TaskID: "t", Tool: "deploy", Params: params}); err != ErrAlreadyPending {
 		t.Errorf("expected ErrAlreadyPending, got %v", err)
+	}
+}
+
+// TestClaimFor_ConcurrentClaimsConsumeOnce is the PR #22 review regression:
+// find+consume+persist must be atomic so concurrent gateway executions can
+// never both unlock on the same approved ticket.
+func TestClaimFor_ConcurrentClaimsConsumeOnce(t *testing.T) {
+	m := NewManager(tmpLedger(t))
+	id, err := m.Create(Ticket{
+		TaskID:   "t-race",
+		Tool:     "push",
+		Params:   map[string]interface{}{"ref": "main"},
+		Deadline: time.Now().Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if err := m.Decide(id, true, "operator"); err != nil {
+		t.Fatalf("decide: %v", err)
+	}
+
+	var (
+		wg      sync.WaitGroup
+		winners int64
+	)
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, ok := m.ClaimFor("t-race", "push", map[string]interface{}{"ref": "main"}); ok {
+				atomic.AddInt64(&winners, 1)
+			}
+		}()
+	}
+	wg.Wait()
+	if winners != 1 {
+		t.Fatalf("exactly one concurrent claim must win, got %d", winners)
+	}
+	if _, ok := m.ApprovedFor("t-race", "push", map[string]interface{}{"ref": "main"}); ok {
+		t.Fatal("claimed ticket must not remain claimable")
 	}
 }

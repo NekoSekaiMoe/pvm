@@ -43,7 +43,10 @@ func registerObservability(e *echo.Echo, apiSecretBytes []byte) {
 	}
 
 	if os.Getenv("PVM_PPROF") == "1" {
-		debug := e.Group("/debug/pprof")
+		// pprof leaks process internals (memory, goroutines, build paths) and
+		// can burn CPU with profile requests: always authenticate, regardless
+		// of PVM_METRICS_NOAUTH (that flag is for /metrics scrapers only).
+		debug := e.Group("/debug/pprof", metricsAuth(apiSecretBytes))
 		wrap := func(h http.HandlerFunc) echo.HandlerFunc {
 			return func(c echo.Context) error {
 				h(c.Response(), c.Request())

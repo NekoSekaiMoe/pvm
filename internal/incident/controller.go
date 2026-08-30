@@ -184,7 +184,9 @@ func (c *Controller) Handle(ctx context.Context, a Anomaly) (Action, error) {
 
 func (c *Controller) applyRevoke(task string) error {
 	if c.broker != nil {
-		c.broker.RevokeAllForTask(task)
+		if _, rerr := c.broker.RevokeAllForTask(task); rerr != nil {
+			return fmt.Errorf("incident: bulk identity revoke for %s may not survive restart: %w", task, rerr)
+		}
 	}
 	if c.hooks.RevokeIdentities != nil {
 		if err := c.hooks.RevokeIdentities(task); err != nil {

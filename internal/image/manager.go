@@ -131,6 +131,11 @@ const DefaultDir = "/var/lib/uml-container/images"
 
 // Pull downloads an image (either Docker or tarball) and extracts it into a new ext4 image
 func Pull(imageRef string) error {
+	// Normalize an explicit scheme away FIRST: go-containerregistry's
+	// name.ParseReference would otherwise treat the "http:" prefix as the
+	// registry host ("http://reg/img" -> registry "http:") and the pull
+	// would fail deep inside the library instead of here with a clean ref.
+	imageRef = strings.TrimPrefix(strings.TrimPrefix(imageRef, "http://"), "https://")
 	// Registry allowlist: refuse references outside the configured set before
 	// any network or disk activity.
 	if !registryAllowed(imageRef) {

@@ -1,8 +1,14 @@
-load("@rules_go//go:def.bzl", "go_library")
+load("@rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
     name = "metrics",
     srcs = ["metrics.go"],
     importpath = "uml-container/internal/metrics",
     visibility = ["//:__subpackages__"],
+)
+
+go_test(
+    name = "metrics_test",
+    srcs = ["metrics_test.go"],
+    embed = [":metrics"],
 )

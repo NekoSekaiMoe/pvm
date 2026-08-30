@@ -15,7 +15,7 @@ info:
     name: Repo license
 externalDocs:
   description: Deployment guide
-  url: https://example.invalid/docs/DEPLOY.md
+  url: https://github.com/NekoSekaiMoe/pvm/blob/main/deploy/README.md
 
 servers:
   - url: http://localhost:8080
@@ -984,7 +984,7 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Snapshot" }
 
-  /api/volumes/{id}/snapshots/{snap}:
+  /api/volumes/{id}/snapshots/{snapId}:
     delete:
       tags: [volumes]
       summary: Delete a volume snapshot
@@ -1109,6 +1109,8 @@ paths:
               schema:
                 type: array
                 items: { type: string }
+
+  /api/egress/{task}/learned/{host}:
     delete:
       tags: [egress]
       summary: Drop one learned domain
@@ -1636,11 +1638,7 @@ paths:
               properties:
                 path: { type: string }
       responses:
-        "200":
-          description: Streamed watch events (5-byte envelope + JSON frames)
-          content:
-            application/json:
-              schema: { $ref: "#/components/responses/OkJson" }
+        "200": { $ref: "#/components/responses/OkJson" }
 
   /files:
     get:

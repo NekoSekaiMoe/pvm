@@ -131,7 +131,9 @@ func (m *Manager) Create(t Ticket) (string, error) {
 	t.ID = id
 	m.tickets[id] = &t
 	cp := t
-	m.persistLocked()
+	if perr := m.persistLocked(); perr != nil {
+		return "", fmt.Errorf("approval: persist ticket: %w", perr)
+	}
 	m.notify("create", cp)
 
 	if m.ledger != nil {
@@ -172,7 +174,9 @@ func (m *Manager) Decide(id string, approved bool, by string) error {
 	t.DecidedBy = by
 	t.DecidedAt = m.now()
 	cp := *t
-	m.persistLocked()
+	if perr := m.persistLocked(); perr != nil {
+		return fmt.Errorf("approval: persist decision: %w", perr)
+	}
 	m.notify("decide", cp)
 
 	if m.ledger != nil {

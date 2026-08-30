@@ -77,11 +77,11 @@ PVM 将 Nuxt 3 前端静态资源直接内嵌至 Go 二进制中，一条命令�
 | `agentpvm run [-config <spec.toml>]` | 启动 TaskSpec 驱动的加固 Agent 沙箱 |
 | `agentpvm webui [--port 3000]` | 启动嵌入式 Nuxt 3 Web 仪表盘与 REST API 服务 |
 | `agentpvm api [-port 8080]` | 启动 E2B 兼容的 REST API 服务端（可选 `PVM_ENVD_ENABLED=1` 同步拉起 envd 兼容面 :49982/:49983） |
-| `agentpvm template watch <id|alias>` | 跟踪模板构建进度（phase + 百分比 + 日志尾部） |
+| `agentpvm template watch <id\|alias>` | 跟踪模板构建进度（phase + 百分比 + 日志尾部） |
 | `agentpvm cow -compact <overlay.qcow2>` | 原位压缩 qcow2 差异盘并释放零簇 |
 | `agentpvm snapshot [export\|import]` | 归档导出或解包还原容器状态 |
 | `umlctl start -name <id> -rootfs <img.img>` | 启动独立轻量 UML 容器 |
-| `umlctl image pull <docker-image|http://reg/img>` | 拉取镜像构建 ext4 底盘（支持私有 HTTP registry，见 `PVM_REGISTRY_INSECURE`） |
+| `umlctl image pull <docker-image\|http://reg/img>` | 拉取镜像构建 ext4 底盘（支持私有 HTTP registry，见 `PVM_REGISTRY_INSECURE`） |
 | `umlctl network create <name>` | 创建网桥（持久化子网分配器自动划分子网） |
 | `umlctl ps` / `umlctl logs <id>` | 查看容器运行状态与控制台日志 |
 

@@ -14,7 +14,7 @@ Contributor guide for **PVM** (`uml-container`), a User-Mode Linux (UML) contain
 - `bpf/` — eBPF C sources (`egress.c`: SSRF IP-floor); compiled into `internal/network/` via `bpf2go`.
 - `uml/agentpvm.toml` — default TaskSpec consumed by `agentpvm run` when no `-config` is given.
 - `webui/` — Nuxt 3 frontend (i18n en/zh + assistant console), embedded into the Go binary via `webui/embed.go`.
-- `deploy/` — systemd units, docker-compose, Dockerfile, one-shot installer (+ `docs/DEPLOY.md`); `Makefile` — dev targets (`test-safe` runs the CI-safe suites); `api/openapi.yaml` — OpenAPI 3.1 spec; `sdk/go/` — official Go SDK.
+- `deploy/` — systemd units, docker-compose, Dockerfile, one-shot installer (`deploy/README.md` is the deployment guide); `api/openapi.yaml` — OpenAPI 3.1 spec (see `api/README.md`); `sdk/go/` — official Go SDK.
 - `scripts/` — kernel build and integration/perf test shell scripts.
 - `tests/` — numbered end-to-end shell suites (`01_test_e2b_api.sh` … `52_test_registry_policy.sh`). Suites `05`–`08`, `10`–`46`, `48`–`52` are CI-safe (no UML kernel/root needed); `47` requires root (bridge setup); `09` additionally requires root + a kernel rebuilt with `CONFIG_MEMCG`/`CONFIG_CGROUP_PIDS` (guest-side limit enforcement); `01`–`04` exercise kernel-adjacent paths.
 - `*_test.go` — Go unit tests colocated with their packages.

@@ -34,6 +34,12 @@ func (m *Manager) EnablePersistence(path string) error {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	// Idempotency guard: a second EnablePersistence would re-append the
+	// same sandboxes and double the rebuilt quota counters, letting one
+	// ready sandbox be claimed twice. One Manager, one store.
+	if m.persistPath != "" {
+		return fmt.Errorf("pool: persistence already enabled (%s); re-enabling would duplicate restored sandboxes", m.persistPath)
+	}
 	m.persistPath = path
 	raw, err := os.ReadFile(path)
 	if err == nil && len(raw) > 0 {

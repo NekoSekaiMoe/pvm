@@ -72,8 +72,13 @@ func sweepDeadlines() {
 			continue
 		}
 
+		// One spec read per task per sweep: both TTL and budget checks below
+		// consume it (loaded only after the deadline check so tasks about to
+		// die skip the disk read entirely).
+		s := loadTaskSpec(st.ID)
+
 		// 2) lifecycle.ttl.
-		if s := loadTaskSpec(st.ID); s != nil && s.Lifecycle.TTL != "" && st.Status == state.StatusRunning {
+		if s != nil && s.Lifecycle.TTL != "" && st.Status == state.StatusRunning {
 			if ttl, perr := time.ParseDuration(s.Lifecycle.TTL); perr == nil && ttl > 0 {
 				start := st.StartedAt
 				if !start.IsZero() && now.After(start.Add(ttl)) {
@@ -84,7 +89,7 @@ func sweepDeadlines() {
 		}
 
 		// 3) budget.max_network_mb (upload direction, gateway-accounted).
-		if s := loadTaskSpec(st.ID); s != nil && s.Budget.MaxNetworkMB > 0 && st.Status == state.StatusRunning {
+		if s != nil && s.Budget.MaxNetworkMB > 0 && st.Status == state.StatusRunning {
 			if g := egressFor(st.ID); g != nil {
 				limit := int64(s.Budget.MaxNetworkMB) * 1024 * 1024
 				if used := g.BytesUsed(st.ID); used > limit && !budgetFlagExists(st.ID) {
@@ -119,7 +124,12 @@ func killTask(taskID string, pid int, reason string) {
 			Decision: audit.DecisionBlock,
 			Reason:   "deadline enforced",
 		})
+		// The task is gone: stop re-verifying its ledger every sweep and drop
+		// its per-task metric series so neither grows with task churn.
+		l.Close()
 	}
+	metricTokensMinted.Delete(taskID)
+	metricTokensRevoked.Delete(taskID)
 	log.Printf("watchdog: task %s killed (%s)", taskID, reason)
 }
 
@@ -141,18 +151,22 @@ func writeBudgetFlag(taskID string, used, limit int64) {
 		[]byte(strconv.FormatInt(used, 10)+"/"+strconv.FormatInt(limit, 10)), 0o600)
 }
 
-// taskMetricsView backs GET /api/tasks/:id/metrics.
+// taskMetricsView backs GET /api/tasks/:id/metrics. Field names follow the
+// OpenAPI contract (net_tx_bytes / net_rx_bytes / egress_denied_total).
 func taskMetricsView(taskID string) map[string]interface{} {
 	out := map[string]interface{}{
-		"task":             taskID,
-		"net_tx_bytes":     int64(0),
-		"egress_denied":    int64(0),
-		"budget_net_limit": nil,
-		"deadline":         nil,
-		"ttl":              nil,
+		"task":                taskID,
+		"net_tx_bytes":        int64(0),
+		"net_rx_bytes":        int64(0),
+		"egress_denied_total": int64(0),
+		"budget_net_limit":    nil,
+		"deadline":            nil,
+		"ttl":                 nil,
 	}
 	if g := egressFor(taskID); g != nil {
 		out["net_tx_bytes"] = g.BytesUsed(taskID)
+		out["net_rx_bytes"] = g.BytesRx(taskID)
+		out["egress_denied_total"] = g.BytesDenied(taskID)
 	}
 	if st, err := state.LoadState(taskID); err == nil && st != nil && !st.Deadline.IsZero() {
 		out["deadline"] = st.Deadline.Format(time.RFC3339)

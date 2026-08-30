@@ -43,6 +43,7 @@ go_test(
         "dns_egress_test.go",
         "e2b_compat_test.go",
         "e2b_server_test.go",
+        "envd_test.go",
         "secret_required_test.go",
         "snapshot_clone_rollback_test.go",
         "volumes_test.go",

@@ -1,7 +1,10 @@
 package sdk
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -9,6 +12,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -46,7 +50,10 @@ func newTestServer(t *testing.T, h http.HandlerFunc) (*Client, func() []reqRecor
 		h(w, r)
 	}))
 	t.Cleanup(ts.Close)
-	c := NewClient(Config{APIURL: ts.URL + "/", APIKey: "test-key"})
+	c, err := NewClient(Config{APIURL: ts.URL + "/", APIKey: "test-key"})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
 	t.Cleanup(func() { c.Close() })
 	snapshot := func() []reqRecord {
 		mu.Lock()
@@ -134,7 +141,10 @@ func TestNewClient_TimeoutDefaults(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			c := NewClient(Config{Timeout: tt.timeout})
+			c, err := NewClient(Config{Timeout: tt.timeout})
+			if err != nil {
+				t.Fatalf("NewClient: %v", err)
+			}
 			defer c.Close()
 			if got := c.http.Timeout; got != tt.want {
 				t.Fatalf("client timeout = %v, want %v", got, tt.want)
@@ -248,7 +258,10 @@ func TestClient_NoAuthHeaderWhenNoKey(t *testing.T) {
 		writeJSON(t, w, http.StatusOK, "["+volumeJSON+"]")
 	}))
 	t.Cleanup(ts.Close)
-	c := NewClient(Config{APIURL: ts.URL})
+	c, err := NewClient(Config{APIURL: ts.URL})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
 	t.Cleanup(func() { c.Close() })
 	if _, err := c.ListVolumes(context.Background()); err != nil {
 		t.Fatalf("ListVolumes: %v", err)
@@ -377,11 +390,14 @@ func TestClient_TimeoutApplied(t *testing.T) {
 		<-release
 	}))
 	t.Cleanup(func() { close(release); ts.Close() })
-	c := NewClient(Config{APIURL: ts.URL, Timeout: 10 * time.Millisecond})
+	c, err := NewClient(Config{APIURL: ts.URL, Timeout: 10 * time.Millisecond})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
 	t.Cleanup(func() { c.Close() })
 
 	start := time.Now()
-	_, err := c.ListVolumes(context.Background())
+	_, err = c.ListVolumes(context.Background())
 	if err == nil {
 		t.Fatalf("expected timeout error, got nil")
 	}
@@ -395,8 +411,294 @@ func TestClient_TimeoutApplied(t *testing.T) {
 }
 
 func TestClient_Close(t *testing.T) {
-	c := NewClient(Config{})
+	c, err := NewClient(Config{})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
 	if err := c.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
+	}
+}
+
+// TestNewClient_SchemePolicy pins the transport policy: plaintext http is
+// only accepted for loopback hosts (localhost, 127.0.0.0/8, ::1); anything
+// else must be https so Bearer credentials never cross in cleartext.
+func TestNewClient_SchemePolicy(t *testing.T) {
+	tests := []struct {
+		name    string
+		apiURL  string
+		wantErr string
+	}{
+		{"http loopback ok", "http://127.0.0.1:3000", ""},
+		{"http any 127/8 ok", "http://127.200.1.1:9", ""},
+		{"http localhost ok", "http://localhost:3000", ""},
+		{"http ipv6 loopback ok", "http://[::1]:3000", ""},
+		{"empty defaults to loopback http ok", "", ""},
+		{"https remote ok", "https://pvm.example.com", ""},
+		{
+			"http remote rejected", "http://pvm.example.com:8080",
+			`refusing plaintext http to non-loopback host "pvm.example.com"`,
+		},
+		{"http private ip rejected", "http://10.0.0.5:3000", "refusing plaintext http"},
+		{"ftp scheme rejected", "ftp://pvm.example.com", "unsupported API URL scheme"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c, err := NewClient(Config{APIURL: tt.apiURL})
+			if c != nil {
+				defer c.Close()
+			}
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("NewClient(%q) = %v, want nil error", tt.apiURL, err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("NewClient(%q) error = %v, want containing %q", tt.apiURL, err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// TestClient_RedirectNoPlaintextDowngrade verifies CheckRedirect: a redirect
+// from an allowed origin to a non-loopback http target aborts the chain,
+// while redirects that stay on loopback http are followed normally.
+func TestClient_RedirectNoPlaintextDowngrade(t *testing.T) {
+	t.Run("downgrade to non-loopback http blocked", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, "http://pvm.example.com:9/api/volumes", http.StatusFound)
+		}))
+		t.Cleanup(ts.Close)
+		c, err := NewClient(Config{APIURL: ts.URL, APIKey: "k"})
+		if err != nil {
+			t.Fatalf("NewClient: %v", err)
+		}
+		t.Cleanup(func() { c.Close() })
+		_, err = c.ListVolumes(context.Background())
+		if err == nil || !strings.Contains(err.Error(), "refusing plaintext http") {
+			t.Fatalf("ListVolumes error = %v, want redirect downgrade to be blocked", err)
+		}
+	})
+
+	t.Run("loopback to loopback redirect followed", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/api/volumes":
+				http.Redirect(w, r, "/api/volumes-2", http.StatusFound)
+			case "/api/volumes-2":
+				writeJSON(t, w, http.StatusOK, "["+volumeJSON+"]")
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		t.Cleanup(ts.Close)
+		c, err := NewClient(Config{APIURL: ts.URL})
+		if err != nil {
+			t.Fatalf("NewClient: %v", err)
+		}
+		t.Cleanup(func() { c.Close() })
+		got, err := c.ListVolumes(context.Background())
+		if err != nil {
+			t.Fatalf("ListVolumes: %v", err)
+		}
+		if len(got) != 1 || got[0].VolumeID != "vol-1" {
+			t.Fatalf("unexpected list after redirect: %+v", got)
+		}
+	})
+}
+
+// TestCreateSandbox_TimeoutValidation covers the three-value timeout
+// semantics: values below the NeverTimeout (-1) sentinel are rejected before
+// any query string is written; -1, 0 and positive values pass through.
+func TestCreateSandbox_TimeoutValidation(t *testing.T) {
+	tests := []struct {
+		name      string
+		timeout   int
+		wantErr   string
+		wantQuery string
+	}{
+		{"below sentinel rejected", -2, "-2 is invalid", ""},
+		{"far below sentinel rejected", -100, "-100 is invalid", ""},
+		{"never timeout sentinel ok", NeverTimeout, "", "-1"},
+		{"positive ttl ok", 300, "", "300"},
+		{"zero means server default", 0, "", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var hit int32
+			var gotQuery string
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				atomic.StoreInt32(&hit, 1)
+				gotQuery = r.URL.Query().Get("timeout")
+				writeJSON(t, w, http.StatusOK, `{"sandboxID":"sbx-1","templateID":"tpl-1"}`)
+			}))
+			t.Cleanup(ts.Close)
+			c, err := NewClient(Config{APIURL: ts.URL})
+			if err != nil {
+				t.Fatalf("NewClient: %v", err)
+			}
+			t.Cleanup(func() { c.Close() })
+
+			_, err = c.CreateSandbox(context.Background(), CreateSandboxOptions{Template: "tpl-1", TimeoutSeconds: tt.timeout})
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("CreateSandbox(timeout=%d) error = %v, want containing %q", tt.timeout, err, tt.wantErr)
+				}
+				if atomic.LoadInt32(&hit) != 0 {
+					t.Fatalf("rejected timeout must not reach the server")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("CreateSandbox(timeout=%d): %v", tt.timeout, err)
+			}
+			if gotQuery != tt.wantQuery {
+				t.Fatalf("timeout query = %q, want %q", gotQuery, tt.wantQuery)
+			}
+		})
+	}
+}
+
+// TestWaitForTemplateReady_TimeoutBoundsPolls verifies the wait timeout is
+// threaded into every poll request: a hanging endpoint cannot stretch the
+// wait past the deadline anymore.
+func TestWaitForTemplateReady_TimeoutBoundsPolls(t *testing.T) {
+	release := make(chan struct{})
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-release
+	}))
+	t.Cleanup(func() { close(release); ts.Close() })
+	c, err := NewClient(Config{APIURL: ts.URL})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	t.Cleanup(func() { c.Close() })
+
+	start := time.Now()
+	_, err = c.WaitForTemplateReady(context.Background(), "tpl-1", 50*time.Millisecond)
+	if err == nil {
+		t.Fatal("expected timeout error, got nil")
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("timeout not applied to in-flight request: took %v", elapsed)
+	}
+}
+
+// TestWaitForTemplateReady_PollsUntilDone covers the happy path: non-terminal
+// phases keep polling (300ms gap) until a terminal phase arrives.
+func TestWaitForTemplateReady_PollsUntilDone(t *testing.T) {
+	var polls atomic.Int32
+	c, recs := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if n := polls.Add(1); n < 2 {
+			writeJSON(t, w, http.StatusOK, `{"phase":"building","pct":10,"log_tail":"tick"}`)
+			return
+		}
+		writeJSON(t, w, http.StatusOK, `{"phase":"done","pct":100,"log_tail":""}`)
+	})
+	st, err := c.WaitForTemplateReady(context.Background(), "tpl-1", 10*time.Second)
+	if err != nil {
+		t.Fatalf("WaitForTemplateReady: %v", err)
+	}
+	if st.Phase != "done" || st.Pct != 100 {
+		t.Fatalf("unexpected status: %+v", st)
+	}
+	if got := polls.Load(); got != 2 {
+		t.Fatalf("polls = %d, want 2", got)
+	}
+	if rs := recs(); len(rs) != 2 || rs[0].path != "/api/templates/tpl-1/build" {
+		t.Fatalf("requests = %+v, want two GET /api/templates/tpl-1/build", rs)
+	}
+}
+
+// newEnvdTestServer spins up an httptest server and wraps it in an EnvdClient
+// pointed at it (base set directly so the test server's port is honored).
+func newEnvdTestServer(t *testing.T, h http.HandlerFunc) *EnvdClient {
+	t.Helper()
+	ts := httptest.NewServer(h)
+	t.Cleanup(ts.Close)
+	return &EnvdClient{base: ts.URL, task: "task-1", http: &http.Client{Timeout: 60 * time.Second}, user: "root"}
+}
+
+// TestNewEnvdClient_SchemeSelection pins the envd transport policy: loopback
+// hosts speak plain http (envd convention), everything else https.
+func TestNewEnvdClient_SchemeSelection(t *testing.T) {
+	tests := []struct {
+		name string
+		host string
+		want string
+	}{
+		{"empty defaults to loopback http", "", "http://127.0.0.1:49983"},
+		{"loopback ipv4 http", "127.0.0.1", "http://127.0.0.1:49983"},
+		{"any 127/8 http", "127.200.1.1", "http://127.200.1.1:49983"},
+		{"localhost http", "localhost", "http://localhost:49983"},
+		{"ipv6 loopback http", "[::1]", "http://[::1]:49983"},
+		{"remote host https", "sandbox.example.com", "https://sandbox.example.com:49983"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := NewEnvdClient(tt.host, "task-1").base; got != tt.want {
+				t.Fatalf("NewEnvdClient(%q).base = %q, want %q", tt.host, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestEnvdClient_WriteFileStatus verifies >= 400 responses surface as errors
+// carrying the path and status code (previously silently returned nil).
+func TestEnvdClient_WriteFileStatus(t *testing.T) {
+	tests := []struct {
+		name    string
+		status  int
+		wantErr string
+	}{
+		{"created ok", http.StatusOK, ""},
+		{"bad request surfaced", http.StatusBadRequest, "envd: write /tmp/f -> 400"},
+		{"server error surfaced", http.StatusInternalServerError, "envd: write /tmp/f -> 500"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			e := newEnvdTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(tt.status)
+			})
+			err := e.WriteFile(context.Background(), "/tmp/f", []byte("data"))
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("WriteFile: %v", err)
+				}
+				return
+			}
+			if err == nil || err.Error() != tt.wantErr {
+				t.Fatalf("WriteFile error = %v, want %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// TestEnvdClient_RunOutputCap streams 5x16 MiB stdout events (80 MiB total)
+// through a fake envd server: Run must abort once the accumulated
+// stdout+stderr exceeds maxRunOutputBytes instead of buffering unbounded.
+func TestEnvdClient_RunOutputCap(t *testing.T) {
+	const chunk = 16 << 20 // 16 MiB raw -> ~21 MiB base64, under the 32 MiB frame cap
+	e := newEnvdTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/connect+json")
+		b64 := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte("a"), chunk))
+		for i := 0; i < 5; i++ { // 5 * 16 MiB = 80 MiB > 64 MiB cap
+			payload, _ := json.Marshal(map[string]any{
+				"event": map[string]any{"data": map[string]string{"stdout": b64}},
+			})
+			_, _ = w.Write(EncodeEnvelope(payload, 0))
+		}
+		end, _ := json.Marshal(map[string]any{})
+		_, _ = w.Write(EncodeEnvelope(end, ConnectEndStreamFlag))
+	})
+	_, err := e.Run(context.Background(), "cat /dev/zero", nil)
+	if err == nil {
+		t.Fatal("Run: expected output-limit error, got nil")
+	}
+	for _, want := range []string{"run output exceeded limit", "83886080", fmt.Sprint(maxRunOutputBytes)} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("Run error = %q, want containing %q", err.Error(), want)
+		}
 	}
 }
