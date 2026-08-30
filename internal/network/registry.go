@@ -1,7 +1,9 @@
 package network
 
 // registry.go is the persistent network registry (bucket-2 "IPAM 硬编码
-// 子网"): every `umlctl network create` allocates the next free /24 from
+// 子网"): `umlctl network create` prefers the historical default
+// 10.0.0.0/24 (gateway 10.0.0.1, baked into existing guest images) and
+// only draws the next free /24 from the pool when that subnet is taken —
 // the configured pool (PVM_NETWORK_POOL, default 10.64.0.0/12), skipping
 // subnets that overlap the host's own interfaces, and records the mapping
 // durably so a restart never hands the same subnet to two bridges.
@@ -84,6 +86,44 @@ func (r *NetworkRegistry) persistLocked() {
 func (r *NetworkRegistry) Allocate(name string) (string, error) {
 	r.mu <- struct{}{}
 	defer func() { <-r.mu }()
+	return r.allocateLocked(name)
+}
+
+// AllocatePreferred reserves want for name when it is free (or already
+// recorded under the same name); when want is nil, or another registered
+// network or the host already occupies it, allocation falls back to the
+// pool scan exactly like Allocate. This keeps the historical default
+// (10.0.0.0/24, gateway 10.0.0.1 — baked into existing guest images and
+// test fixtures) stable for the first bridge, while still preventing
+// collisions across multiple bridges.
+func (r *NetworkRegistry) AllocatePreferred(name string, want *net.IPNet) (string, error) {
+	r.mu <- struct{}{}
+	defer func() { <-r.mu }()
+	if rec, ok := r.nets[name]; ok {
+		return rec.Subnet, nil
+	}
+	if want != nil {
+		free := true
+		for _, t := range r.takenSubnetsLocked() {
+			if t.Contains(want.IP) || want.Contains(t.IP) {
+				free = false
+				break
+			}
+		}
+		if free {
+			gw := make(net.IP, 4)
+			copy(gw, want.IP.To4())
+			gw[3] = 1
+			gwCIDR := fmt.Sprintf("%s/24", gw)
+			r.nets[name] = NetworkRecord{Name: name, Subnet: gwCIDR, CreatedAt: time.Now().UTC()}
+			r.persistLocked()
+			return gwCIDR, nil
+		}
+	}
+	return r.allocateLocked(name)
+}
+
+func (r *NetworkRegistry) allocateLocked(name string) (string, error) {
 	if rec, ok := r.nets[name]; ok {
 		return rec.Subnet, nil
 	}
