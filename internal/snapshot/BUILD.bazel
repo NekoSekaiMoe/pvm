@@ -17,6 +17,7 @@ go_library(
         "//internal/cow",
         "//internal/state",
         "//internal/tarutil",
+        "@org_golang_x_sys//unix",
     ],
 )
 
@@ -26,6 +27,7 @@ go_test(
         "clone_refs_test.go",
         "clone_rollback_test.go",
         "event_snapshot_test.go",
+        "event_test.go",
         "rollback_guard_test.go",
         "rollback_specfp_test.go",
         "tar_archive_links_test.go",
@@ -35,5 +37,6 @@ go_test(
     deps = [
         "//internal/cow",
         "//internal/state",
+        "@org_golang_x_sys//unix",
     ],
 )
