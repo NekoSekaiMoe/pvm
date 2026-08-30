@@ -13,7 +13,10 @@ if [ "$(id -u)" != "0" ]; then
 fi
 
 TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
+# The created bridges outlive the process: remove BOTH networks on exit so
+# reruns and later privileged suites do not inherit regnet-b (the trap's
+# rm -rf only clears the temp state dir, not the host network resources).
+trap 'rm -f "$TMP/umlctl" 2>/dev/null; "$TMP/umlctl" network rm regnet-a &>/dev/null || true; "$TMP/umlctl" network rm regnet-b &>/dev/null || true; rm -rf "$TMP"' EXIT
 
 export PVM_STATE_ROOT="$TMP/state"
 mkdir -p "$PVM_STATE_ROOT"

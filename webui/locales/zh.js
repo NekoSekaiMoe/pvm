@@ -333,6 +333,7 @@ export default {
     },
     policy: {
       title: '策略',
+      subtitle: '工具/策略网关规则（plan.md §6）。首条匹配生效；默认追加一条全量拒绝兑底规则。',
       btnView: '查看规则',
       btnRun: '通过 /api/exec 运行'
     },
@@ -358,10 +359,12 @@ export default {
       btnCreateSnap: '创建快照',
       btnCreateVol: '创建',
       deleteTitle: '删除卷',
+      mountedTitle: '已挂载的卷无法删除',
       noSnaps: '该卷暂无快照 — 请先用 📸 快照 操作创建一个。'
     },
     audit: {
       title: '审计',
+      subtitle: '防篡改审计账本（plan.md §14）。记录保存在沙箱之外，代理无法改写自己的历史。',
       btnOpenLedger: '打开账本',
       btnLoadLedger: '加载账本',
       btnVerify: '校验链',

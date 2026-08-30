@@ -1,7 +1,7 @@
 <template>
   <div>
     <h1>{{ t('pages.policy.title') }}</h1>
-    <p class="muted">Tool/Policy Gateway rules (plan.md §6). First match wins; a default-deny catch-all is auto-appended.</p>
+    <p class="muted">{{ t('pages.policy.subtitle') }}</p>
 
     <div class="glass-card">
       <div class="input-group">

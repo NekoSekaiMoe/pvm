@@ -80,7 +80,7 @@ func (c *Client) TaskSnapshots(ctx context.Context, id string) ([]SnapshotInfo, 
 
 // CreateTaskSnapshot captures an event-level snapshot.
 func (c *Client) CreateTaskSnapshot(ctx context.Context, id, eventID string) (*SnapshotInfo, error) {
-	body := map[string]string{"event": eventID}
+	body := map[string]string{"event_id": eventID}
 	var out SnapshotInfo
 	if err := c.doJSON(ctx, http.MethodPost, "/api/tasks/"+url.PathEscape(id)+"/snapshots", body, &out); err != nil {
 		return nil, err
@@ -99,7 +99,7 @@ func (c *Client) CloneTask(ctx context.Context, id, snapshotID, newID string) er
 
 // RollbackTask restores a task to a snapshot (spec-fingerprint guarded).
 func (c *Client) RollbackTask(ctx context.Context, id, snapshotID string) error {
-	body := map[string]string{"snapshot": snapshotID}
+	body := map[string]string{"snapshot_id": snapshotID}
 	return c.doJSON(ctx, http.MethodPost, "/api/tasks/"+url.PathEscape(id)+"/rollback", body, nil)
 }
 

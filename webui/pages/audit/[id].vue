@@ -1,7 +1,7 @@
 <template>
   <div>
     <h1>{{ t('pages.audit.title') }}</h1>
-    <p class="muted">Tamper-evident ledger (plan.md §14). Records live outside the sandbox; the agent cannot rewrite its own history.</p>
+    <p class="muted">{{ t('pages.audit.subtitle') }}</p>
 
     <div class="glass-card">
       <div class="input-group">

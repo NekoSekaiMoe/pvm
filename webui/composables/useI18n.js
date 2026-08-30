@@ -13,9 +13,12 @@ const dicts = { en, zh }
 const STORAGE_KEY = 'pvm.locale'
 
 const locale = ref('en')
-if (typeof localStorage !== 'undefined') {
+try {
   const saved = localStorage.getItem(STORAGE_KEY)
   if (saved && dicts[saved]) locale.value = saved
+} catch {
+  // Restricted storage policy or opaque origin (SecurityError): keep the
+  // in-memory default instead of breaking module init.
 }
 
 // Dot-path lookup; returns undefined unless the leaf is a string.
@@ -48,7 +51,7 @@ export function useI18n() {
   const setLocale = (l) => {
     if (!dicts[l]) return
     locale.value = l
-    if (typeof localStorage !== 'undefined') localStorage.setItem(STORAGE_KEY, l)
+    try { localStorage.setItem(STORAGE_KEY, l) } catch { /* storage unavailable */ }
   }
 
   const toggleLocale = () => setLocale(locale.value === 'en' ? 'zh' : 'en')

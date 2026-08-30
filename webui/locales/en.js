@@ -333,6 +333,7 @@ export default {
     },
     policy: {
       title: 'Policy',
+      subtitle: 'Tool/Policy Gateway rules (plan.md §6). First match wins; a default-deny catch-all is auto-appended.',
       btnView: 'View Rules',
       btnRun: 'Run via /api/exec'
     },
@@ -358,10 +359,12 @@ export default {
       btnCreateSnap: 'Create Snapshot',
       btnCreateVol: 'Create',
       deleteTitle: 'Delete volume',
+      mountedTitle: 'Cannot delete mounted volume',
       noSnaps: 'No snapshots found for this volume — create one with the 📸 Snapshot action first.'
     },
     audit: {
       title: 'Audit',
+      subtitle: 'Tamper-evident ledger (plan.md §14). Records live outside the sandbox; the agent cannot rewrite its own history.',
       btnOpenLedger: 'Open Ledger',
       btnLoadLedger: 'Load Ledger',
       btnVerify: 'Verify Chain',

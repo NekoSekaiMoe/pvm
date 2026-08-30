@@ -295,7 +295,7 @@ func (e *EnvdClient) FSList(ctx context.Context, path string) ([]FileEntry, erro
 	var out struct {
 		Entries []FileEntry `json:"entries"`
 	}
-	if err := e.fsRPC(ctx, "List", map[string]string{"path": path}, &out); err != nil {
+	if err := e.fsRPC(ctx, "ListDir", map[string]string{"path": path}, &out); err != nil {
 		return nil, err
 	}
 	return out.Entries, nil

@@ -173,7 +173,7 @@ func TestEnvdRunCollectsStream(t *testing.T) {
 func TestEnvdFilesystem(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
-		case r.URL.Path == "/filesystem.Filesystem/List":
+		case r.URL.Path == "/filesystem.Filesystem/ListDir":
 			_ = json.NewEncoder(w).Encode(map[string]interface{}{
 				"entries": []FileEntry{{Name: "a.txt", Type: "file", Size: 3}},
 			})

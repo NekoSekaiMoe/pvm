@@ -79,7 +79,7 @@ func TestSparseExt4ImageSavesSpace(t *testing.T) {
 	p := filepath.Join(dir, "sparse.img")
 	const sizeMB = 300
 	if err := filesystem.CreateExt4Image(p, sizeMB); err != nil {
-		t.Skipf("mkfs failed (privileged env?): %v", err)
+		t.Fatalf("CreateExt4Image: %v", err)
 	}
 	fi, err := os.Stat(p)
 	if err != nil {

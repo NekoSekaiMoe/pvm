@@ -147,7 +147,7 @@ import { ref, computed, onUnmounted } from 'vue'
 import { apiFetch, usePoll } from '~/composables/useApi'
 import { useI18n } from '~/composables/useI18n'
 
-const { t } = useI18n()
+const { t, locale } = useI18n()
 
 const templates = ref([])
 const searchQuery = ref('')
@@ -199,7 +199,7 @@ const buildPillClass = computed(() => {
 })
 
 const stopBuildPolling = () => {
-  if (buildTimer) { clearInterval(buildTimer); buildTimer = null }
+  if (buildTimer) { clearTimeout(buildTimer); buildTimer = null }
 }
 
 const startBuildPolling = (id) => {
@@ -208,22 +208,38 @@ const startBuildPolling = (id) => {
   build.value = { phase: 'queued', pct: 0, log_tail: '' }
   buildError.value = ''
   showBuildLog.value = false
-  buildTimer = setInterval(async () => {
-    if (typeof document !== 'undefined' && document.hidden) return
+  let fails = 0
+  // Serial setTimeout chain (not setInterval): the next poll is scheduled
+  // only after the previous request settles, so a slow API never piles up
+  // concurrent requests; repeated failures end the poll instead of hitting
+  // a stuck/removed template every 1.5s forever.
+  const tick = async () => {
+    if (typeof document !== 'undefined' && document.hidden) {
+      buildTimer = setTimeout(tick, 1500)
+      return
+    }
     try {
       const r = await apiFetch(`/api/templates/${encodeURIComponent(id)}/build`)
       build.value = r || {}
       buildError.value = ''
+      fails = 0
       if (buildDone.value || buildFailed.value) {
         stopBuildPolling()
         refresh()
+        return
       }
     } catch (e) {
       // Transient errors surface as a warning line but keep the poll alive;
       // a stuck/removed template ends the poll after repeated failures.
       buildError.value = e.message
+      if (++fails >= 5) {
+        stopBuildPolling()
+        return
+      }
     }
-  }, 1500)
+    buildTimer = setTimeout(tick, 1500)
+  }
+  buildTimer = setTimeout(tick, 1500)
 }
 
 onUnmounted(stopBuildPolling)
@@ -291,7 +307,7 @@ const deleteTemplate = async (id) => {
   }
 }
 
-const fmt = (iso) => iso ? new Date(iso).toLocaleString() : '—'
+const fmt = (iso) => iso ? new Date(iso).toLocaleString(locale.value) : '—'
 </script>
 
 <style scoped>

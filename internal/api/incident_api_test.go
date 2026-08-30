@@ -16,6 +16,12 @@ import (
 func TestIncidentReportAndList(t *testing.T) {
 	t.Setenv("PVM_STATE_ROOT", t.TempDir())
 	t.Setenv("PVM_CGROUP_ROOT", t.TempDir())
+	// RootDir resolves at package init; the env swap above does not move it.
+	// Isolate the global so later tests never rebuild controllers against a
+	// deleted temp dir (currentIncident/CurrentIdentity cache by RootDir).
+	oldRoot := state.RootDir
+	state.RootDir = t.TempDir()
+	t.Cleanup(func() { state.RootDir = oldRoot })
 
 	e := echo.New()
 	api := e.Group("/api", func(next echo.HandlerFunc) echo.HandlerFunc {
@@ -25,7 +31,8 @@ func TestIncidentReportAndList(t *testing.T) {
 
 	// Invalid severity rejected.
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/api/incidents/t-1/report", strings.NewReader(`{"severity":"apocalyptic"}`))
+	req := httptest.NewRequest(http.MethodPost, "/api/incidents/t-1/report",
+		strings.NewReader(`{"severity":"apocalyptic"}`))
 	req.Header.Set("Content-Type", "application/json")
 	e.ServeHTTP(rec, req)
 	if rec.Code != http.StatusBadRequest {
@@ -66,8 +73,11 @@ func TestIncidentReportAndList(t *testing.T) {
 func TestIncidentEgressDenyAll(t *testing.T) {
 	t.Setenv("PVM_STATE_ROOT", t.TempDir())
 	// The env var is only resolved at package init; swap the package var so
-	// CurrentIdentity/currentIncident rebuild against a live directory.
+	// CurrentIdentity/currentIncident rebuild against a live directory,
+	// and restore it so later tests keep a sane global.
+	oldRoot := state.RootDir
 	state.RootDir = t.TempDir()
+	t.Cleanup(func() { state.RootDir = oldRoot })
 	// A registered gateway gets deny-alled by a high-severity incident.
 	g := egress.NewGateway()
 	RegisterEgressGateway("t-egress", g)

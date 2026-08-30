@@ -103,7 +103,10 @@ while True:
         rest += s.recv(4096)
     body += rest[:size]
     rest = rest[size+2:]  # chunk data + CRLF
-# Parse Connect frames until EOS (or response end).
+# Parse Connect frames until EOS (or response end). Track what actually
+# arrived: a stream that ends without stdout/end events must FAIL, not
+# silently pass because the response terminated cleanly.
+seen_stdout = seen_end = seen_eos = False
 while True:
     if len(body) >= 5:
         flags = body[0]
@@ -112,16 +115,21 @@ while True:
             frame_payload = body[5:5+n]
             body = body[5+n:]
             if flags & 0x02:
+                seen_eos = True
                 break
             ev = json.loads(frame_payload)
             if "event" in ev and "data" in ev["event"]:
                 import base64
                 out = base64.b64decode(ev["event"]["data"].get("stdout", "")).decode()
                 if "simulated" in out and "envd-ok" in out:
-                    print("STREAM_OK")
+                    seen_stdout = True
                     continue
             if "event" in ev and "end" in ev["event"]:
                 assert ev["event"]["end"]["exitCode"] == 0, "exit code"
+                seen_end = True
+            # Keep draining buffered frames: falling through would consult
+            # response_done and abandon a still-buffered EOS frame.
+            continue
     if response_done or len(body) == 0:
         if response_done:
             break
@@ -129,6 +137,10 @@ while True:
     if not chunk:
         break
     body += chunk
+assert seen_stdout, "missing stdout event"
+assert seen_end, "missing end event"
+assert seen_eos, "missing EOS frame"
+print("STREAM_OK")
 PYEOF
 
 echo "--- 6. version websocket handshake (49982-equivalent port)"

@@ -62,7 +62,12 @@ func TestBuildPipelineFailsOnMissingRootfsAndEmpty(t *testing.T) {
 
 	// Missing file -> docker-ref class -> Pull fails (nonexistent ref without
 	// network/root). Either way the record must end FAILED, not stuck PENDING.
-	rec := Record{TemplateID: GenerateTemplateID(), ImageRef: "/nonexistent/no-such.img", Status: "PENDING", Kind: "template"}
+	rec := Record{
+		TemplateID: GenerateTemplateID(),
+		ImageRef:   "/nonexistent/no-such.img",
+		Status:     "PENDING",
+		Kind:       "template",
+	}
 	_ = s.Create(rec)
 	if err := b.Start(s, rec.TemplateID); err != nil {
 		t.Fatal(err)
@@ -79,7 +84,12 @@ func TestBuildPipelineFailsOnMissingRootfsAndEmpty(t *testing.T) {
 	// Empty rootfs file -> explicit failure.
 	empty := filepath.Join(root, "empty.img")
 	_ = os.WriteFile(empty, nil, 0o644)
-	rec2 := Record{TemplateID: GenerateTemplateID(), ImageRef: empty, Status: "PENDING", Kind: "template"}
+	rec2 := Record{
+		TemplateID: GenerateTemplateID(),
+		ImageRef:   empty,
+		Status:     "PENDING",
+		Kind:       "template",
+	}
 	_ = s.Create(rec2)
 	if err := b.Start(s, rec2.TemplateID); err != nil {
 		t.Fatal(err)
@@ -102,7 +112,12 @@ func TestBuildOnlyPendingAndNoConcurrent(t *testing.T) {
 		t.Fatal("READY template must refuse to build")
 	}
 
-	rec2 := Record{TemplateID: GenerateTemplateID(), Status: "PENDING", Kind: "template"} // no image_ref
+	// No image_ref at all.
+	rec2 := Record{
+		TemplateID: GenerateTemplateID(),
+		Status:     "PENDING",
+		Kind:       "template",
+	}
 	_ = s.Create(rec2)
 	if err := b.Start(s, rec2.TemplateID); err != nil {
 		t.Fatal(err)

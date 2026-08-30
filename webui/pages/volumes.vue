@@ -48,7 +48,7 @@
                 <button class="btn btn-primary" style="font-size:0.75rem;padding:0.3rem 0.5rem;margin-right:0.3rem;background:var(--accent);" @click="rollbackVolumePrompt(v.volume_id)">
                   {{ t('pages.volumes.btnRollback') }}
                 </button>
-                <button class="btn btn-danger" style="font-size:0.75rem;padding:0.3rem 0.5rem;" @click="deleteVolume(v.volume_id)" :disabled="v.refcount > 0" :title="v.refcount > 0 ? 'Cannot delete mounted volume' : t('pages.volumes.deleteTitle')">
+                <button class="btn btn-danger" style="font-size:0.75rem;padding:0.3rem 0.5rem;" @click="deleteVolume(v.volume_id)" :disabled="v.refcount > 0" :title="v.refcount > 0 ? t('pages.volumes.mountedTitle') : t('pages.volumes.deleteTitle')">
                   {{ t('pages.volumes.btnDelete') }}
                 </button>
               </td>

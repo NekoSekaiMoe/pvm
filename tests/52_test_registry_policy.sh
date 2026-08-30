@@ -20,8 +20,12 @@ fi
 echo "--- 1. allowlisted registry only"
 OUT=$(PVM_REGISTRY_ALLOWLIST="good.example.com" "$TMP/umlctl" image pull "evil.example.com/img:1" 2>&1 || true)
 echo "$OUT" | grep -q "allowlist" || fail "non-allowlisted registry must fail with allowlist error: $OUT"
-# The failure must be the allowlist fast-fail, not a permission error.
-echo "$OUT" | grep -qv "requires root" || true
+# The failure must be the allowlist fast-fail, not a permission error:
+# policy checks run BEFORE the privilege check, so "requires root" here
+# would mean the fast-fail never fired.
+if echo "$OUT" | grep -q "requires root"; then
+    fail "allowlist check must fast-fail before the root check: $OUT"
+fi
 
 echo "--- 2. explicit http:// scheme is honored (fails on network, not policy)"
 OUT=$(PVM_REGISTRY_ALLOWLIST="good.example.com" "$TMP/umlctl" image pull "http://good.example.com/img:1" 2>&1 || true)

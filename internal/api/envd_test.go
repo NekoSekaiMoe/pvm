@@ -248,13 +248,23 @@ func TestEnvdWatchDirEmitsEvents(t *testing.T) {
 		close(done)
 	}()
 
-	// Wait for the watcher to arm, then create a file in the workspace.
-	time.Sleep(700 * time.Millisecond)
+	// Seed uniquely-named probe files across the watch window: envdWatchDir
+	// takes its baseline (prev := snapshot()) when the handler starts, and a
+	// fixed sleep cannot prove that already happened — a file created BEFORE
+	// the baseline lands in the initial state and never emits CHANGED.
+	// Probes span the whole window so some are guaranteed to land after it.
 	ws, err := taskWorkspace(task)
 	if err != nil {
 		t.Fatal(err)
 	}
-	os.WriteFile(ws+"/newfile.txt", []byte("x"), 0o644)
+	for i := 0; i < 10; i++ {
+		os.WriteFile(fmt.Sprintf("%s/probe-%d.txt", ws, i), []byte("x"), 0o644)
+		select {
+		case <-done:
+			i = 10 // stream already ended; stop seeding
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
 	<-done
 
 	out := rec.Body.Bytes()
@@ -265,12 +275,12 @@ func TestEnvdWatchDirEmitsEvents(t *testing.T) {
 		if err != nil {
 			break
 		}
-		if strings.Contains(string(frame), "newfile.txt") {
+		if strings.Contains(string(frame), "CHANGED") && strings.Contains(string(frame), "probe-") {
 			found = true
 		}
 	}
 	if !found {
-		t.Fatalf("watch must emit CHANGED for newfile.txt: %s", out)
+		t.Fatalf("watch must emit CHANGED for a post-baseline probe file: %s", out)
 	}
 }
 

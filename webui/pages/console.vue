@@ -183,7 +183,7 @@ import { ref, computed } from 'vue'
 import { apiFetch, usePoll } from '~/composables/useApi'
 import { useI18n } from '~/composables/useI18n'
 
-const { t } = useI18n()
+const { t, locale } = useI18n()
 
 // --- Task list (left pane) ---
 const tasks = ref([])
@@ -221,11 +221,17 @@ const selectTask = (id) => {
 const metrics = ref(null)
 const metricsErr = ref('')
 usePoll(async () => {
-  if (!selectedId.value) return null
+  const id = selectedId.value
+  if (!id) return null
   try {
-    metrics.value = await apiFetch(`/api/tasks/${encodeURIComponent(selectedId.value)}/metrics`)
+    const r = await apiFetch(`/api/tasks/${encodeURIComponent(id)}/metrics`)
+    // The await can span a task switch: a stale response must not land in
+    // the panel of a different task.
+    if (id !== selectedId.value) return null
+    metrics.value = r
     metricsErr.value = ''
   } catch (e) {
+    if (id !== selectedId.value) return null
     metricsErr.value = e.message
     metrics.value = null
   }
@@ -276,12 +282,15 @@ const runExec = async () => {
 const consoleTail = ref('')
 const tailError = ref('')
 usePoll(async () => {
-  if (!selectedId.value) return null
+  const id = selectedId.value
+  if (!id) return null
   try {
-    const r = await apiFetch(`/api/tasks/${encodeURIComponent(selectedId.value)}/console`)
+    const r = await apiFetch(`/api/tasks/${encodeURIComponent(id)}/console`)
+    if (id !== selectedId.value) return null
     consoleTail.value = (r && r.tail) || ''
     tailError.value = ''
   } catch (e) {
+    if (id !== selectedId.value) return null
     tailError.value = e.message
   }
   return consoleTail.value
@@ -292,11 +301,13 @@ const snapshots = ref([])
 const snapEventId = ref('')
 
 const loadSnapshots = async () => {
-  if (!selectedId.value) return
+  const id = selectedId.value
+  if (!id) return
   try {
-    snapshots.value = (await apiFetch(`/api/tasks/${encodeURIComponent(selectedId.value)}/snapshots`)) || []
+    const r = (await apiFetch(`/api/tasks/${encodeURIComponent(id)}/snapshots`)) || []
+    if (id === selectedId.value) snapshots.value = r
   } catch (e) {
-    snapshots.value = []
+    if (id === selectedId.value) snapshots.value = []
   }
 }
 usePoll(loadSnapshots, 5000)
@@ -408,7 +419,7 @@ const openParent = () => {
   loadFiles()
 }
 
-const fmt = (iso) => iso ? new Date(iso).toLocaleString() : '—'
+const fmt = (iso) => iso ? new Date(iso).toLocaleString(locale.value) : '—'
 </script>
 
 <style scoped>
