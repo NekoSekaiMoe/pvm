@@ -5,8 +5,9 @@ ALPINE_ARCH=$(uname -m)
 
 echo "========== I/O Performance Test (vhost-user-blk: Go + qemu backends) =========="
 
-# Build the agentpvm and umlctl
-go build -o agentpvm cmd/agentpvm/main.go
+# Build the agentpvm and umlctl (package build: cmd/agentpvm is multi-file
+# since the template watch CLI landed in template_cli.go)
+go build -o agentpvm ./cmd/agentpvm
 go build -o bin/umlctl ./cmd/umlctl
 
 if [ ! -f "bin/linux" ]; then

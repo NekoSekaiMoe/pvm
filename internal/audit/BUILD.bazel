@@ -13,6 +13,7 @@ go_library(
         "//internal/fsjson",
         "//internal/metrics",
     ],
+)
 
 go_test(
     name = "audit_test",
