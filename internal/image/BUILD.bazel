@@ -19,7 +19,13 @@ go_library(
 
 go_test(
     name = "image_test",
-    srcs = ["manager_test.go"],
+    srcs = [
+        "insecure_test.go",
+        "manager_test.go",
+    ],
     embed = [":image"],
-    deps = ["//internal/state"],
+    deps = [
+        "//internal/filesystem",
+        "//internal/state",
+    ],
 )

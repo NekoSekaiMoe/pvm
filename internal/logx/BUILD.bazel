@@ -1,8 +1,14 @@
-load("@rules_go//go:def.bzl", "go_library")
+load("@rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
     name = "logx",
     srcs = ["rotate.go"],
     importpath = "uml-container/internal/logx",
     visibility = ["//:__subpackages__"],
+)
+
+go_test(
+    name = "logx_test",
+    srcs = ["rotate_test.go"],
+    embed = [":logx"],
 )

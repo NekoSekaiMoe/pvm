@@ -1,8 +1,14 @@
-load("@rules_go//go:def.bzl", "go_library")
+load("@rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
     name = "console",
     srcs = ["console.go"],
     importpath = "uml-container/internal/console",
     visibility = ["//:__subpackages__"],
+)
+
+go_test(
+    name = "console_test",
+    srcs = ["console_test.go"],
+    embed = [":console"],
 )

@@ -4,6 +4,7 @@ load("@rules_go//go:def.bzl", "go_test")
 go_test(
     name = "securitytest_test",
     srcs = [
+        "attacks_linux_test.go",
         "attacks_test.go",
         "redaction_test.go",
     ],

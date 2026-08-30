@@ -25,6 +25,7 @@ go_test(
     srcs = [
         "clone_refs_test.go",
         "clone_rollback_test.go",
+        "criu_test.go",
         "event_snapshot_test.go",
         "rollback_guard_test.go",
         "rollback_specfp_test.go",

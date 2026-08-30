@@ -1,0 +1,116 @@
+package template
+
+import (
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+)
+
+func TestBuildPipelineRootfsPathClass(t *testing.T) {
+	root := t.TempDir()
+	s := NewStore(root)
+	t.Cleanup(func() { _ = DefaultBuilder().WaitIdle(5 * time.Second) })
+
+	// A real (non-empty) rootfs file.
+	rootfs := filepath.Join(root, "base.img")
+	if err := os.WriteFile(rootfs, make([]byte, 4096), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	rec := Record{TemplateID: GenerateTemplateID(), ImageRef: rootfs, Status: "PENDING", Kind: "template"}
+	if err := s.Create(rec); err != nil {
+		t.Fatal(err)
+	}
+
+	b := DefaultBuilder()
+	if err := b.Start(s, rec.TemplateID); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err := b.Wait(s, rec.TemplateID, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Phase != PhaseDone || st.Pct != 100 {
+		t.Fatalf("expected done/100, got %s/%d (err=%q)", st.Phase, st.Pct, st.Error)
+	}
+
+	got, _ := s.Get(rec.TemplateID)
+	if got.Status != "READY" {
+		t.Fatalf("record must flip READY, got %s", got.Status)
+	}
+	if got.ImagePath != rootfs {
+		t.Fatalf("ImagePath must bind the rootfs, got %q", got.ImagePath)
+	}
+	// Progress + log persisted.
+	dir := filepath.Join(root, rec.TemplateID)
+	if _, err := os.Stat(filepath.Join(dir, "build.json")); err != nil {
+		t.Fatal("build.json must persist")
+	}
+	logRaw, err := os.ReadFile(filepath.Join(dir, "build.log"))
+	if err != nil || len(logRaw) == 0 {
+		t.Fatalf("build.log must persist (err=%v)", err)
+	}
+}
+
+func TestBuildPipelineFailsOnMissingRootfsAndEmpty(t *testing.T) {
+	root := t.TempDir()
+	s := NewStore(root)
+	b := DefaultBuilder()
+	t.Cleanup(func() { _ = b.WaitIdle(30 * time.Second) })
+
+	// Missing file -> docker-ref class -> Pull fails (nonexistent ref without
+	// network/root). Either way the record must end FAILED, not stuck PENDING.
+	rec := Record{TemplateID: GenerateTemplateID(), ImageRef: "/nonexistent/no-such.img", Status: "PENDING", Kind: "template"}
+	_ = s.Create(rec)
+	if err := b.Start(s, rec.TemplateID); err != nil {
+		t.Fatal(err)
+	}
+	st, _ := b.Wait(s, rec.TemplateID, 30*time.Second)
+	if st.Phase != PhaseFailed {
+		t.Fatalf("missing image must fail the build, got %s", st.Phase)
+	}
+	got, _ := s.Get(rec.TemplateID)
+	if got.Status != "FAILED" {
+		t.Fatalf("record must flip FAILED, got %s", got.Status)
+	}
+
+	// Empty rootfs file -> explicit failure.
+	empty := filepath.Join(root, "empty.img")
+	_ = os.WriteFile(empty, nil, 0o644)
+	rec2 := Record{TemplateID: GenerateTemplateID(), ImageRef: empty, Status: "PENDING", Kind: "template"}
+	_ = s.Create(rec2)
+	if err := b.Start(s, rec2.TemplateID); err != nil {
+		t.Fatal(err)
+	}
+	st2, _ := b.Wait(s, rec2.TemplateID, 5*time.Second)
+	if st2.Phase != PhaseFailed {
+		t.Fatalf("empty rootfs must fail, got %s", st2.Phase)
+	}
+}
+
+func TestBuildOnlyPendingAndNoConcurrent(t *testing.T) {
+	root := t.TempDir()
+	s := NewStore(root)
+	b := DefaultBuilder()
+	t.Cleanup(func() { _ = b.WaitIdle(5 * time.Second) })
+
+	rec := Record{TemplateID: GenerateTemplateID(), ImageRef: "whatever", Status: "READY", Kind: "template"}
+	_ = s.Create(rec)
+	if err := b.Start(s, rec.TemplateID); err == nil {
+		t.Fatal("READY template must refuse to build")
+	}
+
+	rec2 := Record{TemplateID: GenerateTemplateID(), Status: "PENDING", Kind: "template"} // no image_ref
+	_ = s.Create(rec2)
+	if err := b.Start(s, rec2.TemplateID); err != nil {
+		t.Fatal(err)
+	}
+	b.mu.Lock()
+	b.running[rec2.TemplateID] = true // simulate in-flight
+	b.mu.Unlock()
+	if err := b.Start(s, rec2.TemplateID); err == nil {
+		t.Fatal("concurrent build for the same template must be rejected")
+	}
+}

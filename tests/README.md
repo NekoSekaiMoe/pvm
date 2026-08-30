@@ -44,6 +44,22 @@ This directory contains shell-based integration and end-to-end (E2E) suites vali
 | `34_test_dns_egress_policy.sh` | No (needs python3) | DNS-learned domain egress policy: PUT `/api/egress/:task/policy` control-plane learner, wire-format DNS learning through the UDP proxy against a fake upstream, non-allowlisted domains not learned, dns:learn/dns:expire audit rows, TTL expiry + sweeper, DELETE learned/:host, per-task isolation, learn_ttl validation |
 | `35_test_tc_ebpf_dataplane.sh` | Partial (leg 3 root) | TC/eBPF dataplane consolidation: StartTask wires per-task eBPF egress itself (bridge-subnet IPAM guest IP as `pvm_ip=`, pinned whitelist map); CI-safe degraded leg (no-root TC attach failure -> audit `security:degraded_warning`) + root-guarded real clsact attach leg |
 | `36_test_e2b_sdk.sh` | No (needs node+npm) | Real official E2B JS SDK (@e2b/sdk) against the `/sandboxes` compatibility surface: X-API-KEY auth, list shape, create/kill error contracts (kernel-free subset; skips gracefully without node/npm) |
+| `37_test_observability.sh` | No | `/healthz` `/version` (unauth shapes), `/metrics` auth-gated Prometheus text + PVM_METRICS_NOAUTH opt-in, pprof off by default |
+| `38_test_identity_api.sh` | No | Credential broker REST: mint scopes/ttl, refresh rotates+revokes, revoke-all, signing key 0600 persistence + token survival across restart |
+| `39_test_approval_lifecycle.sh` | No | Approval tickets: create/dedupe-409, edit pending params, decide+immutability, persistence across restart, webhook create/decide events |
+| `40_test_incident_api.sh` | No | Incident report API: severity validation, severity→action classification (block/pause/quarantine/terminate), incident listing |
+| `41_test_template_pipeline.sh` | No | Template build pipeline: 201+PENDING → done/READY with a rootfs path, image_path binding, build progress persistence, rebuild semantics, alias binding, `template watch` CLI |
+| `42_test_pool_factory.sh` | No | Warm pool with the real state-recorded factory (no phantom ids), pool+quota persistence across restart |
+| `43_test_task_shortid_metrics.sh` | No | `/api/tasks/:id` unique-prefix resolution (ambiguous prefixes 404), per-task metrics view shape |
+| `44_test_watchdog_deadlines.sh` | No | Deadline executor: expired E2B refresh deadlines destroy, future ones don't, lifecycle TTL via persisted spec.json |
+| `45_test_exec_sim_gateway.sh` | No | Tool gateway full loop under PVM_EXEC_SIM: rule registration, allow/deny/approve-202, approval unlocks ONE execution (Allow once), console tail 404 |
+| `46_test_gate_spec_binding.sh` | No | Artifact gate spec binding: declare enforcement, secret blocking vs advisory, strict tests evidence, gate-failure incident sensor, malformed-diff replay failure |
+| `47_test_network_registry.sh` | Yes (root) | Persistent subnet allocator via `umlctl network create/rm`: distinct /24s, idempotency, release |
+| `48_test_envd_compat.sh` | No (needs python3) | envd data plane: healthz, filesystem RPCs, raw `/files` round trip + traversal fencing, process.Start streaming frames (chunked-aware parser), :49982 websocket handshake |
+| `49_test_audit_signing.sh` | No | ed25519-signed ledger: signed appends, key 0600, verify endpoint green, in-place tampering breaks verification |
+| `50_test_go_sdk.sh` | No (needs go toolchain) | Official Go SDK against a live server: health/version, E2B list, template create+wait, exec sentinel, approvals/identity/incidents/pool round trips |
+| `51_test_deploy_artifacts.sh` | No (needs make+node) | Offline deploy-surface lint: shell syntax sweep, compose/openapi YAML parse, systemd hardening contract, Makefile targets, `make deploy-check`, webui i18n parity, openapi route coverage |
+| `52_test_registry_policy.sh` | No | Registry allowlist fast-fail, explicit `http://` scheme honored past the policy gate, wildcard allowlist, insecure-transport unit matrix |
 
 ---
 

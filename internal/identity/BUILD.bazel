@@ -16,7 +16,10 @@ go_library(
 
 go_test(
     name = "identity_test",
-    srcs = ["broker_test.go"],
+    srcs = [
+        "broker_test.go",
+        "persist_test.go",
+    ],
     embed = [":identity"],
     deps = ["//internal/audit"],
 )

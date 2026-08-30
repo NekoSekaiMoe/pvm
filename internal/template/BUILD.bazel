@@ -18,6 +18,9 @@ go_library(
 
 go_test(
     name = "template_test",
-    srcs = ["store_test.go"],
+    srcs = [
+        "build_test.go",
+        "store_test.go",
+    ],
     embed = [":template"],
 )

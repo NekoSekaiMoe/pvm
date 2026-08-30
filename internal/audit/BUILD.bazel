@@ -21,6 +21,7 @@ go_test(
         "edge_test.go",
         "ledger_test.go",
         "redact_test.go",
+        "signing_test.go",
     ],
     embed = [":audit"],
 )

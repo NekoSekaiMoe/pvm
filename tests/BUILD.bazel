@@ -65,4 +65,23 @@ pvm_suites([
     "33_test_audit_redaction.sh",
     "34_test_dns_egress_policy.sh",
     "36_test_e2b_sdk.sh",
+    "37_test_observability.sh",
+    "38_test_identity_api.sh",
+    "39_test_approval_lifecycle.sh",
+    "40_test_incident_api.sh",
+    "41_test_template_pipeline.sh",
+    "42_test_pool_factory.sh",
+    "43_test_task_shortid_metrics.sh",
+    "44_test_watchdog_deadlines.sh",
+    "45_test_exec_sim_gateway.sh",
+    "46_test_gate_spec_binding.sh",
+    "48_test_envd_compat.sh",
+    "49_test_audit_signing.sh",
+    "52_test_registry_policy.sh",
 ])
+
+# NOT bazel-wired from the 37-52 batch: 47 (root bridge leg — ci.yml
+# sudo loop), 50 (drives `go run` against the module source tree), 51
+# (shells out to make + node for deploy-artifact lint). Both run on the
+# ci.yml loop; everything above is self-contained against the prebuilt
+# binaries. 48/49 lean on python3 like 34 (skip without it).

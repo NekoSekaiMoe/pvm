@@ -131,6 +131,7 @@ go_test(
         "ipam_test.go",
         "network_test.go",
         "policy_test.go",
+        "registry_test.go",
     ],
     embed = [":network"],
 )
