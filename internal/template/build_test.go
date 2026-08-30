@@ -60,43 +60,41 @@ func TestBuildPipelineFailsOnMissingRootfsAndEmpty(t *testing.T) {
 	b := DefaultBuilder()
 	t.Cleanup(func() { _ = b.WaitIdle(30 * time.Second) })
 
-	// Missing file -> docker-ref class -> Pull fails (nonexistent ref without
-	// network/root). Either way the record must end FAILED, not stuck PENDING.
-	rec := Record{
-		TemplateID: GenerateTemplateID(),
-		ImageRef:   "/nonexistent/no-such.img",
-		Status:     "PENDING",
-		Kind:       "template",
-	}
-	_ = s.Create(rec)
-	if err := b.Start(s, rec.TemplateID); err != nil {
-		t.Fatal(err)
-	}
-	st, _ := b.Wait(s, rec.TemplateID, 30*time.Second)
-	if st.Phase != PhaseFailed {
-		t.Fatalf("missing image must fail the build, got %s", st.Phase)
-	}
-	got, _ := s.Get(rec.TemplateID)
-	if got.Status != "FAILED" {
-		t.Fatalf("record must flip FAILED, got %s", got.Status)
-	}
-
-	// Empty rootfs file -> explicit failure.
+	// The empty file exists but carries no filesystem (explicit failure);
+	// the missing path doubles as the docker-ref class (pulling a nonexistent
+	// ref fails without network). Either way the build must end FAILED, not
+	// stuck PENDING.
 	empty := filepath.Join(root, "empty.img")
 	_ = os.WriteFile(empty, nil, 0o644)
-	rec2 := Record{
-		TemplateID: GenerateTemplateID(),
-		ImageRef:   empty,
-		Status:     "PENDING",
-		Kind:       "template",
+
+	cases := []struct {
+		name     string
+		imageRef string
+	}{
+		{"missing rootfs file", "/nonexistent/no-such.img"},
+		{"empty rootfs file", empty},
 	}
-	_ = s.Create(rec2)
-	if err := b.Start(s, rec2.TemplateID); err != nil {
-		t.Fatal(err)
-	}
-	st2, _ := b.Wait(s, rec2.TemplateID, 5*time.Second)
-	if st2.Phase != PhaseFailed {
-		t.Fatalf("empty rootfs must fail, got %s", st2.Phase)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := Record{
+				TemplateID: GenerateTemplateID(),
+				ImageRef:   tc.imageRef,
+				Status:     "PENDING",
+				Kind:       "template",
+			}
+			_ = s.Create(rec)
+			if err := b.Start(s, rec.TemplateID); err != nil {
+				t.Fatal(err)
+			}
+			st, _ := b.Wait(s, rec.TemplateID, 30*time.Second)
+			if st.Phase != PhaseFailed {
+				t.Fatalf("build must fail, got phase %s", st.Phase)
+			}
+			got, _ := s.Get(rec.TemplateID)
+			if got.Status != "FAILED" {
+				t.Fatalf("record must flip FAILED, got %s", got.Status)
+			}
+		})
 	}
 }
 

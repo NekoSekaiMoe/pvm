@@ -12,33 +12,40 @@ import (
 )
 
 func TestInsecureEnabledMatrix(t *testing.T) {
-	t.Setenv("PVM_REGISTRY_INSECURE", "")
-	if insecureEnabled("http://reg.local:5000/img:1") != true {
-		t.Fatal("explicit http:// must always enable insecure")
+	cases := []struct {
+		name string
+		env  string // PVM_REGISTRY_INSECURE value
+		ref  string
+		want bool
+	}{
+		{"explicit http scheme is always insecure", "", "http://reg.local:5000/img:1", true},
+		{"no opt-in keeps plain refs secure", "", "reg.local:5000/img:1", false},
+		{"opt-in enables insecure for private host", "1", "reg.local:5000/img:1", true},
+		{"docker.io never goes insecure via env", "1", "alpine:3", false},
 	}
-	if insecureEnabled("reg.local:5000/img:1") != false {
-		t.Fatal("without opt-in, plain ref must stay secure")
-	}
-	t.Setenv("PVM_REGISTRY_INSECURE", "1")
-	if insecureEnabled("reg.local:5000/img:1") != true {
-		t.Fatal("opt-in + private host must enable insecure")
-	}
-	if insecureEnabled("alpine:3") != false {
-		t.Fatal("docker.io must NEVER go insecure via env")
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("PVM_REGISTRY_INSECURE", tc.env)
+			if got := insecureEnabled(tc.ref); got != tc.want {
+				t.Fatalf("insecureEnabled(%q) with env %q = %v, want %v", tc.ref, tc.env, got, tc.want)
+			}
+		})
 	}
 }
 
 func TestRegistryHostPort(t *testing.T) {
-	cases := map[string]string{
-		"http://reg.local:5000/img:1": "reg.local:5000",
-		"reg.local:5000/img:1":        "reg.local:5000",
-		"alpine:3":                    "docker.io",
-		"docker.io/library/alpine:3":  "docker.io",
+	cases := []struct{ ref, want string }{
+		{"http://reg.local:5000/img:1", "reg.local:5000"},
+		{"reg.local:5000/img:1", "reg.local:5000"},
+		{"alpine:3", "docker.io"},
+		{"docker.io/library/alpine:3", "docker.io"},
 	}
-	for ref, want := range cases {
-		if got := registryHostPort(ref); got != want {
-			t.Fatalf("registryHostPort(%q) = %q, want %q", ref, got, want)
-		}
+	for _, tc := range cases {
+		t.Run(tc.ref, func(t *testing.T) {
+			if got := registryHostPort(tc.ref); got != tc.want {
+				t.Fatalf("registryHostPort(%q) = %q, want %q", tc.ref, got, tc.want)
+			}
+		})
 	}
 }
 
