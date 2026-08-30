@@ -4,7 +4,7 @@
 # Usage:
 #   ./deploy/install.sh                 # install into /usr/local/bin + systemd
 #   PREFIX=/opt/pvm ./deploy/install.sh # custom install prefix
-#   ./deploy/install.sh --uninstall     # remove binaries, units, env file
+#   ./deploy/install.sh --uninstall     # remove binaries and units (keeps /etc/pvm/pvm.env and state data)
 #   ./deploy/install.sh --docker        # print docker compose instructions
 #
 # No docker required. All checks are offline.
@@ -114,6 +114,14 @@ do_install() {
 
   mkdir -p "$STATE_ROOT" "$AUDIT_ROOT" "$CGROUP_ROOT" /var/lib/pvm/bin
   chown -R pvm:pvm /var/lib/pvm
+  # custom roots outside /var/lib/pvm need explicit ownership so User=pvm can write
+  local d
+  for d in "$STATE_ROOT" "$AUDIT_ROOT" "$CGROUP_ROOT"; do
+    case "$d" in
+      /var/lib/pvm|/var/lib/pvm/*) ;;
+      *) chown -R pvm:pvm "$d" ;;
+    esac
+  done
   chmod 0700 /var/lib/pvm "$STATE_ROOT" "$AUDIT_ROOT"
 
   if command -v go >/dev/null 2>&1; then
@@ -128,6 +136,20 @@ do_install() {
     log "installing systemd units"
     install -m 0644 "$REPO_ROOT/deploy/systemd/agentpvm-api.service"   "$UNIT_DIR/"
     install -m 0644 "$REPO_ROOT/deploy/systemd/agentpvm-webui.service" "$UNIT_DIR/"
+    # patch ReadWritePaths in the installed copies when custom roots live outside /var/lib/pvm
+    local rwp="/var/lib/pvm"
+    for d in "$STATE_ROOT" "$AUDIT_ROOT" "$CGROUP_ROOT"; do
+      case "$d" in
+        /var/lib/pvm|/var/lib/pvm/*) ;;
+        *) rwp="$rwp $d" ;;
+      esac
+    done
+    if [[ "$rwp" != "/var/lib/pvm" ]]; then
+      for d in "$UNIT_DIR/agentpvm-api.service" "$UNIT_DIR/agentpvm-webui.service"; do
+        sed -i "s|^ReadWritePaths=.*|ReadWritePaths=$rwp|" "$d"
+      done
+      log "patched ReadWritePaths in installed units: $rwp"
+    fi
     systemctl daemon-reload
     systemctl enable agentpvm-api.service agentpvm-webui.service
     log "enabled agentpvm-api.service agentpvm-webui.service (not started — run: systemctl start agentpvm-api agentpvm-webui)"
@@ -178,7 +200,7 @@ install.sh — idempotent bare-metal installer for PVM (agentpvm).
 Usage:
   ./deploy/install.sh                 # install into /usr/local/bin + systemd
   PREFIX=/opt/pvm ./deploy/install.sh # custom install prefix
-  ./deploy/install.sh --uninstall     # remove binaries, units, env file
+  ./deploy/install.sh --uninstall     # remove binaries and units (keeps /etc/pvm/pvm.env and state data)
   ./deploy/install.sh --docker        # print docker compose instructions
   ./deploy/install.sh --help          # show this help
 EOF

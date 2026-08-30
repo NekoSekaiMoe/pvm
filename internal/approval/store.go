@@ -190,16 +190,26 @@ func (m *Manager) ClaimFor(taskID, tool string, params map[string]interface{}) (
 
 // MarkConsumed burns an approved ticket after its one execution attempt.
 // The gateway path uses ClaimFor instead (atomic); this stays for API
-// compatibility and manual burns.
+// compatibility and manual burns, so the signature stays void. Like
+// ClaimFor, the in-memory consume is rolled back when the durable write
+// fails: the persisted file is what a restart replays, so a memory-only
+// consume would make the ticket look burned in-process while remaining
+// claimable after a restart — the same replay hazard ClaimFor refuses.
 func (m *Manager) MarkConsumed(id string) {
 	m.mu.Lock()
+	defer m.mu.Unlock()
+	var touched *Ticket
+	var prev bool
 	if t, ok := m.tickets[id]; ok && t.State == StateApproved {
+		touched, prev = t, t.Consumed
 		t.Consumed = true
 	}
 	if err := m.persistLocked(); err != nil {
+		if touched != nil {
+			touched.Consumed = prev // memory must mirror the file, not run ahead of it
+		}
 		log.Printf("approval: mark-consumed persist failed: %v", err)
 	}
-	m.mu.Unlock()
 }
 
 // ExpirePending flips tickets whose deadline passed to StateExpired and

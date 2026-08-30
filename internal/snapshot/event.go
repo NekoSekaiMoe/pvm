@@ -16,6 +16,8 @@ import (
 
 	"uml-container/internal/cow"
 	"uml-container/internal/state"
+
+	"golang.org/x/sys/unix"
 )
 
 // EventSnapshot represents a point-in-time snapshot linked to a specific event
@@ -99,6 +101,63 @@ func procBootTime() time.Time {
 	return time.Time{}
 }
 
+// pidfdOpen is swappable in tests to force the kill-by-pid fallback path.
+var pidfdOpen = unix.PidfdOpen
+
+// freezeHandle pins the guest process for the freeze/thaw window around a
+// snapshot. Once pidMatchesStart has validated the recorded PID, a pidfd is
+// opened for it: the fd keeps referencing that exact process even if the PID
+// is later reused by an unrelated one, so neither the SIGSTOP nor the late
+// deferred SIGCONT can ever hit a stranger. When pidfd_open is unavailable
+// the handle falls back to signaling the bare PID (legacy behavior).
+type freezeHandle struct {
+	pid   int
+	pidfd int // -1 when pidfd_open failed; signals then use the bare PID
+}
+
+// newFreezeHandle opens a pidfd for pid, or degrades to kill-by-pid.
+func newFreezeHandle(pid int) *freezeHandle {
+	fd, err := pidfdOpen(pid, 0)
+	if err != nil {
+		// Fallback: old kernels without pidfd_open (pre-5.3, ENOSYS) or a
+		// seccomp sandbox blocking the syscall. Keep the legacy
+		// kill-by-bare-PID path so snapshot behavior on such hosts is
+		// unchanged (same TOCTOU exposure as before).
+		return &freezeHandle{pid: pid, pidfd: -1}
+	}
+	return &freezeHandle{pid: pid, pidfd: fd}
+}
+
+// signal sends sig through the pidfd when available, else to the bare PID.
+func (h *freezeHandle) signal(sig unix.Signal) error {
+	if h.pidfd >= 0 {
+		return unix.PidfdSendSignal(h.pidfd, sig, nil, 0)
+	}
+	return syscall.Kill(h.pid, sig)
+}
+
+// stop freezes the pinned process.
+func (h *freezeHandle) stop() error { return h.signal(unix.SIGSTOP) }
+
+// cont thaws the pinned process. Best-effort: if the guest already exited
+// (and was reaped) since the freeze, the signal fails with ESRCH and is
+// ignored — identical to the legacy unchecked syscall.Kill(SIGCONT).
+func (h *freezeHandle) cont() {
+	if h == nil {
+		return
+	}
+	_ = h.signal(unix.SIGCONT)
+}
+
+// close releases the pinned pidfd.
+func (h *freezeHandle) close() {
+	if h == nil || h.pidfd < 0 {
+		return
+	}
+	unix.Close(h.pidfd)
+	h.pidfd = -1
+}
+
 func snapshotsDir(containerID string) (string, error) {
 	dir, err := state.ContainerDir(containerID)
 	if err != nil {
@@ -171,8 +230,13 @@ func CreateEventSnapshot(taskID, eventID, auditHash string, metadata map[string]
 	// this the guest keeps running between the two steps and a MemoryFull
 	// restore would combine an old memory image with newer disk writes.
 	frozen := false
+	var freeze *freezeHandle
 	if dumpMemory {
-		if kerr := syscall.Kill(st.PID, syscall.SIGSTOP); kerr == nil {
+		// Pin the validated PID with a pidfd BEFORE signaling: see
+		// freezeHandle. stop() failing (guest just died) leaves frozen=false
+		// and no thaw is attempted, as before.
+		freeze = newFreezeHandle(st.PID)
+		if kerr := freeze.stop(); kerr == nil {
 			frozen = true
 		}
 	}
@@ -180,8 +244,9 @@ func CreateEventSnapshot(taskID, eventID, auditHash string, metadata map[string]
 	// once the overlay capture finishes.
 	defer func() {
 		if frozen {
-			syscall.Kill(st.PID, syscall.SIGCONT)
+			freeze.cont()
 		}
+		freeze.close()
 	}()
 	if dumpMemory {
 		if err := DumpMemory(st.PID, MemoryImagesDir(targetDir), true); err == nil {
@@ -222,9 +287,10 @@ func CreateEventSnapshot(taskID, eventID, auditHash string, metadata map[string]
 		}
 	}
 	// Both captures (memory + overlay) are complete: thaw the guest.
+	// Clear frozen FIRST so the deferred safety net never double-sends.
 	if frozen {
 		frozen = false
-		syscall.Kill(st.PID, syscall.SIGCONT)
+		freeze.cont()
 	}
 
 	if metadata == nil {

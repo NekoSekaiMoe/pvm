@@ -457,10 +457,19 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 	if !idRegexp.MatchString(taskID) {
 		return fmt.Errorf("container: invalid task id %q (must match %s)", taskID, idRegexp.String())
 	}
-	// Persist the canonical spec next to the state: the artifact gate, TTL
-	// watchdog and other control planes re-read it (spec.json, atomic write).
-	// A task whose spec cannot be persisted must not start — those planes
-	// would silently run in legacy no-spec mode (no TTL, no budget, no gate).
+	// Full spec validation BEFORE any resource is touched (plan.md §3):
+	// the per-field checks below (mount paths, validateRootfs, TAP charset in
+	// buildTaskArgs) are defense in depth, not the gate. A spec that fails
+	// Validate must not even be persisted — no spec.json on disk, no opened
+	// ledgers, no state, no attached volumes.
+	if err := s.Validate(); err != nil {
+		return fmt.Errorf("container: invalid task spec: %w", err)
+	}
+	// Persist the canonical (already validated) spec next to the state: the
+	// artifact gate, TTL watchdog and other control planes re-read it
+	// (spec.json, atomic write). A task whose spec cannot be persisted must
+	// not start — those planes would silently run in legacy no-spec mode
+	// (no TTL, no budget, no gate).
 	specDir, derr := state.ContainerDir(taskID)
 	if derr != nil {
 		return fmt.Errorf("container: resolve task dir: %w", derr)
@@ -470,13 +479,6 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 	}
 	if werr := fsjson.Write(filepath.Join(specDir, "spec.json"), s); werr != nil {
 		return fmt.Errorf("container: persist task spec: %w", werr)
-	}
-	// Full spec validation BEFORE any resource is touched (plan.md §3):
-	// the per-field checks below (mount paths, validateRootfs, TAP charset in
-	// buildTaskArgs) are defense in depth, not the gate. A spec that fails
-	// Validate must not open ledgers, persist state, or attach volumes.
-	if err := s.Validate(); err != nil {
-		return fmt.Errorf("container: invalid task spec: %w", err)
 	}
 	// Hoist the static kernel-command-line validations out of buildTaskArgs
 	// so a hostile spec fails BEFORE provisioning creates anything to clean

@@ -172,10 +172,22 @@ func (v *TestsRerunVerifier) Verify(b *Bundle) (bool, string) {
 	}
 	evidence := b.BuildLog + "\n" + strings.Join(b.Trace, "\n")
 	ran, fails := scanTestEvidence(evidence)
-	if !ran {
-		if v.Strict {
-			return false, "no test evidence and no test command configured (require_tests_passed=true)"
+	if v.Strict {
+		// Strict (spec require_tests_passed): a loose advisory keyword hit
+		// is not enough — prose like "deployment passed" in a build log must
+		// not count as a green test run. A trusted runner terminal state is
+		// required. Note the go test summary line ("ok\tpkg\t0.5s") contains
+		// none of testRanRe's keywords, so Strict consults testDoneRe
+		// directly and never depends on `ran`.
+		if !testDoneRe.MatchString(evidence) {
+			return false, "no trusted test-runner terminal state in evidence (require_tests_passed=true)"
 		}
+		if fails > 0 {
+			return false, fmt.Sprintf("test evidence shows %d failure(s)", fails)
+		}
+		return true, ""
+	}
+	if !ran {
 		return true, "advisory: no test evidence"
 	}
 	if fails > 0 {
@@ -185,7 +197,15 @@ func (v *TestsRerunVerifier) Verify(b *Bundle) (bool, string) {
 }
 
 var (
-	testRanRe  = regexp.MustCompile(`(?m)(?:go test|pytest|jest|npm test|cargo test|\bPASS\b|OK \(|\bpassed\b|✓)`)
+	testRanRe = regexp.MustCompile(`(?m)(?:go test|pytest|jest|npm test|cargo test|\bPASS\b|OK \(|\bpassed\b|✓)`)
+	// testDoneRe matches only TRUSTED test-runner terminal states: the go
+	// test summary ("ok\tpkg\t0.5s") carries none of testRanRe's loose
+	// keywords, while prose like "deployment passed" matches them with no
+	// test having run. Strict mode (require_tests_passed) demands a match
+	// here: go test `^ok\s` / `^--- PASS` / `^PASS$`, digit-led summaries
+	// ("3 passed in 0.01s"), cargo's `test result: ok`, jest's
+	// "Tests: N passed".
+	testDoneRe = regexp.MustCompile(`(?m)(?:^ok\s|^--- PASS|^PASS$|\d+ passed|test result: ok|Tests:\s*\d+ passed)`)
 	// Failure terminal states or a NON-ZERO failure count. A bare "failed"
 	// keyword would reject healthy summaries like "12 passed, 0 failed".
 	testFailRe = regexp.MustCompile(`(?m)(?:\b(?:FAIL|FAILED|FAILURE)\b|\b[1-9][0-9]*\s+(?:failed|failures?)\b|✗|✕|\bpanic:)`)

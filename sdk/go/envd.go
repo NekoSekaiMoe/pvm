@@ -72,7 +72,8 @@ type EnvdClient struct {
 }
 
 // NewEnvdClient builds a client for host (default 127.0.0.1). host may
-// carry a port. Loopback hosts speak plain http (envd convention); anything
+// carry a port; only a port-less host gets DefaultEnvdPort appended.
+// Loopback hosts speak plain http (envd convention); anything
 // else is addressed over https so credentials never cross in cleartext.
 func NewEnvdClient(host string, task string) *EnvdClient {
 	if host == "" {
@@ -83,11 +84,49 @@ func NewEnvdClient(host string, task string) *EnvdClient {
 		scheme = "http"
 	}
 	return &EnvdClient{
-		base: scheme + "://" + host + ":" + fmt.Sprint(DefaultEnvdPort),
+		base: scheme + "://" + withDefaultEnvdPort(host),
 		task: task,
-		http: &http.Client{Timeout: 120 * time.Second},
+		http: &http.Client{
+			Timeout: 120 * time.Second,
+			// Never follow redirects: 307/308 preserve method+body, so a
+			// Location pointing elsewhere (e.g. plain http) would replay
+			// Run's command/envs envelope to an untrusted destination. The
+			// 3xx itself surfaces as an error via do() below.
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
 		user: "root",
 	}
+}
+
+// withDefaultEnvdPort appends DefaultEnvdPort unless host already carries
+// an explicit port. net.SplitHostPort accepts "host:port" and "[v6]:port"
+// (a bracketed literal like "[::1]" reports a missing port, so it gains
+// ":49983" and stays properly bracketed).
+func withDefaultEnvdPort(host string) string {
+	if _, _, err := net.SplitHostPort(host); err == nil {
+		return host // caller-supplied port wins
+	}
+	return host + ":" + fmt.Sprint(DefaultEnvdPort)
+}
+
+// do issues req through the shared client and converts any 3xx response
+// into an explicit error. Redirect following is disabled in NewEnvdClient
+// (CheckRedirect -> ErrUseLastResponse), so without this check a 307/308
+// would leak through to callers as a confusing empty-body decode failure.
+func (e *EnvdClient) do(req *http.Request) (*http.Response, error) {
+	resp, err := e.http.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+		loc := resp.Header.Get("Location")
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+		resp.Body.Close()
+		return nil, fmt.Errorf("envd: unexpected redirect to %s", loc)
+	}
+	return resp, nil
 }
 
 // envdHostname strips an optional port from a host[:port] string.
@@ -141,7 +180,7 @@ func (e *EnvdClient) Run(ctx context.Context, command string, envs map[string]st
 	if e.task != "" {
 		req.Header.Set("X-Task-Id", e.task)
 	}
-	resp, err := e.http.Do(req)
+	resp, err := e.do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -220,7 +259,7 @@ func (e *EnvdClient) fsRPC(ctx context.Context, method string, body any, out any
 	if e.task != "" {
 		req.Header.Set("X-Task-Id", e.task)
 	}
-	resp, err := e.http.Do(req)
+	resp, err := e.do(req)
 	if err != nil {
 		return err
 	}
@@ -284,7 +323,7 @@ func (e *EnvdClient) ReadFile(ctx context.Context, path string) ([]byte, error) 
 	if e.task != "" {
 		req.Header.Set("X-Task-Id", e.task)
 	}
-	resp, err := e.http.Do(req)
+	resp, err := e.do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -305,7 +344,7 @@ func (e *EnvdClient) WriteFile(ctx context.Context, path string, data []byte) er
 	if e.task != "" {
 		req.Header.Set("X-Task-Id", e.task)
 	}
-	resp, err := e.http.Do(req)
+	resp, err := e.do(req)
 	if err != nil {
 		return err
 	}

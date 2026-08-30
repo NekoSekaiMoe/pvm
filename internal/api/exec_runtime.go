@@ -48,8 +48,10 @@ func ensureGatewayRuntime(gw *policy.Gateway, taskID string) {
 	claim := func(req policy.ToolRequest) (string, bool) {
 		return currentApprovals().ClaimFor(taskID, req.Name, req.Args)
 	}
-	onApproved := func(ticketID string) {
-		metricExecApprovals.Inc(ticketID)
+	onApproved := func(string) {
+		// The counter's only label is "task": credit the unlock to the task
+		// the gateway executes for, not to the (label-less) ticket id.
+		metricExecApprovals.Inc(taskID)
 	}
 	gw.SetRuntimeOnce(executor, claim, onApproved)
 }

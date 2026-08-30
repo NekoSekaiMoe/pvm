@@ -7,14 +7,14 @@ import (
 func TestApprovalClosureUnlocksOnce(t *testing.T) {
 	var consumed []string
 	g := NewGateway([]Rule{{Name: "deploy", Action: ActionApprove, Effect: "prod"}}, nil)
-	g.ApprovalCheck = func(req ToolRequest) (string, bool) {
+	g.approvalCheck = func(req ToolRequest) (string, bool) {
 		if req.Args["env"] == "prod" {
 			return "tkt-1", true
 		}
 		return "", false
 	}
-	g.OnApproved = func(id string) { consumed = append(consumed, id) }
-	g.Executor = SimExecutor()
+	g.onApproved = func(id string) { consumed = append(consumed, id) }
+	g.executor = SimExecutor()
 
 	req := ToolRequest{Name: "deploy", Effect: "prod", Args: map[string]interface{}{"env": "prod"}}
 	resp, err := g.Execute(req)
@@ -35,7 +35,7 @@ func TestApprovalClosureUnlocksOnce(t *testing.T) {
 
 func TestSimExecutorMarksSimulated(t *testing.T) {
 	g := NewGateway([]Rule{{Name: "read", Action: ActionAllow, Effect: "read"}}, nil)
-	g.Executor = SimExecutor()
+	g.executor = SimExecutor()
 	resp, err := g.Execute(ToolRequest{Name: "read", Effect: "read"})
 	if err != nil || !resp.OK {
 		t.Fatalf("sim exec failed: %v %+v", err, resp)

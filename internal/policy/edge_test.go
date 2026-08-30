@@ -95,7 +95,7 @@ func TestExecute_ConstrainExecutorEnforced(t *testing.T) {
 	l := tmpLedger2(t)
 	called := false
 	g := NewGateway([]Rule{{Name: "write", Action: ActionConstrain}}, l)
-	g.Executor = func(req ToolRequest) (ToolResponse, error) {
+	g.executor = func(req ToolRequest) (ToolResponse, error) {
 		called = true
 		return ToolResponse{OK: true, Summary: "wrote", Result: map[string]interface{}{"path": "/task/x"}}, nil
 	}
@@ -117,7 +117,7 @@ func TestExecute_ConstrainExecutorEnforced(t *testing.T) {
 func TestExecute_NestedSecretKeyDropped(t *testing.T) {
 	l := tmpLedger2(t)
 	g := NewGateway([]Rule{{Name: "r", Action: ActionAllow}}, l)
-	g.Executor = func(req ToolRequest) (ToolResponse, error) {
+	g.executor = func(req ToolRequest) (ToolResponse, error) {
 		return ToolResponse{OK: true, Result: map[string]interface{}{
 			"path":   "/ok",
 			"token":  "LEAK", // top-level secret: must drop

@@ -45,6 +45,7 @@ func TestRegistryAllowlist(t *testing.T) {
 		{"", "alpine:3.19", true},                               // default registry docker.io
 		{"", "docker.io/library/alpine:3", true},                //
 		{"", "ghcr.io/org/img:v1", true},                        //
+		{"", "https://ghcr.io/org/img:v1", true},                // scheme stripped before registry extraction
 		{"", "evil.example.com/img:latest", false},              // not on default list
 		{"", "127.0.0.1:5000/foo:bar", true},                    // local dev registries allowed by default
 		{"", "localhost:9000/foo:bar", true},                    //
@@ -85,6 +86,37 @@ func TestImageName_IsCollisionFreeSha256(t *testing.T) {
 	}
 	if len(a) != 64+4 || !strings.HasSuffix(a, ".img") || strings.ContainsAny(a[:64], "/_:") {
 		t.Fatalf("unexpected name format: %q", a)
+	}
+}
+
+// TestStorePath_NormalizesScheme pins the normalization contract between
+// Pull and StorePath: Pull strips an explicit http(s):// scheme before
+// deriving its store name, so StorePath must map all three spellings of the
+// same reference to the SAME on-disk path (DefaultDir/<imageName(normalized)>).
+// Pre-fix, StorePath hashed the raw ref and template builds bound a path
+// Pull would never write.
+func TestStorePath_NormalizesScheme(t *testing.T) {
+	want := filepath.Join(DefaultDir, imageName("reg/img:1"))
+	for _, ref := range []string{"reg/img:1", "http://reg/img:1", "https://reg/img:1"} {
+		got, err := StorePath(ref)
+		if err != nil {
+			t.Fatalf("StorePath(%q): %v", ref, err)
+		}
+		if got != want {
+			t.Errorf("StorePath(%q) = %q, want %q", ref, got, want)
+		}
+	}
+}
+
+// TestStorePath_EmptyReferenceStillErrors: the emptiness guard survives the
+// scheme normalization — a blank reference, or one that is ONLY a scheme
+// (which normalizes to empty), must still be refused instead of hashing the
+// empty string into a phantom store path.
+func TestStorePath_EmptyReferenceStillErrors(t *testing.T) {
+	for _, ref := range []string{"", "   ", "http://", "https://"} {
+		if _, err := StorePath(ref); err == nil {
+			t.Errorf("StorePath(%q) = nil error, want empty-reference rejection", ref)
+		}
 	}
 }
 

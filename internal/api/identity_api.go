@@ -164,6 +164,14 @@ func registerIdentityAPI(api *echo.Group) {
 			}
 		} else if req.Token != "" {
 			if tok, verr := b.Validate(req.Token); verr == nil {
+				// The signed Task claim must match the path task: without this
+				// check, task B's operator could revoke task A's credentials via
+				// /identity/B/revoke while the metric blamed task B.
+				if tok.Task != "" && tok.Task != task {
+					return c.JSON(http.StatusForbidden, map[string]string{
+						"error": "token belongs to task " + tok.Task + ", not " + task,
+					})
+				}
 				if rerr := b.Revoke(tok.ID); rerr != nil {
 					return c.JSON(http.StatusInternalServerError, map[string]string{"error": rerr.Error()})
 				}

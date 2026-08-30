@@ -321,7 +321,12 @@ func main() {
 				}
 			} else if subcmd == "rm" {
 				if reg, rerr := network.LoadNetworkRegistry(os.Getenv("PVM_STATE_ROOT")); rerr == nil {
-					reg.Release(name)
+					// A failed release means the reservation lives on in the
+					// store file and would reappear after a restart — warn, but
+					// still honor the user's primary intent (delete the bridge).
+					if rerr := reg.Release(name); rerr != nil {
+						fmt.Printf("Warning: subnet registry release failed: %v\n", rerr)
+					}
 				}
 				err := network.DeleteBridge(name, "")
 				if err != nil {

@@ -52,22 +52,26 @@ type ToolResponse struct {
 type Gateway struct {
 	rules  []Rule
 	ledger *audit.Ledger
-	// Executor is the host-side action runner. Given a permitted request, it
+	// executor is the host-side action runner. Given a permitted request, it
 	// performs the actual work (e.g. git push, file read) using broker-scoped
 	// credentials, and returns a sanitized summary. nil = dry-run mode.
-	Executor func(req ToolRequest) (ToolResponse, error)
+	// Unexported so callers outside the package cannot bypass SetRuntimeOnce
+	// (and its locking); it is written only via SetRuntimeOnce.
+	executor func(req ToolRequest) (ToolResponse, error)
 
-	// ApprovalCheck closes the approval loop: when an APPROVE-class request
+	// approvalCheck closes the approval loop: when an APPROVE-class request
 	// arrives, the gateway asks for a CLAIM on an approved ticket matching
 	// (task, tool, params). The implementation must find, consume AND durably
 	// persist atomically (see approval.Manager.ClaimFor) so one ticket can
 	// never unlock two concurrent executions. A successful claim consumes
 	// the ticket immediately; nil = approval never auto-clears.
-	ApprovalCheck func(req ToolRequest) (ticketID string, approved bool)
-	// OnApproved is invoked right after a ticket is claimed (before the
+	// Unexported: written only via SetRuntimeOnce (see executor).
+	approvalCheck func(req ToolRequest) (ticketID string, approved bool)
+	// onApproved is invoked right after a ticket is claimed (before the
 	// execution attempt). It is a notification/metric hook — consumption is
 	// the claim's job, not this callback's.
-	OnApproved func(ticketID string)
+	// Unexported: written only via SetRuntimeOnce (see executor).
+	onApproved func(ticketID string)
 
 	// runtimeMu guards the three hook fields above: /api/exec wires them
 	// lazily while other requests may already be executing through the
@@ -81,14 +85,14 @@ type Gateway struct {
 func (g *Gateway) SetRuntimeOnce(executor func(ToolRequest) (ToolResponse, error), approvalCheck func(ToolRequest) (string, bool), onApproved func(string)) {
 	g.runtimeMu.Lock()
 	defer g.runtimeMu.Unlock()
-	if g.Executor == nil && executor != nil {
-		g.Executor = executor
+	if g.executor == nil && executor != nil {
+		g.executor = executor
 	}
-	if g.ApprovalCheck == nil && approvalCheck != nil {
-		g.ApprovalCheck = approvalCheck
+	if g.approvalCheck == nil && approvalCheck != nil {
+		g.approvalCheck = approvalCheck
 	}
-	if g.OnApproved == nil && onApproved != nil {
-		g.OnApproved = onApproved
+	if g.onApproved == nil && onApproved != nil {
+		g.onApproved = onApproved
 	}
 }
 
@@ -96,7 +100,7 @@ func (g *Gateway) SetRuntimeOnce(executor func(ToolRequest) (ToolResponse, error
 func (g *Gateway) runtimeHooks() (func(ToolRequest) (ToolResponse, error), func(ToolRequest) (string, bool), func(string)) {
 	g.runtimeMu.Lock()
 	defer g.runtimeMu.Unlock()
-	return g.Executor, g.ApprovalCheck, g.OnApproved
+	return g.executor, g.approvalCheck, g.onApproved
 }
 
 // Rule is a compiled ToolRule (from spec.ToolRule).

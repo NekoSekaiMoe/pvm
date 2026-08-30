@@ -82,15 +82,27 @@ func splitHostPortRight(s string) (host, port string) {
 	return s[:i], suffix
 }
 
+// normalizeImageRef strips an explicit "http://" or "https://" scheme
+// from an image reference. Every derivation from a reference — the store
+// name (imageName), the registry host (registryHost) and the actual pull
+// (go-containerregistry) — must run on the SAME normalized form: Pull has
+// always stripped the scheme before computing its target path (name.
+// ParseReference would otherwise treat "http:" as the registry host), so
+// StorePath must normalize identically or the same reference would map to
+// two different on-disk paths.
+func normalizeImageRef(ref string) string {
+	return strings.TrimPrefix(strings.TrimPrefix(ref, "http://"), "https://")
+}
+
 // registryHost extracts the registry host from an OCI image reference.
 // Per the distribution-spec convention, the component before the first "/"
 // is a registry only when it contains a "." or ":" or equals "localhost";
 // otherwise the reference uses the default registry (docker.io).
 func registryHost(imageRef string) string {
-	// Strip an explicit scheme first: "http://host/img" must yield
-	// "host", not "http:" (the first path segment would otherwise look
-	// like a registry with a port).
-	imageRef = strings.TrimPrefix(strings.TrimPrefix(imageRef, "http://"), "https://")
+	// Strip an explicit scheme first (shared normalization with Pull and
+	// StorePath): "http://host/img" must yield "host", not "http:" (the
+	// first path segment would otherwise look like a registry with a port).
+	imageRef = normalizeImageRef(imageRef)
 	i := strings.IndexByte(imageRef, '/')
 	if i < 0 {
 		// No slash: the whole ref is <repo>[:<tag>] against the default
@@ -117,8 +129,11 @@ func imageName(imageRef string) string {
 
 // StorePath returns the on-disk ext4 path a Pull of imageRef produces (or
 // would reuse). Template builds bind this path into ImagePath once the
-// pull/verify phase completes.
+// pull/verify phase completes. The reference is normalized exactly the way
+// Pull normalizes it (see normalizeImageRef) so both sides derive the same
+// store name for the same reference.
 func StorePath(imageRef string) (string, error) {
+	imageRef = normalizeImageRef(imageRef)
 	if strings.TrimSpace(imageRef) == "" {
 		return "", fmt.Errorf("image: empty reference")
 	}
@@ -131,11 +146,13 @@ const DefaultDir = "/var/lib/uml-container/images"
 
 // Pull downloads an image (either Docker or tarball) and extracts it into a new ext4 image
 func Pull(imageRef string) error {
-	// Normalize an explicit scheme away FIRST: go-containerregistry's
-	// name.ParseReference would otherwise treat the "http:" prefix as the
-	// registry host ("http://reg/img" -> registry "http:") and the pull
-	// would fail deep inside the library instead of here with a clean ref.
-	imageRef = strings.TrimPrefix(strings.TrimPrefix(imageRef, "http://"), "https://")
+	// Normalize an explicit scheme away FIRST (see normalizeImageRef): go-
+	// containerregistry's name.ParseReference would otherwise treat the
+	// "http:" prefix as the registry host ("http://reg/img" -> registry
+	// "http:") and the pull would fail deep inside the library instead of
+	// here with a clean ref. The store name computed below then matches
+	// StorePath's for the same reference.
+	imageRef = normalizeImageRef(imageRef)
 	// Registry allowlist: refuse references outside the configured set before
 	// any network or disk activity.
 	if !registryAllowed(imageRef) {

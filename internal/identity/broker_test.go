@@ -217,3 +217,87 @@ func TestRevokeAllForTask_SurvivesRestart(t *testing.T) {
 		t.Fatalf("pre-restart token must stay revoked after restart+RevokeAllForTask, got %v", err)
 	}
 }
+
+// TestRefresh_KeepsTaskBindingAcrossRestart is the refresh-unbinding
+// regression: Refresh used to locate the task linkage ONLY via the in-memory
+// taskByToken reverse index, which is empty after a restart. A token
+// refreshed post-restart was minted with Task="", so RevokeAllForTask could
+// never cover it — incident response's bulk revoke silently missed it. The
+// fix prefers the SIGNED Task claim carried in the validated token payload.
+func TestRefresh_KeepsTaskBindingAcrossRestart(t *testing.T) {
+	dir := t.TempDir()
+	keyPath := dir + "/identity.key"
+	revPath := dir + "/revocations.json"
+
+	key1, err := LoadOrCreateKey(keyPath)
+	if err != nil {
+		t.Fatalf("load key: %v", err)
+	}
+	b1, err := NewBroker(key1, StaticStore{}, tmpLedger(t), time.Hour)
+	if err != nil {
+		t.Fatalf("new broker: %v", err)
+	}
+	tok, err := b1.Mint("alice", "eng", "t1", []string{"repo:read"}, time.Hour)
+	if err != nil {
+		t.Fatalf("mint: %v", err)
+	}
+	if err := b1.PersistRevocations(revPath); err != nil {
+		t.Fatalf("persist revocations: %v", err)
+	}
+
+	// Simulate a restart: same key + revocation files, empty memory indexes.
+	key2, err := LoadOrCreateKey(keyPath)
+	if err != nil {
+		t.Fatalf("reload key: %v", err)
+	}
+	b2, err := NewBroker(key2, StaticStore{}, tmpLedger(t), time.Hour)
+	if err != nil {
+		t.Fatalf("new broker 2: %v", err)
+	}
+	if err := b2.PersistRevocations(revPath); err != nil {
+		t.Fatalf("reload revocations: %v", err)
+	}
+
+	fresh, err := b2.Refresh(tok, time.Hour)
+	if err != nil {
+		t.Fatalf("refresh after restart: %v", err)
+	}
+	if _, err := b2.RevokeAllForTask("t1"); err != nil {
+		t.Fatalf("revoke all for t1: %v", err)
+	}
+	if _, err := b2.Validate(fresh); err != ErrRevoked {
+		t.Fatalf("refreshed token must be covered by RevokeAllForTask after restart, got %v", err)
+	}
+}
+
+// TestRefresh_KeepsTaskBindingSameInstance covers the non-restart path: the
+// replacement token stays bound to the original task even while the in-memory
+// index is warm (no regression from preferring the signed claim).
+func TestRefresh_KeepsTaskBindingSameInstance(t *testing.T) {
+	b, err := NewBroker([]byte("k"), StaticStore{}, tmpLedger(t), time.Hour)
+	if err != nil {
+		t.Fatalf("new broker: %v", err)
+	}
+	tok, err := b.Mint("alice", "eng", "t1", []string{"repo:read"}, time.Hour)
+	if err != nil {
+		t.Fatalf("mint: %v", err)
+	}
+	fresh, err := b.Refresh(tok, time.Hour)
+	if err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+	// The replacement must carry the same signed task claim.
+	parsed, err := b.Validate(fresh)
+	if err != nil {
+		t.Fatalf("validate fresh: %v", err)
+	}
+	if parsed.Task != "t1" {
+		t.Fatalf("refreshed token Task = %q, want %q", parsed.Task, "t1")
+	}
+	if _, err := b.RevokeAllForTask("t1"); err != nil {
+		t.Fatalf("revoke all for t1: %v", err)
+	}
+	if _, err := b.Validate(fresh); err != ErrRevoked {
+		t.Fatalf("refreshed token must be revoked by RevokeAllForTask, got %v", err)
+	}
+}

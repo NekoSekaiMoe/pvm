@@ -148,10 +148,15 @@ func (b *Broker) Refresh(tokStr string, ttl time.Duration) (string, error) {
 		return "", fmt.Errorf("identity: refresh: %w", err)
 	}
 	// Locate the task linkage so the replacement keeps RevokeAllForTask
-	// coverage.
-	b.mu.RLock()
-	taskID := b.taskByToken[tok.ID]
-	b.mu.RUnlock()
+	// coverage. Prefer the SIGNED Task claim: taskByToken is memory-only and
+	// empty after a restart, so relying on it alone unbinds refreshed tokens
+	// from their task (RevokeAllForTask could no longer cover them).
+	taskID := tok.Task
+	if taskID == "" {
+		b.mu.RLock()
+		taskID = b.taskByToken[tok.ID]
+		b.mu.RUnlock()
+	}
 
 	fresh, err := b.Mint(tok.Caller, tok.Tenant, taskID, tok.Scope, ttl)
 	if err != nil {

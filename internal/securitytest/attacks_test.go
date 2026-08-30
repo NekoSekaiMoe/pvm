@@ -348,13 +348,13 @@ func TestAttack_ObservationLeak(t *testing.T) {
 	setupRoots(t)
 	ledger, _ := audit.Open("sec-obs")
 	gw := policy.NewGateway([]policy.Rule{{Name: "r", Action: policy.ActionAllow}}, ledger)
-	gw.Executor = func(req policy.ToolRequest) (policy.ToolResponse, error) {
+	gw.SetRuntimeOnce(func(req policy.ToolRequest) (policy.ToolResponse, error) {
 		return policy.ToolResponse{OK: true, Result: map[string]interface{}{
 			"path":         "/ok",
 			"access_token": "bearer SECRET-VALUE",
 			"session":      "safe",
 		}}, nil
-	}
+	}, nil, nil)
 	resp, _ := gw.Execute(policy.ToolRequest{Name: "r"})
 	for _, leak := range []string{"access_token"} {
 		if _, ok := resp.Result[leak]; ok {

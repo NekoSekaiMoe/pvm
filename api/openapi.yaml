@@ -1627,7 +1627,6 @@ paths:
     post:
       tags: [envd]
       summary: envd compat — watch a directory (streamed frames)
-      security: []
       requestBody:
         required: true
         content:
@@ -1638,7 +1637,13 @@ paths:
               properties:
                 path: { type: string }
       responses:
-        "200": { $ref: "#/components/responses/OkJson" }
+        "200":
+          description: >-
+            Streamed Connect-JSON envelope frames — an initial directory
+            snapshot followed by change events (polled every 500ms)
+          content:
+            application/connect+json:
+              schema: { type: string, format: binary }
 
   /files:
     get:

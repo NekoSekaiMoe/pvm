@@ -171,7 +171,9 @@ func (m *Manager) SetQuota(tenant string, q Quota) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.quotas[tenant] = q
-	m.persistLocked()
+	if err := m.persistLocked(); err != nil {
+		log.Printf("pool: %v", err)
+	}
 }
 
 // Warm pre-creates N sandboxes from a template so claims don't pay cold start.
@@ -215,7 +217,9 @@ func (m *Manager) Warm(tmpl Template, n int) int {
 			State:     SandboxReady,
 			CreatedAt: m.now(),
 		})
-		m.persistLocked()
+		if err := m.persistLocked(); err != nil {
+			log.Printf("pool: %v", err)
+		}
 		m.mu.Unlock()
 		created++
 	}
@@ -331,7 +335,9 @@ func (m *Manager) claim(tenant string, tmpl Template, taskID string, logs *[]dec
 		sb.MemMB = wantMB
 		sb.ClaimedAt = now
 		m.accountClaim(tenant, tmpl.CPU, wantMB, now)
-		m.persistLocked()
+		if err := m.persistLocked(); err != nil {
+			log.Printf("pool: %v", err)
+		}
 		recordDecision(logs, tenant, "claimed-warm", true)
 		id := sb.ID
 		m.mu.Unlock()
@@ -398,7 +404,9 @@ func (m *Manager) claim(tenant string, tmpl Template, taskID string, logs *[]dec
 	sb := &Sandbox{ID: id, Template: tmpl.Name, State: SandboxClaimed, TaskID: taskID, Tenant: tenant, CPU: tmpl.CPU, MemMB: wantMB, CreatedAt: now, ClaimedAt: now}
 	m.pool = append(m.pool, sb)
 	m.accountClaim(tenant, tmpl.CPU, wantMB, now)
-	m.persistLocked()
+	if err := m.persistLocked(); err != nil {
+		log.Printf("pool: %v", err)
+	}
 	recordDecision(logs, tenant, "created-on-demand", true)
 	m.mu.Unlock()
 	return id, nil
@@ -524,14 +532,18 @@ func (m *Manager) Release(id string, recycle bool) error {
 			s.CPU = 0
 			s.MemMB = 0
 			s.ClaimedAt = time.Time{}
-			m.persistLocked()
+			if err := m.persistLocked(); err != nil {
+				log.Printf("pool: %v", err)
+			}
 			m.mu.Unlock()
 			return nil
 		}
 		// Destroyer is an external call; do NOT keep m.mu held across it.
 		// Snapshot the fields we need, drop the entry, then destroy.
 		m.pool = append(m.pool[:i], m.pool[i+1:]...)
-		m.persistLocked()
+		if err := m.persistLocked(); err != nil {
+			log.Printf("pool: %v", err)
+		}
 		destroyer := m.Destroyer
 		m.mu.Unlock()
 		if destroyer != nil {

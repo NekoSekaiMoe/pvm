@@ -72,13 +72,24 @@ func (m *Manager) EnablePersistence(path string) error {
 	} else if err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("pool: read store: %w", err)
 	}
-	m.persistLocked()
+	if err := m.persistLocked(); err != nil {
+		// Fall back to pure in-memory mode, matching the comment above: the
+		// caller asked for durable state and the very first snapshot could
+		// not be written — keeping persistPath set would make every later
+		// mutation fail the same way while still pretending to be durable.
+		m.persistPath = ""
+		return fmt.Errorf("pool: initial persist: %w", err)
+	}
 	return nil
 }
 
-func (m *Manager) persistLocked() {
+// persistLocked mirrors the manager state to the store file. Errors are
+// returned, not logged: mutation callers decide whether a failed mirror is
+// fatal (EnablePersistence refuses durability and falls back to memory) or
+// just observable (logged and the in-memory mutation stands).
+func (m *Manager) persistLocked() error {
 	if m.persistPath == "" {
-		return
+		return nil
 	}
 	pf := poolFile{
 		Pool:     make([]Sandbox, 0, len(m.pool)),
@@ -92,6 +103,7 @@ func (m *Manager) persistLocked() {
 		}
 	}
 	if err := fsjson.Write(m.persistPath, pf); err != nil {
-		log.Printf("pool: persist to %s failed: %v", m.persistPath, err)
+		return fmt.Errorf("persist to %s: %w", m.persistPath, err)
 	}
+	return nil
 }

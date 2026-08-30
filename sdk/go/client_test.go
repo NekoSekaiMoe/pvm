@@ -611,17 +611,31 @@ func TestWaitForTemplateReady_PollsUntilDone(t *testing.T) {
 	}
 }
 
-// newEnvdTestServer spins up an httptest server and wraps it in an EnvdClient
-// pointed at it (base set directly so the test server's port is honored).
+// newEnvdTestServer spins up an httptest server and returns an EnvdClient
+// pointing at it via the real NewEnvdClient constructor (so scheme, port
+// and redirect policy are all exercised): ts.URL's host:port is loopback,
+// hence http, and its explicit port must be preserved verbatim.
 func newEnvdTestServer(t *testing.T, h http.HandlerFunc) *EnvdClient {
 	t.Helper()
 	ts := httptest.NewServer(h)
 	t.Cleanup(ts.Close)
-	return &EnvdClient{base: ts.URL, task: "task-1", http: &http.Client{Timeout: 60 * time.Second}, user: "root"}
+	u, err := url.Parse(ts.URL)
+	if err != nil {
+		t.Fatalf("parse %s: %v", ts.URL, err)
+	}
+	e := NewEnvdClient(u.Host, "task-1")
+	if e.base != ts.URL {
+		t.Fatalf("client base = %q, want %q", e.base, ts.URL)
+	}
+	return e
 }
 
 // TestNewEnvdClient_SchemeSelection pins the envd transport policy: loopback
-// hosts speak plain http (envd convention), everything else https.
+// hosts speak plain http (envd convention), everything else https. It also
+// pins port handling: only a port-less host gets DefaultEnvdPort appended;
+// a caller-supplied port ("host:port" or "[v6]:port") is kept verbatim —
+// previously the default port was blindly appended, producing
+// "127.0.0.1:9000:49983".
 func TestNewEnvdClient_SchemeSelection(t *testing.T) {
 	tests := []struct {
 		name string
@@ -633,7 +647,11 @@ func TestNewEnvdClient_SchemeSelection(t *testing.T) {
 		{"any 127/8 http", "127.200.1.1", "http://127.200.1.1:49983"},
 		{"localhost http", "localhost", "http://localhost:49983"},
 		{"ipv6 loopback http", "[::1]", "http://[::1]:49983"},
-		{"remote host https", "sandbox.example.com", "https://sandbox.example.com:49983"},
+		{"remote host https", "example.com", "https://example.com:49983"},
+		{"loopback with port keeps it", "127.0.0.1:9000", "http://127.0.0.1:9000"},
+		{"localhost with port keeps it", "localhost:9000", "http://localhost:9000"},
+		{"ipv6 loopback with port keeps it", "[::1]:9000", "http://[::1]:9000"},
+		{"remote with port keeps https and port", "sandbox.example.com:8443", "https://sandbox.example.com:8443"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -700,5 +718,35 @@ func TestEnvdClient_RunOutputCap(t *testing.T) {
 		if !strings.Contains(err.Error(), want) {
 			t.Fatalf("Run error = %q, want containing %q", err.Error(), want)
 		}
+	}
+}
+
+// TestEnvdClient_RedirectRejected pins that envd clients never follow HTTP
+// redirects. 307/308 preserve method+body, so a server answering with such
+// a status and a Location header must surface as an explicit error instead
+// of Go silently replaying Run's command/envs envelope to the (possibly
+// untrusted, possibly cleartext) redirect target. Server A redirects to
+// server B; B's handler must never be hit.
+func TestEnvdClient_RedirectRejected(t *testing.T) {
+	for _, status := range []int{http.StatusTemporaryRedirect, http.StatusPermanentRedirect} {
+		t.Run(fmt.Sprintf("status_%d", status), func(t *testing.T) {
+			var bHits atomic.Int32
+			b := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				bHits.Add(1)
+			}))
+			t.Cleanup(b.Close)
+
+			e := newEnvdTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+				http.Redirect(w, r, b.URL+"/sink", status)
+			})
+
+			_, err := e.Run(context.Background(), "echo secret-marker", map[string]string{"TOKEN": "leak-me"})
+			if err == nil || !strings.Contains(err.Error(), "redirect") {
+				t.Fatalf("Run error = %v, want error mentioning redirect", err)
+			}
+			if got := bHits.Load(); got != 0 {
+				t.Fatalf("redirect target was hit %d times, want 0 (request body must not be replayed)", got)
+			}
+		})
 	}
 }

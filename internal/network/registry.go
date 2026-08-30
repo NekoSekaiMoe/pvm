@@ -67,7 +67,11 @@ func LoadNetworkRegistry(stateRoot string) (*NetworkRegistry, error) {
 	return r, nil
 }
 
-func (r *NetworkRegistry) persistLocked() {
+// persistLocked mirrors the registry to disk. It returns the (wrapped)
+// fsjson error so mutation paths can roll their in-memory change back —
+// the on-disk file is what survives restarts, so memory must never run
+// ahead of a failed write.
+func (r *NetworkRegistry) persistLocked() error {
 	dump := struct {
 		Networks []NetworkRecord `json:"networks"`
 	}{}
@@ -79,7 +83,10 @@ func (r *NetworkRegistry) persistLocked() {
 	for _, n := range names {
 		dump.Networks = append(dump.Networks, r.nets[n])
 	}
-	_ = fsjson.Write(r.path, dump)
+	if err := fsjson.Write(r.path, dump); err != nil {
+		return fmt.Errorf("network registry: persist %s: %w", r.path, err)
+	}
+	return nil
 }
 
 // lockFile takes an exclusive inter-process flock on <path>.lock. The
@@ -167,7 +174,13 @@ func (r *NetworkRegistry) AllocatePreferred(name string, want *net.IPNet) (strin
 				gw[3] = 1
 				gwCIDR := fmt.Sprintf("%s/24", gw)
 				r.nets[name] = NetworkRecord{Name: name, Subnet: gwCIDR, CreatedAt: time.Now().UTC()}
-				r.persistLocked()
+				if err := r.persistLocked(); err != nil {
+					// Roll the reservation back: an allocation that cannot be
+					// persisted would silently hand the same subnet to another
+					// bridge after the next reload.
+					delete(r.nets, name)
+					return "", err
+				}
 				return gwCIDR, nil
 			}
 		}
@@ -197,7 +210,13 @@ func (r *NetworkRegistry) allocateLocked(name string) (string, error) {
 	gw[3] = 1
 	gwCIDR := fmt.Sprintf("%s/24", gw)
 	r.nets[name] = NetworkRecord{Name: name, Subnet: gwCIDR, CreatedAt: time.Now().UTC()}
-	r.persistLocked()
+	if err := r.persistLocked(); err != nil {
+		// Roll the reservation back: an allocation that cannot be persisted
+		// would silently hand the same subnet to another bridge after the
+		// next reload.
+		delete(r.nets, name)
+		return "", err
+	}
 	return gwCIDR, nil
 }
 
@@ -269,15 +288,26 @@ func orderBinary(v uint32) net.IP {
 	return net.IPv4(byte(v>>24), byte(v>>16), byte(v>>8), byte(v))
 }
 
-// Release forgets name's reservation.
-func (r *NetworkRegistry) Release(name string) {
+// Release forgets name's reservation. It returns an error when the
+// deletion cannot be persisted; the in-memory record is then restored so
+// memory and the durable file stay in sync — callers should surface the
+// failure, since a reservation that lives on in the store file would
+// reappear after the next restart.
+func (r *NetworkRegistry) Release(name string) error {
 	r.mu <- struct{}{}
-	_, _ = r.withFlock(func() (string, error) {
+	defer func() { <-r.mu }()
+	_, err := r.withFlock(func() (string, error) {
+		rec, existed := r.nets[name]
 		delete(r.nets, name)
-		r.persistLocked()
+		if err := r.persistLocked(); err != nil {
+			if existed {
+				r.nets[name] = rec // keep memory mirroring the un-deletable file
+			}
+			return "", err
+		}
 		return "", nil
 	})
-	<-r.mu
+	return err
 }
 
 // Get returns name's record.

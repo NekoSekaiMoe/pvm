@@ -4,12 +4,13 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
-
 	"uml-container/internal/audit"
 )
 
@@ -646,5 +647,33 @@ func TestRetryCleanups_ConcurrentSweepsSerialized(t *testing.T) {
 	}
 	if got := m.PendingCleanups(); got != 0 {
 		t.Fatalf("pending cleanups = %d, want 0 after successful sweep", got)
+	}
+}
+
+// TestEnablePersistenceSnapshotFailureFallsBackToMemory: when the initial
+// snapshot cannot be written, EnablePersistence must fail AND clear
+// persistPath (pure in-memory mode, per the "mirror" contract). The reset
+// is observable without white-box access: the idempotency guard no longer
+// blocks a second EnablePersistence, and that re-enable really writes the
+// store. A >248-byte base name makes the store path a legal but absent
+// filename (read -> ENOENT -> fresh load) while fsjson's temp-file pattern
+// always exceeds NAME_MAX — deterministic on Linux, root-safe (unlike
+// chmod-based unwritable dirs).
+func TestEnablePersistenceSnapshotFailureFallsBackToMemory(t *testing.T) {
+	m := NewManager(4, nil)
+	broken := filepath.Join(t.TempDir(), strings.Repeat("s", 250))
+	if err := m.EnablePersistence(broken); err == nil {
+		t.Fatal("EnablePersistence must fail when the initial snapshot cannot be written")
+	}
+
+	// Mutations keep working in the fallback; nothing re-attempts the broken path.
+	m.SetQuota("tenant-a", DefaultQuota())
+
+	good := filepath.Join(t.TempDir(), "pool.json")
+	if err := m.EnablePersistence(good); err != nil {
+		t.Fatalf("re-enable on a good path after the fallback: %v", err)
+	}
+	if _, err := os.Stat(good); err != nil {
+		t.Fatalf("good store not written after re-enable: %v", err)
 	}
 }

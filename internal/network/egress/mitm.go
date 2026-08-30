@@ -248,10 +248,19 @@ func (g *Gateway) serveMITM(clientConn net.Conn, brw *bufio.ReadWriter, task, ho
 		req.URL.Host = host
 		req.URL.Scheme = "https"
 		req.RequestURI = "" // client-style field; must be cleared to forward
+		// The policy view must describe the CONNECT destination, not the
+		// inner Host header: the request is forwarded to `host` no matter
+		// what Host the tunnelled client claims, so evaluating that header
+		// would let a guest swap a blocked destination for an allowlisted
+		// name. Rebind before viewFromHTTP evaluates.
+		req.Host = host
 
 		v := viewFromHTTP(req)
 		d := g.decideDomain(v, pol)
 		if d == DecisionBlock {
+			// Audit + count like every other block path (BytesDenied, task
+			// ledger) — a silent 403 inside the tunnel would be invisible.
+			g.record(task, req, DecisionBlock, "mitm: blocked by rule")
 			writeMITMError(writer, http.StatusForbidden, "egress: blocked by rule")
 			continue
 		}
@@ -263,11 +272,34 @@ func (g *Gateway) serveMITM(clientConn net.Conn, brw *bufio.ReadWriter, task, ho
 				continue
 			}
 		}
+		// Global policy limits bind inside the tunnel exactly as on the
+		// plaintext path (handleHTTP): a rule opting into interception must
+		// not widen the task's method allowlist or size caps.
+		if !methodAllowed(req.Method, pol.AllowedMethods) {
+			g.record(task, req, DecisionBlock, "mitm: method "+req.Method+" not allowed")
+			writeMITMError(writer, http.StatusMethodNotAllowed, "egress: method not allowed")
+			continue
+		}
+		// Size cap on the request body. ContentLength is -1 for chunked
+		// bodies, so also wrap the body in a LimitedReader and detect the
+		// overrun after the round trip — those bytes have already left, the
+		// same caveat handleHTTP's chunked handling documents.
+		var body io.Reader = req.Body
+		var bodyLimiter *io.LimitedReader
+		if pol.MaxRequestBody > 0 {
+			if req.ContentLength > pol.MaxRequestBody {
+				g.record(task, req, DecisionBlock, fmt.Sprintf("mitm: request body %d > %d", req.ContentLength, pol.MaxRequestBody))
+				writeMITMError(writer, http.StatusRequestEntityTooLarge, "egress: request too large")
+				continue
+			}
+			bodyLimiter = &io.LimitedReader{R: req.Body, N: pol.MaxRequestBody + 1}
+			body = bodyLimiter
+		}
 		g.ApplyInject(req, v, pol)
 		g.addBytes(task, contentLengthOf(req))
 		g.record(task, req, DecisionAllow, "mitm proxied")
 
-		outReq, oerr := http.NewRequest(req.Method, req.URL.String(), req.Body)
+		outReq, oerr := http.NewRequest(req.Method, req.URL.String(), body)
 		if oerr != nil {
 			writeMITMError(writer, http.StatusBadGateway, "egress: bad request")
 			continue
@@ -277,6 +309,24 @@ func (g *Gateway) serveMITM(clientConn net.Conn, brw *bufio.ReadWriter, task, ho
 		if terr != nil {
 			writeMITMError(writer, http.StatusBadGateway, "egress: upstream error: "+terr.Error())
 			continue
+		}
+		if bodyLimiter != nil && bodyLimiter.N <= 0 {
+			// Chunked body exceeded the cap: the bytes were already forwarded
+			// (as in handleHTTP), but the sandbox must not receive the
+			// upstream's answer to an over-limit request.
+			resp.Body.Close()
+			g.record(task, req, DecisionBlock, "mitm: chunked request body exceeded cap")
+			writeMITMError(writer, http.StatusRequestEntityTooLarge, "egress: request too large")
+			continue
+		}
+		// Size cap on the response body (truncation, like handleHTTP). Fix
+		// the advertised length when truncating so the framing the client
+		// parses matches the bytes actually written.
+		if pol.MaxResponseBody > 0 {
+			resp.Body = io.NopCloser(&io.LimitedReader{R: resp.Body, N: pol.MaxResponseBody})
+			if resp.ContentLength > pol.MaxResponseBody {
+				resp.ContentLength = pol.MaxResponseBody
+			}
 		}
 		resp.Write(writer)
 		writer.Flush()
