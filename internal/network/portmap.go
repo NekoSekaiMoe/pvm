@@ -24,6 +24,7 @@ package network
 // requires BPF-side support, so the manager refuses with ErrPortMapTCMode.
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -33,6 +34,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"uml-container/internal/fsjson"
@@ -62,12 +64,19 @@ type portMapRegistry struct {
 var (
 	portMapOnce      bool
 	portMapRegistry_ *portMapRegistry
+	// portMapInitMu serializes the singleton creation: two concurrent
+	// AddPortMapping calls used to both observe nil, build separate
+	// registries (each with its own mutex) and overwrite each other's
+	// portmappings.json — losing records whose iptables rules stayed.
+	portMapInitMu sync.Mutex
 )
 
 // LoadPortMapRegistry opens (or creates) the mapping registry under
 // stateRoot. It is a process-wide singleton because iptables is itself a
 // host-wide singleton — concurrent writers must serialize somewhere.
 func LoadPortMapRegistry(stateRoot string) (*portMapRegistry, error) {
+	portMapInitMu.Lock()
+	defer portMapInitMu.Unlock()
 	if portMapRegistry_ != nil {
 		return portMapRegistry_, nil
 	}
@@ -157,18 +166,34 @@ func validatePortMapping(m PortMapping) error {
 	return nil
 }
 
-// runIptables executes one argv set with a bounded timeout (apply path).
-// Failures carry the combined iptables output so the caller's error text
-// names the real cause.
-func runIptables(argv []string) error {
+// iptablesTimeout bounds every iptables invocation: the calls run while
+// r.mu is held, so an iptables lock contention or a wedged child must not
+// block AddPortMapping/DeletePortMapping/lists indefinitely.
+const iptablesTimeout = 15 * time.Second
+
+// runIptablesCtx executes argv under a deadline (apply path). Failures
+// carry the combined iptables output so the caller's error text names the
+// real cause.
+func runIptablesCtx(ctx context.Context, argv []string) error {
 	if err := argvValid(argv); err != nil {
 		return err
 	}
-	out, err := exec.Command(argv[0], argv[1:]...).CombinedOutput()
+	ctx, cancel := context.WithTimeout(ctx, iptablesTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
+	out, err := cmd.CombinedOutput()
+	if ctx.Err() != nil {
+		return fmt.Errorf("iptables %s: %w: %s", strings.Join(argv[1:], " "), ctx.Err(), strings.TrimSpace(string(out)))
+	}
 	if err != nil {
 		return fmt.Errorf("%v: %s", err, strings.TrimSpace(string(out)))
 	}
 	return nil
+}
+
+// runIptables executes one argv set with a bounded timeout (apply path).
+func runIptables(argv []string) error {
+	return runIptablesCtx(context.Background(), argv)
 }
 
 // runIptablesDelete removes one rule idempotently WITHOUT parsing
@@ -189,7 +214,7 @@ func runIptablesDelete(del []string) error {
 			break
 		}
 	}
-	if cerr := exec.Command(check[0], check[1:]...).Run(); cerr == nil {
+	if cerr := runIptablesCtx(context.Background(), check); cerr == nil {
 		// Rule exists: remove it for real.
 		return runIptables(del)
 	} else if exitCode(cerr) == 1 {
@@ -232,9 +257,15 @@ func AddPortMapping(m PortMapping) error {
 	}
 	r.mu <- struct{}{}
 	defer func() { <-r.mu }()
-	for _, ex := range r.mappings[m.TaskID] {
-		if ex.Protocol == m.Protocol && ex.HostPort == m.HostPort {
-			return fmt.Errorf("network: host port %d/%s already mapped for task %q", m.HostPort, m.Protocol, m.TaskID)
+	// The host port namespace is HOST-WIDE (one iptables PREROUTING):
+	// a duplicate (protocol, hostPort) from ANY task would be shadowed by
+	// the first-installed DNAT rule and silently forward to the wrong
+	// task. Reject across all tasks, not just this one.
+	for _, ms := range r.mappings {
+		for _, ex := range ms {
+			if ex.Protocol == m.Protocol && ex.HostPort == m.HostPort {
+				return fmt.Errorf("network: host port %d/%s already mapped (task %q)", m.HostPort, m.Protocol, ex.TaskID)
+			}
 		}
 	}
 	for _, argv := range portMapRules(m, true) {

@@ -146,25 +146,27 @@ func (s *Session) Total() int64 {
 // by timeout) and returns them with the new absolute offset. The exported
 // form of waitTailSince for streaming consumers (SSE console tail).
 func (s *Session) Since(ctx context.Context, off int64, timeout time.Duration) ([]byte, int64, error) {
-	chunk, err := s.waitTailSince(ctx, int(off), timeout)
+	chunk, end, err := s.waitTailSince(ctx, int(off), timeout)
 	if err != nil {
 		return nil, off, err
 	}
-	return chunk, off + int64(len(chunk)), nil
+	return chunk, end, nil
 }
 
 // waitTailSince blocks until bytes beyond the absolute offset off are
-// available (or timeout/context fires) and returns them. off values are
-// monotonic totals; when the ring has wrapped, the oldest still-held byte is
-// at total-len(ring) and off below that is clamped to it.
-func (s *Session) waitTailSince(ctx context.Context, off int, timeout time.Duration) ([]byte, error) {
+// available (or timeout/context fires) and returns them together with the
+// ABSOLUTE end offset they were read to. off values are monotonic totals;
+// when the ring has wrapped, the oldest still-held byte is at
+// total-len(ring) and off below that is clamped to it — the returned end
+// reflects the clamped start, so callers never derive a stale next offset.
+func (s *Session) waitTailSince(ctx context.Context, off int, timeout time.Duration) ([]byte, int64, error) {
 	deadline := time.Now().Add(timeout)
 	done := ctx.Done()
 	for {
 		s.mu.Lock()
 		if s.closed {
 			s.mu.Unlock()
-			return nil, io.ErrClosedPipe
+			return nil, 0, io.ErrClosedPipe
 		}
 		oldest := s.total - int64(len(s.ring))
 		if int64(off) < oldest {
@@ -174,8 +176,9 @@ func (s *Session) waitTailSince(ctx context.Context, off int, timeout time.Durat
 			start := int64(off) - oldest
 			out := make([]byte, s.total-int64(off))
 			copy(out, s.ring[start:])
+			end := s.total
 			s.mu.Unlock()
-			return out, nil
+			return out, end, nil
 		}
 		s.mu.Unlock()
 
@@ -184,10 +187,10 @@ func (s *Session) waitTailSince(ctx context.Context, off int, timeout time.Durat
 		select {
 		case <-time.After(50 * time.Millisecond):
 			if time.Now().After(deadline) {
-				return nil, fmt.Errorf("console: tail wait timeout after %s", timeout)
+				return nil, 0, fmt.Errorf("console: tail wait timeout after %s", timeout)
 			}
 		case <-done:
-			return nil, ctx.Err()
+			return nil, 0, ctx.Err()
 		}
 	}
 }
@@ -291,6 +294,7 @@ func (s *Session) Exec(ctx context.Context, cmd string, timeout time.Duration) (
 	}
 
 	var collected []byte
+	off := int64(startOff)
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		select {
@@ -298,10 +302,14 @@ func (s *Session) Exec(ctx context.Context, cmd string, timeout time.Duration) (
 			return nil, ctx.Err()
 		case <-time.After(100 * time.Millisecond):
 		}
-		chunk, err := s.waitTailSince(ctx, startOff+len(collected), time.Until(deadline))
+		// Track the ABSOLUTE end offset: after a ring wrap the chunk may
+		// start later than requested, and deriving the next offset from
+		// the caller-side length would re-read already-returned bytes.
+		chunk, next, err := s.waitTailSince(ctx, int(off), time.Until(deadline))
 		if err != nil {
 			break
 		}
+		off = next
 		collected = append(collected, chunk...)
 		if m := endRe.FindSubmatchIndex(collected); m != nil {
 			exit := 0
@@ -400,11 +408,11 @@ func (p *PTY) Tail(ctx context.Context, since int, maxWait time.Duration) ([]byt
 	if closed {
 		return nil, since, io.ErrClosedPipe
 	}
-	chunk, err := p.session.waitTailSince(ctx, since, maxWait)
+	chunk, end, err := p.session.waitTailSince(ctx, since, maxWait)
 	if err != nil {
 		return nil, since, err
 	}
-	return chunk, since + len(chunk), nil
+	return chunk, int(end), nil
 }
 
 // CloseableStdin exposes the raw writer for launcher integration.

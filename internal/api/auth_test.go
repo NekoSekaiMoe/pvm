@@ -38,15 +38,17 @@ func TestParseKeyEntries(t *testing.T) {
 		{"k1, key # note, k2", []APIKey{{Key: "k1", Operator: "k1"}, {Key: "k2", Operator: "k2"}}}, // good entries survive a bad neighbor
 	}
 	for _, tc := range cases {
-		got := parseKeyEntries(tc.blob)
-		if len(got) != len(tc.want) {
-			t.Fatalf("parseKeyEntries(%q) = %+v, want %+v", tc.blob, got, tc.want)
-		}
-		for i := range got {
-			if got[i] != tc.want[i] {
-				t.Fatalf("parseKeyEntries(%q)[%d] = %+v, want %+v", tc.blob, i, got[i], tc.want[i])
+		t.Run(tc.blob, func(t *testing.T) {
+			got := parseKeyEntries(tc.blob)
+			if len(got) != len(tc.want) {
+				t.Fatalf("parseKeyEntries(%q) = %+v, want %+v", tc.blob, got, tc.want)
 			}
-		}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Fatalf("parseKeyEntries(%q)[%d] = %+v, want %+v", tc.blob, i, got[i], tc.want[i])
+				}
+			}
+		})
 	}
 }
 
@@ -227,5 +229,54 @@ func TestRequestKeyBearerFormRequiresSeparator(t *testing.T) {
 		if got := requestKey(req); got != want {
 			t.Fatalf("requestKey(%q) = %q, want %q", tc.auth, got, want)
 		}
+	}
+}
+
+func TestSecureCallbackCleartextRule(t *testing.T) {
+	cases := []struct {
+		name     string
+		callback string
+		optin    string
+		want     string
+	}{
+		{"empty stays empty", "", "", ""},
+		{"https allowed", "https://idp.example/auth", "", "https://idp.example/auth"},
+		{"loopback http allowed", "http://127.0.0.1:9999/auth", "", "http://127.0.0.1:9999/auth"},
+		{"localhost http allowed", "http://localhost:9999/auth", "", "http://localhost:9999/auth"},
+		{"remote http refused", "http://idp.example/auth", "", ""},
+		{"remote http refused with other optin", "http://idp.example/auth", "yes", ""},
+		{"remote http explicit opt-in", "http://idp.example/auth", "1", "http://idp.example/auth"},
+		{"garbage url refused", "://bad", "", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("PVM_AUTH_CALLBACK_ALLOW_HTTP", tc.optin)
+			if got := secureCallback(tc.callback); got != tc.want {
+				t.Fatalf("secureCallback(%q) = %q, want %q", tc.callback, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestAuthenticateCallbackRedirectRefused(t *testing.T) {
+	reached := false
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reached = true
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer target.Close()
+	redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL+"/leak", http.StatusTemporaryRedirect)
+	}))
+	defer redirector.Close()
+
+	// Directly-built registry (client==nil path) must be just as hardened:
+	// the fallback client also refuses to replay the raw-key body.
+	reg := &KeyRegistry{callback: redirector.URL}
+	if _, err := reg.Authenticate("some-key", "/x", "GET"); err != ErrAuthDenied {
+		t.Fatalf("redirected callback must deny, got %v", err)
+	}
+	if reached {
+		t.Fatal("callback redirect must never be followed (raw key would leak)")
 	}
 }

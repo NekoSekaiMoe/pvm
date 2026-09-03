@@ -4,7 +4,7 @@ package api
 // preview endpoints.
 
 import (
-	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"net/http"
@@ -43,10 +43,13 @@ func registerTemplateExtras(api *echo.Group, tmplStore *template.Store) {
 			}
 			req.SnapshotID = ids[len(ids)-1]
 		}
-		rec, err := template.CreateFromSnapshot(tmplStore, req.Task, req.SnapshotID, req.Alias)
+		rec, err := template.CreateFromSnapshot(c.Request().Context(), tmplStore, req.Task, req.SnapshotID, req.Alias)
 		if err != nil {
 			if errors.Is(err, template.ErrSnapshotNotFound) {
 				return c.JSON(http.StatusNotFound, map[string]string{"error": err.Error()})
+			}
+			if errors.Is(err, template.ErrInvalidSnapshotID) {
+				return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
 			}
 			return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		}
@@ -100,7 +103,14 @@ func registerTemplateExtras(api *echo.Group, tmplStore *template.Store) {
 			return c.JSON(http.StatusServiceUnavailable, map[string]string{"error": "UML kernel not available (./bin/linux): preview requires a bootable host"})
 		}
 
-		name := fmt.Sprintf("tplpreview-%s-%d", sanitizePreviewName(rec.TemplateID), time.Now().UnixNano()%1e6)
+		// Cryptographically random suffix: a time-modulo value repeats and
+		// is predictable, so two previews (or a predicted name) could share
+		// a container id and state directory.
+		suffix := make([]byte, 6)
+		if _, err := rand.Read(suffix); err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "preview id: " + err.Error()})
+		}
+		name := fmt.Sprintf("tplpreview-%s-%x", sanitizePreviewName(rec.TemplateID), suffix)
 		memBytes, _ := config.ParseMemory("256M")
 		cfg := &config.ContainerConfig{
 			ID:          name,
@@ -113,7 +123,10 @@ func registerTemplateExtras(api *echo.Group, tmplStore *template.Store) {
 			Ephemeral:   true, // read-only rootfs: preview never mutates the template
 		}
 		mgr := container.NewManager(nil)
-		if err := mgr.Start(context.Background(), cfg); err != nil {
+		// Bind the boot to the request lifetime: a client that walks away
+		// cancels the launch (WaitExit still reaps the ephemeral guest, and
+		// the deferred cleanupPreview below kills anything left over).
+		if err := mgr.Start(c.Request().Context(), cfg); err != nil {
 			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "preview boot failed: " + err.Error()})
 		}
 		defer cleanupPreview(name)

@@ -81,19 +81,23 @@ export GOCACHE GOPATH
 mkdir -p "$GOCACHE" "$GOPATH" 2>/dev/null || true
 
 fail=0
+# Private log dir (not fixed /tmp names: a pre-created symlink at a
+# predictable path would redirect our output to an arbitrary file).
+LOG_DIR="$(mktemp -d)"
+trap 'rm -rf "$LOG_DIR"' EXIT
 for arch in amd64 arm64; do
-  if GOARCH="$arch" CGO_ENABLED=0 "$GO_BIN" build ./cmd/agentpvm ./cmd/umlctl 2>"/tmp/pvm-build-$arch.log"; then
+  if GOARCH="$arch" CGO_ENABLED=0 "$GO_BIN" build ./cmd/agentpvm ./cmd/umlctl 2>"$LOG_DIR/build-$arch.log"; then
     echo "[arm64-check] GOARCH=$arch: OK"
   else
     echo "[arm64-check] GOARCH=$arch: FAILED" >&2
-    sed 's/^/  | /' "/tmp/pvm-build-$arch.log" >&2
+    sed 's/^/  | /' "$LOG_DIR/build-$arch.log" >&2
     fail=1
   fi
 done
 # The eBPF shims compile only on linux; vet them on the native arch too.
-if ! "$GO_BIN" vet ./internal/network/ ./internal/jail/ 2>"/tmp/pvm-vet.log"; then
+if ! "$GO_BIN" vet ./internal/network/ ./internal/jail/ 2>"$LOG_DIR/vet.log"; then
   echo "[arm64-check] vet FAILED" >&2
-  sed 's/^/  | /' "/tmp/pvm-vet.log" >&2
+  sed 's/^/  | /' "$LOG_DIR/vet.log" >&2
   fail=1
 fi
 exit "$fail"

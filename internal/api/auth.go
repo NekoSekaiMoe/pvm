@@ -17,7 +17,12 @@ package api
 //     authenticator (the deployment's own identity provider). Semantics
 //     are fail-closed: HTTP 200 allows, any other callback status denies
 //     with 401, and an unreachable/erroring callback fails CLOSED with
-//     500 — a broken IdP must never open the door.
+//     500 — a broken IdP must never open the door. The callback receives
+//     the RAW key, so a non-https non-loopback URL is refused at load
+//     time (delegation disabled, unknown keys stay 401) unless the
+//     private-network escape hatch PVM_AUTH_CALLBACK_ALLOW_HTTP=1 is
+//     set explicitly; redirects are never followed (the key must not be
+//     replayed to another location) and concurrent callbacks are capped.
 //
 // Both ecosystem header conventions are accepted everywhere:
 // Authorization: Bearer <key> (preferred) and X-API-KEY <key>.
@@ -54,11 +59,21 @@ type APIKey struct {
 	Tenant   string
 }
 
+// Callback POST budget: the raw key rides in the body, so the exchange
+// is capped in time (client timeout), never redirected (CheckRedirect),
+// and capped in concurrency (a junk-key flood must not pile up one
+// 5-second outbound request per API request on the process and the IdP).
+const (
+	callbackTimeout     = 5 * time.Second
+	callbackConcurrency = 8
+)
+
 // KeyRegistry holds the locally known keys plus the optional callback.
 type KeyRegistry struct {
 	keys     []APIKey
 	callback string
 	client   *http.Client
+	cbSem    chan struct{}
 }
 
 // LoadKeyRegistry builds the registry from the environment. The master
@@ -67,7 +82,8 @@ type KeyRegistry struct {
 func LoadKeyRegistry() *KeyRegistry {
 	r := &KeyRegistry{
 		callback: strings.TrimSpace(os.Getenv("PVM_AUTH_CALLBACK_URL")),
-		client:   &http.Client{Timeout: 5 * time.Second},
+		client:   newCallbackClient(),
+		cbSem:    make(chan struct{}, callbackConcurrency),
 	}
 	if master := os.Getenv("API_SECRET"); master != "" {
 		r.keys = append(r.keys, APIKey{Key: master, Operator: "master"})
@@ -90,35 +106,55 @@ func LoadKeyRegistry() *KeyRegistry {
 			}
 		}
 	}
-	warnInsecureCallback(r.callback)
+	r.callback = secureCallback(r.callback)
 	return r
 }
 
-// warnInsecureCallback flags a callback URL that would ship credentials
-// in the clear: Authenticate POSTs the RAW key there, so anything other
-// than https (or a loopback/local authenticator) leaks secrets on the
-// wire. Warned, not refused: private-network TLS-less deployments exist.
-func warnInsecureCallback(callback string) {
+// newCallbackClient builds the hardened exchange for callback POSTs:
+// bounded in time and never redirected — the body carries the RAW API
+// key, so a 307/308 (or any 3xx the client would upgrade) must never
+// replay it to another location.
+func newCallbackClient() *http.Client {
+	return &http.Client{
+		Timeout: callbackTimeout,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+}
+
+// secureCallback enforces the cleartext rule for the callback URL:
+// Authenticate POSTs the RAW key there, so anything other than https (or
+// a loopback/local authenticator) is refused — delegation is disabled and
+// unknown keys keep answering 401 instead of shipping secrets on the
+// wire. Explicit opt-in for private-network TLS-less deployments:
+// PVM_AUTH_CALLBACK_ALLOW_HTTP=1.
+func secureCallback(callback string) string {
 	if callback == "" {
-		return
+		return ""
 	}
 	u, err := url.Parse(callback)
 	if err != nil {
-		log.Printf("auth: PVM_AUTH_CALLBACK_URL %q is not a valid URL: %v (callback delegation will fail closed)", callback, err)
-		return
+		log.Printf("auth: PVM_AUTH_CALLBACK_URL %q is not a valid URL (callback delegation disabled, auth stays fail-closed): %v", callback, err)
+		return ""
 	}
 	if u.Scheme == "https" {
-		return
+		return callback
 	}
 	if host := u.Hostname(); host != "" {
 		if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
-			return
+			return callback
 		}
 		if host == "localhost" {
-			return
+			return callback
 		}
 	}
-	log.Printf("auth: PVM_AUTH_CALLBACK_URL %q is not https and not loopback — raw API keys will be sent %s to it; configure https or a loopback authenticator", callback, u.Scheme)
+	if os.Getenv("PVM_AUTH_CALLBACK_ALLOW_HTTP") == "1" {
+		log.Printf("auth: PVM_AUTH_CALLBACK_ALLOW_HTTP=1: raw API keys will be sent over %s to %q (private-network TLS-less deployment)", u.Scheme, callback)
+		return callback
+	}
+	log.Printf("auth: PVM_AUTH_CALLBACK_URL %q is not https and not loopback — callback delegation DISABLED (fail-closed 401s); set PVM_AUTH_CALLBACK_ALLOW_HTTP=1 to explicitly allow cleartext keys", callback)
+	return ""
 }
 
 // parseKeyEntries splits one blob (env value or file line) into keys.
@@ -187,7 +223,17 @@ func (r *KeyRegistry) Authenticate(key, path, method string) (APIKey, error) {
 	}
 	client := r.client
 	if client == nil {
-		client = &http.Client{Timeout: 5 * time.Second}
+		client = newCallbackClient()
+	}
+	// Cap in-flight callbacks (junk keys are free to send; the IdP is
+	// not). A saturated cap fails closed like an unreachable IdP.
+	if r.cbSem != nil {
+		select {
+		case r.cbSem <- struct{}{}:
+			defer func() { <-r.cbSem }()
+		default:
+			return APIKey{}, fmt.Errorf("%w: callback concurrency cap reached", ErrAuthUnavailable)
+		}
 	}
 	body, err := json.Marshal(callbackRequest{Key: key, Path: path, Method: method})
 	if err != nil {
@@ -228,10 +274,13 @@ func requestKey(r *http.Request) string {
 }
 
 // authError writes the fail-closed distinction: a configured but broken
-// callback surfaces as 500, a plain rejection as 401.
+// callback surfaces as 500, a plain rejection as 401. The underlying
+// unavailable-error names the callback URL and transport details, so it
+// is logged server-side only — unauthenticated clients get a fixed body.
 func authError(c echo.Context, err error) error {
 	if errors.Is(err, ErrAuthUnavailable) {
-		return c.JSON(http.StatusInternalServerError, map[string]string{"message": err.Error()})
+		log.Printf("auth: %v", err)
+		return c.JSON(http.StatusInternalServerError, map[string]string{"message": "authentication backend unavailable"})
 	}
 	return c.JSON(http.StatusUnauthorized, map[string]string{"message": "unauthenticated"})
 }

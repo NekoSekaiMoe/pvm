@@ -99,8 +99,8 @@ func (d Decision) String() string {
 
 // Gateway is the HTTP CONNECT proxy that enforces a Policy per task.
 type Gateway struct {
-	policies   map[string]*Policy // keyed by task id
-	polGen     map[string]uint64 // policy generation per task (bumped on SetPolicy)
+	policies   map[string]*Policy               // keyed by task id
+	polGen     map[string]uint64                // policy generation per task (bumped on SetPolicy)
 	tunnels    map[string]map[net.Conn]struct{} // live tunnels per task (invalidated on policy change)
 	mu         sync.RWMutex
 	ledger     *audit.Ledger            // default ledger (single-task or legacy)
@@ -261,6 +261,27 @@ func (g *Gateway) trackTunnel(task string, c net.Conn) net.Conn {
 	g.tunnels[task][c] = struct{}{}
 	g.mu.Unlock()
 	return c
+}
+
+// trackTunnelIfFresh registers a tunnel ONLY when the task's policy
+// generation still equals gen (the generation observed when the verdict
+// was computed). SetPolicy bumps the generation and closes every
+// registered tunnel; without this check a connection whose dial straddled
+// the update would register AFTER the sweep and keep riding the stale
+// verdict. Returns false (and registers nothing) when stale — the caller
+// must close the connection and refuse the tunnel.
+func (g *Gateway) trackTunnelIfFresh(task string, gen uint64, c net.Conn) bool {
+	g.mu.Lock()
+	if g.polGen[task] != gen {
+		g.mu.Unlock()
+		return false
+	}
+	if g.tunnels[task] == nil {
+		g.tunnels[task] = map[net.Conn]struct{}{}
+	}
+	g.tunnels[task][c] = struct{}{}
+	g.mu.Unlock()
+	return true
 }
 
 // untrackTunnel removes a finished tunnel.
@@ -454,7 +475,7 @@ func (g *Gateway) Addr() string {
 // handle dispatches CONNECT (HTTPS) and plain HTTP methods.
 func (g *Gateway) handle(w http.ResponseWriter, r *http.Request) {
 	task := taskFromRequest(r)
-	pol := g.policy(task)
+	pol, gen := g.policyWithGen(task)
 	if pol == nil {
 		// No policy registered -> default deny. The agent must have a policy
 		// registered by the controller before any traffic can leave.
@@ -463,7 +484,7 @@ func (g *Gateway) handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.Method == http.MethodConnect {
-		g.handleConnect(w, r, task, pol)
+		g.handleConnect(w, r, task, pol, gen)
 		return
 	}
 	g.handleHTTP(w, r, task, pol)
@@ -475,7 +496,7 @@ func (g *Gateway) handle(w http.ResponseWriter, r *http.Request) {
 // Known limitation: the tunnel relays opaque TLS bytes, so EgressInject
 // credentials can never be attached to tunneled requests — an Inject rule
 // matches the tunnel only at the host level (see ApplyInject).
-func (g *Gateway) handleConnect(w http.ResponseWriter, r *http.Request, task string, pol *Policy) {
+func (g *Gateway) handleConnect(w http.ResponseWriter, r *http.Request, task string, pol *Policy, gen uint64) {
 	v := viewFromConnect(r)
 	d := g.decideDomain(v, pol)
 	if d == DecisionBlock {
@@ -555,9 +576,16 @@ func (g *Gateway) handleConnect(w http.ResponseWriter, r *http.Request, task str
 		targetConn.Close()
 		return
 	}
-	// Register the live tunnel: a runtime SetPolicy for this task kills
-	// it (verdicts may have changed; see SetPolicy).
-	g.trackTunnel(task, clientConn)
+	// Register the live tunnel ATOMICALLY with the policy generation:
+	// a SetPolicy that lands between the verdict above and this point has
+	// already closed the then-registered tunnels — this connection must
+	// not slip in afterwards and keep riding the stale verdict.
+	if !g.trackTunnelIfFresh(task, gen, clientConn) {
+		targetConn.Close()
+		clientConn.Close()
+		g.record(task, r, DecisionBlock, "policy updated during connect (generation moved)")
+		return
+	}
 	defer g.untrackTunnel(task, clientConn)
 	// The hijacked ResponseWriter can no longer be written to, so the
 	// CONNECT success response is emitted on the raw connection.
@@ -1193,6 +1221,15 @@ func (g *Gateway) policy(task string) *Policy {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 	return g.policies[task]
+}
+
+// policyWithGen snapshots the policy AND its generation atomically: the
+// generation is the token a later tunnel registration must still match
+// (see trackTunnelIfFresh) for the verdict to stay valid.
+func (g *Gateway) policyWithGen(task string) (*Policy, uint64) {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	return g.policies[task], g.polGen[task]
 }
 
 func (g *Gateway) record(task string, r *http.Request, d Decision, reason string) {

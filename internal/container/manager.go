@@ -1253,6 +1253,17 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 			}
 		}
 
+		// Symmetric teardown registered the MOMENT the closure is complete:
+		// every failure path below (port mappings, DNS learner, ...) returns
+		// through this defer too, so a half-configured task can never leak
+		// its tc dataplane, classic filter, transparent-L7 rules, port
+		// mappings or IPAM address on the host. (The historical placement
+		// after the DNS-learn section left the portmap failure path leaking
+		// all of those.) dnsTeardown is deferred separately AFTER the
+		// learner is configured (it is a no-op until then) and runs first
+		// (LIFO): snooping stops before the map goes away.
+		defer detachNet()
+
 		// Record the resolved network posture on the state record so the
 		// API (and operators) can map host ports without re-deriving it.
 		if st.Metadata == nil {
@@ -1350,9 +1361,8 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 				}); aerr != nil {
 					// Same fail-closed contract as the tc-filter degraded warning
 					// above: this row is the only evidence of table-only learning.
-					if ipam != nil { // nil in tc mode (no IPAM there)
-						ipam.Release(taskID)
-					}
+					// (Network teardown incl. IPAM release runs via the deferred
+					// detachNet registered above.)
 					cleanupVolumes()
 					_ = st.Transition(state.StatusFailed, state.ActorController, "audit dns-learn degraded-warning append failed: "+aerr.Error())
 					state.SaveState(taskID, st)
@@ -1380,8 +1390,9 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 			}
 		}
 	}
-	defer detachNet()
 	// Runs before detachNet (LIFO): stop snooping before the map goes away.
+	// (detachNet itself is already deferred right after its closure was
+	// completed — see the comment there.)
 	defer dnsTeardown()
 
 	// UML seccomp userspace mode is an opt-in guest-integrity trade-off

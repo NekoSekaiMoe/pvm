@@ -195,6 +195,21 @@ func (m *Manager) Attach(ctx context.Context, req *AttachRequest) (*AttachResult
 	// Explicit host mounts validate BEFORE the reservation: a rejected
 	// whitelist miss must not even bump the refcount.
 	if req.HostPath != "" {
+		// The explicit-mount contract is the builtin host-directory driver
+		// ONLY. Judge by plugin INSTANCE, not PluginType: the s3 driver is
+		// also registered as PluginTypeBuiltin, and asking IT for an
+		// explicit host dir used to mount the bucket first and fail the
+		// echo check below — leaking the s3fs mount and its credentials
+		// file while only the refcount rolled back.
+		if _, isHostDir := plugin.(*BuiltinPlugin); !isHostDir {
+			m.mu.Lock()
+			m.refCounts[req.VolumeID]--
+			if m.refCounts[req.VolumeID] <= 0 {
+				delete(m.refCounts, req.VolumeID)
+			}
+			m.mu.Unlock()
+			return nil, fmt.Errorf("volume: explicit host_path requires the builtin host-directory driver, got driver %q", req.Driver)
+		}
 		if _, err := validateExplicitHostPath(req.HostPath, hostPrefixes); err != nil {
 			m.mu.Lock()
 			m.refCounts[req.VolumeID]--
@@ -219,6 +234,22 @@ func (m *Manager) Attach(ctx context.Context, req *AttachRequest) (*AttachResult
 	}
 
 	res, err := plugin.Attach(ctx, req)
+	// compensateDetach undoes a plugin-side attach whose RESULT failed a
+	// Manager-side check: without it a mismatched or escaping host_path
+	// (e.g. a lying RPC plugin, or an s3 mount asked for an explicit host
+	// dir) left the mount — and its credentials file — behind while only
+	// the refcount rolled back. The reservation is dropping back to zero,
+	// so the detach is a last-reference detach.
+	compensateDetach := func() {
+		_ = plugin.Detach(ctx, &DetachRequest{
+			SandboxID:         req.SandboxID,
+			Namespace:         req.Namespace,
+			VolumeID:          req.VolumeID,
+			Driver:            req.Driver,
+			NodeRefLastDetach: true,
+		})
+		rollback()
+	}
 	if err != nil {
 		rollback()
 		return nil, err
@@ -228,7 +259,7 @@ func (m *Manager) Attach(ctx context.Context, req *AttachRequest) (*AttachResult
 		return nil, fmt.Errorf("volume: plugin %q returned nil AttachResult", req.Driver)
 	}
 	if res.HostPath == "" {
-		rollback()
+		compensateDetach()
 		return nil, fmt.Errorf("volume: plugin %q returned empty HostPath", req.Driver)
 	}
 	if req.HostPath != "" {
@@ -236,12 +267,13 @@ func (m *Manager) Attach(ctx context.Context, req *AttachRequest) (*AttachResult
 		// and the RESULT is re-validated against the whitelist (a plugin
 		// returning something else cannot widen the mount).
 		if res.HostPath != req.HostPath {
-			rollback()
-			return nil, fmt.Errorf("volume: plugin %q returned HostPath %q instead of the requested %q", req.Driver, res.HostPath, req.HostPath)
+			err := fmt.Errorf("volume: plugin %q returned HostPath %q instead of the requested %q", req.Driver, res.HostPath, req.HostPath)
+			compensateDetach()
+			return nil, err
 		}
 		resolved, err := validateExplicitHostPath(res.HostPath, hostPrefixes)
 		if err != nil {
-			rollback()
+			compensateDetach()
 			return nil, err
 		}
 		// Mount exactly what was validated: the symlink-resolved path.
@@ -249,7 +281,7 @@ func (m *Manager) Attach(ctx context.Context, req *AttachRequest) (*AttachResult
 		// validate→bind TOCTOU (a swapped symlink redirects the mount).
 		res.HostPath = resolved
 	} else if err := m.validateHostPath(res.HostPath); err != nil {
-		rollback()
+		compensateDetach()
 		return nil, err
 	}
 

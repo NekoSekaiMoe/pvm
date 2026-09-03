@@ -194,10 +194,13 @@ func (m *Manager) pause(taskID string, gen uint64) {
 	// Deep mode: checkpoint + kill instead of the shallow freeze.
 	if m.deepPauseWanted(taskID) {
 		if derr := m.DeepPause(taskID); derr != nil {
+			// Actually fall back to the shallow freeze below (the log has
+			// always claimed it): without criu the old retry-only path left
+			// the task Running forever, pausing nothing every 30s.
 			fmt.Printf("Warning: deep autopause for %s failed (%v); falling back to freeze\n", taskID, derr)
-			m.rearmRetry(taskID, epoch)
+		} else {
+			return
 		}
-		return
 	}
 	// Best-effort freeze: if the cgroup is not present (e.g. tests, or the
 	// task exited between Load and Freeze) still transition. A genuine

@@ -66,18 +66,23 @@ func TestValidatePortMapping(t *testing.T) {
 	if err := validatePortMapping(ok); err != nil {
 		t.Fatalf("valid mapping rejected: %v", err)
 	}
-	bad := []PortMapping{
-		{HostPort: 0, GuestPort: 80, GuestIP: "10.0.0.1"},
-		{HostPort: 70000, GuestPort: 80, GuestIP: "10.0.0.1"},
-		{HostPort: 80, GuestPort: 0, GuestIP: "10.0.0.1"},
-		{HostPort: 80, GuestPort: 80, GuestIP: "not-an-ip"},
-		{HostPort: 80, GuestPort: 80, GuestIP: "::1"},
-		{TaskID: "t", HostPort: 80, GuestPort: 80, GuestIP: "10.0.0.1", Protocol: "sctp"},
+	bad := []struct {
+		name string
+		m    PortMapping
+	}{
+		{"host port zero", PortMapping{HostPort: 0, GuestPort: 80, GuestIP: "10.0.0.1"}},
+		{"host port too high", PortMapping{HostPort: 70000, GuestPort: 80, GuestIP: "10.0.0.1"}},
+		{"guest port zero", PortMapping{HostPort: 80, GuestPort: 0, GuestIP: "10.0.0.1"}},
+		{"guest ip garbage", PortMapping{HostPort: 80, GuestPort: 80, GuestIP: "not-an-ip"}},
+		{"guest ip ipv6", PortMapping{HostPort: 80, GuestPort: 80, GuestIP: "::1"}},
+		{"protocol not tcp/udp", PortMapping{TaskID: "t", HostPort: 80, GuestPort: 80, GuestIP: "10.0.0.1", Protocol: "sctp"}},
 	}
-	for i, m := range bad {
-		if err := validatePortMapping(m); err == nil {
-			t.Fatalf("case %d must be rejected: %+v", i, m)
-		}
+	for _, tc := range bad {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := validatePortMapping(tc.m); err == nil {
+				t.Fatalf("must be rejected: %+v", tc.m)
+			}
+		})
 	}
 }
 

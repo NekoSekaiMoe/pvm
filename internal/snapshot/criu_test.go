@@ -62,24 +62,28 @@ func mkdirState(t *testing.T, id string, status state.Status, pid int) {
 }
 
 func TestDumpMemoryArgsIncremental(t *testing.T) {
-	base := DumpMemoryArgs(42, "/s/criu", "", true)
-	for _, want := range []string{"--tree", "42", "--images-dir", "/s/criu", "--leave-running"} {
-		if !contains(base, want) {
-			t.Fatalf("base args missing %q: %v", want, base)
+	t.Run("base dump", func(t *testing.T) {
+		base := DumpMemoryArgs(42, "/s/criu", "", true)
+		for _, want := range []string{"--tree", "42", "--images-dir", "/s/criu", "--leave-running"} {
+			if !contains(base, want) {
+				t.Fatalf("base args missing %q: %v", want, base)
+			}
 		}
-	}
-	for _, bad := range []string{"--track-mem", "--prev-images-dir"} {
-		if contains(base, bad) {
-			t.Fatalf("base args must not carry %q", bad)
+		for _, bad := range []string{"--track-mem", "--prev-images-dir"} {
+			if contains(base, bad) {
+				t.Fatalf("base args must not carry %q", bad)
+			}
 		}
-	}
-	inc := DumpMemoryArgs(42, "/s/criu", "../snap-1/criu", false)
-	if !contains(inc, "--track-mem") || !contains(inc, "--prev-images-dir") || !contains(inc, "../snap-1/criu") {
-		t.Fatalf("incremental args = %v", inc)
-	}
-	if contains(inc, "--leave-running") {
-		t.Fatal("checkpoint-and-stop must not leave running")
-	}
+	})
+	t.Run("incremental dump", func(t *testing.T) {
+		inc := DumpMemoryArgs(42, "/s/criu", "../snap-1/criu", false)
+		if !contains(inc, "--track-mem") || !contains(inc, "--prev-images-dir") || !contains(inc, "../snap-1/criu") {
+			t.Fatalf("incremental args = %v", inc)
+		}
+		if contains(inc, "--leave-running") {
+			t.Fatal("checkpoint-and-stop must not leave running")
+		}
+	})
 }
 
 func contains(list []string, s string) bool {
@@ -89,4 +93,70 @@ func contains(list []string, s string) bool {
 		}
 	}
 	return false
+}
+
+// prevImagesRel: the relative --prev-images-dir must be computed against
+// the criu IMAGES dir (the "criu" subdir) and must keep the parent inside
+// the task's snapshots root. Regression: the old base (the snapshot dir)
+// rejected every sibling, so incremental dumps never happened.
+func TestPrevImagesRel(t *testing.T) {
+	cases := []struct {
+		name      string
+		targetDir string
+		snapDir   string
+		prev      string
+		want      string
+	}{
+		{
+			name:      "sibling snapshot chains with ..",
+			targetDir: "/s/t1/snapshots/snap-2",
+			snapDir:   "/s/t1/snapshots",
+			prev:      "/s/t1/snapshots/snap-1/criu",
+			want:      "../../snap-1/criu",
+		},
+		{
+			name:      "identical images dir resolves to dot",
+			targetDir: "/s/t1/snapshots/snap-2",
+			snapDir:   "/s/t1/snapshots",
+			prev:      "/s/t1/snapshots/snap-2/criu",
+			want:      ".",
+		},
+		{
+			name:      "escape outside the snapshots root rejected",
+			targetDir: "/s/t1/snapshots/snap-2",
+			snapDir:   "/s/t1/snapshots",
+			prev:      "/s/t2/snapshots/snap-1/criu",
+			want:      "",
+		},
+		{
+			name:      "far escape rejected",
+			targetDir: "/s/t1/snapshots/snap-2",
+			snapDir:   "/s/t1/snapshots",
+			prev:      "/etc/criu",
+			want:      "",
+		},
+		{
+			name:      "empty prev is a full dump",
+			targetDir: "/s/t1/snapshots/snap-2",
+			snapDir:   "/s/t1/snapshots",
+			prev:      "",
+			want:      "",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := prevImagesRel(tc.targetDir, tc.snapDir, tc.prev); got != tc.want {
+				t.Fatalf("prevImagesRel = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// CRIUBin: an explicit override that cannot run is "unavailable" — this is
+// also what lets integration tests isolate a server from a host criu.
+func TestCRIUBinOverrideMustExist(t *testing.T) {
+	t.Setenv("PVM_CRIU_BIN", "/nonexistent/criu-definitely-not-here")
+	if got := CRIUBin(); got != "" {
+		t.Fatalf("unusable override must resolve to empty, got %q", got)
+	}
 }

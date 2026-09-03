@@ -457,24 +457,30 @@ func TestValidateHostPathField(t *testing.T) {
 	base := func() *TaskSpec {
 		return &TaskSpec{Version: 1, Caller: "x"}
 	}
-	s := base()
-	s.Volumes = []VolumeMount{{Name: "v", Path: "/w", HostPath: "/srv/shared/x"}}
-	if err := s.Validate(); err != nil {
-		t.Fatalf("absolute clean host_path must validate: %v", err)
+	cases := []struct {
+		name   string
+		host   string
+		errSub string // "" means must validate
+	}{
+		{"absolute clean path validates", "/srv/shared/x", ""},
+		{"relative path fails", "relative/x", "host_path"},
+		{"whitespace fails (kernel arg charset)", "/has space", "host_path"},
+		{"colon fails (kernel arg charset)", "/has:colon", "host_path"},
 	}
-	s = base()
-	s.Volumes = []VolumeMount{{Name: "v", Path: "/w", HostPath: "relative/x"}}
-	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "host_path") {
-		t.Fatalf("relative host_path must fail, got %v", err)
-	}
-	s = base()
-	s.Volumes = []VolumeMount{{Name: "v", Path: "/w", HostPath: "/has space"}}
-	if err := s.Validate(); err == nil {
-		t.Fatal("host_path with whitespace must fail (kernel arg charset)")
-	}
-	s = base()
-	s.Volumes = []VolumeMount{{Name: "v", Path: "/w", HostPath: "/has:colon"}}
-	if err := s.Validate(); err == nil {
-		t.Fatal("host_path with colon must fail (kernel arg charset)")
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := base()
+			s.Volumes = []VolumeMount{{Name: "v", Path: "/w", HostPath: tc.host}}
+			err := s.Validate()
+			if tc.errSub == "" {
+				if err != nil {
+					t.Fatalf("host_path %q must validate: %v", tc.host, err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.errSub) {
+				t.Fatalf("host_path %q must fail with %q, got %v", tc.host, tc.errSub, err)
+			}
+		})
 	}
 }

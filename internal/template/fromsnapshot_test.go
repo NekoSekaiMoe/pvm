@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -61,7 +62,7 @@ func TestCreateFromSnapshotFlattens(t *testing.T) {
 	storeRoot := t.TempDir()
 	s := NewStore(storeRoot)
 
-	rec, err := CreateFromSnapshot(s, taskID, snapID, "promoted")
+	rec, err := CreateFromSnapshot(context.Background(), s, taskID, snapID, "promoted")
 	if err != nil {
 		t.Fatalf("promotion failed: %v", err)
 	}
@@ -108,18 +109,39 @@ func TestCreateFromSnapshotFlattens(t *testing.T) {
 	}
 }
 
-func TestCreateFromSnapshotMissing(t *testing.T) {
+func TestCreateFromSnapshotValidation(t *testing.T) {
 	state.RootDir = t.TempDir()
 	s := NewStore(t.TempDir())
-	if _, err := CreateFromSnapshot(s, "ghost", "snap-none", ""); err == nil {
-		t.Fatal("missing snapshot must fail")
+	cases := []struct {
+		name       string
+		taskID     string
+		snapshotID string
+		wantErr    error
+	}{
+		// snapshot_id arrives from the request body: separators and
+		// traversal fragments must never reach filepath.Join.
+		{"path separator", "task", "a/b", ErrInvalidSnapshotID},
+		{"backslash separator", "task", `a\b`, ErrInvalidSnapshotID},
+		{"parent traversal", "task", "..", ErrInvalidSnapshotID},
+		{"dot", "task", ".", ErrInvalidSnapshotID},
+		{"nested traversal", "task", "../snap-1", ErrInvalidSnapshotID},
+		{"traversal via event lookup", "task", "../../elsewhere", ErrInvalidSnapshotID},
+		{"missing snapshot", "ghost", "snap-none", ErrSnapshotNotFound},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := CreateFromSnapshot(context.Background(), s, tc.taskID, tc.snapshotID, "")
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("err = %v, want %v", err, tc.wantErr)
+			}
+		})
 	}
 }
 
 func TestInspectFillsStats(t *testing.T) {
 	taskID, snapID, _ := mkSnapshotTask(t)
 	s := NewStore(t.TempDir())
-	rec, err := CreateFromSnapshot(s, taskID, snapID, "")
+	rec, err := CreateFromSnapshot(context.Background(), s, taskID, snapID, "")
 	if err != nil {
 		t.Fatal(err)
 	}

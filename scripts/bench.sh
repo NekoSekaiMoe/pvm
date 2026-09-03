@@ -210,7 +210,7 @@ record_fail() { # op (dependency missing — no request was sent)
 
 between_ops() { # throttle, skipped in dry-run for speed
     [ "$DRY_RUN" -eq 1 ] && return 0
-    [ "$PAUSE_SEC" -gt 0 ] 2>/dev/null && sleep "$PAUSE_SEC"
+    [ "$PAUSE_SEC" != "0" ] && sleep "$PAUSE_SEC"
     return 0
 }
 
@@ -233,6 +233,9 @@ cleanup() {
         [ "$DRY_RUN" -eq 1 ] || request_ok \
             || warn "cleanup: DELETE /api/containers/$id -> $R_CODE (left behind?)"
     done
+    # main()'s `trap cleanup EXIT` REPLACED the mktemp trap registered at
+    # startup, so the temp dir must be removed here or every run leaks one.
+    rm -rf "$TMPDIR_BENCH"
 }
 
 # ---------------------------------------------------------------------------
@@ -359,7 +362,11 @@ report() {
             p50=$(pctl 0.50 <<< "$sorted")
             p95=$(pctl 0.95 <<< "$sorted")
         else
-            min=avg=p50=p95=max="-"
+            # NOT a chained assignment: bash would store the literal
+            # "avg=p50=p95=max=-" into min and leave the rest unset,
+            # which set -u turns into a hard crash while printing the
+            # report — exactly when an op's requests all failed.
+            min="-"; avg="-"; p50="-"; p95="-"; max="-"
         fi
         if [ "$JSON_OUT" -eq 1 ]; then
             printf '{"op":"%s","n":%d,"ok":%d,"fail":%d,"min":%s,"avg":%s,"p50":%s,"p95":%s,"max":%s,"wall":%s}\n' \

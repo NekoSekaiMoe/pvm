@@ -4,7 +4,6 @@ import (
 	"net/http"
 	"net/http/pprof"
 	"os"
-	"strings"
 	"time"
 
 	"github.com/labstack/echo/v4"
@@ -79,9 +78,13 @@ func registerObservability(e *echo.Echo, reg *KeyRegistry) {
 func metricsAuth(reg *KeyRegistry) echo.MiddlewareFunc {
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
 		return func(c echo.Context) error {
-			key := strings.TrimPrefix(c.Request().Header.Get("Authorization"), "Bearer ")
-			if _, ok := reg.Lookup(key); ok {
-				return next(c)
+			// Same header conventions as the /api guard (requestKey):
+			// Authorization: Bearer <key> and X-API-KEY <key>.
+			key := requestKey(c.Request())
+			if key != "" {
+				if _, ok := reg.Lookup(key); ok {
+					return next(c)
+				}
 			}
 			return echo.NewHTTPError(http.StatusUnauthorized, map[string]string{"message": "unauthorized"})
 		}

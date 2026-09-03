@@ -136,15 +136,19 @@ func TestS3FSArgv(t *testing.T) {
 		"use_path_request_style",
 		"allow_other",
 	} {
-		if !strings.Contains(joined, want) {
-			t.Fatalf("s3fs argv missing %q: %s", want, joined)
-		}
+		t.Run("has "+want, func(t *testing.T) {
+			if !strings.Contains(joined, want) {
+				t.Fatalf("s3fs argv missing %q: %s", want, joined)
+			}
+		})
 	}
 	// Path style off by default for real S3 endpoints.
-	args = s3fsArgs("/mnt/x", "b", "", "", false, "/tmp/c")
-	if strings.Contains(strings.Join(args, " "), "use_path_request_style") {
-		t.Fatal("path style must be opt-in")
-	}
+	t.Run("path style off for real S3 endpoints", func(t *testing.T) {
+		args = s3fsArgs("/mnt/x", "b", "", "", false, "/tmp/c")
+		if strings.Contains(strings.Join(args, " "), "use_path_request_style") {
+			t.Fatal("path style must be opt-in")
+		}
+	})
 }
 
 func TestS3PluginMissingBinaryFailsClosed(t *testing.T) {
@@ -161,4 +165,39 @@ func TestS3PluginMissingBinaryFailsClosed(t *testing.T) {
 		t.Fatalf("missing s3fs must fail closed, got %v", err)
 	}
 	_ = os.Getenv("PATH")
+}
+
+// Production attach path must refuse cleartext S3 endpoints that are not
+// loopback (credentials would ride the wire unencrypted); https and
+// loopback http stay allowed, and PVM_S3_ALLOW_HTTP=1 is the explicit
+// private-network opt-in.
+func TestValidateS3Endpoint(t *testing.T) {
+	cases := []struct {
+		name     string
+		endpoint string
+		optin    string
+		wantErr  bool
+	}{
+		{"empty defaults to https AWS", "", "", false},
+		{"https allowed", "https://s3.example", "", false},
+		{"loopback http allowed", "http://127.0.0.1:9000", "", false},
+		{"localhost http allowed", "http://localhost:9000", "", false},
+		{"remote http refused", "http://s3.example", "", true},
+		{"remote http refused with junk optin", "http://s3.example", "yes", true},
+		{"remote http explicit opt-in", "http://s3.example", "1", false},
+		{"garbage refused", "not a url :", "", true},
+		{"wrong scheme refused", "ftp://s3.example", "", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("PVM_S3_ALLOW_HTTP", tc.optin)
+			err := validateS3Endpoint(tc.endpoint)
+			if tc.wantErr && err == nil {
+				t.Fatalf("validateS3Endpoint(%q) must fail", tc.endpoint)
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("validateS3Endpoint(%q) = %v, want ok", tc.endpoint, err)
+			}
+		})
+	}
 }

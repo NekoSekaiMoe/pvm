@@ -6,6 +6,7 @@ package api
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"strconv"
@@ -50,9 +51,20 @@ func registerPortMapAPI(api *echo.Group) {
 		if st.Metadata["dataplane"] == "tc" {
 			return c.JSON(http.StatusConflict, map[string]string{"error": network.ErrPortMapTCMode.Error()})
 		}
+		// An explicit guest_ip must match the task's recorded address: it
+		// becomes the DNAT target (and a FORWARD ACCEPT subject), so a
+		// free-form value would let any key holder steer host traffic to
+		// an arbitrary bridge-reachable address.
+		recorded := st.Metadata["guest_ip"]
+		if req.GuestIP != "" && req.GuestIP != recorded {
+			if recorded == "" {
+				return c.JSON(http.StatusBadRequest, map[string]string{"error": "task has no recorded guest IP; explicit guest_ip is not accepted"})
+			}
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": fmt.Sprintf("guest_ip %q does not match the task's recorded address %q", req.GuestIP, recorded)})
+		}
 		guestIP := req.GuestIP
 		if guestIP == "" {
-			guestIP = st.Metadata["guest_ip"]
+			guestIP = recorded
 		}
 		if guestIP == "" {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": "no guest IP recorded for the task (bridge dataplane required)"})

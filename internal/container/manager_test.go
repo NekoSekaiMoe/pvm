@@ -173,27 +173,40 @@ func TestResolveAutoDataplane(t *testing.T) {
 		f(s)
 		return s
 	}
-	if got := resolveAutoDataplane(mk(func(s *spec.TaskSpec) {
-		s.Network.PortMappings = []spec.PortMappingSpec{{HostPort: 80, GuestPort: 80}}
-	})); got != spec.DataplaneBridge {
-		t.Fatalf("port mappings must pin bridge, got %s", got)
+	// Every L7-visible knob pins the bridge plane (no IPAM/tap NAT path
+	// can enforce domain policy); nothing else does, and then root prefers
+	// tc while non-root falls back to bridge.
+	pinners := []struct {
+		name string
+		set  func(s *spec.TaskSpec)
+	}{
+		{"port mappings", func(s *spec.TaskSpec) {
+			s.Network.PortMappings = []spec.PortMappingSpec{{HostPort: 80, GuestPort: 80}}
+		}},
+		{"egress allow domains", func(s *spec.TaskSpec) {
+			s.Network.EgressAllowDomains = []string{"example.com"}
+		}},
+		{"egress block domains", func(s *spec.TaskSpec) {
+			s.Network.EgressBlockDomains = []string{"evil.example"}
+		}},
+		{"egress rules", func(s *spec.TaskSpec) {
+			s.Network.EgressRules = []spec.EgressRule{{Name: "r"}}
+		}},
 	}
-	if got := resolveAutoDataplane(mk(func(s *spec.TaskSpec) {
-		s.Network.EgressAllowDomains = []string{"example.com"}
-	})); got != spec.DataplaneBridge {
-		t.Fatalf("L7 domains must pin bridge, got %s", got)
+	for _, tc := range pinners {
+		t.Run(tc.name+" pins bridge", func(t *testing.T) {
+			if got := resolveAutoDataplane(mk(tc.set)); got != spec.DataplaneBridge {
+				t.Fatalf("%s must pin bridge, got %s", tc.name, got)
+			}
+		})
 	}
-	if got := resolveAutoDataplane(mk(func(s *spec.TaskSpec) {
-		s.Network.EgressRules = []spec.EgressRule{{Name: "r"}}
-	})); got != spec.DataplaneBridge {
-		t.Fatalf("L7 rules must pin bridge, got %s", got)
-	}
-	// No pinning: root prefers tc, non-root falls back to bridge.
-	want := spec.DataplaneTC
-	if os.Geteuid() != 0 {
-		want = spec.DataplaneBridge
-	}
-	if got := resolveAutoDataplane(mk(func(s *spec.TaskSpec) {})); got != want {
-		t.Fatalf("unpinned auto = %s, want %s", got, want)
-	}
+	t.Run("unpinned auto follows root", func(t *testing.T) {
+		want := spec.DataplaneTC
+		if os.Geteuid() != 0 {
+			want = spec.DataplaneBridge
+		}
+		if got := resolveAutoDataplane(mk(func(s *spec.TaskSpec) {})); got != want {
+			t.Fatalf("unpinned auto = %s, want %s", got, want)
+		}
+	})
 }

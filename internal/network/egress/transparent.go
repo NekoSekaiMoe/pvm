@@ -73,8 +73,10 @@ func originalDstAddr(conn net.Conn) (*net.TCPAddr, error) {
 	if ctrlErr != nil || errno != 0 {
 		return nil, ErrNoOriginalDst
 	}
-	// sockaddr_in: family(2) port(2, network order) addr(4) zero(8).
-	if binary.BigEndian.Uint16(sockaddr[0:2]) != unix.AF_INET {
+	// sockaddr_in: family(2, HOST byte order — sa_family_t is native
+	// endian; on little-endian x86_64/arm64 AF_INET=2 is stored as 02 00)
+	// port(2, network order) addr(4) zero(8).
+	if binary.NativeEndian.Uint16(sockaddr[0:2]) != unix.AF_INET {
 		return nil, ErrNoOriginalDst
 	}
 	port := binary.BigEndian.Uint16(sockaddr[2:4])
@@ -163,7 +165,7 @@ func (g *Gateway) serveTransparent(conn net.Conn, taskID string) {
 	if err != nil {
 		return // not redirected here: nothing we can attribute
 	}
-	pol := g.policy(taskID)
+	pol, gen := g.policyWithGen(taskID)
 	if pol == nil {
 		g.recordRaw(taskID, "transparent", DecisionBlock, "no policy registered")
 		return
@@ -175,7 +177,7 @@ func (g *Gateway) serveTransparent(conn net.Conn, taskID string) {
 		return
 	}
 	if head[0] == 0x16 { // TLS ClientHello
-		g.serveTransparentTLS(conn, br, taskID, dst, pol)
+		g.serveTransparentTLS(conn, br, taskID, dst, pol, gen)
 		return
 	}
 	g.serveTransparentHTTP(conn, taskID, dst)
@@ -208,7 +210,7 @@ func (g *Gateway) serveTransparentHTTP(conn net.Conn, taskID string, dst *net.TC
 
 // serveTransparentTLS sniffs the SNI and either MITMs (rule opted in),
 // splices (allowed), or drops (denied).
-func (g *Gateway) serveTransparentTLS(conn net.Conn, br *bufio.Reader, taskID string, dst *net.TCPAddr, pol *Policy) {
+func (g *Gateway) serveTransparentTLS(conn net.Conn, br *bufio.Reader, taskID string, dst *net.TCPAddr, pol *Policy, gen uint64) {
 	sni, clientHello, err := sniffClientHello(br)
 	if err != nil {
 		g.recordRaw(taskID, "transparent-tls", DecisionBlock, "unreadable ClientHello: "+err.Error())
@@ -246,7 +248,12 @@ func (g *Gateway) serveTransparentTLS(conn net.Conn, br *bufio.Reader, taskID st
 	if _, err := target.Write(clientHello); err != nil {
 		return
 	}
-	g.trackTunnel(taskID, conn)
+	// Atomic-with-generation registration (see handleConnect): a policy
+	// update that fired during the dial must invalidate this splice too.
+	if !g.trackTunnelIfFresh(taskID, gen, conn) {
+		g.recordRaw(taskID, "transparent-tls", DecisionBlock, "policy updated during connect (generation moved)")
+		return
+	}
 	defer g.untrackTunnel(taskID, conn)
 	up := &countingConn{Conn: target, task: taskID, g: g}
 	done := make(chan struct{}, 2)

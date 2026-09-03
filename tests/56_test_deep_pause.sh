@@ -17,7 +17,9 @@ trap '[ -n "$SRV" ] && kill "$SRV" 2>/dev/null || true; rm -rf "$TMP"' EXIT
 export PVM_STATE_ROOT="$TMP/state"
 export PVM_AUDIT_ROOT="$TMP/audit"
 export PVM_CGROUP_ROOT="$TMP/cg"
-export PVM_CRIU_BIN=""   # no criu: deep pause must fail closed
+# Isolate from a host-installed criu: the override points at a path that
+# cannot run, so CRIUBin() resolves to "" even when PATH has criu.
+export PVM_CRIU_BIN="$TMP/no-criu-bin"
 mkdir -p "$PVM_STATE_ROOT" "$PVM_AUDIT_ROOT" "$PVM_CGROUP_ROOT"
 
 PORT=18056
@@ -41,9 +43,11 @@ for _ in $(seq 1 40); do
 done
 curl -sf -H "$AUTH" "$API/containers" >/dev/null 2>&1 || fail "server failed to start: $(cat "$TMP/server.log")"
 
-mkstate() { # id status extra-metadata-json
+mkstate() { # id status extra-metadata-json [pid]
     mkdir -p "$PVM_STATE_ROOT/$1"
-    printf '{"id":"%s","name":"%s","status":"%s","metadata":%s}\n' "$1" "$1" "$2" "$3" \
+    local pid=${4:-0}
+    printf '{"id":"%s","name":"%s","status":"%s","metadata":%s,"pid":%s}\n' \
+        "$1" "$1" "$2" "$3" "$pid" \
         > "$PVM_STATE_ROOT/$1/state.json"
 }
 
@@ -57,7 +61,9 @@ CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$API/tasks/dp-suspended/p
 [ "$CODE" = "409" ] || fail "non-running deep pause must 409, got $CODE"
 
 echo "--- 3. deep pause without criu fails closed (409 + message)"
-mkstate dp-run running '{}'
+# Record a LIVE pid (this shell): with pid=0 the 409 would come from the
+# "no live PID" guard and never exercise the criu-unavailable branch.
+mkstate dp-run running '{}' $$
 BODY=$(curl -s -X POST "$API/tasks/dp-run/pause?deep=1" -H "$AUTH")
 CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$API/tasks/dp-run/pause?deep=1" -H "$AUTH")
 [ "$CODE" = "409" ] || fail "no-criu deep pause must 409, got $CODE"

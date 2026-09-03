@@ -731,7 +731,11 @@ func (d *TapDataplane) Close() error {
 	}
 	d.removeFilters()
 	d.removePins()
+	// Both per-task series go away with the task: a lingering
+	// high-water counter would grow the registry (and /metrics scrape
+	// size) by one series per task forever.
 	dpSessionsGauge.Delete(d.taskID)
+	dpSessionHighWater.Delete(d.taskID)
 	if d.whitelistOwned {
 		UnregisterWhitelistMap(d.tapName) // registry closes the map
 	}

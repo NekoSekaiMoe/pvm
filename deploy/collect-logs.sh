@@ -211,7 +211,7 @@ collect_env_names() {
 }
 
 collect_env_file_keys() {
-    local f candidates=("$PVM_ENV_FILE" /etc/pvm/pvm.env "$SCRIPT_DIR/pvm.env")
+    local f candidates=("${PVM_ENV_FILE:-}" /etc/pvm/pvm.env "$SCRIPT_DIR/pvm.env")
     for f in "${candidates[@]}"; do
         [ -n "$f" ] && [ -f "$f" ] || continue
         echo "==== $f (key names only) ===="

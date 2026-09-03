@@ -66,10 +66,19 @@ func collectTaskGauges() {
 			taskRSSGauge.Set(rss, st.ID)
 		}
 	}
-	// Refresh every known state label (including ones that dropped to 0)
-	// by reading the current label set off the gauges' backing registry.
+	// Refresh every currently-present state label...
 	for s, n := range byState {
 		tasksByState.Set(float64(n), s)
+	}
+	// ...and zero the ones whose last task left: without this, a state
+	// label lingers at its last non-zero value forever (the doc comment
+	// always claimed it; the code never did).
+	for _, lvs := range tasksByState.Labels() {
+		if len(lvs) == 1 {
+			if _, still := byState[lvs[0]]; !still {
+				tasksByState.Set(0, lvs[0])
+			}
+		}
 	}
 	// Drop per-task labels whose task disappeared.
 	for _, lvs := range taskCPUGauge.Labels() {

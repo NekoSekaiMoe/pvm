@@ -197,6 +197,11 @@ type TemplateInfo struct {
 	Status     string    `json:"status"`
 	ImageRef   string    `json:"image_ref"`
 	CreatedAt  time.Time `json:"created_at"`
+	// Image inspection fields (internal/template.Record JSON): filled
+	// by InspectTemplate — without them the inspect result would decode
+	// to zeros and the caller could not see size/hash at all.
+	ImageSizeBytes int64  `json:"image_size_bytes,omitempty"`
+	ImageSHA256    string `json:"image_sha256,omitempty"`
 }
 
 func (c *Client) CreateTemplate(ctx context.Context, imageRef, alias string) (*TemplateInfo, error) {

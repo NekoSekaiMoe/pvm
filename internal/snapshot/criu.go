@@ -32,9 +32,15 @@ const (
 var ErrCRIUUnavailable = fmt.Errorf("snapshot: criu binary not available")
 
 // CRIUBin resolves the criu binary (PVM_CRIU_BIN override, then PATH).
+// An override that cannot actually run counts as "unavailable": the
+// explicit-overridability is also what lets tests isolate a server from
+// a host-installed criu by pointing at a nonexistent path.
 func CRIUBin() string {
 	if v := os.Getenv("PVM_CRIU_BIN"); v != "" {
-		return v
+		if p, err := exec.LookPath(v); err == nil {
+			return p
+		}
+		return ""
 	}
 	if p, err := exec.LookPath("criu"); err == nil {
 		return p

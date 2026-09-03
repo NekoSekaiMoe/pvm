@@ -250,21 +250,17 @@ func CreateEventSnapshot(taskID, eventID, auditHash string, metadata map[string]
 	}()
 	if dumpMemory {
 		// Incremental dumps (opt-in, PVM_SNAPSHOT_INCREMENTAL=1): chain onto
-	// the task's previous FULL-memory snapshot so only pages dirtied since
-	// are written (--track-mem + a RELATIVE --prev-images-dir, which a
-	// later restore follows through the chain).
-	prevRel := ""
-	if os.Getenv("PVM_SNAPSHOT_INCREMENTAL") == "1" {
-		if prev := previousMemoryDir(taskID, snapDir); prev != "" {
-			if rel, rerr := filepath.Rel(targetDir, prev); rerr == nil && !strings.HasPrefix(rel, "..") {
-				prevRel = rel
+		// the task's previous FULL-memory snapshot so only pages dirtied since
+		// are written (--track-mem + a RELATIVE --prev-images-dir, which a
+		// later restore follows through the chain).
+		prevRel := ""
+		if os.Getenv("PVM_SNAPSHOT_INCREMENTAL") == "1" {
+			prevRel = prevImagesRel(targetDir, snapDir, previousMemoryDir(taskID, snapDir))
+		}
+		if err := DumpMemoryExt(st.PID, MemoryImagesDir(targetDir), prevRel, true); err == nil {
+			if prevRel != "" {
+				metadata["memory_incremental"] = "prev-relative:" + prevRel
 			}
-		}
-	}
-	if err := DumpMemoryExt(st.PID, MemoryImagesDir(targetDir), prevRel, true); err == nil {
-		if prevRel != "" {
-			metadata["memory_incremental"] = "prev-relative:" + prevRel
-		}
 			metadata["memory_state"] = string(MemoryFull)
 		} else {
 			metadata["memory_state"] = string(MemoryDegraded)
@@ -477,4 +473,26 @@ func previousMemoryDir(taskID, _ string) string {
 		return ""
 	}
 	return MemoryImagesDir(best)
+}
+
+// prevImagesRel computes the RELATIVE --prev-images-dir value for prev
+// (a sibling snapshot's criu images dir) against the CURRENT dump's
+// --images-dir. criu resolves the flag against MemoryImagesDir(targetDir)
+// (the "criu" subdir), NOT the snapshot dir itself — so a sibling
+// snapshot NEEDS the leading ".." components. (The old base rejected
+// every sibling, so the incremental flag silently always took a FULL
+// dump.) What must never happen is escaping the task's snapshots root:
+// prev has to stay under snapDir. Empty prev or an escaping/unrelated
+// path yields "" (full dump).
+func prevImagesRel(targetDir, snapDir, prev string) string {
+	if prev == "" {
+		return ""
+	}
+	if rel, rerr := filepath.Rel(MemoryImagesDir(targetDir), prev); rerr == nil {
+		if rootRel, rootErr := filepath.Rel(snapDir, prev); rootErr == nil &&
+			rootRel != ".." && !strings.HasPrefix(rootRel, ".."+string(filepath.Separator)) {
+			return rel
+		}
+	}
+	return ""
 }

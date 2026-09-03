@@ -2,7 +2,9 @@ package api
 
 import (
 	"encoding/base64"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -106,7 +108,9 @@ func registerExecRuntimeExtras(api *echo.Group) {
 		}
 		res := c.Response()
 		res.Header().Set("Content-Type", "text/event-stream")
-		res.Header().Set("Cache-Control", "no-cache")
+		// no-store (not no-cache): the stream is key-protected console
+		// output and must never be persisted by any intermediary.
+		res.Header().Set("Cache-Control", "no-store")
 		res.Header().Set("Connection", "keep-alive")
 		res.Header().Set("X-Accel-Buffering", "no")
 		res.WriteHeader(http.StatusOK)
@@ -128,6 +132,12 @@ func registerExecRuntimeExtras(api *echo.Group) {
 			if err != nil {
 				if ctx.Err() != nil {
 					return nil // client went away
+				}
+				// A closed session returns io.ErrClosedPipe IMMEDIATELY:
+				// treating it like a timeout would turn the keepalive
+				// branch into a CPU busy-loop flushing pings forever.
+				if errors.Is(err, io.ErrClosedPipe) {
+					return nil
 				}
 				// Timeout without data: keepalive comment line.
 				fmt.Fprint(res, ": ping\n\n")

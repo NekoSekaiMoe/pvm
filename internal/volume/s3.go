@@ -26,6 +26,8 @@ package volume
 import (
 	"context"
 	"fmt"
+	"net"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -75,6 +77,38 @@ func s3fsArgs(mountpoint, bucket, endpoint, region string, pathStyle bool, passw
 	return args
 }
 
+// validateS3Endpoint refuses cleartext endpoints that would carry the
+// AWS credential exchange (and object data) unencrypted: https by
+// default; http only for loopback/localhost (local MinIO et al.) or
+// behind the explicit PVM_S3_ALLOW_HTTP=1 private-network opt-in.
+func validateS3Endpoint(endpoint string) error {
+	if endpoint == "" {
+		return nil // default AWS endpoints (https)
+	}
+	u, err := url.Parse(endpoint)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return fmt.Errorf("volume s3: PVM_S3_ENDPOINT %q is not a valid endpoint URL", endpoint)
+	}
+	switch u.Scheme {
+	case "https":
+		return nil
+	case "http":
+		host := u.Hostname()
+		if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+			return nil
+		}
+		if host == "localhost" {
+			return nil
+		}
+		if os.Getenv("PVM_S3_ALLOW_HTTP") == "1" {
+			return nil
+		}
+		return fmt.Errorf("volume s3: PVM_S3_ENDPOINT %q is cleartext http for a non-loopback host; use https or set PVM_S3_ALLOW_HTTP=1 explicitly", endpoint)
+	default:
+		return fmt.Errorf("volume s3: PVM_S3_ENDPOINT %q must be an http(s) URL", endpoint)
+	}
+}
+
 func (p *S3Plugin) Attach(ctx context.Context, req *AttachRequest) (*AttachResult, error) {
 	if req.VolumeBaseDir == "" {
 		return nil, fmt.Errorf("volume s3: VolumeBaseDir required")
@@ -116,6 +150,9 @@ func (p *S3Plugin) Attach(ctx context.Context, req *AttachRequest) (*AttachResul
 	}
 
 	endpoint := os.Getenv("PVM_S3_ENDPOINT")
+	if err := validateS3Endpoint(endpoint); err != nil {
+		return nil, err
+	}
 	pathStyle := strings.Contains(os.Getenv("PVM_S3_PATH_STYLE"), "1") || strings.Contains(endpoint, "minio") || strings.Contains(endpoint, "127.0.0.1")
 	args := s3fsArgs(mountpoint, bucket, endpoint, os.Getenv("PVM_S3_REGION"), pathStyle, passwd)
 	cmd := exec.CommandContext(ctx, "s3fs", args...)

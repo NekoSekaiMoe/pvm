@@ -10,6 +10,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 	"unsafe"
 )
 
@@ -136,11 +137,20 @@ func TestSweepOnceNilMap(t *testing.T) {
 }
 
 func TestSessionIdleForProtocolAware(t *testing.T) {
-	if got := sessionIdleFor(6); got != tcpSessionIdleTimeout {
-		t.Fatalf("TCP idle = %v, want %v", got, tcpSessionIdleTimeout)
+	cases := []struct {
+		name     string
+		protocol uint8
+		want     time.Duration
+	}{
+		{"TCP uses the TCP idle timeout", 6, tcpSessionIdleTimeout},
+		{"UDP uses the UDP idle timeout", 17, udpSessionIdleTimeout},
 	}
-	if got := sessionIdleFor(17); got != udpSessionIdleTimeout {
-		t.Fatalf("UDP idle = %v, want %v", got, udpSessionIdleTimeout)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := sessionIdleFor(tc.protocol); got != tc.want {
+				t.Fatalf("sessionIdleFor(%d) = %v, want %v", tc.protocol, got, tc.want)
+			}
+		})
 	}
 	if tcpSessionIdleTimeout <= udpSessionIdleTimeout {
 		t.Fatal("TCP timeout must exceed UDP timeout")
@@ -148,13 +158,22 @@ func TestSessionIdleForProtocolAware(t *testing.T) {
 }
 
 func TestHighWaterTripped(t *testing.T) {
-	if highWaterTripped(-1, 4096) || highWaterTripped(100, 0) {
-		t.Fatal("unknown capacity or negative count never trips")
+	cases := []struct {
+		name     string
+		count    int
+		capacity uint32
+		want     bool
+	}{
+		{"unknown capacity never trips", 100, 0, false},
+		{"negative count never trips", -1, 4096, false},
+		{"just below threshold (0.7998) not tripped", 3276, 4096, false},
+		{"above threshold (0.80004) trips", 3277, 4096, true},
 	}
-	if highWaterTripped(3276, 4096) { // exactly 0.7998… — below 0.8
-		t.Fatal("just-below-threshold must not trip")
-	}
-	if !highWaterTripped(3277, 4096) { // 0.80004… — above
-		t.Fatal("above-threshold must trip")
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := highWaterTripped(tc.count, tc.capacity); got != tc.want {
+				t.Fatalf("highWaterTripped(%d, %d) = %v, want %v", tc.count, tc.capacity, got, tc.want)
+			}
+		})
 	}
 }

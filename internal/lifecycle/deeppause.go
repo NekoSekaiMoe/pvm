@@ -20,7 +20,6 @@ package lifecycle
 
 import (
 	"fmt"
-	"log"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -50,7 +49,8 @@ func (m *Manager) DeepPause(taskID string) error {
 	// A recycled pid would make criu dump (and the SIGKILL below) hit an
 	// innocent victim; refuse before anything touches the process tree.
 	if !state.PIDIdentityOK(st) {
-		return fmt.Errorf("lifecycle: deep pause %s: pid %d no longer names the original process (recycled or gone)", taskID, st.PID)
+		return fmt.Errorf("lifecycle: deep pause %s: pid %d no longer names the original "+
+			"process (recycled or gone)", taskID, st.PID)
 	}
 	// Consistency freeze first (same barrier as event snapshots): the dump
 	// must describe a quiet process tree.
@@ -60,6 +60,9 @@ func (m *Manager) DeepPause(taskID string) error {
 
 	dir, err := state.ContainerDir(taskID)
 	if err != nil {
+		// The cgroup is already frozen: thaw on the way out or the task
+		// stays Running-but-frozen with no recovery path.
+		m.thawBestEffort(taskID)
 		return fmt.Errorf("lifecycle: deep pause %s: %w", taskID, err)
 	}
 	memDir := filepath.Join(dir, "deeppause", "criu")
@@ -75,7 +78,8 @@ func (m *Manager) DeepPause(taskID string) error {
 	}
 	st.Metadata["pause_mode"] = "deep"
 	st.Metadata["pause_memory"] = memDir
-	if err := st.Transition(state.StatusSuspended, state.ActorSystem, "deep pause: memory checkpointed, process killed"); err != nil {
+	if err := st.Transition(state.StatusSuspended, state.ActorSystem,
+		"deep pause: memory checkpointed, process killed"); err != nil {
 		m.thawBestEffort(taskID)
 		return fmt.Errorf("lifecycle: deep pause %s: %w", taskID, err)
 	}
@@ -84,9 +88,18 @@ func (m *Manager) DeepPause(taskID string) error {
 		return fmt.Errorf("lifecycle: deep pause %s: %w", taskID, err)
 	}
 
-	// Now the memory can actually go away.
+	// Now the memory can actually go away. A non-ESRCH kill failure must
+	// not silently return success with a live process behind a
+	// Suspended+deep record: retry once, then surface the inconsistency
+	// (the state stays deep-paused and recoverable via DeepResume).
 	if err := syscall.Kill(st.PID, syscall.SIGKILL); err != nil && err != syscall.ESRCH {
-		log.Printf("lifecycle: deep pause kill %d for %s: %v", st.PID, taskID, err)
+		if retry := syscall.Kill(st.PID, syscall.SIGKILL); retry != nil && retry != syscall.ESRCH {
+			m.thawBestEffort(taskID)
+			return fmt.Errorf(
+				"lifecycle: deep pause %s: kill %d failed after checkpoint "+
+					"(state is Suspended+deep; process may still be alive): %w",
+				taskID, st.PID, err)
+		}
 	}
 	m.Disarm(taskID)
 	return nil
@@ -99,7 +112,8 @@ func (m *Manager) DeepResume(taskID string) error {
 		return fmt.Errorf("lifecycle: deep resume %s: %w", taskID, err)
 	}
 	if st.Status != state.StatusSuspended || st.Metadata["pause_mode"] != "deep" {
-		return fmt.Errorf("lifecycle: deep resume %s: task is not deep-paused (status %s)", taskID, st.Status)
+		return fmt.Errorf("lifecycle: deep resume %s: task is not deep-paused (status %s)",
+			taskID, st.Status)
 	}
 	memDir := st.Metadata["pause_memory"]
 	if memDir == "" {
@@ -120,8 +134,16 @@ func (m *Manager) DeepResume(taskID string) error {
 	}
 	delete(st.Metadata, "pause_mode")
 	delete(st.Metadata, "pause_memory")
-	st.PID = 0 // criu restored the tree in place; the old PID is stale
-	if err := st.Transition(state.StatusRunning, state.ActorSystem, "deep resume complete"); err != nil {
+	// criu restore revives the tree with its ORIGINAL pids (same pid
+	// namespace), so the recorded PID stays meaningful — but the /proc
+	// starttime moved. Re-stamp it so a SECOND DeepPause passes the
+	// recycled-pid guard (the old code zeroed the PID, which made every
+	// later deep pause fail with "no live PID recorded"). If a restore
+	// ever lands on a different pid, PIDIdentityOK refuses the next deep
+	// pause (fail-closed) instead of checkpointing an innocent victim.
+	state.StampPID(st, st.PID)
+	if err := st.Transition(state.StatusRunning, state.ActorSystem,
+		"deep resume complete"); err != nil {
 		return fmt.Errorf("lifecycle: deep resume %s: %w", taskID, err)
 	}
 	return state.SaveState(taskID, st)

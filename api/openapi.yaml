@@ -1289,7 +1289,10 @@ paths:
         - { name: protocol, in: query, schema: { type: string, enum: [tcp, udp], default: tcp } }
       responses:
         "204": { description: Removed }
+        "400": { $ref: "#/components/responses/BadRequest" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "500": { $ref: "#/components/responses/Error" }
 
   # ---------------------------------------------------------------- identity
   /api/identity/{task}/tokens:

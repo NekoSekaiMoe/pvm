@@ -35,15 +35,28 @@ func TestObservabilityMetricsAuth(t *testing.T) {
 		t.Fatalf("metrics without auth must 401, got %d", rec.Code)
 	}
 
-	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
-	req.Header.Set("Authorization", "Bearer secret")
-	rec = httptest.NewRecorder()
-	e.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("metrics with auth must 200, got %d", rec.Code)
-	}
-	if !strings.Contains(rec.Body.String(), "pvm_obs_test_total") {
-		t.Fatalf("metrics body missing series:\n%s", rec.Body.String())
+	// Both ecosystem header conventions must open /metrics (same
+	// requestKey semantics as the /api guard).
+	for _, tc := range []struct {
+		name   string
+		header string
+		value  string
+	}{
+		{"bearer", "Authorization", "Bearer secret"},
+		{"x-api-key", "X-API-KEY", "secret"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+			req.Header.Set(tc.header, tc.value)
+			rec := httptest.NewRecorder()
+			e.ServeHTTP(rec, req)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("metrics with %s auth must 200, got %d", tc.header, rec.Code)
+			}
+			if tc.name == "bearer" && !strings.Contains(rec.Body.String(), "pvm_obs_test_total") {
+				t.Fatalf("metrics body missing series:\n%s", rec.Body.String())
+			}
+		})
 	}
 }
 

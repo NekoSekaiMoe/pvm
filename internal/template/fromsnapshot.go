@@ -21,6 +21,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"uml-container/internal/cow"
@@ -29,6 +30,20 @@ import (
 
 // ErrSnapshotNotFound marks a missing task/snapshot pair.
 var ErrSnapshotNotFound = fmt.Errorf("template: snapshot not found")
+
+// ErrInvalidSnapshotID marks a snapshot id that cannot name a directory
+// under <container>/snapshots (separators or traversal fragments).
+var ErrInvalidSnapshotID = fmt.Errorf("template: invalid snapshot id")
+
+// validateSnapshotID rejects anything that filepath.Join could turn into
+// an escape from <container>/snapshots: the id must be a single clean
+// path element (it arrives from the request body).
+func validateSnapshotID(id string) error {
+	if id == "" || id == "." || id == ".." || strings.ContainsAny(id, "/\\\x00") {
+		return ErrInvalidSnapshotID
+	}
+	return nil
+}
 
 // snapshotDisk resolves the snapshot's disk overlay path: from the
 // persisted event record when possible, else the first image file in the
@@ -64,9 +79,12 @@ func snapshotDisk(snapDir string) (string, error) {
 // CreateFromSnapshot promotes taskID's snapshotID into a new READY
 // template. The snapshot is left untouched (templates are independent
 // copies).
-func CreateFromSnapshot(s *Store, taskID, snapshotID, alias string) (*Record, error) {
+func CreateFromSnapshot(ctx context.Context, s *Store, taskID, snapshotID, alias string) (*Record, error) {
 	if taskID == "" {
 		return nil, fmt.Errorf("template: task id required")
+	}
+	if err := validateSnapshotID(snapshotID); err != nil {
+		return nil, fmt.Errorf("%w: %q", err, snapshotID)
 	}
 	// Locate the snapshot directory (state layout: <container>/snapshots/<id>).
 	cdir, err := state.ContainerDir(taskID)
@@ -88,7 +106,9 @@ func CreateFromSnapshot(s *Store, taskID, snapshotID, alias string) (*Record, er
 		return nil, fmt.Errorf("template: create dir: %w", err)
 	}
 	dest := filepath.Join(tplDir, "image.raw")
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	// Bound the flatten to BOTH the request lifetime and a hard cap: a
+	// client that walks away must not leave the conversion running.
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 	defer cancel()
 	if err := cow.ConvertToRaw(ctx, disk, dest); err != nil {
 		_ = os.RemoveAll(tplDir)
@@ -96,13 +116,13 @@ func CreateFromSnapshot(s *Store, taskID, snapshotID, alias string) (*Record, er
 	}
 
 	rec := Record{
-		TemplateID:  id,
-		Alias:       alias,
-		Kind:        "template",
-		Status:      "READY",
-		ImageRef:    fmt.Sprintf("snapshot:%s/%s", taskID, snapshotID),
-		ImagePath:   dest,
-		CreatedAt:   time.Now().UTC(),
+		TemplateID: id,
+		Alias:      alias,
+		Kind:       "template",
+		Status:     "READY",
+		ImageRef:   fmt.Sprintf("snapshot:%s/%s", taskID, snapshotID),
+		ImagePath:  dest,
+		CreatedAt:  time.Now().UTC(),
 	}
 	if err := fillImageStats(&rec); err != nil {
 		_ = os.RemoveAll(tplDir)

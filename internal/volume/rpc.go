@@ -88,13 +88,25 @@ func (p *RPCPlugin) call(ctx context.Context, req *rpcRequest) (*rpcResponse, er
 		return nil, fmt.Errorf("volume rpc %q dial %s: %w", p.name, p.socketPath, err)
 	}
 	defer conn.Close()
+	// The socket deadline honors the CALLER: min(ctx deadline,
+	// rpcPluginTimeout), and ctx cancellation actively aborts in-flight
+	// I/O — the call runs under the volume lifecycle lock, so a stuck
+	// plugin must never outlive the caller's patience.
 	deadline := time.Now().Add(rpcPluginTimeout)
-	if d, ok := ctx.Deadline(); !ok || d.After(deadline) {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithDeadline(ctx, deadline)
-		defer cancel()
+	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
+		deadline = d
 	}
 	_ = conn.SetDeadline(deadline)
+	watchDone := make(chan struct{})
+	defer close(watchDone)
+	go func() {
+		select {
+		case <-ctx.Done():
+			// Pull the deadline to NOW: ReadBytes/Write unblock at once.
+			_ = conn.SetDeadline(time.Now())
+		case <-watchDone:
+		}
+	}()
 
 	line, err := json.Marshal(req)
 	if err != nil {

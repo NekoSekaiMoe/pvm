@@ -2,12 +2,14 @@ package egress
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -489,11 +491,13 @@ func TestSetPolicyInvalidatesLiveTunnels(t *testing.T) {
 		t.Fatalf("generation after update = %d, want 1", gen)
 	}
 	// The tracked tunnel must now be closed: a read on the OTHER end
-	// returns io.EOF (or an error) once the deadline trips.
+	// returns io.EOF. Requiring the real EOF (not any error) matters:
+	// an untracked tunnel would only fail via the read deadline above,
+	// and accepting that would let the test pass without any close.
 	c2.SetReadDeadline(time.Now().Add(2 * time.Second))
 	buf := make([]byte, 1)
-	if _, err := c2.Read(buf); err == nil {
-		t.Fatal("tracked tunnel survived the policy update")
+	if _, err := c2.Read(buf); !errors.Is(err, io.EOF) {
+		t.Fatalf("tracked tunnel must be closed with io.EOF, got %v", err)
 	}
 	// The registry entry is gone: a second update closes nothing and the
 	// generation still bumps.
@@ -502,4 +506,41 @@ func TestSetPolicyInvalidatesLiveTunnels(t *testing.T) {
 		t.Fatalf("generation after second update = %d, want 2", gen)
 	}
 	_ = c1.Close()
+}
+
+// Regression for the CONNECT/transparent-splice TOCTOU: a tunnel whose
+// verdict was computed against generation N must not register after
+// SetPolicy already bumped to N+1 and swept the registered tunnels.
+func TestTrackTunnelIfFreshRejectsStaleGeneration(t *testing.T) {
+	g := NewGateway()
+	g.SetPolicy("tk", &Policy{AllowDomains: []string{"a.example"}})
+	staleGen := g.PolicyGeneration("tk") // verdict computed here
+
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+
+	// Policy moves AFTER the verdict: the sweep closes registered tunnels.
+	g.SetPolicy("tk", &Policy{})
+	if g.trackTunnelIfFresh("tk", staleGen, c1) {
+		t.Fatal("stale-generation registration must be refused")
+	}
+	// The refused conn was NOT registered: nothing closes it later.
+	g.SetPolicy("tk", &Policy{})
+	c2.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+	buf := make([]byte, 1)
+	if _, err := c2.Read(buf); !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("refused tunnel must stay open (caller closes it), got %v", err)
+	}
+
+	// A fresh generation registers and IS swept by the next update.
+	fresh := g.PolicyGeneration("tk")
+	if !g.trackTunnelIfFresh("tk", fresh, c1) {
+		t.Fatal("fresh-generation registration must succeed")
+	}
+	g.SetPolicy("tk", &Policy{})
+	c2.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := c2.Read(buf); !errors.Is(err, io.EOF) {
+		t.Fatalf("fresh-registered tunnel must be closed by SetPolicy, got %v", err)
+	}
 }
