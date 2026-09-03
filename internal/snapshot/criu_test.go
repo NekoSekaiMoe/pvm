@@ -60,3 +60,33 @@ func mkdirState(t *testing.T, id string, status state.Status, pid int) {
 		t.Fatal(err)
 	}
 }
+
+func TestDumpMemoryArgsIncremental(t *testing.T) {
+	base := DumpMemoryArgs(42, "/s/criu", "", true)
+	for _, want := range []string{"--tree", "42", "--images-dir", "/s/criu", "--leave-running"} {
+		if !contains(base, want) {
+			t.Fatalf("base args missing %q: %v", want, base)
+		}
+	}
+	for _, bad := range []string{"--track-mem", "--prev-images-dir"} {
+		if contains(base, bad) {
+			t.Fatalf("base args must not carry %q", bad)
+		}
+	}
+	inc := DumpMemoryArgs(42, "/s/criu", "../snap-1/criu", false)
+	if !contains(inc, "--track-mem") || !contains(inc, "--prev-images-dir") || !contains(inc, "../snap-1/criu") {
+		t.Fatalf("incremental args = %v", inc)
+	}
+	if contains(inc, "--leave-running") {
+		t.Fatal("checkpoint-and-stop must not leave running")
+	}
+}
+
+func contains(list []string, s string) bool {
+	for _, v := range list {
+		if v == s {
+			return true
+		}
+	}
+	return false
+}

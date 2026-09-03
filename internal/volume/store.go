@@ -38,7 +38,7 @@ var (
 )
 
 // VolumeRecord is the persisted metadata for one volume, mirroring
-// CubeMaster/pkg/base/db/models/volume.go:VolumeRecord.
+// the persisted volume record.
 type VolumeRecord struct {
 	VolumeID    string    `json:"volume_id"`
 	Name        string    `json:"name"`
@@ -180,7 +180,7 @@ func (s *Store) List() ([]VolumeRecord, error) {
 }
 
 // Delete removes the volume directory. Returns an error if refcount != 0
-// (mirrors Cube's "409 when still mounted" guard).
+// (409 while still mounted).
 func (s *Store) Delete(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

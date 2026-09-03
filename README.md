@@ -19,6 +19,10 @@
 5. **人机协同治理与审计**：高危动作（支付/外发/部署）自动拦截进审批流，全程记录基于 SHA-256 哈希链 + ed25519 签名的防篡改审计日志（`PVM_AUDIT_SIGNING=1`），后台在线校验异常即刻上报指标。
 6. **E2B drop-in 数据面**：envd 兼容服务（:49982 版本 WS + :49983 Connect-JSON：`process.Process` / `filesystem.Filesystem` / `/files`），官方 E2B SDK 的 `connect()` 就绪探测与命令/文件/PTY 接口可直接对话 pvm。
 7. **运维平面**：`/metrics`(Prometheus) / `/healthz` / `/version` / 可选 pprof；deploy/ 提供 systemd、docker-compose 与一键安装脚本；sdk/go 为官方 Go SDK（E2B 生命周期 + 治理面全量封装）。
+8. **多密钥认证**：`API_SECRET` 之外支持 `PVM_API_KEYS(_FILE)` 命名操作员密钥与 `PVM_AUTH_CALLBACK_URL` 外部鉴权委托（fail-closed：回调 200 放行 / 非 200 拒绝 / 不可达 500）。
+9. **透明 L7 拦截与入站端口映射**：bridge 数据面下 iptables REDIRECT 免代理配置拦截 80/443（SNI 嗅探 + MITM/直通/拒绝），`[[network.port_mappings]]` / `/api/network/portmaps` 发布宿主端口；`dataplane = "auto"` 按需自动选择数据面。
+10. **深度暂停与增量快照**：`deep_pause`/`pause?deep=1` 以 CRIU checkpoint+kill 归零内存、恢复原样复活;`PVM_SNAPSHOT_INCREMENTAL=1` 链式增量内存快照（只写脏页）。
+11. **模板与卷增强**：快照一键提升为模板（摊平为独立 raw 镜像）+ inspection/preview；host_path 显式挂载（`PVM_HOST_MOUNT_PREFIXES` 白名单强制）、rpc 插件（Unix socket NDJSON）与 s3fs 后端 s3 驱动。
 
 ---
 

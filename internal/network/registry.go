@@ -41,7 +41,13 @@ type NetworkRegistry struct {
 }
 
 // LoadNetworkRegistry opens (or creates) the registry under stateRoot.
+// An empty stateRoot honors $PVM_STATE_ROOT first (mirroring
+// state.RootDir and the portmap registry) so test/non-root trees never
+// touch the production default.
 func LoadNetworkRegistry(stateRoot string) (*NetworkRegistry, error) {
+	if stateRoot == "" {
+		stateRoot = os.Getenv("PVM_STATE_ROOT")
+	}
 	if stateRoot == "" {
 		stateRoot = "/var/lib/uml-container"
 	}

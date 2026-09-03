@@ -452,3 +452,29 @@ dataplane = "tc"
 		t.Fatalf("dataplane=bogus not rejected at load: %v", err)
 	}
 }
+
+func TestValidateHostPathField(t *testing.T) {
+	base := func() *TaskSpec {
+		return &TaskSpec{Version: 1, Caller: "x"}
+	}
+	s := base()
+	s.Volumes = []VolumeMount{{Name: "v", Path: "/w", HostPath: "/srv/shared/x"}}
+	if err := s.Validate(); err != nil {
+		t.Fatalf("absolute clean host_path must validate: %v", err)
+	}
+	s = base()
+	s.Volumes = []VolumeMount{{Name: "v", Path: "/w", HostPath: "relative/x"}}
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "host_path") {
+		t.Fatalf("relative host_path must fail, got %v", err)
+	}
+	s = base()
+	s.Volumes = []VolumeMount{{Name: "v", Path: "/w", HostPath: "/has space"}}
+	if err := s.Validate(); err == nil {
+		t.Fatal("host_path with whitespace must fail (kernel arg charset)")
+	}
+	s = base()
+	s.Volumes = []VolumeMount{{Name: "v", Path: "/w", HostPath: "/has:colon"}}
+	if err := s.Validate(); err == nil {
+		t.Fatal("host_path with colon must fail (kernel arg charset)")
+	}
+}

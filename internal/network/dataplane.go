@@ -1,6 +1,6 @@
 package network
 
-// dataplane.go — P2: CubeVS-style bridgeless TC/eBPF data plane (opt-in via
+// dataplane.go — the bridgeless TC/eBPF data plane (opt-in via
 // the TaskSpec's network.dataplane = "tc").
 //
 // Instead of a Linux bridge + iptables, every sandbox in tc mode gets the
@@ -39,6 +39,8 @@ import (
 	"github.com/cilium/ebpf"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
+
+	"uml-container/internal/metrics"
 )
 
 const (
@@ -73,12 +75,20 @@ const (
 	chainedHandleBase = 100
 	chainedHandleMax  = chainedHandleBase + 64
 
-	// sessionIdleTimeout is how long a NAT session may go without packets
-	// (in either direction — both programs refresh last_seen_ns) before
-	// the sweeper deletes it.
-	sessionIdleTimeout = 5 * time.Minute
-	// sessionSweepInterval is the sweeper's period.
-	sessionSweepInterval = 60 * time.Second
+	// Session idle timeouts are protocol-aware (the conntrack pattern):
+	// TCP flows may legitimately sit silent for hours, while UDP "sessions"
+	// (DNS, keepalives) that have not been replied to in minutes are dead.
+	// Both dataplane programs refresh last_seen_ns on every packet they
+	// forward, in either direction.
+	tcpSessionIdleTimeout = 3 * time.Hour
+	udpSessionIdleTimeout = 180 * time.Second
+	// sessionSweepInterval is the sweeper's period; comfortably below the
+	// UDP timeout so a dead UDP entry is gone within ~2 intervals.
+	sessionSweepInterval = 30 * time.Second
+	// sessionHighWater is the fill ratio of the LRU session map that trips
+	// the high-water counter (scrappers page before the LRU starts
+	// evicting live sessions silently).
+	sessionHighWater = 0.8
 )
 
 // TapDataplaneError wraps every failure of the bridgeless dataplane
@@ -323,6 +333,10 @@ type TapDataplane struct {
 	stats    *ebpf.Map
 	progs    []*ebpf.Program
 
+	// sessionMaxEntries caches the LRU map's capacity for the high-water
+	// gauge (0 = unknown/unreadable).
+	sessionMaxEntries uint32
+
 	// whitelist is nil in the registry sense when shared: sharedHandle is
 	// our extra fd onto the already-pinned/registered map (closed on
 	// detach); an OWNED whitelist (no plain egress filter pinned one
@@ -445,6 +459,9 @@ func AttachTapDataplane(taskID, tapName, hostNIC string) (*TapDataplane, error) 
 		stats:      objs.DpStats,
 		progs:      []*ebpf.Program{objs.TapIngress, objs.WorldIngress, objs.GwEgress},
 		pinDir:     pinDir,
+	}
+	if info, ierr := objs.EgressSessions.Info(); ierr == nil {
+		d.sessionMaxEntries = info.MaxEntries
 	}
 	if sharedWl != nil {
 		d.whitelistShared = sharedWl // objs.WhitelistMap aliases it
@@ -590,10 +607,11 @@ func (d *TapDataplane) removePins() {
 	_ = os.Remove(d.pinDir) // fails harmlessly when non-empty
 }
 
-// sweeper deletes NAT sessions idle for longer than sessionIdleTimeout
-// (CubeVS reaper pattern): both dataplane programs refresh last_seen_ns on
-// every packet they forward, so only genuinely idle entries expire. The LRU
-// map itself bounds total memory.
+// sweeper deletes NAT sessions idle beyond their protocol's timeout
+// (the conntrack-reaper pattern) and publishes capacity gauges. Both
+// dataplane programs refresh last_seen_ns on every packet they forward,
+// so only genuinely idle entries expire. The LRU map itself bounds total
+// memory; the high-water counter fires before silent LRU eviction starts.
 func (d *TapDataplane) sweeper(ctx context.Context) {
 	defer close(d.done)
 	t := time.NewTicker(sessionSweepInterval)
@@ -603,29 +621,42 @@ func (d *TapDataplane) sweeper(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			d.sweepOnce(sessionIdleTimeout)
+			d.sweepOnce(0)
+			d.publishCapacity()
 		}
 	}
 }
 
+// sessionIdleFor returns the idle cutoff multiplier per protocol: TCP
+// sessions survive long silent stretches, UDP ones do not.
+func sessionIdleFor(proto uint8) time.Duration {
+	if proto == 6 { // IPPROTO_TCP
+		return tcpSessionIdleTimeout
+	}
+	return udpSessionIdleTimeout
+}
+
 // sweepOnce removes stale session entries; returns how many were deleted.
+// The legacy single-timeout form is kept for callers/tests that want a
+// uniform cutoff; the sweeper passes 0 to select the per-protocol timeout.
 // Iteration of an LRU hash under concurrent dataplane updates is inherently
 // approximate — keys are collected first, deletes happen after, and a
 // vanished-already entry is not an error.
-func (d *TapDataplane) sweepOnce(idle time.Duration) int {
+func (d *TapDataplane) sweepOnce(uniform time.Duration) int {
 	if d.sessions == nil {
 		return 0
 	}
 	now := monotonicNanos()
-	// Underflow guard: CLOCK_MONOTONIC counts from boot, so on a host
-	// younger than the idle timeout the subtraction would wrap uint64 and
-	// every session would compare as stale (and a failed clock read
-	// returning 0 would do the same). No sessions can be older than the
-	// host uptime, so sweeping is a no-op in that window.
-	if now < uint64(idle) {
-		return 0
+	cutoffFor := func(k tapdpSessionKey) uint64 {
+		idle := sessionIdleFor(k.Proto)
+		if uniform > 0 {
+			idle = uniform
+		}
+		if now < uint64(idle) {
+			return 0 // host younger than the timeout: nothing can be stale
+		}
+		return now - uint64(idle)
 	}
-	cutoff := now - uint64(idle)
 	var stale []tapdpSessionKey
 	var (
 		k tapdpSessionKey
@@ -633,7 +664,7 @@ func (d *TapDataplane) sweepOnce(idle time.Duration) int {
 	)
 	iter := d.sessions.Iterate()
 	for iter.Next(&k, &v) {
-		if v.LastSeenNs < cutoff {
+		if v.LastSeenNs < cutoffFor(k) {
 			stale = append(stale, k)
 		}
 	}
@@ -644,6 +675,39 @@ func (d *TapDataplane) sweepOnce(idle time.Duration) int {
 		}
 	}
 	return deleted
+}
+
+// dpSessionsGauge / dpSessionHighWater are the capacity observability
+// handles for the per-task NAT session table.
+var (
+	dpSessionsGauge    = metrics.Gauge("pvm_dp_sessions", "NAT sessions currently tracked by the tc dataplane", "task")
+	dpSessionHighWater = metrics.Counter("pvm_dp_session_high_water_total", "tc dataplane session table crossed the high-water mark", "task")
+)
+
+// highWaterTripped reports whether the fill ratio crosses the high-water
+// mark (pure — the sweeper path and tests share it).
+func highWaterTripped(n int, maxEntries uint32) bool {
+	if maxEntries == 0 || n < 0 {
+		return false
+	}
+	return float64(n)/float64(maxEntries) > sessionHighWater
+}
+
+// publishCapacity records the session-table fill level. MaxEntries comes
+// from the map definition (LRU-bounded); an unreadable map is reported as
+// gauge only.
+func (d *TapDataplane) publishCapacity() {
+	if d.sessions == nil {
+		return
+	}
+	n := d.sessionCount()
+	if n < 0 {
+		return
+	}
+	dpSessionsGauge.Set(float64(n), d.taskID)
+	if highWaterTripped(n, d.sessionMaxEntries) {
+		dpSessionHighWater.Inc(d.taskID)
+	}
 }
 
 // Close is the symmetric teardown of AttachTapDataplane: stop the sweeper,
@@ -667,6 +731,7 @@ func (d *TapDataplane) Close() error {
 	}
 	d.removeFilters()
 	d.removePins()
+	dpSessionsGauge.Delete(d.taskID)
 	if d.whitelistOwned {
 		UnregisterWhitelistMap(d.tapName) // registry closes the map
 	}

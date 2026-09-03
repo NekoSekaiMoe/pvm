@@ -1,5 +1,4 @@
-// Package lifecycle provides single-host AutoPause/AutoResume,
-// mirroring CubeSandbox docs/guide/lifecycle.md at UML scale.
+// Package lifecycle provides single-host AutoPause/AutoResume.
 //
 // Pausing reclaims CPU via cgroup freeze (cgroup.Manager.Freeze) and
 // transitions the FSM Running -> Suspended. Resuming thaws and moves
@@ -9,6 +8,7 @@ package lifecycle
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"sync"
 	"time"
@@ -28,12 +28,13 @@ var saveState = state.SaveState
 
 // Manager owns per-task idle timers.
 type Manager struct {
-	mu      sync.Mutex
-	timers  map[string]*time.Timer
-	gens    map[string]uint64 // taskID -> generation of the live schedule
-	epochs  map[string]uint64 // taskID -> cancel epoch; bumped by every Arm/Disarm
-	nextGen uint64
-	cg      *cgroup.Manager
+	mu        sync.Mutex
+	timers    map[string]*time.Timer
+	gens      map[string]uint64 // taskID -> generation of the live schedule
+	epochs    map[string]uint64 // taskID -> cancel epoch; bumped by every Arm/Disarm
+	deepTasks map[string]bool   // taskID -> autopause should deep-pause (criu + kill)
+	nextGen   uint64
+	cg        *cgroup.Manager
 }
 
 // New creates a Manager. cg may be nil to use the default cgroup root.
@@ -188,6 +189,14 @@ func (m *Manager) pause(taskID string, gen uint64) {
 		return
 	}
 	if st.Status != state.StatusRunning {
+		return
+	}
+	// Deep mode: checkpoint + kill instead of the shallow freeze.
+	if m.deepPauseWanted(taskID) {
+		if derr := m.DeepPause(taskID); derr != nil {
+			fmt.Printf("Warning: deep autopause for %s failed (%v); falling back to freeze\n", taskID, derr)
+			m.rearmRetry(taskID, epoch)
+		}
 		return
 	}
 	// Best-effort freeze: if the cgroup is not present (e.g. tests, or the

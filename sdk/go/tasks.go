@@ -175,3 +175,23 @@ func (c *Client) WaitForTemplateReady(ctx context.Context, id string, timeout ti
 		}
 	}
 }
+
+// TemplateFromSnapshot promotes a task snapshot into a READY template.
+// Empty snapshotID selects the task's newest snapshot.
+func (c *Client) TemplateFromSnapshot(ctx context.Context, task, snapshotID, alias string) (*TemplateInfo, error) {
+	body := map[string]interface{}{"task": task, "snapshot_id": snapshotID, "alias": alias}
+	var out TemplateInfo
+	if err := c.doJSON(ctx, http.MethodPost, "/api/templates/from-snapshot", body, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// InspectTemplate fetches the record including image size and SHA-256.
+func (c *Client) InspectTemplate(ctx context.Context, id string) (*TemplateInfo, error) {
+	var out TemplateInfo
+	if err := c.doJSON(ctx, http.MethodGet, "/api/templates/"+id+"/inspect", nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}

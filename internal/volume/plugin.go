@@ -1,16 +1,17 @@
-// Package volume implements a pluggable persistent-volume framework
-// mirroring CubeSandbox's Cubelet/plugins/volume design (ref).
+// Package volume implements a pluggable persistent-volume framework.
 //
-// Hooks split into Controller side (Create/Destroy) and Node side
+// Hooks split into a Controller side (Create/Destroy) and a Node side
 // (Attach/Detach). In PVM's single-host UML mode the Controller is
-// collapsed into the local Manager but the same four hooks and the
+// collapsed into the local Manager, but the same four hooks and the
 // refCount/volumeBaseDir containment rules are preserved.
 //
-// Binary plugins speak an explicitly versioned wire protocol (see
-// binary.go): the hardened default pipes credentials over stdin (v2,
-// "stdin"), while unmodified ref/examples/volume plugins such as
-// cube-volume-cos.sh — which parse strict argv and never read stdin —
-// are supported via the byte-compatible "argv-v1" opt-in:
+// Plugin loading mechanisms (PluginType): "builtin" (compiled in: the
+// host-dir driver and the s3fs-backed s3 driver), "binary" (fork per
+// hook) and "rpc" (long-running Unix-socket NDJSON server). Binary
+// plugins speak an explicitly versioned wire protocol (see binary.go):
+// the hardened default pipes credentials over stdin (v2, "stdin"),
+// while strict-argv legacy scripts are supported via the byte-compatible
+// "argv-v1" opt-in:
 //
 //	extra = { protocol = "argv-v1" }
 package volume
@@ -19,7 +20,7 @@ import (
 	"context"
 )
 
-// PluginType mirrors Cubelet/plugins/volume.PluginType.
+// PluginType selects the plugin loading mechanism.
 type PluginType string
 
 const (
@@ -28,7 +29,7 @@ const (
 	PluginTypeRPC     PluginType = "rpc"
 )
 
-// PluginConfig mirrors Cubelet/plugins/volume.PluginConfig. Extra is
+// PluginConfig configures one plugin registration. Extra is
 // forwarded to builtin plugins on Init.
 type PluginConfig struct {
 	Name       string            `toml:"name" json:"name"`
@@ -38,12 +39,17 @@ type PluginConfig struct {
 	Extra      map[string]string `toml:"extra" json:"extra"`
 }
 
-// AttachRequest mirrors Cubelet/plugins/volume.AttachRequest.
+// AttachRequest is the Node-side attach hook input.
 type AttachRequest struct {
 	SandboxID string
 	Namespace string
 	VolumeID  string
 	Driver    string
+	// HostPath, when non-empty, requests an EXPLICIT host-directory mount
+	// (builtin driver only): the pre-existing host dir is bound into the
+	// guest instead of a VolumeBaseDir-backed path. Gated on the
+	// deployment-wide PVM_HOST_MOUNT_PREFIXES whitelist — see hostmount.go.
+	HostPath string
 	// RefCount is the pre-attach count (0 == first attach on this host).
 	RefCount int64
 	// NodeRefFirstAttach is true when this call transitions 0→1 on the node.
@@ -52,14 +58,14 @@ type AttachRequest struct {
 	PrivateData        string
 }
 
-// AttachResult mirrors Cubelet/plugins/volume.AttachResult.
+// AttachResult is the Node-side attach hook output.
 type AttachResult struct {
 	VolumeID string
 	HostPath string
 	Metadata map[string]string
 }
 
-// DetachRequest mirrors Cubelet/plugins/volume.DetachRequest.
+// DetachRequest is the Node-side detach hook input.
 type DetachRequest struct {
 	SandboxID string
 	Namespace string

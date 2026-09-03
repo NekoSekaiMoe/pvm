@@ -4,11 +4,17 @@ go_library(
     name = "egress",
     srcs = [
         "gateway.go",
+        "metrics.go",
         "mitm.go",
+        "transparent.go",
     ],
     importpath = "uml-container/internal/network/egress",
     visibility = ["//:__subpackages__"],
-    deps = ["//internal/audit"],
+    deps = [
+        "//internal/audit",
+        "//internal/metrics",
+        "@org_golang_x_sys//unix",
+    ],
 )
 
 go_test(
@@ -19,6 +25,7 @@ go_test(
         "mitm_test.go",
         "rebind_test.go",
         "rule_matcher_test.go",
+        "transparent_test.go",
     ],
     embed = [":egress"],
     deps = ["//internal/audit"],

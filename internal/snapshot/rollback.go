@@ -19,7 +19,7 @@ var rollbackMu sync.Mutex
 // ErrSpecMismatch is returned by Rollback when the task's CURRENT TaskSpec
 // fingerprint differs from the one recorded alongside the snapshot. Rolling
 // back would pair an old disk with a new configuration — the disk-edition
-// analog of CubeShim's start_vm config guard. Callers may bypass it only by
+// analog of a start_vm config guard. Callers may bypass it only by
 // passing force=true.
 var ErrSpecMismatch = errors.New("snapshot: spec fingerprint mismatch")
 
@@ -67,7 +67,7 @@ func RollbackWithForce(taskID, snapshotID string, force bool) error {
 		return fmt.Errorf("snapshot: failed to parse snapshot metadata: %w", err)
 	}
 
-	// Spec alignment guard (CubeShim start_vm pattern, disk edition): refuse
+	// Spec alignment guard (start_vm pattern, disk edition): refuse
 	// to roll a task whose current spec fingerprint differs from the one
 	// recorded in the snapshot's state copy — "old snapshot + new config"
 	// silently misconfigures the restored task. Runs BEFORE any mutation, so

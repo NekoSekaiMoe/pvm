@@ -94,7 +94,7 @@ func TestBinaryPlugin_V2StdinProtocol(t *testing.T) {
 }
 
 // TestBinaryPlugin_V1ArgvRefCompat verifies the "argv-v1" opt-in against
-// the ref Cubelet wire format: exact flag set (no --driver/--node-ref-*,
+// the legacy wire format: exact flag set (no --driver/--node-ref-*,
 // which strict ref parsers such as cube-volume-cos.sh reject), secrets on
 // argv, --private-data omitted when empty, and no stdin payload.
 func TestBinaryPlugin_V1ArgvRefCompat(t *testing.T) {

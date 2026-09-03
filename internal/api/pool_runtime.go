@@ -17,8 +17,16 @@ import (
 	"path/filepath"
 	"time"
 
+	"uml-container/internal/metrics"
 	"uml-container/internal/pool"
 	"uml-container/internal/state"
+)
+
+// Pool capacity gauges (host_sandbox view), refreshed at scrape time.
+var (
+	poolReadyGauge   = metrics.Gauge("pvm_pool_ready", "Warm-pool sandboxes ready to claim")
+	poolClaimedGauge = metrics.Gauge("pvm_pool_claimed", "Warm-pool sandboxes claimed by tasks")
+	poolTotalGauge   = metrics.Gauge("pvm_pool_total", "Total sandboxes tracked by the warm pool")
 )
 
 func initPoolRuntime() {
@@ -28,6 +36,13 @@ func initPoolRuntime() {
 			log.Printf("pool: persistence disabled: %v", err)
 		}
 	}
+	// Pool gauges refresh at scrape time (host_sandbox view).
+	metrics.OnRender(func() {
+		ready, claimed, total := m.Stats()
+		poolReadyGauge.Set(float64(ready))
+		poolClaimedGauge.Set(float64(claimed))
+		poolTotalGauge.Set(float64(total))
+	})
 	if m.Factory == nil {
 		m.Factory = stateRecordedFactory
 	}

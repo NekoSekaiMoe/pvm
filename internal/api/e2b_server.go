@@ -3,7 +3,6 @@ package api
 import (
 	"bufio"
 	"context"
-	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -81,24 +80,19 @@ func NewE2BServer() (*echo.Echo, error) {
 	if apiSecret == "" {
 		return nil, errors.New("API_SECRET environment variable is required (refusing to start the API with no authentication)")
 	}
-	apiSecretBytes := []byte(apiSecret)
-	api.Use(middleware.KeyAuth(func(key string, c echo.Context) (bool, error) {
-		// Constant-time compare: the secret guards every control-plane
-		// endpoint (approvals, policy, quota), so timing side channels are
-		// worth closing even on loopback.
-		if subtle.ConstantTimeCompare([]byte(key), apiSecretBytes) == 1 {
-			c.Set("actor", "api-user")
-			return true, nil
-		}
-		return false, nil
-	}))
+	// Multi-key registry: API_SECRET remains the required master key;
+	// PVM_API_KEYS(_FILE) add named operator keys and
+	// PVM_AUTH_CALLBACK_URL delegates unknown keys to an external
+	// authenticator (fail-closed). See auth.go.
+	reg := LoadKeyRegistry()
+	api.Use(keyAuthMiddleware(reg))
 
 	// E2B SDK-compatible surface (see e2b_compat.go): root-level
 	// /sandboxes routes so official E2B SDKs can drive PVM.
-	registerE2BCompat(e, apiSecretBytes, autoMgr)
+	registerE2BCompat(e, reg, autoMgr)
 
 	// Observability: /healthz, /version, /metrics (+opt-in pprof).
-	registerObservability(e, apiSecretBytes)
+	registerObservability(e, reg)
 
 	// Console tail + approval edit + approval persistence/webhook.
 	registerExecRuntimeExtras(api)
@@ -108,6 +102,9 @@ func NewE2BServer() (*echo.Echo, error) {
 
 	// Incident controller REST surface (report + list).
 	registerIncidentAPI(api)
+
+	// Inbound host-port → guest mappings (bridge dataplane).
+	registerPortMapAPI(api)
 
 	// Warm pool persistence + real (state-recorded) factory.
 	initPoolRuntime()
@@ -1016,7 +1013,7 @@ func NewE2BServer() (*echo.Echo, error) {
 		return c.JSON(http.StatusOK, v)
 	})
 
-	// --- Volumes (Cube parity: POST/GET/DELETE /volumes) ---
+	// --- Volumes (E2B-compatible surface: POST/GET/DELETE /volumes) ---
 	// One root for metadata AND blocks: records colocate with the cow
 	// engine's qcow2 files (PVM_VOLUME_ROOT, else the engine's PVM_COW_ROOT
 	// fallback via cow.ResolveRoot) so the registry and the block images it
@@ -1372,8 +1369,11 @@ func NewE2BServer() (*echo.Echo, error) {
 		return c.NoContent(http.StatusNoContent)
 	})
 
-	// --- Templates (Cube parity: /templates) ---
+	// --- Templates (E2B-compatible surface: /templates) ---
 	tmplStore := template.NewStore("")
+	// Snapshot promotion / inspection / preview share the SAME store so
+	// alias updates are visible to every route.
+	registerTemplateExtras(api, tmplStore)
 	api.POST("/templates", func(c echo.Context) error {
 		var req struct {
 			ImageRef string `json:"image_ref"`
@@ -1573,7 +1573,7 @@ func NewE2BServer() (*echo.Echo, error) {
 		return c.NoContent(http.StatusNoContent)
 	})
 
-	// --- AutoPause (Cube parity: POST /tasks/:id/pause|resume) ---
+	// --- AutoPause (POST /tasks/:id/pause|resume) ---
 	api.POST("/tasks/:id/pause", func(c echo.Context) error {
 		id := c.Param("id")
 		if !idRegex.MatchString(id) {
@@ -1590,6 +1590,14 @@ func NewE2BServer() (*echo.Echo, error) {
 		}
 		if st.Status != state.StatusRunning {
 			return c.JSON(http.StatusConflict, map[string]string{"error": fmt.Sprintf("task not running (status=%s)", st.Status)})
+		}
+		// ?deep=1: checkpoint + kill instead of a shallow freeze — zero
+		// resident memory, criu-restore resume.
+		if c.QueryParam("deep") == "1" {
+			if derr := autoMgr.DeepPause(id); derr != nil {
+				return c.JSON(http.StatusConflict, map[string]string{"error": "deep pause failed (is criu installed?): " + derr.Error()})
+			}
+			return c.NoContent(http.StatusNoContent)
 		}
 		if err := cgMgr.Freeze(id); err != nil {
 			// A missing cgroup means the runtime is gone (the task exited); do
@@ -1638,6 +1646,17 @@ func NewE2BServer() (*echo.Echo, error) {
 		// config: that flag only governs the automatic resume path in
 		// lifecycleActivity (API activity). A request to this endpoint means
 		// an operator decided the task must run again.
+		// Deep-paused tasks revive through criu, not a cgroup thaw.
+		if lifecycle.IsDeepPaused(id) {
+			if derr := autoMgr.DeepResume(id); derr != nil {
+				return c.JSON(http.StatusInternalServerError, map[string]string{"error": derr.Error()})
+			}
+			st, err := state.LoadState(id)
+			if err != nil {
+				return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			}
+			return c.JSON(http.StatusOK, st)
+		}
 		if err := autoMgr.Resume(id); err != nil {
 			if errors.Is(err, state.ErrInvalidTransition) || errors.Is(err, state.ErrTerminal) {
 				return c.JSON(http.StatusConflict, map[string]string{"error": err.Error()})

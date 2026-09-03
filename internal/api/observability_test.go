@@ -13,7 +13,7 @@ import (
 
 func TestObservabilityHealthVersionNoAuth(t *testing.T) {
 	e := echo.New()
-	registerObservability(e, []byte("secret"))
+	registerObservability(e, &KeyRegistry{keys: []APIKey{{Key: "secret", Operator: "master"}}})
 
 	for _, path := range []string{"/healthz", "/version"} {
 		rec := httptest.NewRecorder()
@@ -26,7 +26,7 @@ func TestObservabilityHealthVersionNoAuth(t *testing.T) {
 
 func TestObservabilityMetricsAuth(t *testing.T) {
 	e := echo.New()
-	registerObservability(e, []byte("secret"))
+	registerObservability(e, &KeyRegistry{keys: []APIKey{{Key: "secret", Operator: "master"}}})
 	metrics.Counter("pvm_obs_test_total", "observability test").Inc()
 
 	rec := httptest.NewRecorder()
@@ -50,7 +50,7 @@ func TestObservabilityMetricsAuth(t *testing.T) {
 func TestObservabilityMetricsNoAuthOptIn(t *testing.T) {
 	t.Setenv("PVM_METRICS_NOAUTH", "1")
 	e := echo.New()
-	registerObservability(e, []byte("secret"))
+	registerObservability(e, &KeyRegistry{keys: []APIKey{{Key: "secret", Operator: "master"}}})
 	rec := httptest.NewRecorder()
 	e.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
 	if rec.Code != http.StatusOK {

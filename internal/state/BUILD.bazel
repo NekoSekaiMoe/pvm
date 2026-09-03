@@ -2,7 +2,10 @@ load("@rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
     name = "state",
-    srcs = ["manager.go"],
+    srcs = [
+        "manager.go",
+        "pid.go",
+    ],
     importpath = "uml-container/internal/state",
     visibility = ["//:__subpackages__"],
 )
@@ -12,6 +15,7 @@ go_test(
     srcs = [
         "fsm_matrix_test.go",
         "manager_test.go",
+        "pid_test.go",
     ],
     embed = [":state"],
 )

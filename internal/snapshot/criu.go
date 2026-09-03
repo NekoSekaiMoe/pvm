@@ -42,10 +42,32 @@ func CRIUBin() string {
 	return ""
 }
 
+// DumpMemoryArgs builds the criu dump argv (pure — unit-tested without
+// a criu binary). prevImagesDir enables INCREMENTAL snapshots: with
+// --track-mem the kernel marks dirtied pages and --prev-images-dir makes
+// the dump write ONLY pages changed since that parent image set. The
+// path must be RELATIVE to dir so a later restore can walk the chain.
+func DumpMemoryArgs(pid int, dir, prevImagesDir string, leaveRunning bool) []string {
+	args := []string{"dump", "--tree", fmt.Sprint(pid), "--images-dir", dir, "--shell-job"}
+	if prevImagesDir != "" {
+		args = append(args, "--track-mem", "--prev-images-dir", prevImagesDir)
+	}
+	if leaveRunning {
+		args = append(args, "--leave-running")
+	}
+	return args
+}
+
 // DumpMemory checkpoints pid into dir (criu images). With leaveRunning the
 // guest keeps executing (checkpoint-and-continue); otherwise it is stopped
 // (checkpoint-and-stop, the pause path).
 func DumpMemory(pid int, dir string, leaveRunning bool) error {
+	return DumpMemoryExt(pid, dir, "", leaveRunning)
+}
+
+// DumpMemoryExt is DumpMemory with an optional incremental parent image
+// set (see DumpMemoryArgs).
+func DumpMemoryExt(pid int, dir, prevImagesDir string, leaveRunning bool) error {
 	bin := CRIUBin()
 	if bin == "" {
 		return ErrCRIUUnavailable
@@ -53,11 +75,7 @@ func DumpMemory(pid int, dir string, leaveRunning bool) error {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-	args := []string{"dump", "--tree", fmt.Sprint(pid), "--images-dir", dir, "--shell-job"}
-	if leaveRunning {
-		args = append(args, "--leave-running")
-	}
-	cmd := exec.Command(bin, args...)
+	cmd := exec.Command(bin, DumpMemoryArgs(pid, dir, prevImagesDir, leaveRunning)...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("snapshot: criu dump: %v: %s", err, lastN(string(out), 400))

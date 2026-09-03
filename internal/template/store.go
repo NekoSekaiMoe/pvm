@@ -1,5 +1,5 @@
 // Package template implements a Template Center mirroring
-// CubeMaster/pkg/templatecenter/store.go at single-host scale.
+// templatecenter-style store at single-host scale.
 //
 // Each template is a filesystem directory at
 // /var/lib/uml-container/templates/<id>/ with meta.json (TemplateRecord)
@@ -36,7 +36,7 @@ var (
 	ErrNotFound = errors.New("template: not found")
 )
 
-// Record mirrors CubeMaster templatecenter.TemplateInfo at the storage layer.
+// Record is one template registry entry.
 type Record struct {
 	TemplateID  string    `json:"template_id"`
 	Alias       string    `json:"alias,omitempty"`
@@ -46,6 +46,10 @@ type Record struct {
 	ImageRef    string    `json:"image_ref,omitempty"`
 	ImagePath   string    `json:"image_path,omitempty"`
 	CreatedAt   time.Time `json:"created_at"`
+	// ImageSizeBytes / ImageSHA256 describe the READY image (filled at
+	// build/promotion or first inspection).
+	ImageSizeBytes int64  `json:"image_size_bytes,omitempty"`
+	ImageSHA256    string `json:"image_sha256,omitempty"`
 }
 
 // Store is a file-backed template registry. It keeps an in-memory

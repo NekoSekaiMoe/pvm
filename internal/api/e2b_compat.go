@@ -23,7 +23,6 @@ package api
 
 import (
 	"context"
-	"crypto/subtle"
 	"errors"
 	"fmt"
 	"net/http"
@@ -42,11 +41,11 @@ import (
 )
 
 // e2bCompatKeyAuth authenticates the /sandboxes group. Unlike the /api
-// KeyAuth middleware (Authorization header), it accepts BOTH headers the
-// ecosystem uses: X-API-KEY (official SDKs) and Authorization: Bearer (curl /
-// PVM's own conventions). Comparison stays constant-time for the same reason
-// as the /api middleware.
-func e2bCompatKeyAuth(apiSecretBytes []byte) echo.MiddlewareFunc {
+// middleware, it accepts BOTH headers the ecosystem uses: X-API-KEY
+// (official SDKs) and Authorization: Bearer (curl / PVM's own
+// conventions). Unknown keys delegate to the auth callback when one is
+// configured (fail-closed), so SDK traffic can ride an external IdP too.
+func e2bCompatKeyAuth(reg *KeyRegistry) echo.MiddlewareFunc {
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
 		return func(c echo.Context) error {
 			key := c.Request().Header.Get("X-API-KEY")
@@ -54,11 +53,15 @@ func e2bCompatKeyAuth(apiSecretBytes []byte) echo.MiddlewareFunc {
 				auth := c.Request().Header.Get("Authorization")
 				key = strings.TrimPrefix(auth, "Bearer ")
 			}
-			if subtle.ConstantTimeCompare([]byte(key), apiSecretBytes) == 1 {
-				c.Set("actor", "e2b-sdk")
-				return next(c)
+			id, err := reg.Authenticate(key, c.Request().URL.Path, c.Request().Method)
+			if err != nil {
+				return authError(c, err)
 			}
-			return c.JSON(http.StatusUnauthorized, map[string]string{"message": "unauthenticated"})
+			c.Set("actor", "e2b-sdk:"+id.Operator)
+			if id.Tenant != "" {
+				c.Set("tenant", id.Tenant)
+			}
+			return next(c)
 		}
 	}
 }
@@ -112,14 +115,14 @@ func resolveSandboxID(shortID string) (string, error) {
 
 // registerE2BCompat wires the SDK-facing routes onto the echo instance at the
 // host root. autoMgr mirrors the legacy start handler's lifecycle wiring.
-func registerE2BCompat(e *echo.Echo, apiSecretBytes []byte, autoMgr *lifecycle.Manager) {
+func registerE2BCompat(e *echo.Echo, reg *KeyRegistry, autoMgr *lifecycle.Manager) {
 	// Register each route directly on the Echo instance with the auth
 	// middleware passed per route. An e.Group("", auth) would make Echo's
 	// Group.Use register catch-all RouteNotFound handlers ("" and "/*")
 	// wrapped with the group middleware, so unauthenticated WebUI SPA
 	// fallback requests would be intercepted with a 401 instead of being
 	// served index.html.
-	auth := e2bCompatKeyAuth(apiSecretBytes)
+	auth := e2bCompatKeyAuth(reg)
 
 	// GET /sandboxes — list all tasks in SDK shape.
 	e.GET("/sandboxes", func(c echo.Context) error {

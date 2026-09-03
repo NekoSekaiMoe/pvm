@@ -1,10 +1,13 @@
 package api
 
 import (
+	"encoding/base64"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/labstack/echo/v4"
 
@@ -86,6 +89,61 @@ func registerExecRuntimeExtras(api *echo.Group) {
 		}
 		tail := string(sess.Tail(8192))
 		return c.JSON(http.StatusOK, map[string]interface{}{"task": id, "tail": tail})
+	})
+
+	// GET /tasks/:id/console/stream — Server-Sent Events tail of the
+	// console ring buffer: `data:` lines carry base64 chunks, `: ping`
+	// keepalives hold intermediaries open, and the first `event: start`
+	// message carries the task id and the starting absolute offset.
+	api.GET("/tasks/:id/console/stream", func(c echo.Context) error {
+		id, err := resolveTaskID(c.Param("id"))
+		if err != nil {
+			return c.JSON(http.StatusNotFound, map[string]string{"error": err.Error()})
+		}
+		sess, err := console.Default().Get(id)
+		if err != nil {
+			return c.JSON(http.StatusNotFound, map[string]string{"error": err.Error()})
+		}
+		res := c.Response()
+		res.Header().Set("Content-Type", "text/event-stream")
+		res.Header().Set("Cache-Control", "no-cache")
+		res.Header().Set("Connection", "keep-alive")
+		res.Header().Set("X-Accel-Buffering", "no")
+		res.WriteHeader(http.StatusOK)
+		flusher, _ := res.Writer.(http.Flusher)
+
+		// Start at most 8 KiB back so the stream replays recent context.
+		start := sess.Total() - 8192
+		if start < 0 {
+			start = 0
+		}
+		fmt.Fprintf(res, "event: start\ndata: {\"task\":%q,\"offset\":%d}\n\n", id, start)
+		if flusher != nil {
+			flusher.Flush()
+		}
+		off := start
+		ctx := c.Request().Context()
+		for {
+			chunk, next, err := sess.Since(ctx, off, 15*time.Second)
+			if err != nil {
+				if ctx.Err() != nil {
+					return nil // client went away
+				}
+				// Timeout without data: keepalive comment line.
+				fmt.Fprint(res, ": ping\n\n")
+				if flusher != nil {
+					flusher.Flush()
+				}
+				continue
+			}
+			if len(chunk) > 0 {
+				fmt.Fprintf(res, "data: %s\n\n", base64.StdEncoding.EncodeToString(chunk))
+				if flusher != nil {
+					flusher.Flush()
+				}
+				off = next
+			}
+		}
 	})
 
 	api.POST("/approvals/:id/edit", func(c echo.Context) error {

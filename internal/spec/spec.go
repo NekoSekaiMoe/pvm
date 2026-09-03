@@ -87,7 +87,7 @@ type TaskSpec struct {
 	Artifacts ArtifactsSpec `toml:"artifacts" json:"artifacts"`
 	Lifecycle LifecycleSpec `toml:"lifecycle" json:"lifecycle"`
 
-	// --- volumes (Cube parity: per-sandbox persistent mounts) ---
+	// --- volumes (per-sandbox persistent mounts) ---
 	Volumes []VolumeMount `toml:"volumes" json:"volumes"`
 
 	// --- security & isolation policy ---
@@ -206,14 +206,14 @@ type NetworkSpec struct {
 	MaxRequestBodyBytes int64 `toml:"max_request_body_bytes" json:"max_request_body_bytes"`
 	// QoSRate is a tc tbf rate, e.g. "10mbit". Empty = no shaping.
 	QoSRate string `toml:"qos_rate" json:"qos_rate"`
-	// EgressRules is the extended L7 rule set (Cube parity: docs/guide/security-proxy.md).
+	// EgressRules is the extended L7 rule set.
 	// When non-empty, rule decisions take precedence over the flat allow/block
 	// domain allowlist; the deny list is always evaluated first at the gateway
 	// and can never be overridden by a rule.
 	EgressRules []EgressRule `toml:"egress_rules" json:"egress_rules"`
 
 	// DNSLearnEnabled turns on DNS-learned domain egress (todo.md P1-B,
-	// CubeVS dns_allow/dns_query_track parity): a per-task UDP DNS proxy
+	// DNS-answer snooping): a per-task UDP DNS proxy
 	// snoops resolver responses and inserts the resolved public IPs of
 	// ALLOWLISTED domains into the task's eBPF whitelist map with a TTL, so
 	// the IP-floor admits exactly the addresses the guest actually resolved.
@@ -230,7 +230,7 @@ type NetworkSpec struct {
 	// capacity or host memory by flooding distinct allowlisted lookups.
 	MaxLearnedEntries int `toml:"max_learned_entries" json:"max_learned_entries"`
 
-	// Dataplane selects the packet data plane (todo.md P2, CubeVS parity):
+	// Dataplane selects the packet data plane:
 	//   "bridge" (default) — TAP enslaved to a Linux bridge; the guest IP
 	//     comes from the per-bridge IPAM (gateway_ip subnet) and the eBPF TC
 	//     program on the TAP egress is the SSRF IP-floor.
@@ -241,18 +241,43 @@ type NetworkSpec struct {
 	//     session table. bridge/gateway_ip/guest_ip are IGNORED in tc mode
 	//     (pvm_ip=169.254.68.6 and egress_proxy=169.254.68.5:<port> are
 	//     injected instead). IPv4 TCP/UDP only; ICMP is dropped.
+	//   "auto" — prefer the tc plane when the environment can load it
+	//     (root/CAP_NET_ADMIN + compiled BPF objects) and no port mappings
+	//     are requested; fall back to bridge otherwise. The choice is
+	//     audit-recorded either way.
 	Dataplane string `toml:"dataplane" json:"dataplane"`
+
+	// PortMappings publishes host ports that forward inbound connections
+	// to the task's guest (bridge dataplane only; in tc mode the launch
+	// degrades with an audited warning — the bridgeless plane reverse-NATs
+	// established sessions only).
+	//
+	//	[[network.port_mappings]]
+	//	host_port  = 8080
+	//	guest_port = 80
+	//	protocol   = "tcp"   # or "udp"; default tcp
+	PortMappings []PortMappingSpec `toml:"port_mappings" json:"port_mappings"`
+}
+
+// PortMappingSpec is one inbound host-port forward declared by a task.
+type PortMappingSpec struct {
+	HostPort  int    `toml:"host_port" json:"host_port"`
+	GuestPort int    `toml:"guest_port" json:"guest_port"`
+	Protocol  string `toml:"protocol" json:"protocol"`
 }
 
 // Dataplane mode values for NetworkSpec.Dataplane.
 const (
 	// DataplaneBridge is the default: Linux bridge + per-bridge IPAM.
 	DataplaneBridge = "bridge"
-	// DataplaneTC is the opt-in CubeVS-style bridgeless TC/eBPF data plane.
+	// DataplaneTC is the opt-in bridgeless TC/eBPF data plane.
 	DataplaneTC = "tc"
+	// DataplaneAuto prefers the tc plane when the environment supports it
+	// and no port mappings are declared; falls back to bridge otherwise.
+	DataplaneAuto = "auto"
 )
 
-// EgressRule is one L7 egress rule, mirroring CubeSandbox's Rule/Match/Action.
+// EgressRule is one L7 egress rule (Match fields AND-combined).
 type EgressRule struct {
 	Name   string        `toml:"name" json:"name"`
 	Host   string        `toml:"host" json:"host"`     // exact or "*.suffix"
@@ -265,17 +290,17 @@ type EgressRule struct {
 	Inject *EgressInject `toml:"inject" json:"inject"`
 	// MITM opts the rule into TLS interception so Inject can run on HTTPS
 	// traffic (egress CA terminates the guest's TLS; the guest rootfs must
-	// trust the CA). Mirrors CubeSgress L7 inject-on-HTTPS.
+	// trust the CA). Injection applies to HTTPS rules.
 	MITM *bool `toml:"mitm" json:"mitm"`
 }
 
-// EgressInject mirrors Cube's Inject{header, format, secret} for credential injection.
+// EgressInject carries credential injection for one rule.
 type EgressInject struct {
 	Header string `toml:"header" json:"header"`
 	Format string `toml:"format" json:"format"` // e.g. "Bearer ${SECRET}", default "${SECRET}"
 	Secret string `toml:"secret" json:"secret"`
 	// AllowPlainHTTP attaches the secret even on plaintext HTTP upstreams
-	// (CubeSandbox #726 semantics; the boundary is that the sandbox never
+	// (the boundary is that the sandbox never
 	// sees it). Default false: HTTPS only.
 	AllowPlainHTTP bool `toml:"allow_plain_http" json:"allow_plain_http"`
 }
@@ -339,11 +364,20 @@ type ArtifactsSpec struct {
 //	path = "/workspace"
 //	driver = "builtin"    # optional, defaults to first registered plugin
 //	read_only = true
+//	host_path = "/srv/shared/dataset"  # optional EXPLICIT host-directory
+//	                                 # mount: gated on the deployment-wide
+//	                                 # PVM_HOST_MOUNT_PREFIXES whitelist;
+//	                                 # the dir must already exist. Mutually
+//	                                 # meaningful only with the builtin driver.
 type VolumeMount struct {
 	Name     string `toml:"name" json:"name"`
 	Path     string `toml:"path" json:"path"`
 	Driver   string `toml:"driver" json:"driver"`
 	ReadOnly bool   `toml:"read_only" json:"read_only"`
+	// HostPath requests an explicit host-directory mount (builtin driver
+	// only). Enforced against PVM_HOST_MOUNT_PREFIXES at attach time —
+	// see internal/volume/hostmount.go.
+	HostPath string `toml:"host_path" json:"host_path,omitempty"`
 }
 
 // SecuritySpec defines host security and isolation policies for the sandbox.
@@ -449,10 +483,15 @@ type LifecycleSpec struct {
 	TTL string `toml:"ttl" json:"ttl"`
 	// IdleTimeout triggers AutoPause: after this much idle time the task is
 	// frozen (cgroup freeze) and moved to Suspended. Empty = disabled.
-	// Mirrors CubeSandbox docs/guide/lifecycle.md: timeout + on_timeout=pause.
+	// timeout + on_timeout=pause semantics.
 	IdleTimeout string `toml:"idle_timeout" json:"idle_timeout"`
+	// DeepPause upgrades the idle pause from a cgroup freeze (CPU only) to
+	// a CRIU checkpoint + kill: host memory drops to zero, resume revives
+	// the exact execution state. Requires criu on the host; failures fall
+	// back to the shallow freeze with a warning.
+	DeepPause bool `toml:"deep_pause" json:"deep_pause"`
 	// AutoResume re-arms a Suspended task on the next API activity (any
-	// /exec, /tasks/:id/*). Mirrors Cube's auto_resume.
+	// /exec, /tasks/:id/*).
 	AutoResume bool `toml:"auto_resume" json:"auto_resume"`
 }
 
@@ -581,10 +620,35 @@ func (s *TaskSpec) Validate() error {
 	switch s.Network.Dataplane {
 	case "":
 		s.Network.Dataplane = DataplaneBridge
-	case DataplaneBridge, DataplaneTC:
+	case DataplaneBridge, DataplaneTC, DataplaneAuto:
 	default:
-		errs = append(errs, fmt.Errorf("spec: network.dataplane %q must be %q or %q",
-			s.Network.Dataplane, DataplaneBridge, DataplaneTC))
+		errs = append(errs, fmt.Errorf("spec: network.dataplane %q must be %q, %q or %q",
+			s.Network.Dataplane, DataplaneBridge, DataplaneTC, DataplaneAuto))
+	}
+	for i, pm := range s.Network.PortMappings {
+		if pm.HostPort < 1 || pm.HostPort > 65535 {
+			errs = append(errs, fmt.Errorf("spec: network.port_mappings[%d].host_port %d out of range", i, pm.HostPort))
+		}
+		if pm.GuestPort < 1 || pm.GuestPort > 65535 {
+			errs = append(errs, fmt.Errorf("spec: network.port_mappings[%d].guest_port %d out of range", i, pm.GuestPort))
+		}
+		switch pm.Protocol {
+		case "", "tcp", "udp":
+		default:
+			errs = append(errs, fmt.Errorf("spec: network.port_mappings[%d].protocol %q must be tcp or udp", i, pm.Protocol))
+		}
+	}
+	seenHost := map[string]bool{}
+	for i, pm := range s.Network.PortMappings {
+		proto := pm.Protocol
+		if proto == "" {
+			proto = "tcp"
+		}
+		k := fmt.Sprintf("%s/%d", proto, pm.HostPort)
+		if seenHost[k] {
+			errs = append(errs, fmt.Errorf("spec: network.port_mappings[%d] duplicates host port %s", i, k))
+		}
+		seenHost[k] = true
 	}
 	// guest_ip lands verbatim in the kernel command line as pvm_ip=<ip>, so
 	// it must be a plain dotted-quad IPv4 (which the kernel-field charset
@@ -732,6 +796,18 @@ func (s *TaskSpec) Validate() error {
 		// corrupt that parameter (see ValidateMountPath).
 		if err := ValidateMountPath(vm.Path); err != nil {
 			errs = append(errs, fmt.Errorf("spec: volumes[%d].path: %w", i, err))
+		}
+		// An explicit host_path shares the kernel-arg charset rules (it is
+		// spliced into hostfs_volume=<host>:<guest>:<mode>) and must be
+		// absolute. The PREFIX whitelist is enforced at attach time by the
+		// volume Manager (deployment env), not here — a spec is valid
+		// against a deployment that allows its prefixes.
+		if vm.HostPath != "" {
+			if !filepath.IsAbs(filepath.Clean(vm.HostPath)) {
+				errs = append(errs, fmt.Errorf("spec: volumes[%d].host_path %q must be absolute", i, vm.HostPath))
+			} else if err := ValidateMountPath(vm.HostPath); err != nil {
+				errs = append(errs, fmt.Errorf("spec: volumes[%d].host_path: %w", i, err))
+			}
 		}
 		// Normalize before validation so equivalent spellings of the same
 		// mount point (trailing slashes, interior "..") are caught as

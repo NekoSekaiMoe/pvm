@@ -1,5 +1,5 @@
 // Package sdk is a thin Go client for PVM's REST API, mirroring
-// ref/sdk/go (CubeSandbox) surface at single-host scale. It talks to
+// E2B-compatible surface at single-host scale. It talks to
 // PVM's /api/* endpoints directly; callers point it at the PVM host.
 package sdk
 
@@ -330,4 +330,47 @@ func (c *Client) fetchText(ctx context.Context, path string) (string, error) {
 		return "", fmt.Errorf("sdk: GET %s -> %d: %s", path, resp.StatusCode, string(b))
 	}
 	return string(b), nil
+}
+
+// PortMapping is one inbound host-port forward (bridge dataplane).
+type PortMapping struct {
+	Task      string `json:"task"`
+	HostPort  int    `json:"host_port"`
+	GuestPort int    `json:"guest_port"`
+	GuestIP   string `json:"guest_ip"`
+	Protocol  string `json:"protocol"`
+}
+
+// ListPortMappings returns every inbound host-port mapping.
+func (c *Client) ListPortMappings(ctx context.Context) ([]PortMapping, error) {
+	var out []PortMapping
+	if err := c.doJSON(ctx, http.MethodGet, "/api/network/portmaps", nil, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// AddPortMapping publishes hostPort on the host, forwarding to guestPort of
+// the task's guest (bridge dataplane only).
+func (c *Client) AddPortMapping(ctx context.Context, task string, hostPort, guestPort int, protocol string) (*PortMapping, error) {
+	if protocol == "" {
+		protocol = "tcp"
+	}
+	body := map[string]interface{}{
+		"task": task, "host_port": hostPort, "guest_port": guestPort, "protocol": protocol,
+	}
+	var out PortMapping
+	if err := c.doJSON(ctx, http.MethodPost, "/api/network/portmaps", body, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// DeletePortMapping removes one inbound mapping.
+func (c *Client) DeletePortMapping(ctx context.Context, task string, hostPort int, protocol string) error {
+	if protocol == "" {
+		protocol = "tcp"
+	}
+	return c.doJSON(ctx, http.MethodDelete,
+		fmt.Sprintf("/api/network/portmaps/%s/%d?protocol=%s", task, hostPort, protocol), nil, nil)
 }

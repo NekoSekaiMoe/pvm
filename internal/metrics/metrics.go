@@ -135,6 +135,18 @@ type GaugeHandle struct{ s *series }
 // Set stores v for the given label values.
 func (g GaugeHandle) Set(v float64, labelValues ...string) { g.s.set(v, labelValues) }
 
+// Labels snapshots the current label-value tuples (one entry per series
+// row). Collectors use it to find stale rows to Delete.
+func (g GaugeHandle) Labels() [][]string {
+	g.s.mu.Lock()
+	defer g.s.mu.Unlock()
+	out := make([][]string, 0, len(g.s.values))
+	for k := range g.s.values {
+		out = append(out, strings.Split(k, "\xff"))
+	}
+	return out
+}
+
 // Delete removes a label combination (call when the labeled task ends).
 func (g GaugeHandle) Delete(labelValues ...string) { g.s.delete(labelValues) }
 
@@ -151,9 +163,41 @@ func Gauge(name, help string, labels ...string) GaugeHandle {
 // Uptime returns how long the registry (process) has been running.
 func Uptime() time.Duration { return time.Since(defaultRegistry.started) }
 
+// renderHooks are invoked at the top of every Render: they refresh gauge
+// values whose source of truth lives elsewhere (task states, /proc, pool
+// stats). A panicking hook is recovered and skipped — a broken collector
+// must never take down /metrics.
+var (
+	renderHooksMu sync.Mutex
+	renderHooks   []func()
+)
+
+// OnRender registers a refresh callback run at the start of Render.
+func OnRender(fn func()) {
+	renderHooksMu.Lock()
+	renderHooks = append(renderHooks, fn)
+	renderHooksMu.Unlock()
+}
+
+func runRenderHooks() {
+	renderHooksMu.Lock()
+	fns := append([]func(){}, renderHooks...)
+	renderHooksMu.Unlock()
+	for _, fn := range fns {
+		if fn == nil {
+			continue
+		}
+		func() {
+			defer func() { _ = recover() }()
+			fn()
+		}()
+	}
+}
+
 // Render produces the Prometheus text exposition format for every series in
 // the registry, in stable (name, labels) order.
 func (r *Registry) Render() string {
+	runRenderHooks()
 	r.mu.Lock()
 	names := make([]string, 0, len(r.series))
 	for n := range r.series {

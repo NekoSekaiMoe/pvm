@@ -474,3 +474,32 @@ func TestConnectTunnelOpaque_NoInject(t *testing.T) {
 		t.Fatalf("target received nothing through the tunnel")
 	}
 }
+
+func TestSetPolicyInvalidatesLiveTunnels(t *testing.T) {
+	g := NewGateway()
+	c1, c2 := net.Pipe()
+	defer c2.Close()
+	g.trackTunnel("tk", c1)
+
+	if gen := g.PolicyGeneration("tk"); gen != 0 {
+		t.Fatalf("fresh task generation = %d, want 0", gen)
+	}
+	g.SetPolicy("tk", &Policy{AllowDomains: []string{"a.example"}})
+	if gen := g.PolicyGeneration("tk"); gen != 1 {
+		t.Fatalf("generation after update = %d, want 1", gen)
+	}
+	// The tracked tunnel must now be closed: a read on the OTHER end
+	// returns io.EOF (or an error) once the deadline trips.
+	c2.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, 1)
+	if _, err := c2.Read(buf); err == nil {
+		t.Fatal("tracked tunnel survived the policy update")
+	}
+	// The registry entry is gone: a second update closes nothing and the
+	// generation still bumps.
+	g.SetPolicy("tk", &Policy{})
+	if gen := g.PolicyGeneration("tk"); gen != 2 {
+		t.Fatalf("generation after second update = %d, want 2", gen)
+	}
+	_ = c1.Close()
+}

@@ -1,5 +1,5 @@
 // Package dnslearn implements DNS-learned domain egress policy (todo.md
-// P1-B, modelled on CubeSandbox CubeVS's dns_allow/dns_query_track): a
+// P1-B): a
 // per-task UDP DNS proxy snoops resolver responses, and the resolved PUBLIC
 // IPs of allowlisted domains are inserted into the task's eBPF whitelist
 // map (internal/network filter registry) with TTL-bounded expiry. The IP

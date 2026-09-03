@@ -313,6 +313,36 @@ func runCmd(args []string) {
 			os.Exit(1)
 		}
 	}
+	// The s3 driver (s3fs-backed S3-compatible buckets) is registered
+	// alongside the host-dir builtin: attach fails with a clear error when
+	// s3fs is absent, so registering costs nothing on hosts without it.
+	if err := volMgr.Register(ctxVol, volume.PluginConfig{Name: "s3", Type: volume.PluginTypeBuiltin}, volume.NewS3("s3")); err != nil {
+		fmt.Fprintf(os.Stderr, "volume s3 register: %v\n", err)
+		os.Exit(1)
+	}
+	// Long-running RPC plugins over Unix sockets:
+	// PVM_VOLUME_RPC_PLUGINS=name=/abs/socket.sock (comma-separated).
+	for _, ent := range strings.Split(os.Getenv("PVM_VOLUME_RPC_PLUGINS"), ",") {
+		ent = strings.TrimSpace(ent)
+		if ent == "" {
+			continue
+		}
+		parts := strings.SplitN(ent, "=", 2)
+		if len(parts) != 2 || !filepath.IsAbs(strings.TrimSpace(parts[1])) {
+			fmt.Fprintf(os.Stderr, "PVM_VOLUME_RPC_PLUGINS entry %q must be name=/abs/socket.sock\n", ent)
+			os.Exit(1)
+		}
+		name := strings.TrimSpace(parts[0])
+		sock := strings.TrimSpace(parts[1])
+		if !volume.ValidateID(name) {
+			fmt.Fprintf(os.Stderr, "PVM_VOLUME_RPC_PLUGINS entry %q: invalid driver name %q\n", ent, name)
+			os.Exit(1)
+		}
+		if err := volMgr.Register(ctxVol, volume.PluginConfig{Name: name, Type: volume.PluginTypeRPC, SocketPath: sock}, volume.NewRPC(name, sock)); err != nil {
+			fmt.Fprintf(os.Stderr, "volume rpc plugin %s register: %v\n", name, err)
+			os.Exit(1)
+		}
+	}
 
 	mgr := container.NewManager(nil)
 	mgr.Broker = broker

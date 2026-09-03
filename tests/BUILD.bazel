@@ -78,6 +78,12 @@ pvm_suites([
     "48_test_envd_compat.sh",
     "49_test_audit_signing.sh",
     "52_test_registry_policy.sh",
+    "53_test_auth_multikey.sh",
+    "54_test_portmap_api.sh",
+    "55_test_template_extras.sh",
+    "56_test_deep_pause.sh",
+    "57_test_spec_new_fields.sh",
+    "58_test_console_sse_and_ops.sh",
 ])
 
 # NOT bazel-wired from the 37-52 batch: 47 (root bridge leg — ci.yml

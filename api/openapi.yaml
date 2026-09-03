@@ -315,6 +315,23 @@ paths:
                   tail: { type: string }
         "404": { $ref: "#/components/responses/NotFound" }
 
+  /api/tasks/{id}/console/stream:
+    get:
+      tags: [tasks]
+      summary: Server-Sent Events console stream (base64 chunks + ping keepalives)
+      description: >-
+        Content-Type text/event-stream. The first `event: start` message
+        carries {task, offset}; subsequent `data:` lines carry base64-
+        encoded console chunks. `: ping` comment lines are keepalives.
+      parameters: [{ $ref: "#/components/parameters/TaskIdPath" }]
+      responses:
+        "200":
+          description: SSE stream
+          content:
+            text/event-stream:
+              schema: { type: string }
+        "404": { $ref: "#/components/responses/NotFound" }
+
   /api/tasks/{id}/metrics:
     get:
       tags: [tasks]
@@ -1095,6 +1112,54 @@ paths:
         "404": { $ref: "#/components/responses/NotFound" }
         "409": { $ref: "#/components/responses/Conflict" }
 
+  /api/templates/from-snapshot:
+    post:
+      tags: [templates]
+      summary: Promote a task snapshot into a READY template (backing chain flattened to a standalone raw image)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [task]
+              properties:
+                task: { type: string }
+                snapshot_id: { type: string, description: empty = the task's newest snapshot }
+                alias: { type: string }
+      responses:
+        "201": { $ref: "#/components/responses/OkJson" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "500": { $ref: "#/components/responses/Error" }
+
+  /api/templates/{id}/inspect:
+    get:
+      tags: [templates]
+      summary: Template record with image size and SHA-256
+      parameters: [{ $ref: "#/components/parameters/IdPath" }]
+      responses:
+        "200": { $ref: "#/components/responses/OkJson" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/templates/{id}/preview:
+    post:
+      tags: [templates]
+      summary: Boot an ephemeral sandbox from the template and return its console output
+      parameters: [{ $ref: "#/components/parameters/IdPath" }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                command: { type: string }
+                timeout_seconds: { type: integer, default: 30, maximum: 180 }
+      responses:
+        "200": { $ref: "#/components/responses/OkJson" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict", description: template not READY }
+        "503": { $ref: "#/components/responses/Error", description: no UML kernel on this host }
+
   # ---------------------------------------------------------------- egress
   /api/egress/{task}/learned:
     get:
@@ -1184,6 +1249,46 @@ paths:
       parameters: [{ $ref: "#/components/parameters/TaskPath" }]
       responses:
         "200": { $ref: "#/components/responses/OkJson" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/network/portmaps:
+    get:
+      tags: [network]
+      summary: List inbound host-port to guest mappings
+      responses:
+        "200": { $ref: "#/components/responses/OkJson" }
+    post:
+      tags: [network]
+      summary: Publish a host port forwarding to a task's guest (bridge dataplane only)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [task, host_port, guest_port]
+              properties:
+                task: { type: string }
+                host_port: { type: integer, minimum: 1, maximum: 65535 }
+                guest_port: { type: integer, minimum: 1, maximum: 65535 }
+                guest_ip: { type: string, description: optional override; defaults to the task's recorded guest IP }
+                protocol: { type: string, enum: [tcp, udp], default: tcp }
+      responses:
+        "201": { $ref: "#/components/responses/OkJson" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict", description: tc-mode tasks cannot map ports }
+
+  /api/network/portmaps/{task}/{hostPort}:
+    delete:
+      tags: [network]
+      summary: Remove one inbound port mapping
+      parameters:
+        - { $ref: "#/components/parameters/TaskPath" }
+        - { name: hostPort, in: path, required: true, schema: { type: integer } }
+        - { name: protocol, in: query, schema: { type: string, enum: [tcp, udp], default: tcp } }
+      responses:
+        "204": { description: Removed }
         "404": { $ref: "#/components/responses/NotFound" }
 
   # ---------------------------------------------------------------- identity

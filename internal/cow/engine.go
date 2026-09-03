@@ -1,4 +1,4 @@
-// Package cow — Engine abstraction (Cube parity: cubecow/src/engine/mod.rs).
+// Package cow — the qcow2 volume/snapshot Engine abstraction.
 //
 // The original pure-Go qcow2 (qcow2.go) is the only backend today.
 // Engine selects the backend at construction time via NewEngine, mirroring
@@ -28,7 +28,7 @@ func validateName(kind, name string) error {
 	return nil
 }
 
-// Volume mirrors cubecow::Volume / Cubelet/pkg/cubecow.Volume.
+// Volume is one engine-managed qcow2 volume record.
 type Volume struct {
 	Name          string `json:"name"`
 	SizeBytes     uint64 `json:"size_bytes"`

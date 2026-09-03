@@ -135,6 +135,24 @@ func (s *Session) Tail(max int) []byte {
 	return out
 }
 
+// Total returns the absolute append counter (monotonic; see Since).
+func (s *Session) Total() int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.total
+}
+
+// Since blocks until bytes beyond the absolute offset off appear (bounded
+// by timeout) and returns them with the new absolute offset. The exported
+// form of waitTailSince for streaming consumers (SSE console tail).
+func (s *Session) Since(ctx context.Context, off int64, timeout time.Duration) ([]byte, int64, error) {
+	chunk, err := s.waitTailSince(ctx, int(off), timeout)
+	if err != nil {
+		return nil, off, err
+	}
+	return chunk, off + int64(len(chunk)), nil
+}
+
 // waitTailSince blocks until bytes beyond the absolute offset off are
 // available (or timeout/context fires) and returns them. off values are
 // monotonic totals; when the ring has wrapped, the oldest still-held byte is

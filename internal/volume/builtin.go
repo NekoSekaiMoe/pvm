@@ -9,7 +9,7 @@ import (
 )
 
 // BuiltinPlugin is a host-directory plugin compiled into the binary.
-// It mirrors the "builtin" PluginType in ref/Cubelet/plugins/volume.
+// It is the always-registered "builtin" PluginType.
 //
 // Attach creates <VolumeBaseDir>/<driver>-<volumeID> on first attach (mkdir -p)
 // and reuses it thereafter. Detach is a no-op until the last holder leaves
@@ -33,6 +33,16 @@ func (p *BuiltinPlugin) Init(_ context.Context, cfg PluginConfig) error {
 }
 
 func (p *BuiltinPlugin) Attach(_ context.Context, req *AttachRequest) (*AttachResult, error) {
+	// Explicit host-directory mount: bind the operator-supplied directory
+	// as-is (it must already exist — the Manager's whitelist validation
+	// checked that). Metadata records the origin for auditability.
+	if req.HostPath != "" {
+		return &AttachResult{
+			VolumeID: req.VolumeID,
+			HostPath: req.HostPath,
+			Metadata: map[string]string{"hostPath": req.HostPath, "origin": "explicit"},
+		}, nil
+	}
 	if req.VolumeBaseDir == "" {
 		return nil, fmt.Errorf("volume builtin: VolumeBaseDir required")
 	}

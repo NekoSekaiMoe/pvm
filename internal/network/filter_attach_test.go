@@ -15,6 +15,9 @@ import (
 func TestLoadBpfSpec_ExemptConstants(t *testing.T) {
 	spec, err := loadBpf()
 	if err != nil {
+		if errors.Is(err, ErrBpfNotGenerated) {
+			t.Skip("compiled BPF objects not generated in this checkout")
+		}
 		t.Fatalf("loadBpf: %v", err)
 	}
 	err = spec.RewriteConstants(map[string]interface{}{

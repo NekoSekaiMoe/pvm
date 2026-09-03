@@ -48,7 +48,7 @@ type Policy struct {
 	// ReviewHook is called for requests flagged as REVIEW (large POST, etc.).
 	// If nil, REVIEW is treated as BLOCK.
 	ReviewHook func(req *http.Request, bodySize int64) (allow bool, reason string)
-	// Rules is the extended L7 set (Cube parity: security-proxy.md). When
+	// Rules is the extended L7 set. When
 	// non-empty, rule decisions take precedence over the flat AllowDomains
 	// allowlist. BlockDomains is always evaluated first and can never be
 	// overridden by a rule; when Rules is empty the flat lists decide.
@@ -79,7 +79,7 @@ type EgressInject struct {
 	Format string // e.g. "Bearer ${SECRET}"
 	Secret string
 	// AllowPlainHTTP permits attaching this secret on plaintext HTTP
-	// upstreams (CubeSandbox #726 semantics). Default false: HTTPS only.
+	// upstreams. Default false: HTTPS only.
 	AllowPlainHTTP bool
 }
 
@@ -100,6 +100,8 @@ func (d Decision) String() string {
 // Gateway is the HTTP CONNECT proxy that enforces a Policy per task.
 type Gateway struct {
 	policies   map[string]*Policy // keyed by task id
+	polGen     map[string]uint64 // policy generation per task (bumped on SetPolicy)
+	tunnels    map[string]map[net.Conn]struct{} // live tunnels per task (invalidated on policy change)
 	mu         sync.RWMutex
 	ledger     *audit.Ledger            // default ledger (single-task or legacy)
 	ledgers    map[string]*audit.Ledger // per-task ledgers (take precedence)
@@ -192,6 +194,8 @@ func learnedSetContainsIP(set map[string]struct{}, addr net.Addr) bool {
 func NewGateway() *Gateway {
 	return &Gateway{
 		policies: make(map[string]*Policy),
+		polGen:   make(map[string]uint64),
+		tunnels:  make(map[string]map[net.Conn]struct{}),
 		ledgers:  make(map[string]*audit.Ledger),
 		bytesOut: make(map[string]*int64),
 		bytesIn:  make(map[string]*int64),
@@ -212,8 +216,63 @@ func (g *Gateway) EnableSSRFBypassForTest() {
 // SetPolicy installs/updates the egress policy for a task.
 func (g *Gateway) SetPolicy(task string, p *Policy) {
 	g.mu.Lock()
-	defer g.mu.Unlock()
+	if g.policies == nil {
+		g.policies = make(map[string]*Policy)
+		g.polGen = make(map[string]uint64)
+		g.tunnels = make(map[string]map[net.Conn]struct{})
+	}
 	g.policies[task] = p
+	g.polGen[task]++
+	gen := g.polGen[task]
+	conns := make([]net.Conn, 0, len(g.tunnels[task]))
+	for c := range g.tunnels[task] {
+		conns = append(conns, c)
+	}
+	delete(g.tunnels, task)
+	g.mu.Unlock()
+	// Runtime policy updates INVALIDATE live tunnels: verdicts may have
+	// changed, so established flows must not keep riding the old decision.
+	// Closing outside the lock tears the tunnels down with an error the
+	// client sees as a reset; the next connection is judged by the new
+	// policy (generation %d).
+	_ = gen
+	for _, c := range conns {
+		_ = c.Close()
+	}
+	metricsPolicyUpdates.Inc(task)
+}
+
+// PolicyGeneration returns the task's current policy generation. The
+// generation bumps on every SetPolicy — callers can detect a concurrent
+// update between snapshotting a policy and finishing a decision.
+func (g *Gateway) PolicyGeneration(task string) uint64 {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	return g.polGen[task]
+}
+
+// trackTunnel registers a live long-lived connection (CONNECT tunnel or
+// transparent TLS splice) for a task so a later SetPolicy can kill it.
+func (g *Gateway) trackTunnel(task string, c net.Conn) net.Conn {
+	g.mu.Lock()
+	if g.tunnels[task] == nil {
+		g.tunnels[task] = map[net.Conn]struct{}{}
+	}
+	g.tunnels[task][c] = struct{}{}
+	g.mu.Unlock()
+	return c
+}
+
+// untrackTunnel removes a finished tunnel.
+func (g *Gateway) untrackTunnel(task string, c net.Conn) {
+	g.mu.Lock()
+	if m := g.tunnels[task]; m != nil {
+		delete(m, c)
+		if len(m) == 0 {
+			delete(g.tunnels, task)
+		}
+	}
+	g.mu.Unlock()
 }
 
 // PolicySnapshot returns a copy of the task's current policy (zero value
@@ -292,6 +351,10 @@ func (t *taskListener) Addr() string { return t.addr }
 
 // Close stops the per-task listener.
 func (t *taskListener) Close() error {
+	if t.server == nil {
+		// Raw (transparent) listener: no http.Server to shut down.
+		return t.listener.Close()
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	return t.server.Shutdown(ctx)
@@ -492,6 +555,10 @@ func (g *Gateway) handleConnect(w http.ResponseWriter, r *http.Request, task str
 		targetConn.Close()
 		return
 	}
+	// Register the live tunnel: a runtime SetPolicy for this task kills
+	// it (verdicts may have changed; see SetPolicy).
+	g.trackTunnel(task, clientConn)
+	defer g.untrackTunnel(task, clientConn)
 	// The hijacked ResponseWriter can no longer be written to, so the
 	// CONNECT success response is emitted on the raw connection.
 	if _, err := clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")); err != nil {
@@ -938,7 +1005,7 @@ func (g *Gateway) ApplyInject(outReq *http.Request, v requestView, pol *Policy) 
 	}
 	if !strings.EqualFold(v.scheme, "https") {
 		// Plaintext request: credentials are attached ONLY when the OWNING
-		// rule explicitly opts in (AllowPlainHTTP). The CubeSandbox boundary
+		// rule explicitly opts in (AllowPlainHTTP). The boundary
 		// is "the sandbox never sees the secret"; the wire risk proxy→
 		// upstream is accepted by operators who set this flag (internal HTTP
 		// services, sidecar meshes).
@@ -954,7 +1021,7 @@ func (g *Gateway) ApplyInject(outReq *http.Request, v requestView, pol *Policy) 
 		val := strings.ReplaceAll(format, "${SECRET}", owner.Inject.Secret)
 		outReq.Header.Set(owner.Inject.Header, val)
 	}
-	// owner is the first fully matching rule, like CubeEgress
+	// owner is the first fully matching rule (first-match-wins
 }
 
 // domainMatches supports exact and "*.suffix" wildcard.

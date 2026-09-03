@@ -2,11 +2,12 @@ load("@rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
     name = "lifecycle",
-    srcs = ["autopause.go"],
+    srcs = ["autopause.go", "deeppause.go"],
     importpath = "uml-container/internal/lifecycle",
     visibility = ["//:__subpackages__"],
     deps = [
         "//internal/cgroup",
+        "//internal/snapshot",
         "//internal/state",
     ],
 )
@@ -15,6 +16,7 @@ go_test(
     name = "lifecycle_test",
     srcs = [
         "autopause_test.go",
+        "deeppause_test.go",
         "epoch_test.go",
     ],
     embed = [":lifecycle"],

@@ -134,3 +134,27 @@ func TestSweepOnceNilMap(t *testing.T) {
 		t.Fatalf("sweepOnce on nil sessions = %d", got)
 	}
 }
+
+func TestSessionIdleForProtocolAware(t *testing.T) {
+	if got := sessionIdleFor(6); got != tcpSessionIdleTimeout {
+		t.Fatalf("TCP idle = %v, want %v", got, tcpSessionIdleTimeout)
+	}
+	if got := sessionIdleFor(17); got != udpSessionIdleTimeout {
+		t.Fatalf("UDP idle = %v, want %v", got, udpSessionIdleTimeout)
+	}
+	if tcpSessionIdleTimeout <= udpSessionIdleTimeout {
+		t.Fatal("TCP timeout must exceed UDP timeout")
+	}
+}
+
+func TestHighWaterTripped(t *testing.T) {
+	if highWaterTripped(-1, 4096) || highWaterTripped(100, 0) {
+		t.Fatal("unknown capacity or negative count never trips")
+	}
+	if highWaterTripped(3276, 4096) { // exactly 0.7998… — below 0.8
+		t.Fatal("just-below-threshold must not trip")
+	}
+	if !highWaterTripped(3277, 4096) { // 0.80004… — above
+		t.Fatal("above-threshold must trip")
+	}
+}

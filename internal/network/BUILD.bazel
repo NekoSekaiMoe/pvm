@@ -70,8 +70,10 @@ go_library(
         "filter.go",
         "ipam.go",
         "policy.go",
+        "portmap.go",
         "registry.go",
         "tap.go",
+        "transparent_l7.go",
     ] + select({
         # generated bindings carry their own //go:build constraints; each
         # endianness file only compiles on matching platforms.
@@ -115,6 +117,7 @@ go_library(
     visibility = ["//:__subpackages__"],
     deps = [
         "//internal/fsjson",
+        "//internal/metrics",
         "@com_github_cilium_ebpf//:ebpf",
         "@com_github_vishvananda_netlink//:netlink",
         "@org_golang_x_sys//unix",
@@ -131,6 +134,7 @@ go_test(
         "ipam_test.go",
         "network_test.go",
         "policy_test.go",
+        "portmap_test.go",
         "registry_test.go",
     ],
     embed = [":network"],

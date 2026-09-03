@@ -5,8 +5,11 @@ go_library(
     srcs = [
         "binary.go",
         "builtin.go",
+        "hostmount.go",
         "manager.go",
         "plugin.go",
+        "rpc.go",
+        "s3.go",
         "store.go",
     ],
     importpath = "uml-container/internal/volume",
@@ -19,7 +22,9 @@ go_test(
     srcs = [
         "binary_test.go",
         "hardening_test.go",
+        "hostmount_test.go",
         "interleave_test.go",
+        "rpc_test.go",
         "store_durability_test.go",
         "volume_test.go",
     ],

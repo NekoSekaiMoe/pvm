@@ -41,7 +41,7 @@ func (l *limitedBuffer) Write(p []byte) (int, error) {
 }
 
 // BinaryPlugin forks an external process per hook, mirroring
-// Cubelet/plugins/volume/binary.Driver from ref.
+// the fork-per-hook binary driver.
 //
 // # Wire protocol versions
 //
@@ -49,7 +49,7 @@ func (l *limitedBuffer) Write(p []byte) (int, error) {
 // picks one via PluginConfig.Extra["protocol"] at Init time:
 //
 //	protocol = "stdin"    (default, v2 — PVM hardening)
-//	protocol = "argv-v1"  (ref Cubelet byte-compatible)
+//	protocol = "argv-v1"  (legacy byte-compatible wire format)
 //
 // v2 (default) keeps credentials OUT of argv, because /proc/<pid>/cmdline
 // is world-readable: argv carries only non-secret fields and the private
@@ -63,8 +63,8 @@ func (l *limitedBuffer) Write(p []byte) (int, error) {
 //	stdin line:  {"private_data":"..."}   (attach)
 //	             {"metadata":{...}}        (detach)
 //
-// v1 ("argv-v1") reproduces ref Cubelet's exact flag set so unmodified
-// plugins from ref/examples/volume (e.g. cube-volume-cos.sh, whose strict
+// v1 ("argv-v1") reproduces the legacy flag set so unmodified
+// community plugins (strict-argv scripts that never read stdin, e.g.
 // parser dies on unknown flags and which never reads stdin) keep working:
 //
 //	attach argv: --op attach --sandbox-id --namespace --volume-id
@@ -79,7 +79,7 @@ type BinaryPlugin struct {
 	name       string
 	binaryPath string
 	cfg        PluginConfig
-	legacyArgv bool // v1 "argv-v1": ref Cubelet wire format
+	legacyArgv bool // v1 "argv-v1": legacy wire format
 }
 
 func NewBinary(name, binaryPath string) *BinaryPlugin {
@@ -102,7 +102,7 @@ func (p *BinaryPlugin) Init(_ context.Context, cfg PluginConfig) error {
 		return fmt.Errorf("volume binary: binary_path must be absolute, got %q", p.binaryPath)
 	}
 	// Explicit protocol versioning (see the wire-protocol block above):
-	// "stdin" is the hardened default; "argv-v1" opts into the ref Cubelet
+	// "stdin" is the hardened default; "argv-v1" opts into the legacy
 	// wire format. Unknown values fail fast instead of guessing.
 	switch cfg.Extra["protocol"] {
 	case "", "stdin":
@@ -131,7 +131,7 @@ func (p *BinaryPlugin) Attach(ctx context.Context, req *AttachRequest) (*AttachR
 	in := pluginInput{PrivateData: req.PrivateData}
 	var args []string
 	if p.legacyArgv {
-		// v1: ref Cubelet byte-compatibility. PrivateData rides argv (the
+		// v1: legacy byte-compatibility. PrivateData rides argv (the
 		// documented v1 trade-off) and is omitted when empty, like ref;
 		// nothing is written to stdin.
 		args = []string{
@@ -183,7 +183,7 @@ func (p *BinaryPlugin) Detach(ctx context.Context, req *DetachRequest) error {
 	in := pluginInput{Metadata: req.Metadata}
 	var args []string
 	if p.legacyArgv {
-		// v1: ref Cubelet byte-compatibility; Metadata rides argv as a JSON
+		// v1: legacy byte-compatibility; Metadata rides argv as a JSON
 		// object, stdin stays closed.
 		metaJSON, err := json.Marshal(req.Metadata)
 		if err != nil {

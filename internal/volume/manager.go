@@ -12,21 +12,22 @@ import (
 
 // DefaultVolumeBaseDir is the parent directory all plugin hostPaths must
 // live under. Overridable via PVM_VOLUME_BASE_DIR (mirrors
-// Cubelet's volume_plugin_base_dir / PVM_VOLUME_BASE_DIR).
+// PVM_VOLUME_BASE_DIR).
 const DefaultVolumeBaseDir = "/var/lib/uml-container/volumes"
 
 // Manager routes Attach/Detach by driver name and maintains per-volume
 // ref counts (node-local, single-host). It mirrors
-// Cubelet/plugins/volume.Manager at single-host scale.
+// a single-host volume lifecycle Manager.
 type Manager struct {
-	mu        sync.Mutex
-	plugins   map[string]VolumePlugin // driver -> plugin
-	baseDir   string
-	refCounts map[string]int64             // volumeID -> current count
-	attached  map[string]*AttachResult     // volumeID -> last AttachResult (for Detach metadata)
-	extraMeta map[string]map[string]string // volumeID -> user metadata passthrough
-	volLocks  map[string]*volumeLock       // volumeID -> per-volume lifecycle lock
-	volLocksM sync.Mutex                   // guards volLocks and volumeLock.holders
+	mu           sync.Mutex
+	plugins      map[string]VolumePlugin // driver -> plugin
+	baseDir      string
+	hostPrefixes []string                     // explicit host-mount whitelist (PVM_HOST_MOUNT_PREFIXES)
+	refCounts    map[string]int64             // volumeID -> current count
+	attached     map[string]*AttachResult     // volumeID -> last AttachResult (for Detach metadata)
+	extraMeta    map[string]map[string]string // volumeID -> user metadata passthrough
+	volLocks     map[string]*volumeLock       // volumeID -> per-volume lifecycle lock
+	volLocksM    sync.Mutex                   // guards volLocks and volumeLock.holders
 }
 
 // volumeLock pairs a per-volume lifecycle mutex with a holder count so the
@@ -76,21 +77,37 @@ func NewManager(baseDir string) *Manager {
 	if baseDir == "" {
 		baseDir = DefaultVolumeBaseDir
 	}
-	return &Manager{
-		plugins:   make(map[string]VolumePlugin),
-		baseDir:   baseDir,
-		refCounts: make(map[string]int64),
-		attached:  make(map[string]*AttachResult),
-		extraMeta: make(map[string]map[string]string),
-		volLocks:  make(map[string]*volumeLock),
+	// The host-mount whitelist is deployment config: load (and on a bad
+	// value, ignore-with-error) at construction so every Attach sees the
+	// same policy. An unreadable whitelist DISABLES explicit host mounts.
+	prefixes, perr := HostMountPrefixesFromEnv()
+	if perr != nil {
+		prefixes = nil
 	}
+	return &Manager{
+		plugins:      make(map[string]VolumePlugin),
+		baseDir:      baseDir,
+		hostPrefixes: prefixes,
+		refCounts:    make(map[string]int64),
+		attached:     make(map[string]*AttachResult),
+		extraMeta:    make(map[string]map[string]string),
+		volLocks:     make(map[string]*volumeLock),
+	}
+}
+
+// SetHostMountPrefixes replaces the explicit-host-mount whitelist (tests
+// and embedding). An empty slice disables explicit host mounts.
+func (m *Manager) SetHostMountPrefixes(prefixes []string) {
+	m.mu.Lock()
+	m.hostPrefixes = append([]string(nil), prefixes...)
+	m.mu.Unlock()
 }
 
 // BaseDir returns the configured volume base dir (for spec validation / tests).
 func (m *Manager) BaseDir() string { return m.baseDir }
 
 // Register installs a plugin under its Name(). The driver name must be unique
-// (mirrors Cubelet's "name must be unique among volume_plugins" rule).
+// (driver names must be unique in the registry).
 func (m *Manager) Register(ctx context.Context, cfg PluginConfig, p VolumePlugin) error {
 	if cfg.Name == "" {
 		return fmt.Errorf("volume: plugin name required")
@@ -172,7 +189,22 @@ func (m *Manager) Attach(ctx context.Context, req *AttachRequest) (*AttachResult
 	m.refCounts[req.VolumeID]++
 	req.NodeRefFirstAttach = req.RefCount == 0
 	req.VolumeBaseDir = m.baseDir
+	hostPrefixes := m.hostPrefixes
 	m.mu.Unlock()
+
+	// Explicit host mounts validate BEFORE the reservation: a rejected
+	// whitelist miss must not even bump the refcount.
+	if req.HostPath != "" {
+		if _, err := validateExplicitHostPath(req.HostPath, hostPrefixes); err != nil {
+			m.mu.Lock()
+			m.refCounts[req.VolumeID]--
+			if m.refCounts[req.VolumeID] <= 0 {
+				delete(m.refCounts, req.VolumeID)
+			}
+			m.mu.Unlock()
+			return nil, err
+		}
+	}
 
 	// Roll back the reservation on any failure below.
 	rollback := func() {
@@ -199,7 +231,24 @@ func (m *Manager) Attach(ctx context.Context, req *AttachRequest) (*AttachResult
 		rollback()
 		return nil, fmt.Errorf("volume: plugin %q returned empty HostPath", req.Driver)
 	}
-	if err := m.validateHostPath(res.HostPath); err != nil {
+	if req.HostPath != "" {
+		// Explicit mount: the plugin must have honored the requested path,
+		// and the RESULT is re-validated against the whitelist (a plugin
+		// returning something else cannot widen the mount).
+		if res.HostPath != req.HostPath {
+			rollback()
+			return nil, fmt.Errorf("volume: plugin %q returned HostPath %q instead of the requested %q", req.Driver, res.HostPath, req.HostPath)
+		}
+		resolved, err := validateExplicitHostPath(res.HostPath, hostPrefixes)
+		if err != nil {
+			rollback()
+			return nil, err
+		}
+		// Mount exactly what was validated: the symlink-resolved path.
+		// Keeping the operator's spelling here would re-open the
+		// validate→bind TOCTOU (a swapped symlink redirects the mount).
+		res.HostPath = resolved
+	} else if err := m.validateHostPath(res.HostPath); err != nil {
 		rollback()
 		return nil, err
 	}

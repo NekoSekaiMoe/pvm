@@ -1,5 +1,5 @@
 // Spec-alignment guard tests for Rollback (todo #3, disk edition of the
-// CubeShim start_vm config guard): a task whose spec fingerprint changed
+// start_vm config guard): a task whose spec fingerprint changed
 // since the snapshot must refuse to roll back (unless forced), and the
 // refusal must leave state untouched. An unreadable/corrupt snapshot state
 // copy is not "legacy": it must fail closed instead of silently bypassing

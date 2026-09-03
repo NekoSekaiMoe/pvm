@@ -2,7 +2,7 @@ package sdk
 
 // sandbox.go — E2B-compatible lifecycle surface (root-level /sandboxes,
 // X-API-KEY auth): list/create/kill/refresh (=setTimeout), with the
-// NEVER_TIMEOUT sentinel from the CubeSandbox semantics.
+// NEVER_TIMEOUT sentinel (a zero deadline = never).
 
 import (
 	"context"

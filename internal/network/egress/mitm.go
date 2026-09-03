@@ -6,8 +6,8 @@ package egress
 // by the pvm egress CA, apply the full L7 pipeline (decide → inject →
 // audit) on the plaintext, and re-encrypt to the real upstream with the
 // correct SNI. The CA is generated once per host (state dir, 0600) and must
-// be trusted by the guest rootfs (same operational model as CubeSandbox's
-// CubeEgress CA provisioning); an untrusting guest fails the handshake —
+// be trusted by the guest rootfs (CA provisioning); an untrusting guest
+// fails the handshake —
 // credentials never travel a path the CA cannot protect.
 
 import (

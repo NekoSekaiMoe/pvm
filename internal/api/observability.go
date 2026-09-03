@@ -1,7 +1,6 @@
 package api
 
 import (
-	"crypto/subtle"
 	"net/http"
 	"net/http/pprof"
 	"os"
@@ -20,7 +19,8 @@ import (
 // healthchecks and load balancers need before any secret is configured).
 // /metrics follows the API auth unless PVM_METRICS_NOAUTH=1 opts out for
 // scrapers that cannot send headers. pprof is disabled unless PVM_PPROF=1.
-func registerObservability(e *echo.Echo, apiSecretBytes []byte) {
+func registerObservability(e *echo.Echo, reg *KeyRegistry) {
+	registerResourceCollectors()
 	e.GET("/healthz", func(c echo.Context) error {
 		return c.JSON(http.StatusOK, map[string]interface{}{
 			"status":         "ok",
@@ -39,14 +39,14 @@ func registerObservability(e *echo.Echo, apiSecretBytes []byte) {
 	if os.Getenv("PVM_METRICS_NOAUTH") == "1" {
 		e.GET("/metrics", metricsHandler)
 	} else {
-		e.GET("/metrics", metricsHandler, metricsAuth(apiSecretBytes))
+		e.GET("/metrics", metricsHandler, metricsAuth(reg))
 	}
 
 	if os.Getenv("PVM_PPROF") == "1" {
 		// pprof leaks process internals (memory, goroutines, build paths) and
 		// can burn CPU with profile requests: always authenticate, regardless
 		// of PVM_METRICS_NOAUTH (that flag is for /metrics scrapers only).
-		debug := e.Group("/debug/pprof", metricsAuth(apiSecretBytes))
+		debug := e.Group("/debug/pprof", metricsAuth(reg))
 		wrap := func(h http.HandlerFunc) echo.HandlerFunc {
 			return func(c echo.Context) error {
 				h(c.Response(), c.Request())
@@ -73,11 +73,14 @@ func registerObservability(e *echo.Echo, apiSecretBytes []byte) {
 
 // metricsAuth mirrors the /api KeyAuth (constant-time bearer compare) without
 // depending on middleware ordering.
-func metricsAuth(secret []byte) echo.MiddlewareFunc {
+// metricsAuth guards /metrics and /debug/pprof. Local keys only — no
+// callback delegation: scrapers run every few seconds and must not turn a
+// broken IdP into either an outage or an auth hammer.
+func metricsAuth(reg *KeyRegistry) echo.MiddlewareFunc {
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
 		return func(c echo.Context) error {
 			key := strings.TrimPrefix(c.Request().Header.Get("Authorization"), "Bearer ")
-			if subtle.ConstantTimeCompare([]byte(key), secret) == 1 {
+			if _, ok := reg.Lookup(key); ok {
 				return next(c)
 			}
 			return echo.NewHTTPError(http.StatusUnauthorized, map[string]string{"message": "unauthorized"})

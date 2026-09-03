@@ -10,3 +10,5 @@ load("@gazelle//:def.bzl", "gazelle")
 # gazelle:exclude mnt_pkg
 # gazelle:exclude ref
 gazelle(name = "gazelle")
+
+exports_files(["LICENSE"])

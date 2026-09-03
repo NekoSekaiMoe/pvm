@@ -1,4 +1,4 @@
-// Package network — policy hardening mirroring CubeNet/cubevs/netpolicy.go
+// Package network — network policy hardening
 // at single-host scale.
 //
 // BuildNetPolicyPlan is a pure-Go planner that runs before programming the

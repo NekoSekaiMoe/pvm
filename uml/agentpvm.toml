@@ -70,6 +70,13 @@ tap           = ""        # auto-derived from task name when empty
 max_request_body_bytes = 1048576   # 1 MiB upload cap
 qos_rate      = ""        # e.g. "10mbit"
 
+# Inbound port publishing (bridge dataplane only): forward host TCP/UDP
+# ports to the guest. In tc mode these degrade with an audited warning.
+# [[network.port_mappings]]
+# host_port  = 8080
+# guest_port = 80
+# protocol   = "tcp"
+
 # Domain allowlist enforced by the L7 CONNECT proxy. HTTPS sees the domain via
 # SNI without TLS MITM. Wildcards supported: "*.github.com".
 egress_allow_domains = [
@@ -83,7 +90,7 @@ egress_block_domains = [
     "169.254.169.254",   # cloud metadata (also blocked by eBPF floor)
 ]
 
-# Extended L7 rules (Cube parity: docs/guide/security-proxy.md).
+# Extended L7 rules (first match wins).
 # First match wins. Example: read-only api.github.com access, no credentials:
 # [[network.egress_rules]]
 # name   = "github-api"
@@ -147,6 +154,10 @@ block_secrets        = true   # gate fails if a declared artifact diff has a sec
 
 # --- lifecycle (plan.md §8, §11) ---
 [lifecycle]
+# deep_pause = false   # idle autopause checkpoints (CRIU) and KILLS the
+                      # process: zero resident memory; resume revives the
+                      # exact execution state. Requires criu on the host;
+                      # failures fall back to the shallow cgroup freeze.
 paused     = false      # start in Suspended (checkpoint-on-start)
 max_retries = 2         # Failed -> Provisioning attempts
 on_anomaly  = "pause"   # "pause" (default) or "terminate"
@@ -154,7 +165,7 @@ ttl         = "1h"      # overall task lifetime
 idle_timeout = ""       # e.g. "10m": freeze + Suspended after idle (single-host AutoPause)
 auto_resume  = false     # when true, next API activity thaws Suspended -> Running
 
-# --- volumes (Cube parity: persistent mounts) ---
+# --- volumes (persistent mounts) ---
 # Each entry is mounted via the volume plugin framework (internal/volume).
 # driver defaults to the first registered plugin when omitted; with the
 # stock wiring that is "builtin" (the always-registered built-in
@@ -167,6 +178,18 @@ auto_resume  = false     # when true, next API activity thaws Suspended -> Runni
 # path      = "/workspace"
 # driver    = "builtin"
 # read_only = false
+
+# Explicit host-directory mount (optional): bind a pre-existing host dir
+# into the guest. Gated on the deployment-wide PVM_HOST_MOUNT_PREFIXES
+# whitelist (comma-separated absolute prefixes) — with no whitelist
+# configured, host_path mounts are REFUSED (fail-closed). The directory
+# must already exist; symlinks are resolved before matching.
+# [[volumes]]
+# name      = "shared-dataset"
+# path      = "/dataset"
+# driver    = "builtin"
+# read_only = true
+# host_path = "/srv/shared/dataset"
 
 # --- security & host isolation baseline (gVisor Gofer jail & seccomp-bpf) ---
 [security]

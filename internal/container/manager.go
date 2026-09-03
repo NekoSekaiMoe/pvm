@@ -335,7 +335,9 @@ func (m *Manager) Boot(ctx context.Context, cfg *config.ContainerConfig) (*Boote
 		ctx = context.WithValue(ctx, uml.KeyConsoleTee, consoleSession)
 	}
 	pid, p, err := m.Launcher.Start(ctx, cfg.Kernel, args, logFile)
-	st.PID = pid
+	// Stamp the pid WITH its /proc starttime: later control paths
+	// (deep pause checkpoint+kill) refuse to act on a recycled pid.
+	state.StampPID(st, pid)
 	if err != nil {
 		if consoleSession != nil {
 			console.Default().Detach(cfg.ID)
@@ -423,6 +425,12 @@ func (m *Manager) WaitExit(id string, b *Booted) error {
 	b.closeConsoleLogs()
 	st, lerr := state.LoadState(id)
 	if lerr == nil && st != nil {
+		// Deep pause: the process death was INTENTIONAL (checkpointed and
+		// killed by lifecycle.DeepPause); the Suspended state must survive
+		// for the criu-restore resume — do not record a terminal status.
+		if st.Status == state.StatusSuspended && st.Metadata["pause_mode"] == "deep" {
+			return err
+		}
 		if err != nil {
 			st.Status = state.StatusExited
 		} else {
@@ -659,7 +667,7 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 	if m.Volumes != nil && len(s.Volumes) > 0 {
 		for _, vm := range s.Volumes {
 			// Resolve the driver ONCE at the attach point: an empty Driver means
-			// "first registered plugin" (mirrors Cube's "first entry" rule).
+			// "first registered plugin" (the registry order decides the default).
 			// Recording the resolved name on the mount copy (vm is a copy of the
 			// spec entry, so the spec itself is not mutated) lets the rollback
 			// and cleanupVolumes paths below detach through the SAME driver the
@@ -675,6 +683,7 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 				SandboxID: taskID,
 				VolumeID:  vm.Name,
 				Driver:    vm.Driver,
+				HostPath:  vm.HostPath,
 			})
 			if err != nil {
 				// Detach already-attached volumes through their recorded drivers
@@ -901,7 +910,30 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 	// root/CAP_NET_ADMIN) or the bind fails, we degrade with an audit
 	// warning and STILL inject the fixed address: fail-closed (unreachable)
 	// beats silently telling the guest an address that happens to work.
+	// dataplane "auto" resolves BEFORE anything else touches the network:
+	// port mappings pin bridge (static inbound DNAT), L7-rule tasks pin
+	// bridge (transparent interception is iptables-side), and a non-root
+	// process cannot load eBPF anyway. Otherwise tc is preferred for its
+	// no-iptables posture; its attach path already degrades back to bridge
+	// when a bridge/gateway is configured.
+	if s.Network.Enabled && s.Network.Dataplane == spec.DataplaneAuto {
+		resolved := resolveAutoDataplane(s)
+		s.Network.Dataplane = resolved
+		_ = ledger.Append(audit.Record{
+			Phase:    audit.PhaseExec,
+			Subject:  s.Caller,
+			Action:   "network:dataplane_auto",
+			Params:   map[string]interface{}{"resolved": resolved},
+			Decision: audit.DecisionAllow,
+			Reason:   "dataplane auto-selection",
+		})
+	}
 	tcDataplane := s.Network.Enabled && s.Network.Dataplane == spec.DataplaneTC
+	// Transparent L7 bookkeeping (bridge plane): the wildcard listener's
+	// port (0 = none) and the guest IP whose :80/:443 REDIRECT rules must
+	// be removed at teardown.
+	transparentPort := 0
+	transparentGuestIP := ""
 	if m.Egress != nil && s.Network.Enabled {
 		pol := &egress.Policy{
 			AllowDomains:   s.Network.EgressAllowDomains,
@@ -940,6 +972,32 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 			})
 		}
 		m.Egress.SetPolicy(taskID, pol)
+		// Transparent L7 interception (bridge plane only): when a policy is
+		// declared, a second per-task listener accepts iptables-REDIRECTed
+		// :80/:443 traffic so the guest needs NO proxy configuration. The
+		// REDIRECT rules are installed later, once the guest IP exists.
+		hasL7Policy := len(s.Network.EgressRules) > 0 ||
+			len(s.Network.EgressAllowDomains) > 0 ||
+			len(s.Network.EgressBlockDomains) > 0
+		if hasL7Policy && !tcDataplane {
+			if tln, terr := m.Egress.ListenTransparentForTask(ctx, taskID); terr == nil {
+				defer tln.Close()
+				if _, port, perr := net.SplitHostPort(tln.Addr()); perr == nil {
+					if pv, convErr := strconv.Atoi(port); convErr == nil {
+						transparentPort = pv
+					}
+				}
+			} else {
+				warn := fmt.Sprintf("transparent L7 listener bind failed: %v; egress enforcement stays explicit-proxy", terr)
+				fmt.Printf("Warning: %s\n", warn)
+				if aerr := appendDegradedWarning(ledger, s.Caller, warn); aerr != nil {
+					cleanupVolumes()
+					_ = st.Transition(state.StatusFailed, state.ActorController, "audit transparent-l7 degraded-warning append failed: "+aerr.Error())
+					state.SaveState(taskID, st)
+					return fmt.Errorf("container: audit transparent-l7 degraded warning for %s: %w", taskID, aerr)
+				}
+			}
+		}
 		listenAddr := ""
 		if tcDataplane {
 			if _, gwErr := network.EnsureGwDevice(); gwErr != nil {
@@ -1124,6 +1182,24 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 			}
 			guestIP = gip.String()
 			dnsGateway = ipam.GatewayIP()
+			// Transparent L7 REDIRECT rules (bridge plane): now that the guest
+			// IP exists, steer its :80/:443 into the wildcard listener started
+			// earlier. Failure degrades with evidence — the explicit proxy
+			// path keeps enforcing.
+			if transparentPort != 0 {
+				if terr := network.EnableTransparentL7(taskID, guestIP, transparentPort); terr != nil {
+					warn := fmt.Sprintf("transparent L7 redirect install failed: %v; egress enforcement stays explicit-proxy", terr)
+					fmt.Printf("Warning: %s\n", warn)
+					if aerr := appendDegradedWarning(ledger, s.Caller, warn); aerr != nil {
+						cleanupVolumes()
+						_ = st.Transition(state.StatusFailed, state.ActorController, "audit transparent-l7-rule degraded-warning append failed: "+aerr.Error())
+						state.SaveState(taskID, st)
+						return fmt.Errorf("container: audit transparent-l7-rule degraded warning for %s: %w", taskID, aerr)
+					}
+				} else {
+					transparentGuestIP = guestIP
+				}
+			}
 			if _, ferr := network.AttachEgressFilter(tapName, taskID, ipam.GatewayIP(), gip); ferr != nil {
 				warn := fmt.Sprintf("tc egress filter attach failed for tap %s: %v; "+
 					"running WITHOUT the BPF IP-floor (L7 egress proxy remains the enforcement point)", tapName, ferr)
@@ -1161,8 +1237,64 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 					fmt.Printf("Warning: tc filter detach for %s: %v\n", taskID, derr)
 				}
 			}
+			// Transparent L7 rules (bridge plane): remove before the rest of
+			// the network goes away.
+			if transparentPort != 0 && transparentGuestIP != "" {
+				if err := network.DisableTransparentL7(taskID, transparentGuestIP, transparentPort); err != nil {
+					fmt.Printf("Warning: transparent L7 removal for %s: %v\n", taskID, err)
+				}
+			}
+			// Inbound port mappings (bridge plane): remove rules + records.
+			if err := network.CleanupTaskPortMappings(taskID); err != nil {
+				fmt.Printf("Warning: port mapping cleanup for %s: %v\n", taskID, err)
+			}
 			if ipam != nil {
 				ipam.Release(taskID)
+			}
+		}
+
+		// Record the resolved network posture on the state record so the
+		// API (and operators) can map host ports without re-deriving it.
+		if st.Metadata == nil {
+			st.Metadata = map[string]string{}
+		}
+		st.Metadata["guest_ip"] = guestIP
+		st.Metadata["tap"] = tapName
+		if dpAttached {
+			st.Metadata["dataplane"] = "tc"
+		} else if bridgePlane {
+			st.Metadata["dataplane"] = "bridge"
+		}
+
+		// Inbound port mappings ([[network.port_mappings]]): bridge plane
+		// only — the bridgeless tc plane reverse-NATs established sessions
+		// and has no static inbound NAT, so declared mappings degrade with
+		// an audited warning instead of failing the launch.
+		if len(s.Network.PortMappings) > 0 {
+			if bridgePlane && !dpAttached {
+				for _, pm := range s.Network.PortMappings {
+					if err := network.AddPortMapping(network.PortMapping{
+						TaskID:    taskID,
+						HostPort:  pm.HostPort,
+						GuestPort: pm.GuestPort,
+						GuestIP:   guestIP,
+						Protocol:  pm.Protocol,
+					}); err != nil {
+						cleanupVolumes()
+						_ = st.Transition(state.StatusFailed, state.ActorController, "port mapping failed: "+err.Error())
+						state.SaveState(taskID, st)
+						return fmt.Errorf("container: port mapping for %s: %w", taskID, err)
+					}
+				}
+			} else {
+				warn := fmt.Sprintf("port mappings require the bridge dataplane; %d mapping(s) skipped (tc plane active)", len(s.Network.PortMappings))
+				fmt.Printf("Warning: %s\n", warn)
+				if aerr := appendDegradedWarning(ledger, s.Caller, warn); aerr != nil {
+					cleanupVolumes()
+					_ = st.Transition(state.StatusFailed, state.ActorController, "audit portmap degraded-warning append failed: "+aerr.Error())
+					state.SaveState(taskID, st)
+					return fmt.Errorf("container: audit portmap degraded warning for %s: %w", taskID, aerr)
+				}
 			}
 		}
 
@@ -1394,7 +1526,7 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 		ctx = context.WithValue(ctx, uml.KeyConsoleTee, consoleSession)
 	}
 	pid, p, err := m.Launcher.Start(ctx, s.Kernel.Path, args, logFile)
-	st.PID = pid
+	state.StampPID(st, pid) // pid + starttime stamp (recycled-pid guard)
 	if err != nil {
 		if consoleSession != nil {
 			console.Default().Detach(taskID)
@@ -1491,6 +1623,7 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 	// authoritatively Running would pause (or interfere with) a failed launch.
 	if m.Autopause != nil && s.Lifecycle.IdleTimeout != "" {
 		if d, err := time.ParseDuration(s.Lifecycle.IdleTimeout); err == nil && d > 0 {
+			m.Autopause.SetDeepPause(taskID, s.Lifecycle.DeepPause)
 			m.Autopause.Arm(taskID, d)
 		}
 	}
@@ -2010,3 +2143,32 @@ func buildTaskArgs(s *spec.TaskSpec, vhostSock, resolvedRootfs, egressAddr strin
 // idRegexp is the task id format used by StartTask's defense-in-depth check.
 // Mirrors the regex used by state.ContainerDir / the CLI.
 var idRegexp = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
+
+// resolveAutoDataplane picks the data plane for specs that say
+// network.dataplane = "auto". Policy (in priority order):
+//
+//  1. port mappings pin bridge — the bridgeless tc plane has no static
+//     inbound NAT;
+//  2. L7 egress rules or a flat allow/block domain list pin bridge —
+//     transparent HTTP(S) interception (iptables REDIRECT into the L7
+//     gateway) is wired on the bridge path;
+//  3. an unprivileged process cannot load TC eBPF at all — bridge;
+//  4. otherwise prefer tc (no iptables footprint); its attach path
+//     degrades back to the classic plane when a bridge/gateway exists.
+//
+// Pure function of the spec + the process euid: deterministic and
+// unit-testable.
+func resolveAutoDataplane(s *spec.TaskSpec) string {
+	if len(s.Network.PortMappings) > 0 {
+		return spec.DataplaneBridge
+	}
+	if len(s.Network.EgressRules) > 0 ||
+		len(s.Network.EgressAllowDomains) > 0 ||
+		len(s.Network.EgressBlockDomains) > 0 {
+		return spec.DataplaneBridge
+	}
+	if os.Geteuid() != 0 {
+		return spec.DataplaneBridge
+	}
+	return spec.DataplaneTC
+}

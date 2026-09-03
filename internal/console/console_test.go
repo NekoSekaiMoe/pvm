@@ -85,3 +85,30 @@ func TestManagerGetDetach(t *testing.T) {
 	}
 	m.Detach("a") // idempotent
 }
+
+func TestSessionSinceStreaming(t *testing.T) {
+	m := defaultManager
+	sess := m.Attach("sse-test")
+	defer m.Detach("sse-test")
+
+	if _, err := sess.Write([]byte("hello ")); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	chunk, off, err := sess.Since(ctx, 0, 500*time.Millisecond)
+	if err != nil || string(chunk) != "hello " || off != 6 {
+		t.Fatalf("Since = %q %d %v", chunk, off, err)
+	}
+	// No new data: timeout, offset unchanged.
+	if _, off2, err := sess.Since(ctx, off, 50*time.Millisecond); err == nil || off2 != off {
+		t.Fatalf("idle Since must time out in place: %d %v", off2, err)
+	}
+	if _, err := sess.Write([]byte("world")); err != nil {
+		t.Fatal(err)
+	}
+	chunk, off, err = sess.Since(ctx, off, 500*time.Millisecond)
+	if err != nil || string(chunk) != "world" || off != 11 {
+		t.Fatalf("Since#2 = %q %d %v", chunk, off, err)
+	}
+}

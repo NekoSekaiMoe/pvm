@@ -249,7 +249,22 @@ func CreateEventSnapshot(taskID, eventID, auditHash string, metadata map[string]
 		freeze.close()
 	}()
 	if dumpMemory {
-		if err := DumpMemory(st.PID, MemoryImagesDir(targetDir), true); err == nil {
+		// Incremental dumps (opt-in, PVM_SNAPSHOT_INCREMENTAL=1): chain onto
+	// the task's previous FULL-memory snapshot so only pages dirtied since
+	// are written (--track-mem + a RELATIVE --prev-images-dir, which a
+	// later restore follows through the chain).
+	prevRel := ""
+	if os.Getenv("PVM_SNAPSHOT_INCREMENTAL") == "1" {
+		if prev := previousMemoryDir(taskID, snapDir); prev != "" {
+			if rel, rerr := filepath.Rel(targetDir, prev); rerr == nil && !strings.HasPrefix(rel, "..") {
+				prevRel = rel
+			}
+		}
+	}
+	if err := DumpMemoryExt(st.PID, MemoryImagesDir(targetDir), prevRel, true); err == nil {
+		if prevRel != "" {
+			metadata["memory_incremental"] = "prev-relative:" + prevRel
+		}
 			metadata["memory_state"] = string(MemoryFull)
 		} else {
 			metadata["memory_state"] = string(MemoryDegraded)
@@ -428,4 +443,38 @@ func DeleteEventSnapshot(taskID, snapshotID string) error {
 		return err
 	}
 	return os.RemoveAll(targetDir)
+}
+
+// previousMemoryDir finds the NEWEST earlier snapshot of taskID that
+// carries a memory image set (a full dump or the head of an incremental
+// chain). The candidate must sort BEFORE the snapshot being created's
+// parent dir name space; callers pass the snapshots root for context.
+func previousMemoryDir(taskID, _ string) string {
+	root, err := snapshotsDir(taskID)
+	if err != nil {
+		return ""
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return ""
+	}
+	// Snapshot ids embed their creation nanotime, so lexicographic order
+	// approximates chronological order within one task.
+	var best string
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		mem := MemoryImagesDir(filepath.Join(root, e.Name()))
+		if info, err := os.Stat(mem); err != nil || !info.IsDir() {
+			continue
+		}
+		if best == "" || e.Name() > filepath.Base(best) {
+			best = filepath.Join(root, e.Name())
+		}
+	}
+	if best == "" {
+		return ""
+	}
+	return MemoryImagesDir(best)
 }
