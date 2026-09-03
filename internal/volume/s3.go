@@ -158,10 +158,14 @@ func (p *S3Plugin) Attach(ctx context.Context, req *AttachRequest) (*AttachResul
 		os.Getenv("AWS_ACCESS_KEY_ID"), os.Getenv("AWS_SECRET_ACCESS_KEY"))), 0o600); err != nil {
 		return nil, fmt.Errorf("volume s3: credentials file: %w", err)
 	}
+	// s3fs reads passwd_file at startup and never re-reads it: unlink as
+	// soon as the command returns (success OR failure) so the cleartext
+	// key cannot linger past the mount (e.g. after a process crash —
+	// Detach's own best-effort remove would never run then).
+	defer os.Remove(passwd)
 	args := s3fsArgs(mountpoint, bucket, endpoint, os.Getenv("PVM_S3_REGION"), pathStyle, passwd)
 	cmd := exec.CommandContext(ctx, "s3fs", args...)
 	if out, err := cmd.CombinedOutput(); err != nil {
-		_ = os.Remove(passwd)
 		return nil, fmt.Errorf("volume s3: s3fs mount %s: %v (%s)", bucket, err, strings.TrimSpace(string(out)))
 	}
 	return &AttachResult{

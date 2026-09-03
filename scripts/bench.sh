@@ -246,7 +246,7 @@ main() {
     trap cleanup EXIT
 
     API=${API%/}
-    for op in ${ALL_OPS[@]}; do
+    for op in "${ALL_OPS[@]}"; do
         wants "$op" && : > "$TMPDIR_BENCH/$op.tsv"
     done
 
@@ -347,7 +347,7 @@ report() {
         printf '%-10s %5s %5s %5s %10s %10s %10s %10s %10s %10s\n' \
             OP N OK FAIL MIN AVG P50 P95 MAX WALL
     fi
-    for op in ${ALL_OPS[@]}; do
+    for op in "${ALL_OPS[@]}"; do
         wants "$op" || continue
         f="$TMPDIR_BENCH/$op.tsv"
         read -r ok fail wall <<< "$(awk -F'\t' '

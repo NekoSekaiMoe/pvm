@@ -202,8 +202,15 @@ func (g *Gateway) serveTransparentHTTP(conn net.Conn, taskID string, dst *net.TC
 		g.handle(w, r)
 	})
 	srv := &http.Server{
-		Handler:           handler,
+		Handler: handler,
+		// ReadHeaderTimeout alone only bounds the header; an untrusted
+		// guest could else pin a goroutine forever with a slow body or an
+		// idle keep-alive conn. (IdleTimeout still matters here: Serve on
+		// the one-conn listener loops over keep-alive requests.)
 		ReadHeaderTimeout: 30 * time.Second,
+		ReadTimeout:       5 * time.Minute,
+		WriteTimeout:      5 * time.Minute,
+		IdleTimeout:       60 * time.Second,
 	}
 	_ = srv.Serve(&oneConnListener{conn: conn})
 }

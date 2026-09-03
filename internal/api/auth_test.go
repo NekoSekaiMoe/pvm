@@ -235,10 +235,20 @@ func TestRequestKeyBearerFormRequiresSeparator(t *testing.T) {
 
 func TestSecureCallbackCleartextRule(t *testing.T) {
 	// Deterministic resolver: the "localhost" case must not depend on the
-	// host machine's /etc/hosts.
+	// host machine's /etc/hosts, and the opt-in cases must exercise the
+	// private-network pinning (public vs private resolution).
 	orig := lookupHost
 	defer func() { lookupHost = orig }()
-	lookupHost = func(string) ([]string, error) { return []string{"127.0.0.1"}, nil }
+	lookupHost = func(host string) ([]string, error) {
+		switch {
+		case host == "localhost":
+			return []string{"127.0.0.1"}, nil
+		case strings.HasSuffix(host, ".internal"):
+			return []string{"10.1.2.3"}, nil
+		default:
+			return []string{"192.0.2.5"}, nil // public: opt-in must stay pinned
+		}
+	}
 
 	cases := []struct {
 		name     string
@@ -252,7 +262,10 @@ func TestSecureCallbackCleartextRule(t *testing.T) {
 		{"localhost http allowed", "http://localhost:9999/auth", "", "http://localhost:9999/auth"},
 		{"remote http refused", "http://idp.example/auth", "", ""},
 		{"remote http refused with other optin", "http://idp.example/auth", "yes", ""},
-		{"remote http explicit opt-in", "http://idp.example/auth", "1", "http://idp.example/auth"},
+		{"remote http opt-in still pinned to private", "http://idp.example/auth", "1", ""},
+		{"private-network opt-in allowed", "http://idp.internal/auth", "1", "http://idp.internal/auth"},
+		{"private literal IP opt-in allowed", "http://10.1.2.3:9999/auth", "1", "http://10.1.2.3:9999/auth"},
+		{"public literal IP opt-in refused", "http://192.0.2.5:9999/auth", "1", ""},
 		{"garbage url refused", "://bad", "", ""},
 	}
 	for _, tc := range cases {
@@ -306,7 +319,8 @@ func TestSecureCallbackLocalhostResolution(t *testing.T) {
 		{"non-loopback resolution refuses", []string{"10.0.0.9"}, nil, "", ""},
 		{"mixed resolution refuses", []string{"127.0.0.1", "192.0.2.5"}, nil, "", ""},
 		{"resolver failure refuses (fail closed)", nil, fmt.Errorf("dns broken"), "", ""},
-		{"explicit opt-in overrides resolution", []string{"10.0.0.9"}, nil, "1", "http://localhost:9999/auth"},
+		{"explicit opt-in overrides resolution (private)", []string{"10.0.0.9"}, nil, "1", "http://localhost:9999/auth"},
+		{"opt-in does NOT rescue public resolution", []string{"192.0.2.5"}, nil, "1", ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

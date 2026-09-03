@@ -32,6 +32,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -349,6 +350,17 @@ func ListPortMappings() []PortMapping {
 	for _, ms := range r.mappings {
 		out = append(out, ms...)
 	}
+	// r.mappings is a map (task -> mappings): iteration order is random,
+	// so sort for the stable API output the doc comment promises.
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].TaskID != out[j].TaskID {
+			return out[i].TaskID < out[j].TaskID
+		}
+		if out[i].Protocol != out[j].Protocol {
+			return out[i].Protocol < out[j].Protocol
+		}
+		return out[i].HostPort < out[j].HostPort
+	})
 	return out
 }
 

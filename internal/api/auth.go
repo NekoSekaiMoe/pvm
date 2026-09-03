@@ -21,8 +21,10 @@ package api
 //     the RAW key, so a non-https non-loopback URL is refused at load
 //     time (delegation disabled, unknown keys stay 401) unless the
 //     private-network escape hatch PVM_AUTH_CALLBACK_ALLOW_HTTP=1 is
-//     set explicitly; redirects are never followed (the key must not be
-//     replayed to another location) and concurrent callbacks are capped.
+//     set explicitly — and even then the callback host must resolve
+//     into loopback/RFC1918/ULA space (public cleartext stays refused);
+//     redirects are never followed (the key must not be replayed to
+//     another location) and concurrent callbacks are capped.
 //
 // Both ecosystem header conventions are accepted everywhere:
 // Authorization: Bearer <key> (preferred) and X-API-KEY <key>.
@@ -128,7 +130,9 @@ func newCallbackClient() *http.Client {
 // a loopback/local authenticator) is refused — delegation is disabled and
 // unknown keys keep answering 401 instead of shipping secrets on the
 // wire. Explicit opt-in for private-network TLS-less deployments:
-// PVM_AUTH_CALLBACK_ALLOW_HTTP=1.
+// PVM_AUTH_CALLBACK_ALLOW_HTTP=1 — and even then the target must resolve
+// into loopback/RFC1918/ULA space (hostPrivatenetOnly); public cleartext
+// is never allowed.
 // lookupHost is net.LookupHost indirected for tests (the "localhost"
 // verification below must be testable against a hostile resolver).
 var lookupHost = net.LookupHost
@@ -158,6 +162,15 @@ func secureCallback(callback string) string {
 		}
 	}
 	if os.Getenv("PVM_AUTH_CALLBACK_ALLOW_HTTP") == "1" {
+		// The opt-in is pinned to private networks: a cleartext callback
+		// to a public address stays fail-closed no matter what.
+		if !hostPrivatenetOnly(u.Hostname()) {
+			log.Printf("auth: PVM_AUTH_CALLBACK_URL %q is cleartext http to a "+
+				"NON-private address — callback delegation DISABLED even with "+
+				"PVM_AUTH_CALLBACK_ALLOW_HTTP=1 (raw keys must not cross the "+
+				"public internet in the clear)", callback)
+			return ""
+		}
 		log.Printf("auth: PVM_AUTH_CALLBACK_ALLOW_HTTP=1: raw API keys will be "+
 			"sent over %s to %q (private-network TLS-less deployment)", u.Scheme, callback)
 		return callback
@@ -179,6 +192,29 @@ func localhostResolvesLoopbackOnly() bool {
 	for _, ip := range ips {
 		pip := net.ParseIP(ip)
 		if pip == nil || !pip.IsLoopback() {
+			return false
+		}
+	}
+	return true
+}
+
+// hostPrivatenetOnly reports whether every address `host` resolves to (or
+// literally is) is loopback or RFC1918/ULA private space. It bounds the
+// PVM_AUTH_CALLBACK_ALLOW_HTTP escape hatch to genuinely private
+// networks: cleartext RAW keys to a PUBLIC address stay fail-closed even
+// with the opt-in. Resolution failure or an empty answer set fails
+// closed (mirroring localhostResolvesLoopbackOnly).
+func hostPrivatenetOnly(host string) bool {
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback() || ip.IsPrivate()
+	}
+	ips, err := lookupHost(host)
+	if err != nil || len(ips) == 0 {
+		return false
+	}
+	for _, ip := range ips {
+		pip := net.ParseIP(ip)
+		if pip == nil || (!pip.IsLoopback() && !pip.IsPrivate()) {
 			return false
 		}
 	}

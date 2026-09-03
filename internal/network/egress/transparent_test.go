@@ -71,11 +71,12 @@ func TestParseSNIMalformedNeverPanics(t *testing.T) {
 	full := buildClientHello("example.com", nil)
 	hs := full[5:]
 	corruptions := [][]byte{
+		hs, // control: the complete handshake record must parse
 		nil,
 		{},
-		{0x02},                  // not a ClientHello
-		hs[:10],                 // truncated
-		hs[:len(hs)-5],          // extension block overruns
+		{0x02},                           // not a ClientHello
+		hs[:10],                          // truncated
+		hs[:len(hs)-5],                   // extension block overruns
 		corruptSNILen(hs, "example.com"), // SNI name length overruns the extension
 	}
 	for i, c := range corruptions {

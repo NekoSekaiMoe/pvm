@@ -337,6 +337,12 @@ type TapDataplane struct {
 	// gauge (0 = unknown/unreadable).
 	sessionMaxEntries uint32
 
+	// highWatered is the sweeper's edge memory for the high-water
+	// counter: publishCapacity Inc()s only on a not-tripped → tripped
+	// transition, never again while the condition stays true (the
+	// sweeper is its only caller, so no extra locking is needed).
+	highWatered bool
+
 	// whitelist is nil in the registry sense when shared: sharedHandle is
 	// our extra fd onto the already-pinned/registered map (closed on
 	// detach); an OWNED whitelist (no plain egress filter pinned one
@@ -680,8 +686,10 @@ func (d *TapDataplane) sweepOnce(uniform time.Duration) int {
 // dpSessionsGauge / dpSessionHighWater are the capacity observability
 // handles for the per-task NAT session table.
 var (
-	dpSessionsGauge    = metrics.Gauge("pvm_dp_sessions", "NAT sessions currently tracked by the tc dataplane", "task")
-	dpSessionHighWater = metrics.Counter("pvm_dp_session_high_water_total", "tc dataplane session table crossed the high-water mark", "task")
+	dpSessionsGauge = metrics.Gauge("pvm_dp_sessions",
+		"NAT sessions currently tracked by the tc dataplane", "task")
+	dpSessionHighWater = metrics.Counter("pvm_dp_session_high_water_total",
+		"tc dataplane session table crossed the high-water mark", "task")
 )
 
 // highWaterTripped reports whether the fill ratio crosses the high-water
@@ -705,9 +713,14 @@ func (d *TapDataplane) publishCapacity() {
 		return
 	}
 	dpSessionsGauge.Set(float64(n), d.taskID)
-	if highWaterTripped(n, d.sessionMaxEntries) {
+	// Edge-triggered: the counter must name crossing EVENTS, not poll
+	// ticks while above the mark (a steady 90%-full table must not grow
+	// the counter every 30s and fake an alert rate).
+	tripped := highWaterTripped(n, d.sessionMaxEntries)
+	if tripped && !d.highWatered {
 		dpSessionHighWater.Inc(d.taskID)
 	}
+	d.highWatered = tripped
 }
 
 // Close is the symmetric teardown of AttachTapDataplane: stop the sweeper,

@@ -142,6 +142,12 @@ func (g GaugeHandle) Labels() [][]string {
 	defer g.s.mu.Unlock()
 	out := make([][]string, 0, len(g.s.values))
 	for k := range g.s.values {
+		if len(g.s.labels) == 0 {
+			// Unlabeled series: the key is "", and Split would wrongly
+			// yield a one-empty-string tuple instead of the empty one.
+			out = append(out, []string{})
+			continue
+		}
 		out = append(out, strings.Split(k, "\xff"))
 	}
 	return out

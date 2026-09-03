@@ -99,6 +99,17 @@ func collectInventoryGauges() {
 		for s, n := range byStatus {
 			tmplGauge.Set(float64(n), s)
 		}
+		// ...and zero the ones whose last template left, mirroring
+		// collectTaskGauges' stale-state handling (otherwise
+		// pvm_templates{status=X} lingers at its last non-zero value
+		// after the final X template is deleted or changes state).
+		for _, lvs := range tmplGauge.Labels() {
+			if len(lvs) == 1 {
+				if _, still := byStatus[lvs[0]]; !still {
+					tmplGauge.Set(0, lvs[0])
+				}
+			}
+		}
 	}
 	if vols, err := volume.NewStore("").List(); err == nil {
 		volGauge.Set(float64(len(vols)))

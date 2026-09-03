@@ -21,6 +21,10 @@ import (
 // whose backing chain reaches into the base (the flatten path that matters).
 func mkSnapshotTask(t *testing.T) (taskID, snapID, overlay string) {
 	t.Helper()
+	// t.TempDir dies at test end; later tests must not read the stale
+	// state root.
+	old := state.RootDir
+	t.Cleanup(func() { state.RootDir = old })
 	root := t.TempDir()
 	state.RootDir = root
 	taskID = "snaptest"
@@ -110,6 +114,10 @@ func TestCreateFromSnapshotFlattens(t *testing.T) {
 }
 
 func TestCreateFromSnapshotValidation(t *testing.T) {
+	// t.TempDir dies at test end; later tests must not read the stale
+	// state root.
+	old := state.RootDir
+	t.Cleanup(func() { state.RootDir = old })
 	state.RootDir = t.TempDir()
 	s := NewStore(t.TempDir())
 	cases := []struct {

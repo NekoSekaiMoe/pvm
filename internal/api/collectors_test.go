@@ -70,11 +70,28 @@ func TestCollectorsRenderHookWired(t *testing.T) {
 // last non-zero value (the collectTaskGauges doc comment always claimed
 // this; the code only learned it here).
 func TestCollectTaskGaugesZeroesStaleStates(t *testing.T) {
+	// t.TempDir dies at test end; later tests must not read the stale
+	// state root.
+	old := state.RootDir
+	t.Cleanup(func() { state.RootDir = old })
 	state.RootDir = t.TempDir() // no tasks at all
 	tasksByState.Set(3, "running")
 	collectTaskGauges()
 	out := metrics.Default().Render()
 	if !strings.Contains(out, `pvm_tasks{state="running"} 0`) {
 		t.Fatalf("stale state label not zeroed:\n%s", out)
+	}
+}
+
+// A template status whose last template left must drop to 0 too —
+// pvm_templates{status=X} must not linger at its last non-zero value
+// after the final X template is deleted (mirrors the task behavior).
+func TestCollectInventoryGaugesZeroesStaleTemplateStates(t *testing.T) {
+	t.Setenv("PVM_TEMPLATE_ROOT", t.TempDir()) // no templates at all
+	tmplGauge.Set(2, "READY")
+	collectInventoryGauges()
+	out := metrics.Default().Render()
+	if !strings.Contains(out, `pvm_templates{status="READY"} 0`) {
+		t.Fatalf("stale template status label not zeroed:\n%s", out)
 	}
 }
