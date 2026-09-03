@@ -14,10 +14,11 @@ package volume
 //
 // Credentials come from the environment (AWS_ACCESS_KEY_ID /
 // AWS_SECRET_ACCESS_KEY), NEVER from plugin config files in world-readable
-// locations; a passwd file is materialized 0600 per attach and unlinked at
-// detach. Attach mounts <base>/s3-<volumeID>; Detach (last ref) runs
-// fusermount -u. Destroy scope stays with the Manager (prefix delete is
-// the backend's concern).
+// locations; a passwd file is materialized 0600 per attach, unlinked as
+// soon as the s3fs command returns, and swept again on the last detach —
+// including orphans left by prior process instances. Attach mounts
+// <base>/s3-<volumeID>; Detach (last ref) runs fusermount -u. Destroy
+// scope stays with the Manager (prefix delete is the backend's concern).
 //
 // Requirements: s3fs + fuse on the host and CAP_SYS_ADMIN (or the
 // user-allow_other fuse policy). Missing binaries fail the attach with a
@@ -25,7 +26,9 @@ package volume
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io/fs"
 	"net"
 	"net/url"
 	"os"
@@ -109,7 +112,25 @@ func validateS3Endpoint(endpoint string) error {
 	}
 }
 
-func (p *S3Plugin) Attach(ctx context.Context, req *AttachRequest) (*AttachResult, error) {
+// credsFile returns the per-volume credentials file path that lives
+// beside the mountpoint in the volume base directory.
+func (p *S3Plugin) credsFile(mountpoint, volumeID string) string {
+	return filepath.Join(filepath.Dir(mountpoint), fmt.Sprintf(".%s-%s.creds", p.name, volumeID))
+}
+
+// removeCreds deletes a credentials file. A missing file is success
+// (idempotent); any other failure is returned — a lingering cleartext
+// key must never pass silently.
+func removeCreds(path string) error {
+	if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("volume s3: remove credentials file %s: %w", path, err)
+	}
+	return nil
+}
+
+func (p *S3Plugin) Attach(
+	ctx context.Context, req *AttachRequest,
+) (res *AttachResult, retErr error) {
 	if req.VolumeBaseDir == "" {
 		return nil, fmt.Errorf("volume s3: VolumeBaseDir required")
 	}
@@ -146,23 +167,38 @@ func (p *S3Plugin) Attach(ctx context.Context, req *AttachRequest) (*AttachResul
 	p.mu.Unlock()
 	// Already mounted (refcount > 1): reuse.
 	if err := exec.Command("mountpoint", "-q", mountpoint).Run(); err == nil {
+		// hostPath must ride along here too: the Manager OVERWRITES its
+		// Detach-replay metadata with every attach result, and losing it
+		// would break the prior-instance cleanup path in Detach.
+		meta := map[string]string{"driver": p.name, "bucket": bucket,
+			"reused": "1", "hostPath": mountpoint}
 		return &AttachResult{VolumeID: req.VolumeID, HostPath: mountpoint,
-			Metadata: map[string]string{"driver": p.name, "bucket": bucket, "reused": "1"}}, nil
+			Metadata: meta}, nil
 	}
 
 	pathStyle := strings.Contains(os.Getenv("PVM_S3_PATH_STYLE"), "1") || strings.Contains(endpoint, "minio") || strings.Contains(endpoint, "127.0.0.1")
 	// Credentials file only AFTER the endpoint validated (and only when a
 	// fresh mount is actually needed — the reuse path above never writes).
-	passwd := filepath.Join(req.VolumeBaseDir, fmt.Sprintf(".%s-%s.creds", p.name, req.VolumeID))
+	passwd := p.credsFile(mountpoint, req.VolumeID)
 	if err := os.WriteFile(passwd, []byte(fmt.Sprintf("%s:%s\n",
 		os.Getenv("AWS_ACCESS_KEY_ID"), os.Getenv("AWS_SECRET_ACCESS_KEY"))), 0o600); err != nil {
 		return nil, fmt.Errorf("volume s3: credentials file: %w", err)
 	}
 	// s3fs reads passwd_file at startup and never re-reads it: unlink as
-	// soon as the command returns (success OR failure) so the cleartext
-	// key cannot linger past the mount (e.g. after a process crash —
-	// Detach's own best-effort remove would never run then).
-	defer os.Remove(passwd)
+	// soon as the command returns (success OR failure — a deferred remove
+	// covers both) so the cleartext key cannot linger past the mount
+	// (e.g. after a process crash — Detach's orphan sweep is the backstop
+	// then). Removal failures are REPORTED, never swallowed: a lingering
+	// cleartext key must fail the attach rather than pass silently.
+	defer func() {
+		if err := removeCreds(passwd); err != nil {
+			if retErr != nil {
+				retErr = fmt.Errorf("%v; additionally, %w", retErr, err)
+			} else {
+				retErr = err
+			}
+		}
+	}()
 	args := s3fsArgs(mountpoint, bucket, endpoint, os.Getenv("PVM_S3_REGION"), pathStyle, passwd)
 	cmd := exec.CommandContext(ctx, "s3fs", args...)
 	if out, err := cmd.CombinedOutput(); err != nil {
@@ -183,18 +219,29 @@ func (p *S3Plugin) Detach(_ context.Context, req *DetachRequest) error {
 	mountpoint := p.mnts[req.VolumeID]
 	delete(p.mnts, req.VolumeID)
 	p.mu.Unlock()
+	// Prior process instance: this process never saw the Attach (e.g. the
+	// plugin host was SIGKILLed before its deferred remove ran), but the
+	// Manager replays the attach metadata — recover the mountpoint from it
+	// so the teardown still reaches this volume.
 	if mountpoint == "" {
-		return nil // never attached through this process: nothing to unmount
+		mountpoint = req.Metadata["hostPath"]
+	}
+	if mountpoint == "" {
+		return nil // no mountpoint on record anywhere: nothing to unmount
 	}
 	if out, err := exec.Command("fusermount", "-u", mountpoint).CombinedOutput(); err != nil {
-		// Not mounted is success (idempotent detach).
+		// Not mounted is success (idempotent detach) — and the exact "no
+		// active mount" confirmation the credentials sweep below needs
+		// before it may delete.
 		low := strings.ToLower(string(out))
 		if !strings.Contains(low, "not mounted") && !strings.Contains(low, "no such file") && !strings.Contains(low, "not found") {
 			return fmt.Errorf("volume s3: fusermount -u %s: %v (%s)", mountpoint, err, strings.TrimSpace(string(out)))
 		}
 	}
-	_ = os.Remove(filepath.Join(filepath.Dir(mountpoint), fmt.Sprintf(".%s-%s.creds", p.name, req.VolumeID)))
-	return nil
+	// No active mounts remain: drop the credentials file too — including
+	// an orphan left by a prior process instance that died between
+	// Attach's write and its deferred remove.
+	return removeCreds(p.credsFile(mountpoint, req.VolumeID))
 }
 
 func (p *S3Plugin) Close() error { return nil }

@@ -70,20 +70,29 @@ func TestParseSNIExtractsServerName(t *testing.T) {
 func TestParseSNIMalformedNeverPanics(t *testing.T) {
 	full := buildClientHello("example.com", nil)
 	hs := full[5:]
-	corruptions := [][]byte{
-		hs, // control: the complete handshake record must parse
-		nil,
-		{},
-		{0x02},                           // not a ClientHello
-		hs[:10],                          // truncated
-		hs[:len(hs)-5],                   // extension block overruns
-		corruptSNILen(hs, "example.com"), // SNI name length overruns the extension
+	cases := []struct {
+		name    string
+		input   []byte
+		wantErr bool // only the control case parses; every corruption must error
+	}{
+		{"control: complete handshake parses", hs, false},
+		{"nil input", nil, true},
+		{"empty input", []byte{}, true},
+		{"not a ClientHello", []byte{0x02}, true},
+		{"truncated handshake", hs[:10], true},
+		{"extension block overruns", hs[:len(hs)-5], true},
+		{"SNI length overruns extension", corruptSNILen(hs, "example.com"), true},
 	}
-	for i, c := range corruptions {
-		if _, err := parseSNI(c); i > 0 && err == nil {
-			// Only the full record (i=0) parses; the rest must error.
-			t.Fatalf("corruption %d unexpectedly parsed", i)
-		}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := parseSNI(tc.input)
+			if tc.wantErr && err == nil {
+				t.Fatalf("parseSNI unexpectedly parsed: %q", got)
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("parseSNI control case failed: %v", err)
+			}
+		})
 	}
 }
 

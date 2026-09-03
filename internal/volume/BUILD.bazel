@@ -25,6 +25,7 @@ go_test(
         "hostmount_test.go",
         "interleave_test.go",
         "rpc_test.go",
+	"s3_test.go",
         "store_durability_test.go",
         "volume_test.go",
     ],

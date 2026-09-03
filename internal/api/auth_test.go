@@ -319,7 +319,8 @@ func TestSecureCallbackLocalhostResolution(t *testing.T) {
 		{"non-loopback resolution refuses", []string{"10.0.0.9"}, nil, "", ""},
 		{"mixed resolution refuses", []string{"127.0.0.1", "192.0.2.5"}, nil, "", ""},
 		{"resolver failure refuses (fail closed)", nil, fmt.Errorf("dns broken"), "", ""},
-		{"explicit opt-in overrides resolution (private)", []string{"10.0.0.9"}, nil, "1", "http://localhost:9999/auth"},
+		{"explicit opt-in overrides resolution (private)",
+			[]string{"10.0.0.9"}, nil, "1", "http://localhost:9999/auth"},
 		{"opt-in does NOT rescue public resolution", []string{"192.0.2.5"}, nil, "1", ""},
 	}
 	for _, tc := range cases {

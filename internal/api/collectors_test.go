@@ -87,11 +87,34 @@ func TestCollectTaskGaugesZeroesStaleStates(t *testing.T) {
 // pvm_templates{status=X} must not linger at its last non-zero value
 // after the final X template is deleted (mirrors the task behavior).
 func TestCollectInventoryGaugesZeroesStaleTemplateStates(t *testing.T) {
-	t.Setenv("PVM_TEMPLATE_ROOT", t.TempDir()) // no templates at all
-	tmplGauge.Set(2, "READY")
-	collectInventoryGauges()
-	out := metrics.Default().Render()
-	if !strings.Contains(out, `pvm_templates{status="READY"} 0`) {
-		t.Fatalf("stale template status label not zeroed:\n%s", out)
+	cases := []struct {
+		name    string
+		tmplEnv string  // PVM_TEMPLATE_ROOT ("" = a fresh empty dir: no templates)
+		setVal  float64 // stale gauge value planted for the status label
+		status  string
+		want    string // expected zeroed render line
+	}{
+		{
+			name:    "no templates zeroes READY",
+			tmplEnv: "",
+			setVal:  2,
+			status:  "READY",
+			want:    `pvm_templates{status="READY"} 0`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			root := tc.tmplEnv
+			if root == "" {
+				root = t.TempDir() // no templates at all
+			}
+			t.Setenv("PVM_TEMPLATE_ROOT", root)
+			tmplGauge.Set(tc.setVal, tc.status)
+			collectInventoryGauges()
+			out := metrics.Default().Render()
+			if !strings.Contains(out, tc.want) {
+				t.Fatalf("stale template status label not zeroed:\n%s", out)
+			}
+		})
 	}
 }
