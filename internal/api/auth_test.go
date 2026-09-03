@@ -4,6 +4,7 @@ package api
 // (parse formats, local lookup, fail-closed callback, middleware headers).
 
 import (
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -233,6 +234,12 @@ func TestRequestKeyBearerFormRequiresSeparator(t *testing.T) {
 }
 
 func TestSecureCallbackCleartextRule(t *testing.T) {
+	// Deterministic resolver: the "localhost" case must not depend on the
+	// host machine's /etc/hosts.
+	orig := lookupHost
+	defer func() { lookupHost = orig }()
+	lookupHost = func(string) ([]string, error) { return []string{"127.0.0.1"}, nil }
+
 	cases := []struct {
 		name     string
 		callback string
@@ -278,5 +285,36 @@ func TestAuthenticateCallbackRedirectRefused(t *testing.T) {
 	}
 	if reached {
 		t.Fatal("callback redirect must never be followed (raw key would leak)")
+	}
+}
+
+// "localhost" is only a name: the callback must be refused when the
+// resolver points it at a non-loopback address (fail closed), and only
+// accepted when EVERY resolved address is loopback.
+func TestSecureCallbackLocalhostResolution(t *testing.T) {
+	orig := lookupHost
+	defer func() { lookupHost = orig }()
+
+	cases := []struct {
+		name  string
+		ips   []string
+		lerr  error
+		optin string
+		want  string
+	}{
+		{"all loopback allows http", []string{"127.0.0.1", "::1"}, nil, "", "http://localhost:9999/auth"},
+		{"non-loopback resolution refuses", []string{"10.0.0.9"}, nil, "", ""},
+		{"mixed resolution refuses", []string{"127.0.0.1", "192.0.2.5"}, nil, "", ""},
+		{"resolver failure refuses (fail closed)", nil, fmt.Errorf("dns broken"), "", ""},
+		{"explicit opt-in overrides resolution", []string{"10.0.0.9"}, nil, "1", "http://localhost:9999/auth"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("PVM_AUTH_CALLBACK_ALLOW_HTTP", tc.optin)
+			lookupHost = func(string) ([]string, error) { return tc.ips, tc.lerr }
+			if got := secureCallback("http://localhost:9999/auth"); got != tc.want {
+				t.Fatalf("secureCallback = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }

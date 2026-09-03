@@ -238,15 +238,17 @@ func (m *Manager) Attach(ctx context.Context, req *AttachRequest) (*AttachResult
 	// Manager-side check: without it a mismatched or escaping host_path
 	// (e.g. a lying RPC plugin, or an s3 mount asked for an explicit host
 	// dir) left the mount — and its credentials file — behind while only
-	// the refcount rolled back. The reservation is dropping back to zero,
-	// so the detach is a last-reference detach.
+	// the refcount rolled back. The plugin-side unmount runs ONLY when
+	// this call was the node's first attach (0→1): a failed SECOND attach
+	// still has live holders, and unmounting under them would tear down a
+	// volume someone else is using.
 	compensateDetach := func() {
 		_ = plugin.Detach(ctx, &DetachRequest{
 			SandboxID:         req.SandboxID,
 			Namespace:         req.Namespace,
 			VolumeID:          req.VolumeID,
 			Driver:            req.Driver,
-			NodeRefLastDetach: true,
+			NodeRefLastDetach: req.NodeRefFirstAttach,
 		})
 		rollback()
 	}

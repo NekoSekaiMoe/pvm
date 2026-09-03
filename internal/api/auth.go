@@ -129,13 +129,18 @@ func newCallbackClient() *http.Client {
 // unknown keys keep answering 401 instead of shipping secrets on the
 // wire. Explicit opt-in for private-network TLS-less deployments:
 // PVM_AUTH_CALLBACK_ALLOW_HTTP=1.
+// lookupHost is net.LookupHost indirected for tests (the "localhost"
+// verification below must be testable against a hostile resolver).
+var lookupHost = net.LookupHost
+
 func secureCallback(callback string) string {
 	if callback == "" {
 		return ""
 	}
 	u, err := url.Parse(callback)
 	if err != nil {
-		log.Printf("auth: PVM_AUTH_CALLBACK_URL %q is not a valid URL (callback delegation disabled, auth stays fail-closed): %v", callback, err)
+		log.Printf("auth: PVM_AUTH_CALLBACK_URL %q is not a valid URL "+
+			"(callback delegation disabled, auth stays fail-closed): %v", callback, err)
 		return ""
 	}
 	if u.Scheme == "https" {
@@ -145,16 +150,39 @@ func secureCallback(callback string) string {
 		if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
 			return callback
 		}
-		if host == "localhost" {
+		// "localhost" is only a name: /etc/hosts or a resolver can point
+		// it anywhere. Accept it only when EVERY resolved address is
+		// loopback; anything else is treated like any other remote host.
+		if host == "localhost" && localhostResolvesLoopbackOnly() {
 			return callback
 		}
 	}
 	if os.Getenv("PVM_AUTH_CALLBACK_ALLOW_HTTP") == "1" {
-		log.Printf("auth: PVM_AUTH_CALLBACK_ALLOW_HTTP=1: raw API keys will be sent over %s to %q (private-network TLS-less deployment)", u.Scheme, callback)
+		log.Printf("auth: PVM_AUTH_CALLBACK_ALLOW_HTTP=1: raw API keys will be "+
+			"sent over %s to %q (private-network TLS-less deployment)", u.Scheme, callback)
 		return callback
 	}
-	log.Printf("auth: PVM_AUTH_CALLBACK_URL %q is not https and not loopback — callback delegation DISABLED (fail-closed 401s); set PVM_AUTH_CALLBACK_ALLOW_HTTP=1 to explicitly allow cleartext keys", callback)
+	log.Printf("auth: PVM_AUTH_CALLBACK_URL %q is not https and not loopback — "+
+		"callback delegation DISABLED (fail-closed 401s); set "+
+		"PVM_AUTH_CALLBACK_ALLOW_HTTP=1 to explicitly allow cleartext keys", callback)
 	return ""
+}
+
+// localhostResolvesLoopbackOnly reports whether every address the host
+// resolver returns for "localhost" is a loopback address. A resolution
+// failure is treated as "not verifiable" (fail closed).
+func localhostResolvesLoopbackOnly() bool {
+	ips, err := lookupHost("localhost")
+	if err != nil || len(ips) == 0 {
+		return false
+	}
+	for _, ip := range ips {
+		pip := net.ParseIP(ip)
+		if pip == nil || !pip.IsLoopback() {
+			return false
+		}
+	}
+	return true
 }
 
 // parseKeyEntries splits one blob (env value or file line) into keys.
@@ -175,7 +203,8 @@ func parseKeyEntries(blob string) []APIKey {
 		// Inner whitespace/'#' cannot be part of a key (list separators
 		// were already handled); anything left is a malformed entry.
 		if strings.ContainsAny(raw, " \t#") {
-			log.Printf("auth: skipping malformed key entry %q (inline spaces or '#' are not supported; put comments on their own line)", raw)
+			log.Printf("auth: skipping malformed key entry %q (inline spaces or '#' "+
+				"are not supported; put comments on their own line)", raw)
 			continue
 		}
 		parts := strings.Split(raw, ":")
@@ -280,7 +309,8 @@ func requestKey(r *http.Request) string {
 func authError(c echo.Context, err error) error {
 	if errors.Is(err, ErrAuthUnavailable) {
 		log.Printf("auth: %v", err)
-		return c.JSON(http.StatusInternalServerError, map[string]string{"message": "authentication backend unavailable"})
+		return c.JSON(http.StatusInternalServerError,
+			map[string]string{"message": "authentication backend unavailable"})
 	}
 	return c.JSON(http.StatusUnauthorized, map[string]string{"message": "unauthenticated"})
 }

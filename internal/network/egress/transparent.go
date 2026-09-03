@@ -224,6 +224,13 @@ func (g *Gateway) serveTransparentTLS(conn net.Conn, br *bufio.Reader, taskID st
 	if g.ruleMITM(sni, pol) != nil {
 		// Replay the buffered ClientHello: serveMITM reads the handshake
 		// itself from the connection + bufio pair.
+		// Generation guard first: a policy update during the handshake
+		// window must kill this intercepted connection too.
+		if !g.trackTunnelIfFresh(taskID, gen, conn) {
+			g.recordRaw(taskID, "transparent-tls", DecisionBlock, "policy updated during connect (generation moved)")
+			return
+		}
+		defer g.untrackTunnel(taskID, conn)
 		replay := &prefixedConn{Conn: conn, r: io.MultiReader(bytesReader(clientHello), conn)}
 		brw := &bufio.ReadWriter{Reader: bufio.NewReader(replay), Writer: bufio.NewWriter(replay)}
 		g.serveMITM(replay, brw, taskID, sni, pol)

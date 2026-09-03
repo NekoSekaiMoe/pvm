@@ -90,14 +90,31 @@ func (m *Manager) DeepPause(taskID string) error {
 
 	// Now the memory can actually go away. A non-ESRCH kill failure must
 	// not silently return success with a live process behind a
-	// Suspended+deep record: retry once, then surface the inconsistency
-	// (the state stays deep-paused and recoverable via DeepResume).
+	// Suspended+deep record: retry once, then roll the state back
+	// (metadata cleared, Running again, persisted) BEFORE thawing — if the
+	// rollback itself fails the cgroup stays FROZEN so the process can
+	// never run against stale deep-pause bookkeeping (and DeepResume no
+	// longer sees pause_mode=deep, so it cannot "restore" onto a live tree).
 	if err := syscall.Kill(st.PID, syscall.SIGKILL); err != nil && err != syscall.ESRCH {
 		if retry := syscall.Kill(st.PID, syscall.SIGKILL); retry != nil && retry != syscall.ESRCH {
+			delete(st.Metadata, "pause_mode")
+			delete(st.Metadata, "pause_memory")
+			rolledBack := false
+			if st.Transition(state.StatusResuming, state.ActorSystem, "deep pause kill failed: rolling back") == nil {
+				if st.Transition(state.StatusRunning, state.ActorSystem, "deep pause kill failed: rolled back") == nil {
+					rolledBack = state.SaveState(taskID, st) == nil
+				}
+			}
+			if !rolledBack {
+				return fmt.Errorf(
+					"lifecycle: deep pause %s: kill %d failed and the state rollback "+
+						"failed; task left FROZEN as Suspended+deep (recover manually): %w",
+					taskID, st.PID, err)
+			}
 			m.thawBestEffort(taskID)
 			return fmt.Errorf(
-				"lifecycle: deep pause %s: kill %d failed after checkpoint "+
-					"(state is Suspended+deep; process may still be alive): %w",
+				"lifecycle: deep pause %s: kill %d failed after checkpoint; "+
+					"state restored to Running and cgroup thawed: %w",
 				taskID, st.PID, err)
 		}
 	}
@@ -125,7 +142,8 @@ func (m *Manager) DeepResume(taskID string) error {
 	if err := st.Transition(state.StatusResuming, state.ActorSystem, "deep resume"); err != nil {
 		return fmt.Errorf("lifecycle: deep resume %s: %w", taskID, err)
 	}
-	if err := snapshot.RestoreMemory(memDir); err != nil {
+	restoredPID, err := snapshot.RestoreMemory(memDir)
+	if err != nil {
 		// Back to Suspended: the images (and the deep mode) survive for a
 		// retry or an operator's fresh-boot rollback.
 		_ = st.Transition(state.StatusSuspended, state.ActorSystem, "deep resume failed: "+err.Error())
@@ -134,14 +152,12 @@ func (m *Manager) DeepResume(taskID string) error {
 	}
 	delete(st.Metadata, "pause_mode")
 	delete(st.Metadata, "pause_memory")
-	// criu restore revives the tree with its ORIGINAL pids (same pid
-	// namespace), so the recorded PID stays meaningful — but the /proc
-	// starttime moved. Re-stamp it so a SECOND DeepPause passes the
-	// recycled-pid guard (the old code zeroed the PID, which made every
-	// later deep pause fail with "no live PID recorded"). If a restore
-	// ever lands on a different pid, PIDIdentityOK refuses the next deep
-	// pause (fail-closed) instead of checkpointing an innocent victim.
-	state.StampPID(st, st.PID)
+	// Stamp the ACTUAL restored root pid (criu --pidfile) — not the stale
+	// pre-checkpoint one — so a second DeepPause passes the recycled-pid
+	// guard (the historical code zeroed the PID, which made every later
+	// deep pause fail with "no live PID recorded"). The running state is
+	// persisted only after the stamp succeeded.
+	state.StampPID(st, restoredPID)
 	if err := st.Transition(state.StatusRunning, state.ActorSystem,
 		"deep resume complete"); err != nil {
 		return fmt.Errorf("lifecycle: deep resume %s: %w", taskID, err)

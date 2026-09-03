@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -163,3 +164,82 @@ func (p *lyingPlugin) Attach(_ context.Context, req *AttachRequest) (*AttachResu
 }
 func (p *lyingPlugin) Detach(_ context.Context, _ *DetachRequest) error { return nil }
 func (p *lyingPlugin) Close() error                                     { return nil }
+
+// compensationSpyPlugin returns a valid base-dir path for its first
+// (lieFrom-1) attaches and an escaping path afterwards, recording every
+// Detach's NodeRefLastDetach.
+type compensationSpyPlugin struct {
+	name     string
+	lieFrom  int
+	mu       sync.Mutex
+	attaches int
+	detaches []bool
+}
+
+func (p *compensationSpyPlugin) Name() string           { return p.name }
+func (p *compensationSpyPlugin) PluginType() PluginType { return PluginTypeRPC }
+func (p *compensationSpyPlugin) Init(_ context.Context, _ PluginConfig) error {
+	return nil
+}
+func (p *compensationSpyPlugin) Attach(_ context.Context, req *AttachRequest) (*AttachResult, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.attaches++
+	if p.attaches < p.lieFrom {
+		return &AttachResult{VolumeID: req.VolumeID,
+			HostPath: filepath.Join(req.VolumeBaseDir, req.VolumeID)}, nil
+	}
+	return &AttachResult{VolumeID: req.VolumeID, HostPath: "/elsewhere"}, nil
+}
+func (p *compensationSpyPlugin) Detach(_ context.Context, req *DetachRequest) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.detaches = append(p.detaches, req.NodeRefLastDetach)
+	return nil
+}
+func (p *compensationSpyPlugin) Close() error { return nil }
+
+// The compensation detach after a failed post-attach validation must be a
+// LAST-reference detach only when THIS call created the node mount: a
+// failed second attach still has live holders, and unmounting under them
+// would tear down a volume someone else is using.
+func TestAttachCompensationKeepsLiveHolders(t *testing.T) {
+	t.Run("failed second attach does not last-detach", func(t *testing.T) {
+		m := newTestManager(t, nil)
+		p := &compensationSpyPlugin{name: "rec", lieFrom: 2}
+		m.MustRegister(context.Background(), PluginConfig{Name: "rec", Type: PluginTypeRPC}, p)
+
+		if _, err := m.Attach(context.Background(), &AttachRequest{SandboxID: "s", VolumeID: "v1", Driver: "rec"}); err != nil {
+			t.Fatal(err)
+		}
+		// Second attach's result escapes the base dir: rejected, rolled
+		// back — but the first holder's mount must survive.
+		if _, err := m.Attach(context.Background(), &AttachRequest{SandboxID: "s", VolumeID: "v1", Driver: "rec"}); err == nil {
+			t.Fatal("escaping second attach must fail")
+		}
+		if n := m.RefCount("v1"); n != 1 {
+			t.Fatalf("refcount after failed second attach = %d, want 1", n)
+		}
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		if len(p.detaches) != 1 || p.detaches[0] {
+			t.Fatalf("compensation must be one NON-last detach, got %v", p.detaches)
+		}
+	})
+
+	t.Run("failed first attach compensates with a last detach", func(t *testing.T) {
+		m := newTestManager(t, nil)
+		p := &compensationSpyPlugin{name: "rec2", lieFrom: 1}
+		m.MustRegister(context.Background(), PluginConfig{Name: "rec2", Type: PluginTypeRPC}, p)
+		if _, err := m.Attach(context.Background(), &AttachRequest{SandboxID: "s", VolumeID: "v9", Driver: "rec2"}); err == nil {
+			t.Fatal("escaping first attach must fail")
+		}
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		// The lying first attach is rejected by the containment rule; the
+		// compensation is a last-reference detach (0→1 rolled back to 0).
+		if len(p.detaches) != 1 || !p.detaches[0] {
+			t.Fatalf("first-attach compensation must be a LAST detach, got %v", p.detaches)
+		}
+	})
+}

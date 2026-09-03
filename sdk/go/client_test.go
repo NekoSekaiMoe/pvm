@@ -780,19 +780,43 @@ func TestWithDefaultEnvdPortIPv6(t *testing.T) {
 // Contract: InspectTemplate must decode the Record's inspection fields
 // (image_size_bytes / image_sha256) — the whole point of the endpoint.
 func TestInspectTemplateDecodesImageStats(t *testing.T) {
-	c, _ := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, `{"template_id":"tpl-9","alias":"snap","kind":"template","status":"READY",`+
-			`"image_ref":"snapshot:t-1/s-1","created_at":"2025-01-02T03:04:05Z",`+
-			`"image_size_bytes":1048576,"image_sha256":"`+strings.Repeat("ab", 32)+`"}`)
-	})
-	rec, err := c.InspectTemplate(context.Background(), "tpl-9")
-	if err != nil {
-		t.Fatal(err)
+	cases := []struct {
+		name       string
+		body       string
+		wantSize   int64
+		wantSHA256 string
+	}{
+		{
+			name: "filled stats",
+			body: `{"template_id":"tpl-9","alias":"snap","kind":"template","status":"READY",` +
+				`"image_ref":"snapshot:t-1/s-1","created_at":"2025-01-02T03:04:05Z",` +
+				`"image_size_bytes":1048576,"image_sha256":"` + strings.Repeat("ab", 32) + `"}`,
+			wantSize:   1 << 20,
+			wantSHA256: strings.Repeat("ab", 32),
+		},
+		{
+			name: "omitted stats decode to zero values",
+			body: `{"template_id":"tpl-9","alias":"snap","kind":"template","status":"READY",` +
+				`"image_ref":"snapshot:t-1/s-1","created_at":"2025-01-02T03:04:05Z"}`,
+			wantSize:   0,
+			wantSHA256: "",
+		},
 	}
-	if rec.ImageSizeBytes != 1<<20 {
-		t.Fatalf("image_size_bytes = %d, want %d", rec.ImageSizeBytes, 1<<20)
-	}
-	if rec.ImageSHA256 != strings.Repeat("ab", 32) {
-		t.Fatalf("image_sha256 = %q", rec.ImageSHA256)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c, _ := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+				fmt.Fprint(w, tc.body)
+			})
+			rec, err := c.InspectTemplate(context.Background(), "tpl-9")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if rec.ImageSizeBytes != tc.wantSize {
+				t.Fatalf("image_size_bytes = %d, want %d", rec.ImageSizeBytes, tc.wantSize)
+			}
+			if rec.ImageSHA256 != tc.wantSHA256 {
+				t.Fatalf("image_sha256 = %q, want %q", rec.ImageSHA256, tc.wantSHA256)
+			}
+		})
 	}
 }

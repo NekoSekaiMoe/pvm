@@ -186,7 +186,10 @@ func runIptablesCtx(ctx context.Context, argv []string) error {
 		return fmt.Errorf("iptables %s: %w: %s", strings.Join(argv[1:], " "), ctx.Err(), strings.TrimSpace(string(out)))
 	}
 	if err != nil {
-		return fmt.Errorf("%v: %s", err, strings.TrimSpace(string(out)))
+		// %w (not %v): runIptablesDelete recovers the exit status from the
+		// wrapped *exec.ExitError — iptables -C's documented exit 1 ("rule
+		// does not exist") is what makes idempotent -D a no-op.
+		return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
 	}
 	return nil
 }

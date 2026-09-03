@@ -17,6 +17,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
+	"strings"
 )
 
 // MemoryState classifies what a snapshot captured.
@@ -89,18 +91,32 @@ func DumpMemoryExt(pid int, dir, prevImagesDir string, leaveRunning bool) error 
 	return nil
 }
 
-// RestoreMemory revives a dumped process tree from dir.
-func RestoreMemory(dir string) error {
+// RestoreMemory revives a dumped process tree from dir and returns the
+// HOST pid of the restored root process (criu --pidfile). A missing or
+// unusable pidfile is an error: callers must never guess the pid (a
+// wrong guess would make the next deep pause checkpoint an innocent
+// victim or refuse forever).
+func RestoreMemory(dir string) (int, error) {
 	bin := CRIUBin()
 	if bin == "" {
-		return ErrCRIUUnavailable
+		return 0, ErrCRIUUnavailable
 	}
-	cmd := exec.Command(bin, "restore", "--images-dir", dir, "--shell-job")
+	pidFile := filepath.Join(dir, "restore.pid")
+	_ = os.Remove(pidFile) // stale pidfile from an earlier attempt
+	cmd := exec.Command(bin, "restore", "--images-dir", dir, "--shell-job", "--pidfile", pidFile)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("snapshot: criu restore: %v: %s", err, lastN(string(out), 400))
+		return 0, fmt.Errorf("snapshot: criu restore: %v: %s", err, lastN(string(out), 400))
 	}
-	return nil
+	raw, err := os.ReadFile(pidFile)
+	if err != nil {
+		return 0, fmt.Errorf("snapshot: criu restore pidfile unreadable: %w", err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+	if err != nil || pid <= 0 {
+		return 0, fmt.Errorf("snapshot: criu restore pidfile has no usable pid (%q)", strings.TrimSpace(string(raw)))
+	}
+	return pid, nil
 }
 
 // MemoryImagesDir is where DumpMemory writes inside a snapshot dir.

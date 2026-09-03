@@ -532,6 +532,15 @@ func (g *Gateway) handleConnect(w http.ResponseWriter, r *http.Request, task str
 		if herr != nil {
 			return
 		}
+		// Same generation guard as the raw tunnel below: a SetPolicy that
+		// lands between the MITM verdict and here must also be able to kill
+		// the intercepted connection.
+		if !g.trackTunnelIfFresh(task, gen, clientConn) {
+			clientConn.Close()
+			g.record(task, r, DecisionBlock, "policy updated during connect (generation moved)")
+			return
+		}
+		defer g.untrackTunnel(task, clientConn)
 		g.serveMITM(clientConn, brw, task, r.Host, pol)
 		return
 	}

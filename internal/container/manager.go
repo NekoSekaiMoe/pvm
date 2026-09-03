@@ -1117,6 +1117,44 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 		var ipam *network.IPAM
 		filterAttached := false
 		dpAttached := false
+		detachNet = func() {
+			if dpAttached {
+				if derr := network.DetachTapDataplane(taskID); derr != nil {
+					fmt.Printf("Warning: tc dataplane detach for %s: %v\n", taskID, derr)
+				}
+			}
+			if filterAttached {
+				if derr := network.DetachTaskFilter(taskID, tapName); derr != nil {
+					fmt.Printf("Warning: tc filter detach for %s: %v\n", taskID, derr)
+				}
+			}
+			// Transparent L7 rules (bridge plane): remove before the rest of
+			// the network goes away.
+			if transparentPort != 0 && transparentGuestIP != "" {
+				if err := network.DisableTransparentL7(taskID, transparentGuestIP, transparentPort); err != nil {
+					fmt.Printf("Warning: transparent L7 removal for %s: %v\n", taskID, err)
+				}
+			}
+			// Inbound port mappings (bridge plane): remove rules + records.
+			if err := network.CleanupTaskPortMappings(taskID); err != nil {
+				fmt.Printf("Warning: port mapping cleanup for %s: %v\n", taskID, err)
+			}
+			if ipam != nil {
+				ipam.Release(taskID)
+			}
+		}
+
+		// Symmetric teardown registered the MOMENT the closure is complete:
+		// every failure path below (port mappings, DNS learner, ...) returns
+		// through this defer too, so a half-configured task can never leak
+		// its tc dataplane, classic filter, transparent-L7 rules, port
+		// mappings or IPAM address on the host. (The historical placement
+		// after the DNS-learn section left the portmap failure path leaking
+		// all of those.) dnsTeardown is deferred separately AFTER the
+		// learner is configured (it is a no-op until then) and runs first
+		// (LIFO): snooping stops before the map goes away.
+		defer detachNet()
+
 		// dnsGateway is where the guest's default resolver points (the
 		// bridge gateway in bridge mode, the fixed tc gateway otherwise);
 		// the DNS-learn proxy prefer-binds there.
@@ -1208,10 +1246,8 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 					// The degraded warning is the ONLY auditable trace that this
 					// task runs without the BPF floor; fail closed rather than boot
 					// a downgraded sandbox with no evidence (mirrors the jail
-					// degraded-warning contract above).
-					if ipam != nil { // nil in tc mode (no IPAM there)
-						ipam.Release(taskID)
-					}
+					// degraded-warning contract above). Network teardown
+					// (filters/rules/IPAM) runs via the deferred detachNet.
 					cleanupVolumes()
 					_ = st.Transition(state.StatusFailed, state.ActorController, "audit tc-filter degraded-warning append failed: "+aerr.Error())
 					state.SaveState(taskID, st)
@@ -1226,44 +1262,6 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 		// filter, unpin maps, release the registry entry and free the guest
 		// IP. Runs on every return path after this point, including the
 		// normal task-exit path below.
-		detachNet = func() {
-			if dpAttached {
-				if derr := network.DetachTapDataplane(taskID); derr != nil {
-					fmt.Printf("Warning: tc dataplane detach for %s: %v\n", taskID, derr)
-				}
-			}
-			if filterAttached {
-				if derr := network.DetachTaskFilter(taskID, tapName); derr != nil {
-					fmt.Printf("Warning: tc filter detach for %s: %v\n", taskID, derr)
-				}
-			}
-			// Transparent L7 rules (bridge plane): remove before the rest of
-			// the network goes away.
-			if transparentPort != 0 && transparentGuestIP != "" {
-				if err := network.DisableTransparentL7(taskID, transparentGuestIP, transparentPort); err != nil {
-					fmt.Printf("Warning: transparent L7 removal for %s: %v\n", taskID, err)
-				}
-			}
-			// Inbound port mappings (bridge plane): remove rules + records.
-			if err := network.CleanupTaskPortMappings(taskID); err != nil {
-				fmt.Printf("Warning: port mapping cleanup for %s: %v\n", taskID, err)
-			}
-			if ipam != nil {
-				ipam.Release(taskID)
-			}
-		}
-
-		// Symmetric teardown registered the MOMENT the closure is complete:
-		// every failure path below (port mappings, DNS learner, ...) returns
-		// through this defer too, so a half-configured task can never leak
-		// its tc dataplane, classic filter, transparent-L7 rules, port
-		// mappings or IPAM address on the host. (The historical placement
-		// after the DNS-learn section left the portmap failure path leaking
-		// all of those.) dnsTeardown is deferred separately AFTER the
-		// learner is configured (it is a no-op until then) and runs first
-		// (LIFO): snooping stops before the map goes away.
-		defer detachNet()
-
 		// Record the resolved network posture on the state record so the
 		// API (and operators) can map host ports without re-deriving it.
 		if st.Metadata == nil {

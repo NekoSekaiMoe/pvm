@@ -123,23 +123,33 @@ func registerTemplateExtras(api *echo.Group, tmplStore *template.Store) {
 			Ephemeral:   true, // read-only rootfs: preview never mutates the template
 		}
 		mgr := container.NewManager(nil)
-		// Bind the boot to the request lifetime: a client that walks away
-		// cancels the launch (WaitExit still reaps the ephemeral guest, and
-		// the deferred cleanupPreview below kills anything left over).
-		if err := mgr.Start(c.Request().Context(), cfg); err != nil {
+		// NON-BLOCKING boot: Start (Boot+WaitExit) would hold the handler
+		// until the ephemeral guest exits, making the timeout below
+		// unenforceable. Boot returns as soon as the process exists; the
+		// reaping runs in the background, and cleanupPreview (deferred,
+		// always executed) kills whatever is still running when the probe
+		// ends — timeout or client disconnect alike.
+		booted, err := mgr.Boot(c.Request().Context(), cfg)
+		if err != nil {
 			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "preview boot failed: " + err.Error()})
 		}
 		defer cleanupPreview(name)
+		go func() { _ = mgr.WaitExit(name, booted) }()
 
-		// Wait for console output (boot noise or the guest init's banner).
+		// Wait for console output (boot noise or the guest init's banner),
+		// bounded by BOTH the probe timeout and the request lifetime.
 		dir, err := state.ContainerDir(name)
 		if err != nil {
 			return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		}
 		logPath := filepath.Join(dir, "logs", "console.log")
+		reqCtx := c.Request().Context()
 		deadline := time.Now().Add(timeout)
 		var out []byte
 		for time.Now().Before(deadline) {
+			if reqCtx.Err() != nil {
+				break // client went away: cleanupPreview (deferred) kills it
+			}
 			if data, err := os.ReadFile(logPath); err == nil && len(strings.TrimSpace(string(data))) > 0 {
 				out = data
 				if len(out) > 16*1024 {

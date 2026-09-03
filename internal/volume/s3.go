@@ -129,6 +129,13 @@ func (p *S3Plugin) Attach(ctx context.Context, req *AttachRequest) (*AttachResul
 	if os.Getenv("AWS_ACCESS_KEY_ID") == "" || os.Getenv("AWS_SECRET_ACCESS_KEY") == "" {
 		return nil, fmt.Errorf("volume s3: AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY not set")
 	}
+	// Endpoint scheme is validated BEFORE anything touches the disk: a
+	// refused cleartext endpoint must not leave a .creds file (or a
+	// mountpoint) behind.
+	endpoint := os.Getenv("PVM_S3_ENDPOINT")
+	if err := validateS3Endpoint(endpoint); err != nil {
+		return nil, err
+	}
 
 	mountpoint := filepath.Join(req.VolumeBaseDir, fmt.Sprintf("%s-%s", p.name, req.VolumeID))
 	if err := os.MkdirAll(mountpoint, 0o755); err != nil {
@@ -143,17 +150,14 @@ func (p *S3Plugin) Attach(ctx context.Context, req *AttachRequest) (*AttachResul
 			Metadata: map[string]string{"driver": p.name, "bucket": bucket, "reused": "1"}}, nil
 	}
 
+	pathStyle := strings.Contains(os.Getenv("PVM_S3_PATH_STYLE"), "1") || strings.Contains(endpoint, "minio") || strings.Contains(endpoint, "127.0.0.1")
+	// Credentials file only AFTER the endpoint validated (and only when a
+	// fresh mount is actually needed — the reuse path above never writes).
 	passwd := filepath.Join(req.VolumeBaseDir, fmt.Sprintf(".%s-%s.creds", p.name, req.VolumeID))
 	if err := os.WriteFile(passwd, []byte(fmt.Sprintf("%s:%s\n",
 		os.Getenv("AWS_ACCESS_KEY_ID"), os.Getenv("AWS_SECRET_ACCESS_KEY"))), 0o600); err != nil {
 		return nil, fmt.Errorf("volume s3: credentials file: %w", err)
 	}
-
-	endpoint := os.Getenv("PVM_S3_ENDPOINT")
-	if err := validateS3Endpoint(endpoint); err != nil {
-		return nil, err
-	}
-	pathStyle := strings.Contains(os.Getenv("PVM_S3_PATH_STYLE"), "1") || strings.Contains(endpoint, "minio") || strings.Contains(endpoint, "127.0.0.1")
 	args := s3fsArgs(mountpoint, bucket, endpoint, os.Getenv("PVM_S3_REGION"), pathStyle, passwd)
 	cmd := exec.CommandContext(ctx, "s3fs", args...)
 	if out, err := cmd.CombinedOutput(); err != nil {
