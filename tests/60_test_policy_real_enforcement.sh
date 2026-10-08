@@ -61,29 +61,29 @@ echo "--- 2. deny 403 且无 exec:ok（真没执行）"
 CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$API/exec?task=$TASK" -H "$AUTH" -H "Content-Type: application/json" \
     -d '{"cmd":"pay amount=100"}')
 [ "$CODE" = "403" ] || fail "deny must 403, got $CODE"
-AUD=$(curl -sf -H "$AUTH" "$API/audit")
-echo "$AUD" | jq -e 'any(.action | test("exec.*deny|deny"))' >/dev/null || fail "deny must leave an audit deny row: $AUD"
-echo "$AUD" | jq -e '[.[] | select(.action | test("exec.*ok") and (.task // "" | test("t-pol-real")))] | length == 0' >/dev/null \
+AUD=$(curl -sf -H "$AUTH" "$API/audit/$TASK")
+echo "$AUD" | jq -e 'any(.action == "tool:pay" and .decision == "deny")' >/dev/null || fail "deny must leave an audit deny row: $AUD"
+echo "$AUD" | jq -e 'any(.phase == "execution" and (.decision == "allow" or .decision == "constrain")) | not' >/dev/null \
     || fail "deny must never produce exec:ok: $AUD"
 
 echo "--- 3. approve 未审批前 202，且无 exec:ok"
 CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$API/exec?task=$TASK" -H "$AUTH" -H "Content-Type: application/json" \
     -d '{"cmd":"deploy env=prod effect=prod"}')
 [ "$CODE" = "202" ] || fail "approve-class must 202, got $CODE"
-AUD2=$(curl -sf -H "$AUTH" "$API/audit")
-echo "$AUD2" | jq -e '[.[] | select(.action | test("exec.*ok") and (.task // "" | test("t-pol-real")))] | length == 0' >/dev/null \
+AUD2=$(curl -sf -H "$AUTH" "$API/audit/$TASK")
+echo "$AUD2" | jq -e 'any(.phase == "execution" and (.decision == "allow" or .decision == "constrain")) | not' >/dev/null \
     || fail "pre-approval must not execute: $AUD2"
 
 echo "--- 4. 审批后恰好放行一次，第二次回到 202/403"
 TICKET=$(curl -sf -X POST "$API/approvals" -H "$AUTH" -H "Content-Type: application/json" \
-    -d "{\"task\":\"$TASK\",\"cmd\":\"deploy env=prod effect=prod\"}")
+    -d "{\"task_id\":\"$TASK\",\"tool\":\"deploy\",\"params\":{\"env\":\"prod\"}}")
 TID=$(echo "$TICKET" | jq -r '.id // .ticket.id // empty')
 [ -n "$TID" ] || fail "ticket create failed: $TICKET"
 curl -sf -X POST "$API/approvals/$TID/decide" -H "$AUTH" -H "Content-Type: application/json" \
-    -d '{"approve":true}' >/dev/null || fail "ticket approve failed"
+    -d '{"approved":true}' >/dev/null || fail "ticket approve failed"
 CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$API/exec?task=$TASK" -H "$AUTH" -H "Content-Type: application/json" \
     -d '{"cmd":"deploy env=prod effect=prod"}')
-case "$CODE" in 200|202) : ;; *) fail "post-approval first exec must 200/202, got $CODE" ;; esac
+[ "$CODE" = "200" ] || fail "post-approval first exec must 200, got $CODE"
 CODE2=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$API/exec?task=$TASK" -H "$AUTH" -H "Content-Type: application/json" \
     -d '{"cmd":"deploy env=prod effect=prod"}')
 case "$CODE2" in 202|403) : ;; *) fail "second exec must return to 202/403 (Allow once), got $CODE2" ;; esac

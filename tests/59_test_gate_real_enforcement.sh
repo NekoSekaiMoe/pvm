@@ -66,10 +66,10 @@ gate() { curl -sf -X POST "$API/gate/verify" -H "$AUTH" -H "Content-Type: applic
 echo "--- 1. smuggled bundle FAIL：审计必须有 gate:fail 行，且链校验过"
 V=$(gate "{\"task_id\":\"$TASK\",\"claimed_ok\":true,\"build_log\":\"go test ./...\\nok\\nPASS\",\"files\":{\"smuggled.txt\":\"$(b64 hello)\"}}")
 echo "$V" | jq -e '.passed == false' >/dev/null || fail "smuggled must fail: $V"
-curl -sf -H "$AUTH" "$API/audit/verify" | jq -e '.ok == true' >/dev/null || fail "audit chain must verify after FAIL"
-AUD=$(curl -sf -H "$AUTH" "$API/audit")
-echo "$AUD" | jq -e 'any(.action | test("gate"))' >/dev/null || fail "FAIL must leave a gate audit row: $AUD"
-echo "$AUD" | jq -e 'any(.action == "gate:pass") | not' >/dev/null || fail "no gate:pass may exist before a PASS: $AUD"
+curl -sf -H "$AUTH" "$API/audit/$TASK/verify" | jq -e '.valid == true' >/dev/null || fail "audit chain must verify after FAIL"
+AUD=$(curl -sf -H "$AUTH" "$API/audit/$TASK")
+echo "$AUD" | jq -e 'any(.action == "artifact_gate" and .decision == "deny")' >/dev/null || fail "FAIL must leave a gate audit row: $AUD"
+echo "$AUD" | jq -e 'any(.action == "artifact_gate" and .decision == "allow") | not' >/dev/null || fail "no gate:pass may exist before a PASS: $AUD"
 
 echo "--- 2. FAIL 必须触发 incident，且未 PASS 前 releases 仍为空"
 INC=$(curl -sf -H "$AUTH" "$API/incidents")
@@ -80,8 +80,8 @@ LOG=$(printf '$ go test ./...\nok  pkg  0.1s\nPASS')
 V=$(gate "$(jq -nc --arg log "$LOG" --arg b64 "$(b64 'all good')" \
     '{task_id:"t-gate-real",claimed_ok:true,build_log:$log,files:{"report.md":$b64}}')")
 echo "$V" | jq -e '.passed == true' >/dev/null || fail "clean bundle must pass: $V"
-AUD2=$(curl -sf -H "$AUTH" "$API/audit")
-echo "$AUD2" | jq -e 'any(.action == "gate:pass")' >/dev/null || fail "PASS must leave gate:pass: $AUD2"
-curl -sf -H "$AUTH" "$API/audit/verify" | jq -e '.ok == true' >/dev/null || fail "audit chain must verify after PASS"
+AUD2=$(curl -sf -H "$AUTH" "$API/audit/$TASK")
+echo "$AUD2" | jq -e 'any(.action == "artifact_gate" and .decision == "allow")' >/dev/null || fail "PASS must leave gate:pass: $AUD2"
+curl -sf -H "$AUTH" "$API/audit/$TASK/verify" | jq -e '.valid == true' >/dev/null || fail "audit chain must verify after PASS"
 
 echo "✅ 59 gate real enforcement suite passed"
