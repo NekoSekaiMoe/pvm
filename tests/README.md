@@ -60,6 +60,9 @@ This directory contains shell-based integration and end-to-end (E2E) suites vali
 | `50_test_go_sdk.sh` | No (needs go toolchain) | Official Go SDK against a live server: health/version, E2B list, template create+wait, exec sentinel, approvals/identity/incidents/pool round trips |
 | `51_test_deploy_artifacts.sh` | No (needs make+node) | Offline deploy-surface lint: shell syntax sweep, compose/openapi YAML parse, systemd hardening contract, Makefile targets, `make deploy-check`, webui i18n parity, openapi route coverage |
 | `52_test_registry_policy.sh` | No | Registry allowlist fast-fail, explicit `http://` scheme honored past the policy gate, wildcard allowlist, insecure-transport unit matrix |
+| `59_test_gate_real_enforcement.sh` | No | Gate real assertions (companion to 46): FAIL leaves gate:fail audit + incident, no gate:pass before PASS, chain verifies |
+| `60_test_policy_real_enforcement.sh` | No (no PVM_EXEC_SIM) | Policy real assertions (companion to 14/45): deny 403 + no exec:ok, approve 202 pre-ticket, Allow-once after ticket |
+| `61_test_egress_real_enforcement.sh` | No (needs python3) | Egress real assertions (companion to 02/34/35): non-allowlisted rejected + unlearned, whitelist fail-closed without pinned map, per-task isolation |
 
 ---
 
