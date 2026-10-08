@@ -25,6 +25,7 @@ API="http://127.0.0.1:$PORT/api"
 AUTH="Authorization: Bearer secret"
 export API_SECRET="secret"
 
+# Print the failure message in $1 to stdout and exit the script with status 1.
 fail() { echo "❌ $1"; exit 1; }
 
 if [ -n "${AGENTPVM_BIN:-}" ]; then

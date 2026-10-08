@@ -28,6 +28,7 @@ API_SECRET="egress-real-$RANDOM$RANDOM"
 export API_SECRET
 AUTH="Authorization: Bearer $API_SECRET"
 
+# Print the failure message in $1 to stdout and exit the script with status 1.
 fail() { echo "❌ $1"; exit 1; }
 
 if [ -n "${AGENTPVM_BIN:-}" ]; then

@@ -24,6 +24,7 @@ API="http://127.0.0.1:$PORT/api"
 AUTH="Authorization: Bearer secret"
 export API_SECRET="secret"
 
+# Print the failure message in $1 to stdout and exit the script with status 1.
 fail() { echo "❌ $1"; exit 1; }
 
 if [ -n "${AGENTPVM_BIN:-}" ]; then
@@ -56,7 +57,10 @@ cat > "$PVM_STATE_ROOT/$TASK/spec.json" <<'EOF'
 }
 EOF
 
+# Encode $1 as base64 on stdout without line wrapping or a trailing newline.
 b64() { printf '%s' "$1" | base64 -w0; }
+# POST the JSON payload in $1 to $API/gate/verify using $AUTH; print the response
+# body to stdout and return curl's status (nonzero for HTTP or transport errors).
 gate() { curl -sf -X POST "$API/gate/verify" -H "$AUTH" -H "Content-Type: application/json" -d "$1"; }
 
 echo "--- 1. smuggled bundle FAIL：审计必须有 gate:fail 行，且链校验过"
