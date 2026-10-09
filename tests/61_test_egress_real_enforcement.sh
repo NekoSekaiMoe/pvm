@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 61_test_egress_real_enforcement.sh — egress 真断言伴生（对应 02/34/35 sim）。
 # 不断言 CLI 形状，断言 fail-closed：
-#   1. 未 allowlisted 的外连在控制面即被拒绝（非 allowlisted 不学习、不放行），且有审计行；
+#   1. 未 allowlisted 的外连在控制面即被拒绝（非 allowlisted 不学习、不放行）；
 #   2. 无 pinned map 时 whitelist 写入必须报 typed pinned-map 错误（绝不静默放行）；
 #   3. 同一 host 在 task 间隔离：A task 学到的条目在 B task 不可见。
 # CI-safe：无内核、无 root、无真 DNS；用 34 同款 python3 fake upstream。
@@ -72,14 +72,15 @@ done
 [ -s "$TMP/dns-port" ] || fail "fake DNS failed to start"
 UPSTREAM_PORT=$(cat "$TMP/dns-port")
 
-echo "--- 1. 非 allowlisted 域名不学习：learned 为空且有拒绝审计"
+echo "--- 1. 非 allowlisted 域名不学习：learned 为空且被策略拒绝"
 curl -sf -X PUT "$API/egress/t-egr-a/policy" -H "$AUTH" -H "Content-Type: application/json" \
     -d '{"allow_domains":["allowed.example"],"dns_learn_enabled":true,"learn_ttl":"60s","dns_upstream":"127.0.0.1:'"$UPSTREAM_PORT"'"}' >/dev/null || fail "policy put"
 LEARNED=$(curl -sf -H "$AUTH" "$API/egress/t-egr-a/learned")
 echo "$LEARNED" | jq -e '.entries | length == 0' >/dev/null || fail "nothing learned yet: $LEARNED"
-BAD=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$API/egress/t-egr-a/allow" -H "$AUTH" -H "Content-Type: application/json" \
-    -d '{"host":"evil.example","ip":"198.51.100.9"}')
-case "$BAD" in 400|403|404|422) : ;; *) fail "non-allowlisted allow must be rejected, got $BAD" ;; esac
+# Query the learner's DNS proxy, then attempt HTTP through the real L7 gateway.
+# /allow promotes valid domains; it is not the policy enforcement path.
+curl -sf -H "$AUTH" "$API/egress/t-egr-a/policy" | go run ./tests/fixtures/egress_query \
+    || fail "egress policy must reject evil.example"
 LEARNED2=$(curl -sf -H "$AUTH" "$API/egress/t-egr-a/learned")
 echo "$LEARNED2" | jq -e 'any(.entries[]; .domain == "evil.example") | not' >/dev/null || fail "evil must not be learned: $LEARNED2"
 
