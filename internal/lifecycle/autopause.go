@@ -35,6 +35,8 @@ type Manager struct {
 	deepTasks map[string]bool   // taskID -> autopause should deep-pause (criu + kill)
 	nextGen   uint64
 	cg        *cgroup.Manager
+	// quota is the optional pool seam (see quota.go); nil disables it.
+	quota QuotaHooks
 }
 
 // New creates a Manager. cg may be nil to use the default cgroup root.
@@ -113,13 +115,26 @@ func (m *Manager) Resume(taskID string) error {
 	if st.Status != state.StatusSuspended {
 		return state.ErrInvalidTransition
 	}
+	// Re-reserve the paused task's memory quota BEFORE touching the runtime:
+	// a refusal (ErrQuotaExceeded) must leave the task suspended and frozen,
+	// not thawed-but-unaccounted. A task that never went through the pool
+	// has no reservation and this is a no-op.
+	if err := m.reserveQuota(taskID); err != nil {
+		return err
+	}
+	// Restore the pre-pause memory.max BEFORE the thaw: a ballooned task
+	// must not revive squeezed into an OOM. st is persisted below, so the
+	// cleared marker commits with the resume.
+	m.RestorePauseBalloon(taskID, st)
 	if err := m.cg.Thaw(taskID); err != nil {
 		// Best-effort: if cgroup was already removed, still resume the FSM.
 		if !isNotExist(err) {
+			m.releaseQuota(taskID)
 			return err
 		}
 	}
 	if err := st.Transition(state.StatusResuming, state.ActorController, "auto-resume"); err != nil {
+		m.releaseQuota(taskID)
 		return err
 	}
 	if err := saveState(taskID, st); err != nil {
@@ -129,9 +144,11 @@ func (m *Manager) Resume(taskID string) error {
 		// Resume can simply be retried. A missing cgroup (task exited,
 		// tests) is fine; other freeze errors have no remedy at this layer.
 		m.refreezeBestEffort(taskID)
+		m.releaseQuota(taskID)
 		return err
 	}
 	if err := st.Transition(state.StatusRunning, state.ActorController, "resumed"); err != nil {
+		m.releaseQuota(taskID)
 		return err
 	}
 	if err := saveState(taskID, st); err != nil {
@@ -147,6 +164,7 @@ func (m *Manager) Resume(taskID string) error {
 			_ = saveState(taskID, st)
 		}
 		m.refreezeBestEffort(taskID)
+		m.releaseQuota(taskID)
 		return err
 	}
 	// The task is Running again: restart its idle countdown so a resumed
@@ -258,7 +276,17 @@ func (m *Manager) commitPause(taskID string, epoch uint64, st *state.ContainerSt
 			}
 		}
 		m.thawBestEffort(taskID)
+		return
 	}
+	// The task is committed Suspended: reclaim its clean page cache by
+	// ballooning memory.max. Best effort — a missing cgroup or unreadable
+	// memory file leaves the pause intact.
+	if err := m.BalloonPause(taskID); err != nil && !isNotExist(err) {
+		fmt.Printf("Warning: balloon pause for %s failed: %v\n", taskID, err)
+	}
+	// Release the pool's memory reservation too: the pause is durable, so a
+	// tenant must not be charged for memory the host can reclaim.
+	m.releaseQuota(taskID)
 }
 
 // epochCurrent reports whether the task's cancel epoch still equals epoch,

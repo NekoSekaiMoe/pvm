@@ -112,12 +112,22 @@ func (m *Manager) EnablePersistence(path string) error {
 				m.capacity = pf.Capacity
 			}
 			// Rebuild live counters from claimed entries so quota checks stay
-			// correct after a restart.
+			// correct after a restart. A PAUSED sandbox holds its concurrency
+			// and CPU slot but has released its memory reservation (see
+			// Suspend), so it counts for running/cpu but not memMB.
 			for _, s := range m.pool {
-				if s.State == SandboxClaimed && s.Tenant != "" {
+				if s.Tenant == "" {
+					continue
+				}
+				switch s.State {
+				case SandboxClaimed:
 					m.running[s.Tenant]++
 					m.cpu[s.Tenant] += s.CPU
 					m.memMB[s.Tenant] += s.MemMB
+					m.hourly[s.Tenant] = append(m.hourly[s.Tenant], s.ClaimedAt)
+				case SandboxPaused:
+					m.running[s.Tenant]++
+					m.cpu[s.Tenant] += s.CPU
 					m.hourly[s.Tenant] = append(m.hourly[s.Tenant], s.ClaimedAt)
 				}
 			}

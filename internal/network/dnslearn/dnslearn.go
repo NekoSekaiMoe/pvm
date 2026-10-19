@@ -44,6 +44,10 @@ const (
 	DefaultMaxEntries  = 256
 	defaultSweepEvery  = time.Second
 	dnsProxyBufferSize = 4096 // comfortably covers EDNS0 UDP payloads
+	// minLearnTTL floors a learned entry's lifetime so a short DNS TTL
+	// (often 30–60s on CDNs) does not churn the eBPF whitelist. The
+	// effective lifetime is min(max(DNS TTL, minLearnTTL), learn_ttl).
+	minLearnTTL = 300 * time.Second
 )
 
 // MapWriter is the per-task eBPF whitelist-map sink. Implementations must be
@@ -83,7 +87,8 @@ type Config struct {
 	// spec.Network.EgressAllowDomains plus the hosts of allow EgressRules.
 	AllowDomains []string
 	// LearnTTL caps a learned entry's lifetime; the effective TTL of every
-	// insert is min(DNS answer TTL, LearnTTL). <= 0 selects DefaultLearnTTL.
+	// insert is min(max(DNS answer TTL, minLearnTTL), LearnTTL).
+	// <= 0 selects DefaultLearnTTL.
 	LearnTTL time.Duration
 	// Upstream is the resolver the DNS proxy forwards to: "IP" or "IP:port".
 	// Empty selects the first /etc/resolv.conf nameserver (1.1.1.1:53 last).
@@ -236,15 +241,19 @@ func (l *Learner) IsAllowlisted(domain string) bool {
 // ProcessResponse consumes one snooped DNS answer: qname is the question
 // name, ips the A-record answers, ttl their (minimum) TTL in seconds. Each
 // public IPv4 of an ALLOWLISTED qname is inserted with expiry =
-// now + min(ttl, learn_ttl); anything else (non-allowlisted name, private
-// IP, IPv6 answer) is ignored. Returns the number of entries inserted or
-// refreshed. A zero TTL means "do not cache" per RFC 1035 and is skipped.
+// now + min(max(ttl, minLearnTTL), learn_ttl); anything else
+// (non-allowlisted name, private IP, IPv6 answer) is ignored. Returns
+// the number of entries inserted or refreshed. A zero TTL means "do not
+// cache" per RFC 1035 and is skipped.
 func (l *Learner) ProcessResponse(qname string, ips []net.IP, ttl uint32) int {
 	domain := normalizeName(qname)
 	if ttl == 0 || len(ips) == 0 {
 		return 0
 	}
 	lifetime := time.Duration(ttl) * time.Second
+	if lifetime < minLearnTTL {
+		lifetime = minLearnTTL
+	}
 
 	l.mu.Lock()
 	if !l.enabled {

@@ -190,3 +190,26 @@ func TestSaveState_PersistsLifecycleFields(t *testing.T) {
 		})
 	}
 }
+
+// TestSaveState_PersistsMCP is the regression test for snapshotLocked
+// dropping the MCP gateway config: the raw JSON must survive Save -> Load so
+// a guest-side launcher can consume it after a restart.
+func TestSaveState_PersistsMCP(t *testing.T) {
+	origRoot := RootDir
+	RootDir = t.TempDir()
+	t.Cleanup(func() { RootDir = origRoot })
+
+	const id = "mcp-state"
+	const mcp = `{"github":{"command":"npx","args":["-y","server-github"]}}`
+	st := &ContainerState{ID: id, Name: id, Status: StatusRunning, MCP: mcp}
+	if err := SaveState(id, st); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	got, err := LoadState(id)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if got.MCP != mcp {
+		t.Fatalf("MCP lost in round trip: %q, want %q", got.MCP, mcp)
+	}
+}

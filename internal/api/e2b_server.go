@@ -56,6 +56,9 @@ func NewE2BServer() (*echo.Echo, error) {
 	// pause/resume and activity endpoints below instead of separate instances.
 	cgMgr := cgroup.NewManager()
 	autoMgr := lifecycle.New(cgMgr)
+	// Wire the warm pool's memory accounting onto pause/resume: a paused task
+	// releases its tenant's memory reservation, and resuming re-reserves it.
+	autoMgr.SetQuotaHooks(poolQuotaHooks{})
 	// Autopause timers live in process memory: tasks persisted as Running
 	// by a previous server process have no timers after a restart. Re-arm
 	// them from the persisted IdleTimeout so an idle task still suspends
@@ -582,14 +585,19 @@ func NewE2BServer() (*echo.Echo, error) {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid task id"})
 		}
 		var req struct {
-			EventID   string            `json:"event_id"`
-			AuditHash string            `json:"audit_hash"`
-			Metadata  map[string]string `json:"metadata"`
+			EventID        string            `json:"event_id"`
+			AuditHash      string            `json:"audit_hash"`
+			Metadata       map[string]string `json:"metadata"`
+			FilesystemOnly bool              `json:"filesystem_only"`
 		}
 		if err := c.Bind(&req); err != nil {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": "bad request: " + err.Error()})
 		}
-		snap, err := snapshot.CreateEventSnapshot(id, req.EventID, req.AuditHash, req.Metadata)
+		if v := c.QueryParam("filesystem_only"); v == "1" || v == "true" {
+			req.FilesystemOnly = true
+		}
+		snap, err := snapshot.CreateEventSnapshotWithOptions(id, req.EventID, req.AuditHash, req.Metadata,
+			snapshot.SnapshotOptions{FilesystemOnly: req.FilesystemOnly})
 		if err != nil {
 			if strings.Contains(err.Error(), "not found") {
 				return c.JSON(http.StatusNotFound, map[string]string{"error": err.Error()})
@@ -974,6 +982,44 @@ func NewE2BServer() (*echo.Echo, error) {
 			return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		}
 		return c.JSON(http.StatusOK, map[string]string{"status": "ok"})
+	})
+
+	// POST /api/pool/suspend — pause a claimed sandbox: release its memory
+	// quota reservation while keeping its binding, so the tenant's memory
+	// headroom is not held by a paused task. Body: {id}.
+	api.POST("/pool/suspend", func(c echo.Context) error {
+		var req struct {
+			ID string `json:"id"`
+		}
+		if err := c.Bind(&req); err != nil {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+		}
+		if req.ID == "" {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "id required"})
+		}
+		if err := currentPool().Suspend(req.ID); err != nil {
+			return c.JSON(poolMutationStatus(err), map[string]string{"error": err.Error()})
+		}
+		return c.JSON(http.StatusOK, map[string]string{"status": "paused"})
+	})
+
+	// POST /api/pool/resume — re-reserve a paused sandbox's memory quota and
+	// return it to claimed. Body: {id}. Refused (409) when the tenant's memory
+	// quota no longer fits (ErrQuotaExceeded), leaving the sandbox paused.
+	api.POST("/pool/resume", func(c echo.Context) error {
+		var req struct {
+			ID string `json:"id"`
+		}
+		if err := c.Bind(&req); err != nil {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+		}
+		if req.ID == "" {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "id required"})
+		}
+		if err := currentPool().Resume(req.ID); err != nil {
+			return c.JSON(poolMutationStatus(err), map[string]string{"error": err.Error()})
+		}
+		return c.JSON(http.StatusOK, map[string]string{"status": "claimed"})
 	})
 
 	// --- Artifact Gate (plan.md §7) ---
@@ -1628,6 +1674,13 @@ func NewE2BServer() (*echo.Echo, error) {
 			reArm()
 			return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		}
+		// Reclaim the now-frozen task's clean page cache without killing it
+		// (best effort; a missing cgroup is fine and the pause stands).
+		_ = autoMgr.BalloonPause(id)
+		// Release the tenant's memory reservation: the pause is durable, so
+		// keeping it would hold quota the host has already reclaimed. Best
+		// effort, and a no-op for tasks that never came from the warm pool.
+		_, _ = currentPool().SuspendByTask(id)
 		return c.NoContent(http.StatusNoContent)
 	})
 	api.POST("/tasks/:id/resume", func(c echo.Context) error {
@@ -2082,4 +2135,18 @@ func currentPool() *pool.Manager {
 	planesMu.RLock()
 	defer planesMu.RUnlock()
 	return globalPool
+}
+
+// poolMutationStatus maps a pool Suspend/Resume error onto an HTTP status:
+// an unknown sandbox is 404, a quota refusal or a wrong-state target is a
+// 409 conflict, and anything else is an internal error.
+func poolMutationStatus(err error) int {
+	switch {
+	case errors.Is(err, pool.ErrSandboxNotFound):
+		return http.StatusNotFound
+	case errors.Is(err, pool.ErrQuotaExceeded), errors.Is(err, pool.ErrBadState):
+		return http.StatusConflict
+	default:
+		return http.StatusInternalServerError
+	}
 }

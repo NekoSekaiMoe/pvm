@@ -44,31 +44,31 @@ for _ in $(seq 1 40); do
 done
 curl -sf -H "$AUTH" "$API/containers" >/dev/null || fail "server failed to start"
 
-echo "--- 1. 非 allowlisted 域名不学习：learned 为空且有拒绝审计"
+echo "--- 1. 非 allowlisted 域名不学习：learned 为空且畸形 allow 被拒绝"
 curl -sf -X PUT "$API/egress/t-egr-a/policy" -H "$AUTH" -H "Content-Type: application/json" \
-    -d '{"allow_domains":["allowed.example"],"learn_ttl":60}' >/dev/null || fail "policy put"
+    -d '{"dns_learn_enabled":true,"allow_domains":["allowed.example"],"learn_ttl":"60s"}' >/dev/null || fail "policy put"
 LEARNED=$(curl -sf -H "$AUTH" "$API/egress/t-egr-a/learned")
-echo "$LEARNED" | jq -e 'length == 0' >/dev/null || fail "nothing learned yet: $LEARNED"
+echo "$LEARNED" | jq -e '.entries | length == 0' >/dev/null || fail "nothing learned yet: $LEARNED"
 BAD=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$API/egress/t-egr-a/allow" -H "$AUTH" -H "Content-Type: application/json" \
     -d '{"host":"evil.example","ip":"198.51.100.9"}')
 case "$BAD" in 400|403|404|422) : ;; *) fail "non-allowlisted allow must be rejected, got $BAD" ;; esac
 LEARNED2=$(curl -sf -H "$AUTH" "$API/egress/t-egr-a/learned")
-echo "$LEARNED2" | jq -e 'any(.host == "evil.example") | not' >/dev/null || fail "evil must not be learned: $LEARNED2"
+echo "$LEARNED2" | jq -e '.entries | any(.domain == "evil.example") | not' >/dev/null || fail "evil must not be learned: $LEARNED2"
 
 echo "--- 2. 无 pinned map 时 whitelist 写入 fail-closed（typed 错误，非静默放行）"
 if [ -n "${AGENTPVM_BIN:-}" ]; then cp "$AGENTPVM_BIN" "$TMP/wl"; else go build -o "$TMP/wl" ./cmd/agentpvm; fi
 WL_OUT=$("$TMP/wl" network whitelist add t-egr-nomap 198.51.100.1 2>&1 || true)
 echo "$WL_OUT"
 case "$WL_OUT" in
-    *pinned*|*no such*|*not found*|*failed*|*error*|*Error*)
+    *"Whitelist Error:"*"pinned map"*)
         echo "   fail-closed typed error ✓" ;;
     *) fail "whitelist without pinned map must fail closed, got: $WL_OUT" ;;
 esac
 
 echo "--- 3. task 间隔离：A 学到的 B 不可见"
 curl -sf -X PUT "$API/egress/t-egr-b/policy" -H "$AUTH" -H "Content-Type: application/json" \
-    -d '{"allow_domains":["allowed.example"],"learn_ttl":60}' >/dev/null || fail "policy put b"
+    -d '{"dns_learn_enabled":true,"allow_domains":["allowed.example"],"learn_ttl":"60s"}' >/dev/null || fail "policy put b"
 LB=$(curl -sf -H "$AUTH" "$API/egress/t-egr-b/learned")
-echo "$LB" | jq -e 'any(.host == "evil.example") | not' >/dev/null || fail "cross-task leak: $LB"
+echo "$LB" | jq -e '.entries | any(.domain == "evil.example") | not' >/dev/null || fail "cross-task leak: $LB"
 
 echo "✅ 61 egress real enforcement suite passed"

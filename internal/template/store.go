@@ -21,7 +21,17 @@ import (
 
 	"github.com/google/uuid"
 	"uml-container/internal/fsjson"
+	"uml-container/internal/version"
 )
+
+// BuildVersions resolves the kernel and agent versions a template built on
+// this host pins itself to. The agent version comes from the link-time build
+// metadata; the kernel version is the operator-published PVM_KERNEL_VERSION
+// (empty when the host does not advertise one). A var so tests can inject
+// deterministic values.
+var BuildVersions = func() (kernel, agent string) {
+	return os.Getenv("PVM_KERNEL_VERSION"), version.Version
+}
 
 var idRe = regexp.MustCompile(`^(tpl|snap)-[a-f0-9]{24}$`)
 var aliasRe = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$`)
@@ -50,6 +60,13 @@ type Record struct {
 	// build/promotion or first inspection).
 	ImageSizeBytes int64  `json:"image_size_bytes,omitempty"`
 	ImageSHA256    string `json:"image_sha256,omitempty"`
+	// KernelVersion / AgentVersion pin the build the template was produced
+	// against, so a sandbox launched from it records the exact kernel and
+	// agent it expects (reproducible launches; a later mismatch is
+	// detectable instead of silent drift). Filled from the running build
+	// when the record does not carry explicit values.
+	KernelVersion string `json:"kernel_version,omitempty"`
+	AgentVersion  string `json:"agent_version,omitempty"`
 }
 
 // Store is a file-backed template registry. It keeps an in-memory
@@ -163,6 +180,7 @@ func (s *Store) Create(rec Record) error {
 			rec.Kind = "template"
 		}
 	}
+	pinBuildVersions(&rec)
 	if err := validateAlias(rec.Alias); err != nil {
 		return err
 	}
@@ -213,6 +231,24 @@ func (s *Store) Create(rec Record) error {
 		s.aliases[rec.Alias] = rec.TemplateID
 	}
 	return nil
+}
+
+// pinBuildVersions fills the kernel/agent version pins from the running
+// build when the record does not already carry them. Explicit values are
+// never overwritten, so an operator can stamp a template with a version the
+// host is not currently running (e.g. a pre-built template imported into a
+// fresh store).
+func pinBuildVersions(rec *Record) {
+	if rec.AgentVersion != "" && rec.KernelVersion != "" {
+		return
+	}
+	kernel, agent := BuildVersions()
+	if rec.KernelVersion == "" {
+		rec.KernelVersion = kernel
+	}
+	if rec.AgentVersion == "" {
+		rec.AgentVersion = agent
+	}
 }
 
 // readMeta loads the persisted Record from dir (used to reconcile the

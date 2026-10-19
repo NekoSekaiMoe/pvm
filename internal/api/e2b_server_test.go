@@ -14,6 +14,7 @@ import (
 	"time"
 	"uml-container/internal/lifecycle"
 	"uml-container/internal/policy"
+	"uml-container/internal/pool"
 	"uml-container/internal/state"
 	"uml-container/internal/template"
 )
@@ -480,5 +481,55 @@ func TestValidateAPIRootfs_ResolvesSymlinksAndKeepsFormatChecks(t *testing.T) {
 	if _, err := validateRootfsUnder(filepath.Join(aliasDir, "swapped", "evil.img"), aliasDir); err == nil ||
 		!strings.Contains(err.Error(), "rootfs must live under") {
 		t.Fatalf("symlink-swapped rootfs must be rejected post-resolution, got %v", err)
+	}
+}
+
+// TestAPI_PoolSuspendResume exercises the quota-release-on-pause management
+// endpoints: a claimed sandbox can be suspended (memory reservation released)
+// and resumed (re-reserved), and the error paths map to the right status.
+func TestAPI_PoolSuspendResume(t *testing.T) {
+	base := bootServer(t)
+
+	m := pool.NewManager(4, nil)
+	m.SetQuota("t", pool.Quota{MaxConcurrent: 4, MaxCPU: 4, MaxMemoryMB: 512, MaxTasksPerHour: 10})
+	tmpl := pool.Template{Name: "alpine", Memory: "512M", CPU: 1}
+	m.Warm(tmpl, 1)
+	id, err := m.Claim("t", tmpl, "task-pool-1")
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	RegisterPoolManager(m)
+	t.Cleanup(func() { RegisterPoolManager(pool.NewManager(16, nil)) })
+
+	post := func(path, body string) int {
+		req, _ := http.NewRequest(http.MethodPost, base+path, strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer secret")
+		req.Header.Set("Content-Type", "application/json")
+		resp, derr := http.DefaultClient.Do(req)
+		if derr != nil {
+			t.Fatalf("POST %s: %v", path, derr)
+		}
+		defer resp.Body.Close()
+		io.Copy(io.Discard, resp.Body)
+		return resp.StatusCode
+	}
+
+	body := `{"id":"` + id + `"}`
+	if code := post("/api/pool/suspend", body); code != http.StatusOK {
+		t.Fatalf("suspend: want 200, got %d", code)
+	}
+	// Suspending an already-paused sandbox is idempotent.
+	if code := post("/api/pool/suspend", body); code != http.StatusOK {
+		t.Fatalf("idempotent suspend: want 200, got %d", code)
+	}
+	if code := post("/api/pool/resume", body); code != http.StatusOK {
+		t.Fatalf("resume: want 200, got %d", code)
+	}
+	// An unknown id is 404, a missing id 400.
+	if code := post("/api/pool/suspend", `{"id":"nope"}`); code != http.StatusNotFound {
+		t.Fatalf("unknown id: want 404, got %d", code)
+	}
+	if code := post("/api/pool/suspend", `{}`); code != http.StatusBadRequest {
+		t.Fatalf("missing id: want 400, got %d", code)
 	}
 }

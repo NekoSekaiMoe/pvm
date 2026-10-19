@@ -1283,11 +1283,13 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 			if bridgePlane && !dpAttached {
 				for _, pm := range s.Network.PortMappings {
 					if err := network.AddPortMapping(network.PortMapping{
-						TaskID:    taskID,
-						HostPort:  pm.HostPort,
-						GuestPort: pm.GuestPort,
-						GuestIP:   guestIP,
-						Protocol:  pm.Protocol,
+						TaskID:          taskID,
+						HostPort:        pm.HostPort,
+						GuestPort:       pm.GuestPort,
+						GuestIP:         guestIP,
+						Protocol:        pm.Protocol,
+						AccessToken:     pm.AccessToken,
+						MaskRequestHost: pm.MaskRequestHost,
 					}); err != nil {
 						cleanupVolumes()
 						_ = st.Transition(state.StatusFailed, state.ActorController, "port mapping failed: "+err.Error())

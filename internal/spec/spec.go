@@ -220,7 +220,9 @@ type NetworkSpec struct {
 	DNSLearnEnabled bool `toml:"dns_learn_enabled" json:"dns_learn_enabled"`
 	// LearnTTL caps how long a learned IP stays whitelisted (Go duration,
 	// default DefaultLearnTTL). The effective per-entry lifetime is
-	// min(DNS TTL, learn_ttl) so a short-lived DNS answer never lingers.
+	// min(max(DNS TTL, 300s), learn_ttl): short CDN TTLs are floored so
+	// the eBPF whitelist does not churn, then capped so a long answer
+	// never outlives the operator budget.
 	LearnTTL string `toml:"learn_ttl" json:"learn_ttl"`
 	// DNSUpstream is the resolver the DNS proxy forwards to, "IP" or
 	// "IP:port". Empty = the host's first /etc/resolv.conf nameserver.
@@ -264,6 +266,14 @@ type PortMappingSpec struct {
 	HostPort  int    `toml:"host_port" json:"host_port"`
 	GuestPort int    `toml:"guest_port" json:"guest_port"`
 	Protocol  string `toml:"protocol" json:"protocol"`
+	// AccessToken, when set, gates inbound HTTP: requests must carry the
+	// token in the X-Access-Token header (or ?access_token= query) or the
+	// host-side ingress proxy answers 401. TCP/HTTP only.
+	AccessToken string `toml:"traffic_access_token" json:"traffic_access_token"`
+	// MaskRequestHost, when set, rewrites the inbound Host header to this
+	// value before forwarding to the guest (so the guest never learns the
+	// public hostname). TCP/HTTP only.
+	MaskRequestHost string `toml:"mask_request_host" json:"mask_request_host"`
 }
 
 // Dataplane mode values for NetworkSpec.Dataplane.
@@ -482,8 +492,8 @@ type LifecycleSpec struct {
 	// TTL is the task's overall lifetime; on expiry the task is Destroyed.
 	TTL string `toml:"ttl" json:"ttl"`
 	// IdleTimeout triggers AutoPause: after this much idle time the task is
-	// frozen (cgroup freeze) and moved to Suspended. Empty = disabled.
-	// timeout + on_timeout=pause semantics.
+	// frozen (cgroup freeze) and moved to Suspended. Three-value contract:
+	// empty/0s = off, "-1s" = never auto-pause, positive duration = TTL.
 	IdleTimeout string `toml:"idle_timeout" json:"idle_timeout"`
 	// DeepPause upgrades the idle pause from a cgroup freeze (CPU only) to
 	// a CRIU checkpoint + kill: host memory drops to zero, resume revives
@@ -636,6 +646,9 @@ func (s *TaskSpec) Validate() error {
 		case "", "tcp", "udp":
 		default:
 			errs = append(errs, fmt.Errorf("spec: network.port_mappings[%d].protocol %q must be tcp or udp", i, pm.Protocol))
+		}
+		if (pm.AccessToken != "" || pm.MaskRequestHost != "") && pm.Protocol == "udp" {
+			errs = append(errs, fmt.Errorf("spec: network.port_mappings[%d]: traffic_access_token/mask_request_host are HTTP (tcp) only", i))
 		}
 	}
 	seenHost := map[string]bool{}
@@ -826,8 +839,8 @@ func (s *TaskSpec) Validate() error {
 		d, err := time.ParseDuration(s.Lifecycle.IdleTimeout)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("spec: lifecycle.idle_timeout: %w", err))
-		} else if d <= 0 {
-			errs = append(errs, fmt.Errorf("spec: lifecycle.idle_timeout must be positive, got %q", s.Lifecycle.IdleTimeout))
+		} else if d < 0 && d != -time.Second {
+			errs = append(errs, fmt.Errorf("spec: lifecycle.idle_timeout must be 0s, -1s (never), or positive, got %q", s.Lifecycle.IdleTimeout))
 		}
 	}
 	return errors.Join(errs...)

@@ -209,7 +209,6 @@ func (g *Gateway) serveTransparentHTTP(conn net.Conn, taskID string, dst *net.TC
 		// the one-conn listener loops over keep-alive requests.)
 		ReadHeaderTimeout: 30 * time.Second,
 		ReadTimeout:       5 * time.Minute,
-		WriteTimeout:      5 * time.Minute,
 		IdleTimeout:       60 * time.Second,
 	}
 	_ = srv.Serve(&oneConnListener{conn: conn})

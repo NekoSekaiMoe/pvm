@@ -113,6 +113,11 @@ type ContainerState struct {
 	IdleTimeout string `json:"idle_timeout,omitempty"`
 	AutoResume  bool   `json:"auto_resume,omitempty"`
 
+	// MCP is the opaque MCP server config accepted by the E2B create
+	// request, stored as raw JSON so a guest-side gateway launcher can
+	// consume it verbatim (mirrors E2B's pass-through Mcp object).
+	MCP string `json:"mcp,omitempty"`
+
 	// lifecycle bookkeeping
 	Transitions []Transition `json:"transitions,omitempty"`
 	Retries     int          `json:"retries,omitempty"`
@@ -247,6 +252,7 @@ func (s *ContainerState) snapshotLocked() *ContainerState {
 		SpecFP:      s.SpecFP,
 		IdleTimeout: s.IdleTimeout,
 		AutoResume:  s.AutoResume,
+		MCP:         s.MCP,
 		Retries:     s.Retries,
 		Deadline:    s.Deadline,
 		NetworkTap:  s.NetworkTap,

@@ -271,8 +271,14 @@ func (b *Builder) run(s *Store, id, imageRef string) {
 func (b *Builder) finish(s *Store, id string) {
 	// Persist READY BEFORE reporting PhaseDone: a Wait() caller must never
 	// observe a done build.json whose record is still PENDING or lacks
-	// ImagePath — using that template would fail downstream.
-	if err := s.Update(id, func(r *Record) error { r.Status = "READY"; return nil }); err != nil {
+	// ImagePath — using that template would fail downstream. The version
+	// pins are (re)stamped here too: a record created through a path that
+	// skipped them still leaves READY with its build provenance recorded.
+	if err := s.Update(id, func(r *Record) error {
+		r.Status = "READY"
+		pinBuildVersions(r)
+		return nil
+	}); err != nil {
 		metricTemplateBuilds.Inc("failed")
 		b.progress(s, id, BuildStatus{Phase: PhaseFailed, Pct: 100, Error: fmt.Sprintf("persist READY record: %v", err), UpdatedAt: time.Now().UTC()}, "failed")
 		_ = s.Update(id, func(r *Record) error { r.Status = "FAILED"; return nil })

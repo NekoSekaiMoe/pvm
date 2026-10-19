@@ -145,12 +145,49 @@ func TestLearner_TTLCappedAndZeroSkipped(t *testing.T) {
 	}
 }
 
+func TestLearner_MinTTLFloor(t *testing.T) {
+	now := time.Now()
+	l := testLearner(t, Config{
+		AllowDomains: []string{"example.com"},
+		LearnTTL:     10 * time.Minute,
+	})
+	l.now = func() time.Time { return now }
+
+	// DNS TTL 30s floors to minLearnTTL (300s), still under learn_ttl.
+	l.ProcessResponse("example.com", []net.IP{net.ParseIP("93.184.216.34")}, 30)
+	es := l.List()
+	if len(es) != 1 {
+		t.Fatalf("List = %v, want 1 entry", es)
+	}
+	want := now.Add(minLearnTTL)
+	if es[0].Expiry != want {
+		t.Fatalf("expiry %v, want floored %v", es[0].Expiry, want)
+	}
+
+	// DNS TTL above the floor, below learn_ttl: use the answer TTL.
+	l2 := testLearner(t, Config{
+		AllowDomains: []string{"example.com"},
+		LearnTTL:     10 * time.Minute,
+	})
+	l2.now = func() time.Time { return now }
+	l2.ProcessResponse("example.com", []net.IP{net.ParseIP("93.184.216.34")}, 400)
+	es2 := l2.List()
+	if len(es2) != 1 {
+		t.Fatalf("List = %v, want 1 entry", es2)
+	}
+	want2 := now.Add(400 * time.Second)
+	if es2[0].Expiry != want2 {
+		t.Fatalf("expiry %v, want DNS TTL %v", es2[0].Expiry, want2)
+	}
+}
+
 func TestLearner_SweeperExpiry(t *testing.T) {
 	w := newRecWriter()
 	now := time.Now()
 	l := testLearner(t, Config{
 		AllowDomains: []string{"example.com"},
 		Writer:       w,
+		LearnTTL:     5 * time.Second,
 	})
 	l.now = func() time.Time { return now }
 
@@ -158,7 +195,7 @@ func TestLearner_SweeperExpiry(t *testing.T) {
 	if l.Count() != 1 {
 		t.Fatalf("count = %d, want 1", l.Count())
 	}
-	now = now.Add(31 * time.Second) // past expiry
+	now = now.Add(6 * time.Second) // past learn_ttl cap
 	l.sweep()
 	if l.Count() != 0 {
 		t.Fatalf("count after sweep = %d, want 0", l.Count())

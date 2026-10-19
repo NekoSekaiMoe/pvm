@@ -92,6 +92,16 @@ const (
 	DecisionReview
 )
 
+const (
+	// upstreamHeaderTimeout is how long the proxy waits for the first
+	// upstream response header (TTFB). Sized for LLM/tool streams that
+	// think for minutes before the first byte.
+	upstreamHeaderTimeout = 2 * time.Hour
+	// maxInjectValueBytes is the hard ceiling on an injected header value.
+	// Oversized secrets are refused rather than truncated.
+	maxInjectValueBytes = 2048
+)
+
 // verdictString mirrors audit decisions for ledger rows.
 func (d Decision) String() string {
 	return [...]string{"allow", "block", "review"}[d]
@@ -342,12 +352,13 @@ func (g *Gateway) Listen(ctx context.Context, addr string) (string, error) {
 	g.listener = ln
 	g.server = &http.Server{
 		Handler: http.HandlerFunc(g.handle),
-		// Tight timeouts: a sandbox should not hold a proxy idle for long.
 		// ReadHeaderTimeout bounds the headers; ReadTimeout bounds the whole
-		// request (incl. body) so a slow-body attacker can't pin a goroutine.
+		// inbound request (incl. body) so a slow-body attacker can't pin a
+		// goroutine. WriteTimeout is left unset: a 60s write deadline would
+		// truncate long upstream streams (and a TTFB up to
+		// upstreamHeaderTimeout) before the first byte lands.
 		ReadTimeout:       60 * time.Second,
 		ReadHeaderTimeout: 10 * time.Second,
-		WriteTimeout:      60 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
 	g.mu.Unlock()
@@ -432,7 +443,6 @@ func (g *Gateway) ListenForTaskOn(ctx context.Context, taskID, addr string) (*ta
 		}),
 		ReadTimeout:       60 * time.Second,
 		ReadHeaderTimeout: 10 * time.Second,
-		WriteTimeout:      60 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
 	go tl.server.Serve(ln)
@@ -777,7 +787,7 @@ func (g *Gateway) dialCheckedTransport() *http.Transport {
 			}
 			return conn, nil
 		},
-		ResponseHeaderTimeout: 30 * time.Second,
+		ResponseHeaderTimeout: upstreamHeaderTimeout,
 		// Bound the TLS handshake separately from the dial timeout: without
 		// it a TLS endpoint that accepts TCP but stalls the handshake pins a
 		// connection (and its goroutine) indefinitely.
@@ -1012,10 +1022,11 @@ func (g *Gateway) decideDomain(v requestView, pol *Policy) Decision {
 // Credentials are injected ONLY when the request travels over HTTPS
 // (v.scheme == "https"): writing a secret onto a plaintext HTTP request
 // would leak it to every hop on the wire, so even a rule with no Scheme
-// constraint of its own must not inject over http. Call after decideDomain
-// returned Allow; it mutates outReq.Header in place. A rule that matches but
-// carries no Inject stops the walk: a later, broader rule must never leak
-// its credentials into this request.
+// constraint of its own must not inject over http. The rendered header
+// value is refused (not truncated) when it exceeds maxInjectValueBytes.
+// Call after decideDomain returned Allow; it mutates outReq.Header in
+// place. A rule that matches but carries no Inject stops the walk: a
+// later, broader rule must never leak its credentials into this request.
 //
 // Limitation (by construction): CONNECT tunnels never receive injections.
 // handleConnect relays opaque TLS bytes with no readable header, so an
@@ -1056,6 +1067,9 @@ func (g *Gateway) ApplyInject(outReq *http.Request, v requestView, pol *Policy) 
 			format = "${SECRET}"
 		}
 		val := strings.ReplaceAll(format, "${SECRET}", owner.Inject.Secret)
+		if len(val) > maxInjectValueBytes {
+			return
+		}
 		outReq.Header.Set(owner.Inject.Header, val)
 	}
 	// owner is the first fully matching rule (first-match-wins

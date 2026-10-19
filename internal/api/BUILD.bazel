@@ -2,7 +2,7 @@ load("@rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
     name = "api",
-    srcs = ["auth.go", "collectors.go", "dns_egress.go", "e2b_compat.go", "e2b_server.go", "envd.go", "exec_runtime.go", "gate_spec.go", "identity_api.go", "incident_api.go", "network_dataplane.go", "observability.go", "pool_runtime.go", "portmap_api.go", "template_extra.go", "watchdog.go"],
+    srcs = ["auth.go", "collectors.go", "dns_egress.go", "e2b_compat.go", "e2b_server.go", "envd.go", "exec_runtime.go", "gate_spec.go", "identity_api.go", "incident_api.go", "network_dataplane.go", "observability.go", "pool_quota.go", "pool_runtime.go", "portmap_api.go", "template_extra.go", "watchdog.go"],
     importpath = "uml-container/internal/api",
     visibility = ["//:__subpackages__"],
     deps = [

@@ -125,6 +125,11 @@ func envdPortFromEnv(key string, def int) int {
 	return def
 }
 
+// envdCompatVersion is the envd version PVM advertises. The E2B SDK's
+// getInfo() reads it and compares against the version it needs, so the
+// REST info view and the :49982 websocket must report the same value.
+func envdCompatVersion() string { return "0.1.0" }
+
 // --- version websocket (:49982) ---
 
 func envdVersionWS(w http.ResponseWriter, r *http.Request) {
@@ -148,7 +153,7 @@ func envdVersionWS(w http.ResponseWriter, r *http.Request) {
 
 	accept := base64.StdEncoding.EncodeToString(sha1Sum([]byte(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")))
 	fmt.Fprintf(rw, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n\r\n", accept)
-	ver, _ := json.Marshal(map[string]string{"service": "envd", "version": "0.1.0"})
+	ver, _ := json.Marshal(map[string]string{"service": "envd", "version": envdCompatVersion()})
 	writeWSFrame(rw, 0x1, ver)
 	rw.Flush()
 

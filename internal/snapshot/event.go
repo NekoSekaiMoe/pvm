@@ -166,10 +166,25 @@ func snapshotsDir(containerID string) (string, error) {
 	return filepath.Join(dir, "snapshots"), nil
 }
 
+// SnapshotOptions selects what an event snapshot captures.
+type SnapshotOptions struct {
+	// FilesystemOnly skips the CRIU memory dump and captures only the
+	// persisted state and the disk overlay. The guest is still frozen for
+	// the overlay copy so the captured disk describes one instant; restoring
+	// the snapshot boots a fresh guest over that disk.
+	FilesystemOnly bool
+}
+
 // CreateEventSnapshot creates an event-level snapshot for a task/container.
 // It snapshots the container state and disk overlay/files into a designated
 // snapshot directory and links it with the audit trail hash.
 func CreateEventSnapshot(taskID, eventID, auditHash string, metadata map[string]string) (*EventSnapshot, error) {
+	return CreateEventSnapshotWithOptions(taskID, eventID, auditHash, metadata, SnapshotOptions{})
+}
+
+// CreateEventSnapshotWithOptions is CreateEventSnapshot with an explicit
+// capture mode (e.g. filesystem-only, no memory image).
+func CreateEventSnapshotWithOptions(taskID, eventID, auditHash string, metadata map[string]string, opts SnapshotOptions) (*EventSnapshot, error) {
 	if !validContainerID.MatchString(taskID) {
 		return nil, fmt.Errorf("snapshot: invalid task id %q", taskID)
 	}
@@ -216,22 +231,32 @@ func CreateEventSnapshot(taskID, eventID, auditHash string, metadata map[string]
 	} else {
 		metadata = copyMeta(metadata)
 	}
-	dumpMemory := st.PID > 0 && st.Status == state.StatusRunning
-	if dumpMemory && !pidMatchesStart(st.PID, st.StartedAt) {
+	// liveGuest is a Running task whose recorded PID still names the
+	// original process — the only case worth freezing.
+	liveGuest := st.PID > 0 && st.Status == state.StatusRunning
+	if liveGuest && !pidMatchesStart(st.PID, st.StartedAt) {
 		// The recorded PID now names a DIFFERENT process (PID reuse after a
 		// crash): dumping it would write a stranger's memory into this task's
-		// snapshot. Skip memory instead of capturing the wrong process.
-		dumpMemory = false
+		// snapshot, and freezing it would suspend an unrelated process. Skip
+		// both instead of capturing the wrong process.
+		liveGuest = false
 		metadata["memory_state"] = string(MemoryNotAttempt)
 		metadata["memory_error"] = fmt.Sprintf("pid %d does not match recorded start time (possible PID reuse)", st.PID)
 	}
-	// Consistency barrier: freeze the guest for BOTH captures so the CRIU
-	// memory image and the disk overlay describe the same instant. Without
-	// this the guest keeps running between the two steps and a MemoryFull
-	// restore would combine an old memory image with newer disk writes.
+	dumpMemory := liveGuest && !opts.FilesystemOnly
+	if opts.FilesystemOnly {
+		// Explicit scope marker: consumers can tell a disk-only snapshot from
+		// one whose memory dump merely degraded.
+		metadata["snapshot_scope"] = "filesystem"
+	}
+	// Consistency barrier: freeze the guest for the captures so the CRIU
+	// memory image and the disk overlay describe the same instant. A
+	// filesystem-only snapshot skips memory but still freezes for the
+	// overlay copy — a disk captured across a live write is not a
+	// point-in-time image.
 	frozen := false
 	var freeze *freezeHandle
-	if dumpMemory {
+	if liveGuest {
 		// Pin the validated PID with a pidfd BEFORE signaling: see
 		// freezeHandle. stop() failing (guest just died) leaves frozen=false
 		// and no thaw is attempted, as before.

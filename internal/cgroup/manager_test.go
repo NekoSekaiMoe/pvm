@@ -73,3 +73,61 @@ func TestManager_Setup_OutsideSysfsDoesNotTouchRealCgroup(t *testing.T) {
 		}
 	}
 }
+
+func TestManager_MemoryMaxRoundTrip(t *testing.T) {
+	tmpDir := t.TempDir()
+	m := &Manager{CgroupRoot: tmpDir}
+	const id = "mem-cg"
+	cgPath := filepath.Join(tmpDir, id)
+	if err := os.MkdirAll(cgPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// MemoryMax / MemoryCurrent parse the written values.
+	if err := m.SetMemoryMax(id, 1073741824); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := m.MemoryMax(id); err != nil || got != 1073741824 {
+		t.Fatalf("MemoryMax = %d, %v; want 1073741824", got, err)
+	}
+	// A negative value writes the literal "max", read back as unlimited.
+	if err := m.SetMemoryMax(id, MemoryUnlimited); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(cgPath, "memory.max")); string(b) != "max" {
+		t.Fatalf("memory.max = %q, want max", string(b))
+	}
+	if got, err := m.MemoryMax(id); err != nil || got != MemoryUnlimited {
+		t.Fatalf("MemoryMax unlimited = %d, %v", got, err)
+	}
+	if err := os.WriteFile(filepath.Join(cgPath, "memory.current"), []byte("268435456\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := m.MemoryCurrent(id); err != nil || got != 268435456 {
+		t.Fatalf("MemoryCurrent = %d, %v", got, err)
+	}
+	// A missing cgroup surfaces an error, not a zero value.
+	if _, err := m.MemoryMax("absent"); err == nil {
+		t.Fatal("MemoryMax on a missing cgroup must error")
+	}
+}
+
+func TestParseMemoryLimit(t *testing.T) {
+	cases := []struct {
+		in   string
+		want int64
+		ok   bool
+	}{
+		{"max", MemoryUnlimited, true},
+		{"0", 0, true},
+		{"1073741824", 1073741824, true},
+		{"-1", 0, false},
+		{"bogus", 0, false},
+		{"", 0, false},
+	}
+	for _, c := range cases {
+		got, err := parseMemoryLimit(c.in)
+		if c.ok != (err == nil) || got != c.want {
+			t.Errorf("parseMemoryLimit(%q) = %d, %v; want %d ok=%v", c.in, got, err, c.want, c.ok)
+		}
+	}
+}
