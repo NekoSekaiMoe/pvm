@@ -71,6 +71,8 @@ func ephemeralFalseExplicit(fs *flag.FlagSet) bool {
 	return boolFalseExplicit(fs, "ephemeral")
 }
 
+// main dispatches the umlctl subcommand selected by the command-line arguments.
+// Usage and command errors are reported through a nonzero process exit status.
 func main() {
 	if len(os.Args) < 2 {
 		fmt.Println("Usage: umlctl [start|image|logs|ps|network]")

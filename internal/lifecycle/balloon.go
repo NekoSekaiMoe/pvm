@@ -27,9 +27,12 @@ import (
 // as ballooned; RestorePauseBalloon removes it.
 const pauseMemoryMaxKey = "pause_memory_max"
 
-// BalloonPause lowers a Suspended task's cgroup memory.max to its current
-// usage and records the prior limit in the state metadata. It is a no-op when
-// the task is not Suspended, already ballooned, or has no readable cgroup.
+// BalloonPause lowers a Suspended task's cgroup memory.max to current usage,
+// without raising an existing lower limit, and persists the prior limit in
+// state metadata. It is a no-op if the task is not Suspended, is already
+// ballooned, or reports nonpositive usage. State and cgroup read/write errors
+// are returned, including missing cgroups. If saving the marker fails, it
+// attempts to restore the prior limit and returns the save error.
 func (m *Manager) BalloonPause(taskID string) error {
 	st, err := state.LoadState(taskID)
 	if err != nil {
@@ -76,10 +79,10 @@ func (m *Manager) BalloonPause(taskID string) error {
 	return nil
 }
 
-// RestorePauseBalloon restores the limit BalloonPause lowered for taskID and
-// clears the metadata marker. It mutates st (the caller persists it) so the
-// restore is committed atomically with the resume transition. A no-op when
-// the task was never ballooned.
+// RestorePauseBalloon attempts to restore the limit recorded by BalloonPause
+// and clears the metadata marker in st; the caller must persist st. It is a
+// no-op for nil state or a missing marker. Malformed markers and cgroup write
+// errors are ignored, and the marker is cleared even if restoration fails.
 func (m *Manager) RestorePauseBalloon(taskID string, st *state.ContainerState) {
 	if st == nil || st.Metadata == nil {
 		return

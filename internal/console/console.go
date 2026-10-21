@@ -80,6 +80,8 @@ type Session struct {
 
 const defaultRingSize = 256 * 1024
 
+// newSession creates a session retaining ringSize bytes of console output.
+// A nonpositive ringSize uses defaultRingSize; stdin must be attached separately.
 func newSession(id string, ringSize int) *Session {
 	if ringSize <= 0 {
 		ringSize = defaultRingSize
@@ -92,10 +94,10 @@ func newSession(id string, ringSize int) *Session {
 // ID returns the container id the session belongs to.
 func (s *Session) ID() string { return s.id }
 
-// Write appends guest output to the ring buffer (io.Writer contract so the
-// launcher can tee into it via io.MultiWriter). At most two segment copies
-// land in the fixed backing array; a write larger than the whole window
-// keeps only its tail.
+// Write appends guest output, retaining only the most recent maxLen bytes.
+// It returns io.ErrClosedPipe if the session is closed. When p exceeds the
+// window, only its tail is retained and the returned count is maxLen;
+// otherwise the count is len(p).
 func (s *Session) Write(p []byte) (int, error) {
 	s.mu.Lock()
 	if s.closed {
@@ -128,8 +130,9 @@ func (s *Session) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// readAtLocked copies up to len(out) bytes starting at absolute offset off
-// (>= oldest retained) out of the ring. Callers hold mu.
+// readAtLocked copies len(out) bytes starting at absolute offset off into out
+// and returns the number copied. The requested range must be entirely within
+// the retained output, and callers must hold mu.
 func (s *Session) readAtLocked(off int64, out []byte) int {
 	oldest := s.total - int64(s.size)
 	start := int(off-oldest) + s.head
@@ -165,7 +168,8 @@ func (s *Session) Close() {
 	s.mu.Unlock()
 }
 
-// Tail returns up to max bytes of the most recent console output.
+// Tail returns a copy of up to max bytes of the most recent console output.
+// A nonpositive max defaults to 4096 bytes.
 func (s *Session) Tail(max int) []byte {
 	if max <= 0 {
 		max = 4096
@@ -200,12 +204,11 @@ func (s *Session) Since(ctx context.Context, off int64, timeout time.Duration) (
 	return chunk, end, nil
 }
 
-// waitTailSince blocks until bytes beyond the absolute offset off are
-// available (or timeout/context fires) and returns them together with the
-// ABSOLUTE end offset they were read to. off values are monotonic totals;
-// when the ring has wrapped, the oldest still-held byte is at
-// total-len(ring) and off below that is clamped to it — the returned end
-// reflects the clamped start, so callers never derive a stale next offset.
+// waitTailSince waits for bytes beyond the absolute append offset off and
+// returns the retained bytes and their absolute end offset. An offset older
+// than the retained window is clamped forward, so evicted bytes are omitted.
+// A closed session returns io.ErrClosedPipe; cancellation returns ctx.Err(),
+// and expiry without new output returns a timeout error.
 func (s *Session) waitTailSince(ctx context.Context, off int, timeout time.Duration) ([]byte, int64, error) {
 	deadline := time.Now().Add(timeout)
 	done := ctx.Done()
@@ -335,6 +338,16 @@ func findMarkerEnd(collected []byte, token string) (int, int, int) {
 // the command; END carries the command's exit status ($? expanded by the
 // guest shell — the echoed literal `$?` in the input stream does not match
 // the numeric pattern). Everything between the markers is the output.
+// Output and exit status are guest-attested: a guest can forge the markers.
+// A nonzero guest exit code is returned in Result, not as an error.
+//
+// Calls on one session are serialized. Nonpositive timeout defaults to 30
+// seconds and bounds the marker wait after stdin is written, excluding time
+// waiting for another Exec or writing stdin. Cancellation or timeout does
+// not stop the guest command. Missing stdin returns ErrNoStdin; token and
+// stdin write failures propagate. Cancellation checked before a tail wait
+// returns ctx.Err(); tail-wait errors, including closure or cancellation,
+// are converted to an exec timeout error.
 func (s *Session) Exec(ctx context.Context, cmd string, timeout time.Duration) (*Result, error) {
 	if timeout <= 0 {
 		timeout = 30 * time.Second

@@ -303,7 +303,10 @@ func argvValid(argv []string) error {
 }
 
 // AddPortMapping validates, applies and records one mapping. Duplicate
-// (task, protocol, hostPort) is a conflict.
+// (protocol, hostPort) conflicts across all tasks. An empty protocol defaults
+// to TCP. A token or Host mask starts an HTTP proxy; other mappings use DNAT.
+// Validation, registry, iptables, listener, and persistence errors propagate.
+// A save failure can leave the rules, proxy, and in-memory mapping active.
 func AddPortMapping(m PortMapping) error {
 	if m.Protocol == "" {
 		m.Protocol = "tcp"

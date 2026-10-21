@@ -174,7 +174,8 @@ const MemoryUnlimited int64 = -1
 
 // MemoryMax reads the cgroup's memory.max in bytes. It returns
 // MemoryUnlimited for "max". A missing file (cgroup gone) surfaces the
-// os error so callers can distinguish "no limit" from "no cgroup".
+// os error so callers can distinguish "no limit" from "no cgroup". Invalid
+// container IDs and malformed or negative file values also return errors.
 func (m *Manager) MemoryMax(containerID string) (int64, error) {
 	if !validContainerID.MatchString(containerID) {
 		return 0, fmt.Errorf("invalid container ID")
@@ -187,7 +188,8 @@ func (m *Manager) MemoryMax(containerID string) (int64, error) {
 }
 
 // MemoryCurrent reads the cgroup's memory.current (bytes) — live usage
-// including reclaimable page cache.
+// including reclaimable page cache. Invalid container IDs, file read failures,
+// and values that cannot be parsed as signed 64-bit integers return errors.
 func (m *Manager) MemoryCurrent(containerID string) (int64, error) {
 	if !validContainerID.MatchString(containerID) {
 		return 0, fmt.Errorf("invalid container ID")
@@ -204,7 +206,8 @@ func (m *Manager) MemoryCurrent(containerID string) (int64, error) {
 }
 
 // SetMemoryMax writes the cgroup's memory.max. A negative bytes value writes
-// the literal "max" (unlimited); otherwise the byte count is written.
+// the literal "max" (unlimited); otherwise the byte count is written. Invalid
+// container IDs and file write failures are returned to the caller.
 func (m *Manager) SetMemoryMax(containerID string, bytes int64) error {
 	if !validContainerID.MatchString(containerID) {
 		return fmt.Errorf("invalid container ID")

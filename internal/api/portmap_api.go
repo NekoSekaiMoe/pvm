@@ -34,6 +34,9 @@ type portMapRequest struct {
 	MaskRequestHost string `json:"mask_request_host"`
 }
 
+// registerPortMapAPI registers routes to list, create, and delete inbound port
+// mappings. Creation requires the task's recorded guest IP and rejects the tc
+// dataplane; token checks and Host rewriting are passed to the network layer.
 func registerPortMapAPI(api *echo.Group) {
 	api.GET("/network/portmaps", func(c echo.Context) error {
 		return c.JSON(http.StatusOK, network.ListPortMappings())

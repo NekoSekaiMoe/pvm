@@ -106,6 +106,9 @@ var webhookClient = &http.Client{
 	},
 }
 
+// notify asynchronously POSTs the event and ticket to the configured webhook.
+// It is a no-op without a webhook URL. Delivery is best effort: errors do not
+// reach callers, responses are discarded, and redirects are not followed.
 func (m *Manager) notify(event string, t Ticket) {
 	url := m.webhookURL
 	if url == "" {

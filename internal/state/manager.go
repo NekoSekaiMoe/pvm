@@ -33,6 +33,7 @@ import (
 // at init.
 var rootDir atomic.Value // string
 
+// init sets the initial state root from PVM_STATE_ROOT or the default path.
 func init() { rootDir.Store(resolveStateRoot()) }
 
 // Root returns the current state root (atomic; safe from background
@@ -57,6 +58,9 @@ func resolveStateRoot() string {
 
 var idRe = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 
+// ContainerDir returns the path for id under the current state root without
+// creating it. Empty IDs or characters outside letters, digits, underscores,
+// and hyphens return an error.
 func ContainerDir(id string) (string, error) {
 	if !idRe.MatchString(id) {
 		return "", fmt.Errorf("invalid container ID")
@@ -326,17 +330,14 @@ func LoadState(id string) (*ContainerState, error) {
 	return &st, nil
 }
 
-// ListAll returns the state of every known task under Root(). Tasks whose
-// state.json is missing/corrupt are skipped (never panic the listing).
+// ListAll returns states for task directories under Root(), with a non-nil
+// empty slice when none are readable. Root directory read errors are returned;
+// missing, unreadable, or corrupt task state files are skipped when loaded.
 //
-// Hot-path cache: the control plane calls ListAll per /metrics scrape, per
-// watchdog sweep (1s) and per WebUI poll (2s); with N tasks that is N+1
-// file reads + N JSON parses per call just to see "nothing changed". A
-// mtime-keyed cache serves repeat calls from memory: any state.json write
-// (SaveState) updates its mtime, so a stale task is never served, and a
-// Root() switch (tests) drops the cache entirely. The root itself is read
-// atomically (see rootDir), so background sweepers and test reassignment
-// no longer race.
+// States are cached by file modification time; SaveState invalidates the task's
+// entry, and changing roots clears the cache. External writes that preserve
+// mtime may remain unseen. Returned pointers can be shared with later listings;
+// mutating them also changes the cached values.
 func ListAll() ([]*ContainerState, error) {
 	root := Root()
 	listMu.Lock()

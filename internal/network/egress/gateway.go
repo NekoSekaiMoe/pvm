@@ -1096,11 +1096,9 @@ func (g *Gateway) decideDomain(v requestView, pol *Policy) Decision {
 }
 
 // ApplyInject adds credential headers from the FIRST fully matching rule.
-// Credentials are injected ONLY when the request travels over HTTPS
-// (v.scheme == "https"): writing a secret onto a plaintext HTTP request
-// would leak it to every hop on the wire, so even a rule with no Scheme
-// constraint of its own must not inject over http. The rendered header
-// value is refused (not truncated) when it exceeds maxInjectValueBytes.
+// Credentials are injected over HTTPS, or over plaintext only when the
+// first fully matching rule's Inject.AllowPlainHTTP explicitly opts in. The
+// rendered header value is refused (not truncated) when it exceeds maxInjectValueBytes.
 // Call after decideDomain returned Allow; it mutates outReq.Header in
 // place. A rule that matches but carries no Inject stops the walk: a
 // later, broader rule must never leak its credentials into this request.

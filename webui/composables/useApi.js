@@ -10,6 +10,12 @@ const API_SECRET = typeof import.meta !== 'undefined' && import.meta.env && impo
 const SESSION_KEY = 'pvm.api-key'
 let prompted = false
 
+/**
+ * Return a configured build-time key; otherwise use the page's api-secret
+ * meta value if the tag exists, or the session key. Return '' if none is
+ * available.
+ * Browser storage access errors propagate to the caller.
+ */
 export function apiKey() {
   if (API_SECRET) return API_SECRET
   if (typeof document !== 'undefined') {
@@ -31,9 +37,12 @@ export function setApiKey(k) {
   }
 }
 
-// ensureApiKey prompts for the key exactly once when a request 401s and
-// no key is configured. Returns the (possibly updated) key or '' when the
-// operator dismissed the prompt.
+/**
+ * Return a configured key or prompt at most once per module instance for one.
+ * A nonblank entry is trimmed and saved to sessionStorage. Return '' if the
+ * prompt is unavailable, already used, dismissed, or blank. Storage errors
+ * reject the promise. apiFetch calls this after a 401 response.
+ */
 export async function ensureApiKey() {
   const k = apiKey()
   if (k) return k
@@ -47,11 +56,16 @@ export async function ensureApiKey() {
   return ''
 }
 
-// apiFetch normalizes the response. 202 (Accepted) is a business-level
-// "request received" (e.g. /api/exec returning approval_required) and is
-// returned as JSON. 409 (Conflict) is a hard failure (duplicate ticket,
-// already-decided, invalid state) and is thrown with the server's reason so
-// the caller can surface it instead of silently treating it as success.
+/**
+ * Fetch an API response with a bearer key and return its JSON or text body.
+ * Object bodies are JSON-encoded, replacing opts.body. Without a build-time
+ * key, a 401 can retry once with the key returned by ensureApiKey.
+ * A 202 response (such as approval_required) is returned normally. Other
+ * non-OK responses, including 409 conflicts (duplicate or already-decided
+ * tickets, or invalid state), reject with the server's error message and a
+ * status property. Network, storage, serialization, and
+ * successful-response decoding errors also propagate.
+ */
 export async function apiFetch(path, opts = {}) {
   let headers = { Authorization: `Bearer ${apiKey()}`, ...(opts.headers || {}) }
   if (opts.body && typeof opts.body === 'object') {

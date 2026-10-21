@@ -27,6 +27,17 @@ struct {
 const volatile __u32 exempt_ip_a = 0;
 const volatile __u32 exempt_ip_b = 0;
 
+/**
+ * egress_filter - filter guest traffic at the TAP ingress classifier
+ * @skb: packet supplied by the tc hook
+ *
+ * ARP and the configured destination exemptions pass. Other IPv4 traffic
+ * must avoid the reserved address ranges and have a whitelist value of 1.
+ *
+ * Return: TC_ACT_OK for permitted traffic or an incomplete Ethernet header;
+ * TC_ACT_SHOT for other non-IPv4 traffic, incomplete IPv4 headers, reserved
+ * destinations, or destinations without an enabled whitelist entry.
+ */
 SEC("tc")
 int egress_filter(struct __sk_buff *skb) {
     void *data = (void *)(long)skb->data;

@@ -38,7 +38,8 @@ import (
 	"sync"
 )
 
-// validS3Bucket enforces S3 bucket naming rules on the string that becomes
+// validS3Bucket accepts 2–63 lowercase letters, digits, dots, or hyphens,
+// with alphanumeric ends and no consecutive dots. It guards the string used as
 // s3fs's first positional argument. Without this, PrivateData like
 // "-o,no_check_certificate" would be parsed by s3fs as an option list and
 // could disable TLS verification (leaking the mounted credentials file).
@@ -156,6 +157,16 @@ func removeCreds(path string) error {
 	return nil
 }
 
+// Attach mounts an S3 bucket with s3fs under VolumeBaseDir and returns its
+// host path and detach metadata, reusing an existing mount when detected.
+// PrivateData selects the bucket before its first slash; otherwise VolumeID
+// with the driver-name prefix removed selects it. A PrivateData suffix does
+// not restrict the mount to a prefix.
+//
+// It requires s3fs and AWS credentials in the environment and validates the
+// bucket and PVM_S3_ENDPOINT before creating the mountpoint. Validation,
+// filesystem, mount command, and credential-file cleanup failures are returned.
+// A cleanup failure can accompany a non-nil result after the mount succeeded.
 func (p *S3Plugin) Attach(
 	ctx context.Context, req *AttachRequest,
 ) (res *AttachResult, retErr error) {

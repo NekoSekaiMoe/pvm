@@ -544,7 +544,8 @@ func normalizeMCPConfig(raw json.RawMessage) (string, error) {
 
 // parseSandboxTimeout interprets the three-value create timeout:
 // omitted/empty/0 = defaultSandboxTimeout, -1 = never (zero Deadline),
-// N>0 = N seconds. Anything below the never sentinel is a client error.
+// N>0 = N seconds. The boolean is true only for -1. Non-integer input
+// and values below the never sentinel return an error.
 func parseSandboxTimeout(raw string) (time.Duration, bool, error) {
 	if raw == "" {
 		return defaultSandboxTimeout, false, nil

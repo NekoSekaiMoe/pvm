@@ -303,6 +303,11 @@ func recordDecision(out *[]decisionLog, tenant, why string, allow bool) {
 	*out = append(*out, decisionLog{allow: allow, tenant: tenant, note: why})
 }
 
+// claim reserves tenant quota and binds a warm or newly created sandbox to
+// taskID, returning its ID. It collects decisions in logs for the caller to
+// flush. Invalid template memory and persistence failures are returned;
+// quota refusal wraps ErrQuotaExceeded, while capacity or factory failures
+// return or wrap ErrNoCapacity.
 func (m *Manager) claim(tenant string, tmpl Template, taskID string, logs *[]decisionLog) (string, error) {
 	// ---- phase 1: quota check under lock ----
 	m.mu.Lock()
@@ -623,12 +628,12 @@ func (m *Manager) Release(id string, recycle bool) error {
 	return fmt.Errorf("pool: sandbox %s not found", id)
 }
 
-// Suspend marks a claimed sandbox as paused and RELEASES its memory quota
-// reservation: a paused sandbox holds no live memory (its snapshot lives on
-// disk), so keeping the tenant's memory reservation would block the tenant
-// from claiming another sandbox. The concurrency slot and the claimed
-// binding (ID, task, template) survive so Resume can re-reserve exactly what
-// Suspend freed. Idempotent: a no-op on an already-paused sandbox.
+// Suspend marks a claimed sandbox as paused and releases its memory quota
+// reservation. CPU, concurrency, and the task binding remain reserved for
+// Resume. This changes accounting only; the lifecycle caller pauses the guest.
+// An already-paused sandbox is a no-op. It returns ErrBadState for other states,
+// ErrSandboxNotFound for an unknown ID, or a wrapped persistence error; a
+// persistence failure restores the prior accounting and sandbox state.
 func (m *Manager) Suspend(id string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -706,7 +711,10 @@ func (m *Manager) sandboxIDForTask(taskID string) (string, bool) {
 // Resume returns a paused sandbox to claimed, re-reserving the memory quota
 // Suspend released. When the tenant's memory quota has since been consumed
 // by other sandboxes, the re-reservation is refused (ErrQuotaExceeded) and
-// the sandbox stays paused — the caller can free quota and retry.
+// the sandbox stays paused — the caller can free quota and retry. It returns
+// ErrBadState unless paused, ErrSandboxNotFound for an unknown ID, and wrapped
+// persistence errors. A persistence failure restores the paused accounting.
+// This changes accounting only; the lifecycle caller restores or thaws the guest.
 func (m *Manager) Resume(id string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

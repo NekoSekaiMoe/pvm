@@ -158,6 +158,11 @@ type TestsRerunVerifier struct {
 
 func (v *TestsRerunVerifier) Name() string { return "tests_rerun" }
 
+// Verify runs TestCmd on the host in Workspace when both are configured;
+// command failures become a false result with a reason. Otherwise it scans
+// BuildLog and Trace: Strict requires a recognized test-runner terminal state
+// without failure evidence, while advisory mode accepts missing test evidence.
+// Evidence is guest-attested; only the host command path verifies an actual run.
 func (v *TestsRerunVerifier) Verify(b *Bundle) (bool, string) {
 	if v.TestCmd != "" && v.Workspace != "" {
 		cmd := exec.Command("/bin/sh", "-c", v.TestCmd)

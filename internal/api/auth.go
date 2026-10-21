@@ -98,7 +98,9 @@ type KeyRegistry struct {
 
 // LoadKeyRegistry builds the registry from the environment. The master
 // key comes from API_SECRET (caller has already enforced its presence);
-// named keys come from PVM_API_KEYS and PVM_API_KEYS_FILE.
+// named keys come from PVM_API_KEYS and PVM_API_KEYS_FILE. Approver keys come
+// from PVM_APPROVER_KEYS. An unreadable key file leaves its keys unloaded;
+// the rest of the registry remains usable.
 func LoadKeyRegistry() *KeyRegistry {
 	r := &KeyRegistry{
 		callback: strings.TrimSpace(os.Getenv("PVM_AUTH_CALLBACK_URL")),
@@ -364,7 +366,10 @@ type callbackRequest struct {
 }
 
 // Authenticate resolves key to an identity. path/method are forwarded to
-// the callback so it can make route-scoped decisions.
+// the callback so it can make route-scoped decisions for keys not found locally.
+// Only HTTP 200 accepts a callback identity. Missing callbacks or other status
+// codes yield ErrAuthDenied; callback capacity, encoding, or request failures
+// yield or wrap ErrAuthUnavailable.
 func (r *KeyRegistry) Authenticate(key, path, method string) (APIKey, error) {
 	if k, ok := r.Lookup(key); ok {
 		return k, nil

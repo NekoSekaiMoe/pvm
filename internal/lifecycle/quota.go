@@ -29,7 +29,7 @@ func (m *Manager) SetQuotaHooks(h QuotaHooks) {
 	m.quota = h
 }
 
-// releaseQuotaLocked is a best-effort SuspendByTask: a pause must not fail
+// releaseQuota is a best-effort SuspendByTask: a pause must not fail
 // merely because quota bookkeeping did (the guest is already stopped).
 func (m *Manager) releaseQuota(taskID string) {
 	m.mu.Lock()

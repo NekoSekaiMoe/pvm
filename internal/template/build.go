@@ -268,6 +268,9 @@ func (b *Builder) run(s *Store, id, imageRef string) {
 	b.finish(s, id)
 }
 
+// finish marks the template READY and fills missing version pins before
+// reporting the build done. If the READY update fails, it reports PhaseFailed
+// and attempts to mark the template FAILED.
 func (b *Builder) finish(s *Store, id string) {
 	// Persist READY BEFORE reporting PhaseDone: a Wait() caller must never
 	// observe a done build.json whose record is still PENDING or lacks

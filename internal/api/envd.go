@@ -132,6 +132,9 @@ func envdCompatVersion() string { return "0.1.0" }
 
 // --- version websocket (:49982) ---
 
+// envdVersionWS upgrades the connection, sends the envd version as a JSON text
+// frame, and answers pings until the peer closes or a frame read fails. It
+// responds with 400 for a missing WebSocket key and 500 if hijacking is unsupported.
 func envdVersionWS(w http.ResponseWriter, r *http.Request) {
 	// Minimal RFC6455 server: accept the upgrade, send one version text
 	// frame, then echo pings until the peer goes away.

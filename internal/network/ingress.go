@@ -50,11 +50,13 @@ var (
 	ingressProxies = map[string]*ingressProxy{} // key: ingestKey(taskID, hostPort)
 )
 
+// ingressKey identifies a task's ingress proxy by task ID and host port.
 func ingressKey(taskID string, hostPort int) string {
 	return taskID + "/" + strconv.Itoa(hostPort)
 }
 
-// authorized reports whether the request carries the configured token.
+// authorized accepts any request if no token is configured; otherwise it
+// checks X-Access-Token, falling back to ?access_token= when the header is empty.
 // The comparison is constant-time so a timing side channel cannot recover
 // the token byte by byte.
 func (p *ingressProxy) authorized(r *http.Request) bool {
@@ -69,7 +71,9 @@ func (p *ingressProxy) authorized(r *http.Request) bool {
 }
 
 // startIngressProxy binds HostPort and serves the token/Host-masking
-// reverse proxy. Callers must hold no other ingress lock.
+// reverse proxy on all interfaces. Target URL and listener bind errors are
+// returned; upstream forwarding failures become HTTP 502 responses. Callers must hold
+// no other ingress lock.
 func startIngressProxy(m PortMapping) error {
 	target, err := url.Parse("http://" + net.JoinHostPort(m.GuestIP, strconv.Itoa(m.GuestPort)))
 	if err != nil {

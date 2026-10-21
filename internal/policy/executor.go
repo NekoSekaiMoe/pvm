@@ -18,6 +18,10 @@ import (
 // (e.g. `bash -lc '...'`); otherwise the tool name itself runs as the
 // command. Output is capped in the summary; the full exit code and duration
 // ride in Result. Secrets scrubbing happens in the gateway's sanitize step.
+// Results carry guest_attested=true: the guest can forge console markers, so
+// OK reports the guest's claimed exit status. Session lookup and console exec
+// errors reach the caller; a nonzero guest exit code sets OK=false without
+// returning an error.
 func ConsoleExecutor(taskID string, sessFn func(taskID string) (*console.Session, error)) func(req ToolRequest) (ToolResponse, error) {
 	return func(req ToolRequest) (ToolResponse, error) {
 		sess, err := sessFn(taskID)

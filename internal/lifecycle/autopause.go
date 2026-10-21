@@ -106,7 +106,9 @@ func (m *Manager) Disarm(taskID string) {
 }
 
 // Resume thaws a Suspended task and drives Suspended -> Resuming -> Running.
-// Returns an error if the task is not in Suspended or thaw fails.
+// It re-reserves pool memory before thawing and rearms a positive idle timeout
+// after success. State load, transition, save, quota, and thaw failures are
+// returned; a missing cgroup during thaw is ignored.
 func (m *Manager) Resume(taskID string) error {
 	st, err := state.LoadState(taskID)
 	if err != nil {

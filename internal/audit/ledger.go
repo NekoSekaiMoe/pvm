@@ -284,16 +284,15 @@ func (l *Ledger) refreshTailLocked() error {
 // most once per groupCommitInterval, plus once at Close. The hash chain's
 // tamper-evidence is unaffected (it lives in the records themselves); a
 // crash between a record write and the head flush leaves head lagging the
-// tail, which weakens truncation detection exactly like the previously
-// documented crash window and never false-positives. This removes the
-// 2-fsync + temp-rename from the per-request egress hot path (~2.25ms/op
-// measured, serialized across every proxied request).
+// tail. Success does not guarantee record durability across a crash.
+// File, locking, tail-reading, encoding, and write errors reach the caller;
+// watermark flush errors are handled asynchronously.
 //
 // The flock is taken and released PER Append (not held for the Ledger's
 // life): the same task's ledger may be Open()ed by several Ledger objects
 // in one process (per-request audit.Open), and a held lock would deadlock
-// the second instance's first Append. The open/lock/unlock/close syscall
-// pair per Append is negligible next to the two fsyncs this change removed.
+// the second instance's first Append. The append descriptor remains open
+// until Close.
 func (l *Ledger) Append(r Record) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -461,18 +460,19 @@ func (l *Ledger) flushHead() {
 	}
 }
 
-// FlushHead durably writes the pending head watermark NOW (synchronous).
-// Append already schedules an async flush; this is the explicit barrier for
-// callers that need the watermark durable before proceeding (tests that
-// tamper with the file, operational snapshots).
+// FlushHead attempts to persist a pending head watermark synchronously.
+// Errors do not reach the caller: a missing directory is ignored, and other
+// write errors leave the watermark dirty for retry. It does not wait for a
+// flush already in progress and does not fsync the ledger records.
 func (l *Ledger) FlushHead() {
 	l.flushHead()
 }
 
-// Close flushes the pending head watermark, stops the flusher, releases the
-// cached append fd (dropping its flock), and unregisters this ledger from
-// the online verification monitor. The Ledger must not be Appended to
-// afterwards.
+// Close signals the flusher to stop, attempts to flush a pending watermark,
+// closes the append file, and unregisters the ledger from online verification.
+// It returns joined errors from its own watermark write and file close, but
+// does not wait for or report errors from a background flush already in
+// progress. Call Close only once and do not Append afterwards.
 func (l *Ledger) Close() error {
 	// Stop the flusher first; it flushes its pending watermark on exit.
 	l.mu.Lock()

@@ -264,6 +264,10 @@ func forwardFloorRules(op, subnetCIDR string) [][]string {
 	return rules
 }
 
+// teardownBridge attempts to remove the subnet's NAT and forwarding rules,
+// then deletes the bridge. An empty subnetCIDR skips rule removal. Rule and
+// link-down errors are ignored; bridge deletion errors are returned unless the
+// device is already absent. It does not change the IP-forwarding reference count.
 func teardownBridge(bridgeName string, subnetCIDR string) error {
 	if subnetCIDR != "" {
 		// 与 SetupBridge 对称删除：MASQUERADE + FORWARD 入/出规则。

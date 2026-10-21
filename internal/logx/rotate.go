@@ -44,7 +44,11 @@ type Rotator struct {
 	stopped chan struct{}
 }
 
-// NewRotator opens (creating if needed) path with rotation policy.
+// NewRotator opens path for appending, creating its parent directories as
+// needed. maxBytes is the generation size limit in bytes; keep is the number
+// of rotated generations to retain. Nonpositive values use DefaultMaxBytes
+// and DefaultKeep. Directory or file open failures are returned. Close must
+// be called to flush buffered output and stop the background flusher.
 func NewRotator(path string, maxBytes int64, keep int) (*Rotator, error) {
 	if maxBytes <= 0 {
 		maxBytes = DefaultMaxBytes
@@ -79,7 +83,10 @@ func NewRotator(path string, maxBytes int64, keep int) (*Rotator, error) {
 // and lands on disk when the buffer fills, the flush ticker fires, a
 // rotation happens, or Close is called. The rotation check uses
 // buffered+incoming bytes so the generation boundary granularity matches
-// the unbuffered behavior.
+// the unbuffered behavior. Success may mean p is only buffered; no fsync is
+// performed. Write returns os.ErrClosed after closure, and propagates errors
+// from foreground flushes, writes, and reopening after rotation. Background
+// flush errors do not reach this caller.
 func (r *Rotator) Write(p []byte) (int, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -159,7 +166,8 @@ func (r *Rotator) flushLoop() {
 }
 
 // Close flushes any buffered bytes, stops the flusher, and closes the
-// current generation.
+// current generation. Repeated calls after closure return nil. A buffer flush
+// error takes precedence over a file close error.
 func (r *Rotator) Close() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
