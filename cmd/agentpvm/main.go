@@ -250,9 +250,15 @@ func runCmd(args []string) {
 		},
 		Terminate: func(id string) error {
 			st, err := state.LoadState(id)
-			if err == nil && st.PID > 0 {
-				if p, err := os.FindProcess(st.PID); err == nil {
-					return p.Kill()
+			if err == nil && st != nil && st.PID > 0 {
+				// PIDs are recycled: verify the persisted pid still lives in
+				// this task's cgroup before killing, so a stale pid cannot
+				// name an unrelated host process (same guard as the api
+				// package's Terminate/delete paths).
+				if belongs, berr := api.ProcBelongsToContainer(st.PID, id); berr == nil && belongs {
+					if p, perr := os.FindProcess(st.PID); perr == nil {
+						return p.Kill()
+					}
 				}
 			}
 			return nil

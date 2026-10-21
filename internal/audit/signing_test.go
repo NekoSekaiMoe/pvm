@@ -79,14 +79,32 @@ func TestLedgerSigningEndToEnd(t *testing.T) {
 	}
 }
 
-func TestSignerForRootOffByDefault(t *testing.T) {
+func TestSignerForRootDefaultOnAndOptOut(t *testing.T) {
 	t.Setenv("PVM_AUDIT_SIGNING", "")
 	root := t.TempDir()
 	signerMu.Lock()
 	delete(signerCache, root)
 	signerMu.Unlock()
-	if s := SignerForRoot(root); s != nil {
-		t.Fatal("signing must stay off without env or key")
+	t.Cleanup(func() {
+		signerMu.Lock()
+		delete(signerCache, root)
+		signerMu.Unlock()
+	})
+	if s := SignerForRoot(root); s == nil {
+		t.Fatal("signing must be ON by default (key generated on first use)")
+	}
+	if _, err := os.Stat(filepath.Join(root, signingKeyFile)); err != nil {
+		t.Fatalf("default-on must materialize the key file: %v", err)
+	}
+
+	// Explicit opt-out: no signer, and no key is force-created.
+	t.Setenv("PVM_AUDIT_SIGNING", "0")
+	root2 := t.TempDir()
+	if s := SignerForRoot(root2); s != nil {
+		t.Fatal("PVM_AUDIT_SIGNING=0 must disable signing")
+	}
+	if _, err := os.Stat(filepath.Join(root2, signingKeyFile)); !os.IsNotExist(err) {
+		t.Fatalf("opt-out must not create a key: %v", err)
 	}
 }
 

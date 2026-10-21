@@ -20,6 +20,8 @@ func TestLedger_ConcurrentAppends(t *testing.T) {
 	LedgerRoot = t.TempDir()
 	l, _ := Open("concurrent")
 	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var appendErrs []error
 	const goroutines = 16
 	const each = 25
 	for g := 0; g < goroutines; g++ {
@@ -27,16 +29,27 @@ func TestLedger_ConcurrentAppends(t *testing.T) {
 		go func(id int) {
 			defer wg.Done()
 			for i := 0; i < each; i++ {
-				_ = l.Append(Record{
+				if err := l.Append(Record{
 					Phase: PhaseExec, Subject: "agent",
 					Action:   fmt.Sprintf("call-%d-%d", id, i),
 					Params:   map[string]interface{}{"g": id, "i": i},
 					Decision: DecisionAllow,
-				})
+				}); err != nil {
+					mu.Lock()
+					appendErrs = append(appendErrs, fmt.Errorf("g%d i%d: %w", id, i, err))
+					mu.Unlock()
+					return
+				}
 			}
 		}(g)
 	}
 	wg.Wait()
+	// Surface append errors explicitly: a swallowed error would otherwise
+	// masquerade as "appends lost" with no diagnosis (seen once in a full
+	// suite run under heavy load).
+	if len(appendErrs) > 0 {
+		t.Fatalf("%d append(s) failed under concurrency; first: %v", len(appendErrs), appendErrs[0])
+	}
 
 	// Reopen to re-read the tail.
 	l2, _ := Open("concurrent")
@@ -75,6 +88,9 @@ func TestLedger_TamperTruncation(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		l.Append(Record{Phase: PhaseExec, Subject: "x", Action: "a", Decision: DecisionAllow})
 	}
+	// Group commit: make the seq=5 watermark durable BEFORE truncating —
+	// truncation detection compares the replayed record count against it.
+	l.FlushHead()
 	// truncate by reading lines and dropping the last
 	path := filepath.Join(LedgerRoot, "trunc", "ledger.jsonl")
 	data, _ := os.ReadFile(path)
@@ -103,6 +119,10 @@ func TestLedger_TruncationWithoutHeadSkipped(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		l.Append(Record{Phase: PhaseExec, Subject: "x", Action: "a", Decision: DecisionAllow})
 	}
+	// Stop the async head flusher FIRST: the group-commit loop would
+	// otherwise (re)create the head file after the Remove below and break
+	// the "legacy, no watermark" precondition.
+	l.Close()
 	path := filepath.Join(LedgerRoot, "legacy", "ledger.jsonl")
 	data, _ := os.ReadFile(path)
 	lines := strings.Split(strings.TrimRight(string(data), "\n"), "\n")

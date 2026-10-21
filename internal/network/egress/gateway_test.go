@@ -108,6 +108,25 @@ func TestDomainBlock(t *testing.T) {
 	}
 }
 
+func TestUpstreamHeaderTimeout(t *testing.T) {
+	g := NewGateway()
+	tr := g.dialCheckedTransport()
+	if tr.ResponseHeaderTimeout != upstreamHeaderTimeout {
+		t.Fatalf("ResponseHeaderTimeout = %v, want %v", tr.ResponseHeaderTimeout, upstreamHeaderTimeout)
+	}
+}
+
+func TestListenWriteTimeoutUnset(t *testing.T) {
+	g := NewGateway()
+	if _, err := g.Listen(nil, "127.0.0.1:0"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { g.Shutdown(nil) })
+	if g.server.WriteTimeout != 0 {
+		t.Fatalf("WriteTimeout = %v, want 0 (unset for long streams)", g.server.WriteTimeout)
+	}
+}
+
 func TestWildcardMatch(t *testing.T) {
 	if !domainMatches("api.github.com", "*.github.com") {
 		t.Error("*.github.com should match api.github.com")

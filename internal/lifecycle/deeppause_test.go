@@ -7,7 +7,7 @@ import (
 )
 
 func TestDeepPauseModeBookkeeping(t *testing.T) {
-	state.RootDir = t.TempDir()
+	state.SetRoot(t.TempDir())
 	m := New(nil)
 	cases := []struct {
 		name string
@@ -33,7 +33,7 @@ func TestDeepPauseModeBookkeeping(t *testing.T) {
 }
 
 func TestIsDeepPausedRequiresState(t *testing.T) {
-	state.RootDir = t.TempDir()
+	state.SetRoot(t.TempDir())
 	cases := []struct {
 		name string
 		id   string

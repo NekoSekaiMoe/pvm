@@ -72,9 +72,9 @@ func TestCollectorsRenderHookWired(t *testing.T) {
 func TestCollectTaskGaugesZeroesStaleStates(t *testing.T) {
 	// t.TempDir dies at test end; later tests must not read the stale
 	// state root.
-	old := state.RootDir
-	t.Cleanup(func() { state.RootDir = old })
-	state.RootDir = t.TempDir() // no tasks at all
+	old := state.Root()
+	t.Cleanup(func() { state.SetRoot(old) })
+	state.SetRoot(t.TempDir()) // no tasks at all
 	tasksByState.Set(3, "running")
 	collectTaskGauges()
 	out := metrics.Default().Render()

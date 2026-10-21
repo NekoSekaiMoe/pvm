@@ -56,7 +56,7 @@ int egress_filter(struct __sk_buff *skb) {
     __u32 dest_ip_host = __builtin_bswap32(ip->daddr);
     // Loopback: 127.0.0.0/8
     if ((dest_ip_host & 0xFF000000) == 0x7F000000) return TC_ACT_SHOT;
-    // Link-local: 169.254.0.0/16
+    // Link-local: 169.254.0.0/16 (cloud metadata)
     if ((dest_ip_host & 0xFFFF0000) == 0xA9FE0000) return TC_ACT_SHOT;
     // 10.0.0.0/8
     if ((dest_ip_host & 0xFF000000) == 0x0A000000) return TC_ACT_SHOT;
@@ -64,6 +64,16 @@ int egress_filter(struct __sk_buff *skb) {
     if ((dest_ip_host & 0xFFF00000) == 0xAC100000) return TC_ACT_SHOT;
     // 192.168.0.0/16
     if ((dest_ip_host & 0xFFFF0000) == 0xC0A80000) return TC_ACT_SHOT;
+    // CGNAT: 100.64.0.0/10 (cloud metadata, e.g. 100.100.100.200)
+    if ((dest_ip_host & 0xFFC00000) == 0x64400000) return TC_ACT_SHOT;
+    // "This" network: 0.0.0.0/8
+    if ((dest_ip_host & 0xFF000000) == 0x00000000) return TC_ACT_SHOT;
+    // Multicast: 224.0.0.0/4
+    if ((dest_ip_host & 0xF0000000) == 0xE0000000) return TC_ACT_SHOT;
+    // Reserved: 240.0.0.0/4 (incl. 255.255.255.255)
+    if ((dest_ip_host & 0xF0000000) == 0xF0000000) return TC_ACT_SHOT;
+    // Benchmarking: 198.18.0.0/15
+    if ((dest_ip_host & 0xFFFE0000) == 0xC6120000) return TC_ACT_SHOT;
 
     __u32 dest_ip = ip->daddr;
     __u32 *allowed = bpf_map_lookup_elem(&whitelist_map, &dest_ip);

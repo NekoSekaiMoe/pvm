@@ -22,9 +22,9 @@ func newRollbackTask(t *testing.T, specFP string) {
 	// RootDir is a package global: restore it after the test so subsequent
 	// tests in this process are not redirected into this test's (now
 	// deleted) temp dir.
-	origRoot := state.RootDir
-	t.Cleanup(func() { state.RootDir = origRoot })
-	state.RootDir = t.TempDir()
+	origRoot := state.Root()
+	t.Cleanup(func() { state.SetRoot(origRoot) })
+	state.SetRoot(t.TempDir())
 	if err := state.SaveState("rbguard1", &state.ContainerState{
 		ID:     "rbguard1",
 		Name:   "rbguard1",

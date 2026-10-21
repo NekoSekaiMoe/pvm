@@ -13,7 +13,7 @@ KERNEL_VERSION="6.18.36"
 KERNEL_TAR="linux-${KERNEL_VERSION}.tar.xz"
 KERNEL_URL="https://cdn.kernel.org/pub/linux/kernel/v6.x/${KERNEL_TAR}"
 ZALEXDEV_REPO="https://github.com/zalexdev/linux-um-arm64"
-ZALEXDEV_REV="8897487c52233cd00cf2850008ca068892f1ae91"
+ZALEXDEV_REV="32e5e10b81d8882bdaf77b71e4106a941840c750"
 
 case "$ARCH" in
   x86_64)

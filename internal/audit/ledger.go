@@ -15,6 +15,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -69,8 +70,8 @@ type Record struct {
 	Reason   string      `json:"reason,omitempty"`
 	PrevHash string      `json:"prev_hash"`
 	ThisHash string      `json:"hash"`
-	// Sig is the base64 ed25519 signature over ThisHash, present when the
-	// audit root arms signing (PVM_AUDIT_SIGNING=1 or an existing key).
+	// Sig is the base64 ed25519 signature over ThisHash. Signing is ON by
+	// default (see SignerForRoot); PVM_AUDIT_SIGNING=0 opts out.
 	Sig string `json:"sig,omitempty"`
 }
 
@@ -102,6 +103,21 @@ type Ledger struct {
 	// persisted (see redact.go). Defaults to DefaultRedactor(); nil disables
 	// redaction entirely (test escape hatch via WithRedactor).
 	redactor Redactor
+
+	// --- group-commit state (all guarded by mu) ---
+	// f is the cached append fd (reopened per Append previously: ~2 fsyncs
+	// + 2 opens + a rename per record measured 2.25ms/op on the hot egress
+	// path).
+	f *os.File
+	// headPending is the head watermark string that still needs a durable
+	// writeHeadAtomic; headDirty marks headPending as set. The flusher
+	// (groupCommitLoop, started lazily) coalesces these into at most one
+	// atomic watermark write per flush interval, and Close flushes the
+	// remainder.
+	headPending string
+	headDirty   bool
+	flushStop   chan struct{}
+	flusherOnce sync.Once
 }
 
 // Option customizes a Ledger at Open time.
@@ -260,21 +276,40 @@ func (l *Ledger) refreshTailLocked() error {
 // the current tail under the lock, advances seq/lastHash, and writes. Without
 // the flock, two processes could both read the same tail and emit records
 // sharing PrevHash/Seq, breaking Verify under concurrency.
+//
+// Persistence model (group commit): the record itself is written through
+// the cached O_APPEND fd WITHOUT a per-record fsync (write ordering is
+// guaranteed by mu + flock serialization), and the anti-truncation head
+// watermark is marked dirty and durably written by a background flusher at
+// most once per groupCommitInterval, plus once at Close. The hash chain's
+// tamper-evidence is unaffected (it lives in the records themselves); a
+// crash between a record write and the head flush leaves head lagging the
+// tail, which weakens truncation detection exactly like the previously
+// documented crash window and never false-positives. This removes the
+// 2-fsync + temp-rename from the per-request egress hot path (~2.25ms/op
+// measured, serialized across every proxied request).
+//
+// The flock is taken and released PER Append (not held for the Ledger's
+// life): the same task's ledger may be Open()ed by several Ledger objects
+// in one process (per-request audit.Open), and a held lock would deadlock
+// the second instance's first Append. The open/lock/unlock/close syscall
+// pair per Append is negligible next to the two fsyncs this change removed.
 func (l *Ledger) Append(r Record) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	// Open the file first and acquire the cross-process lock BEFORE computing
-	// seq/hash. The single lock-protected refresh below is the authoritative
-	// seed for seq/lastHash. A prior version also refreshed + seq++ here
-	// (pre-lock) and then again under the lock, which ran seq++ twice and made
-	// the first record of an empty ledger seq=2 instead of seq=1.
+	// Lazily (re)open the append fd BEFORE computing seq/hash. The single
+	// lock-protected refresh below is the authoritative seed for
+	// seq/lastHash.
 	// 0600: evidence file, owner-only.
-	f, err := os.OpenFile(l.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
-	if err != nil {
-		return err
+	if l.f == nil {
+		f, err := os.OpenFile(l.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+		if err != nil {
+			return err
+		}
+		l.f = f
 	}
-	defer f.Close()
+	f := l.f
 	// Cross-process mutex: hold an exclusive lock for the duration of the
 	// append so concurrent writers serialize on the OS, not just in-process.
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
@@ -302,8 +337,8 @@ func (l *Ledger) Append(r Record) error {
 	}
 	r.PrevHash = l.lastHash
 	r.ThisHash = hashRecord(r, l.lastHash)
-	// Signature over the chained digest: arming is per audit-root
-	// (PVM_AUDIT_SIGNING=1 or an existing key). Unsigned ledgers skip.
+	// Signature over the chained digest: signing is ON by default (see
+	// SignerForRoot; PVM_AUDIT_SIGNING=0 opts out). Unsigned ledgers skip.
 	if signer := SignerForRoot(l.rootDir()); signer != nil {
 		r.Sig = signer.Sign(r.ThisHash)
 	}
@@ -348,17 +383,125 @@ func (l *Ledger) Append(r Record) error {
 	l.lastHash = r.ThisHash
 	l.readOffset += int64(buf.Len())
 
-	// Anti-truncation watermark: persist "<seq> <lastHash>" in a sibling file
-	// while still holding the flock. Verify compares the replayed record count
-	// against this high-water mark, so chopping records off the end of the
-	// ledger (even with a valid sub-chain) is detected. Written AFTER the
-	// record itself: a crash between the two leaves head lagging, which only
-	// weakens detection, never false-positives.
-	head := fmt.Sprintf("%d %s\n", r.Seq, r.ThisHash)
-	if err := l.writeHeadAtomic(head); err != nil {
-		return err
-	}
+	// Anti-truncation watermark: mark "<seq> <lastHash>" pending in a
+	// sibling file. Verify compares the replayed record count against this
+	// high-water mark, so chopping records off the end of the ledger (even
+	// with a valid sub-chain) is detected. Group-committed by the
+	// background flusher (and Close): a crash between the record write and
+	// the head flush leaves head lagging, which only weakens detection,
+	// never false-positives — the same semantics as a crash mid-window
+	// under the old synchronous design.
+	l.headPending = fmt.Sprintf("%d %s\n", r.Seq, r.ThisHash)
+	l.headDirty = true
+	l.startFlusherLocked()
 	return nil
+}
+
+// groupCommitInterval bounds how long a dirty head watermark may lag the
+// ledger tail before the flusher durably writes it.
+const groupCommitInterval = 100 * time.Millisecond
+
+// startFlusherLocked lazily starts the group-commit loop (once per
+// Ledger). Callers hold mu. The loop flushes on the interval tick only —
+// an Append-driven nudge would wake the flusher while a TEST (or short
+// task) is tearing down its temp dir, racing the cleanup.
+func (l *Ledger) startFlusherLocked() {
+	l.flusherOnce.Do(func() {
+		l.flushStop = make(chan struct{})
+		go l.groupCommitLoop()
+	})
+}
+
+// groupCommitLoop durably persists the dirty head watermark at most once
+// per groupCommitInterval until flushStop closes. Exits (flushing any
+// remainder first) when told to stop.
+func (l *Ledger) groupCommitLoop() {
+	ticker := time.NewTicker(groupCommitInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-l.flushStop:
+			l.flushHead()
+			return
+		case <-ticker.C:
+			l.flushHead()
+		}
+	}
+}
+
+// flushHead writes the pending watermark (if any) durably. Safe to call
+// concurrently; only the caller that observes headDirty under mu performs
+// the write, and the pending string it snapshots is immutable until the
+// next Append replaces it (a lost update merely leaves head one record
+// behind, which Verify tolerates by design).
+func (l *Ledger) flushHead() {
+	l.mu.Lock()
+	if !l.headDirty {
+		l.mu.Unlock()
+		return
+	}
+	head := l.headPending
+	l.headDirty = false
+	l.mu.Unlock()
+	if err := l.writeHeadAtomic(head); err != nil {
+		// A vanished audit dir means the ledger's owner (task teardown /
+		// test cleanup) removed the tree: there is nowhere left to persist
+		// the watermark and nothing to retry — stop cleanly.
+		if errors.Is(err, os.ErrNotExist) {
+			return
+		}
+		// Re-mark so the next flush retries; the ledger records themselves
+		// are already durable-enough (O_APPEND write), only the watermark
+		// lags. Surface loudly: a permanently failing watermark is an
+		// integrity-relevant condition.
+		log.Printf("audit: head watermark flush failed (will retry): %v", err)
+		l.mu.Lock()
+		l.headDirty = true
+		l.mu.Unlock()
+	}
+}
+
+// FlushHead durably writes the pending head watermark NOW (synchronous).
+// Append already schedules an async flush; this is the explicit barrier for
+// callers that need the watermark durable before proceeding (tests that
+// tamper with the file, operational snapshots).
+func (l *Ledger) FlushHead() {
+	l.flushHead()
+}
+
+// Close flushes the pending head watermark, stops the flusher, releases the
+// cached append fd (dropping its flock), and unregisters this ledger from
+// the online verification monitor. The Ledger must not be Appended to
+// afterwards.
+func (l *Ledger) Close() error {
+	// Stop the flusher first; it flushes its pending watermark on exit.
+	l.mu.Lock()
+	if l.flushStop != nil {
+		close(l.flushStop)
+	}
+	l.mu.Unlock()
+
+	var errs []error
+	// Fallback flush for a watermark still dirty (covers a flusher that
+	// exited between the stop signal and its final flush).
+	l.mu.Lock()
+	dirty, pending := l.headDirty, l.headPending
+	l.headDirty = false
+	f := l.f
+	l.f = nil
+	l.mu.Unlock()
+	if dirty && pending != "" {
+		if err := l.writeHeadAtomic(pending); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if f != nil {
+		if err := f.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	l.unregisterLedgerNow()
+	return errors.Join(errs...)
 }
 
 // writeHeadAtomic atomically replaces the head watermark. The old O_TRUNC
@@ -517,6 +660,16 @@ func (l *Ledger) Verify() (int, error) {
 		log.Printf("audit: warning: ledger %q has %d record(s) but no readable head watermark (legacy data or missing/corrupt %s); anti-truncation check skipped", l.task, count, headFileName)
 	}
 	return count, nil
+}
+
+// HeadWatermark exposes the anti-truncation watermark's readability for
+// observability surfaces (the /api/audit/:id/verify response): ok=false
+// with a non-empty ledger means the anti-truncation check could not run
+// (missing or corrupt head file — e.g. an attacker deleted it to hide a
+// truncation), which operators should alert on. Read-only; it does not
+// affect verification semantics.
+func (l *Ledger) HeadWatermark() (seq int64, hash string, ok bool) {
+	return l.readHead()
 }
 
 // readHead parses the head watermark file ("<seq> <hash>"). ok=false when the

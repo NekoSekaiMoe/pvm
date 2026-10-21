@@ -125,6 +125,11 @@ func envdPortFromEnv(key string, def int) int {
 	return def
 }
 
+// envdCompatVersion is the envd version PVM advertises. The E2B SDK's
+// getInfo() reads it and compares against the version it needs, so the
+// REST info view and the :49982 websocket must report the same value.
+func envdCompatVersion() string { return "0.1.0" }
+
 // --- version websocket (:49982) ---
 
 func envdVersionWS(w http.ResponseWriter, r *http.Request) {
@@ -148,7 +153,7 @@ func envdVersionWS(w http.ResponseWriter, r *http.Request) {
 
 	accept := base64.StdEncoding.EncodeToString(sha1Sum([]byte(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")))
 	fmt.Fprintf(rw, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n\r\n", accept)
-	ver, _ := json.Marshal(map[string]string{"service": "envd", "version": "0.1.0"})
+	ver, _ := json.Marshal(map[string]string{"service": "envd", "version": envdCompatVersion()})
 	writeWSFrame(rw, 0x1, ver)
 	rw.Flush()
 
@@ -308,6 +313,15 @@ func taskWorkspace(taskID string) (string, error) {
 // cannot resolve the leaf — so the DEEPEST EXISTING ancestor is resolved and
 // fenced instead: a workspace symlink pointing outside ("link/new-file")
 // is caught at the link, not after MkdirAll/Create followed it out.
+//
+// The RESOLVED path is returned, never the lexical join: the workspace is
+// guest writable, and a guest that swaps a checked intermediate directory
+// for a symlink between this check and the caller's open/create/rename
+// would otherwise redirect the operation outside the fence (TOCTOU).
+// Components below the deepest existing ancestor do not exist yet, so
+// nothing can be swapped in for them; operations that materialize them
+// (MkdirAll, Create, Rename destination) walk through the verified
+// ancestor.
 func fenceJoin(root, rel string) (string, error) {
 	rel = strings.TrimPrefix(rel, "/")
 	p := filepath.Join(root, filepath.Clean("/"+rel))
@@ -337,7 +351,19 @@ func fenceJoin(root, rel string) (string, error) {
 		}
 		probe = parent
 	}
-	return p, nil
+	resolved, err := filepath.EvalSymlinks(probe)
+	if err != nil {
+		return "", fmt.Errorf("resolve %s: %w", probe, err)
+	}
+	if p == probe {
+		return resolved, nil
+	}
+	// Re-join the not-yet-existing tail below the verified ancestor.
+	tail := strings.TrimPrefix(strings.TrimPrefix(p, probe), string(filepath.Separator))
+	if tail == "" {
+		return resolved, nil
+	}
+	return filepath.Join(resolved, filepath.FromSlash(tail)), nil
 }
 
 // --- process.Process ---

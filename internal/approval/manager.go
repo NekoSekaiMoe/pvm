@@ -59,6 +59,14 @@ type Ticket struct {
 	Consumed bool       `json:"consumed,omitempty"`
 	EditedBy string     `json:"edited_by,omitempty"`
 	EditedAt *time.Time `json:"edited_at,omitempty"`
+	// CreatedBy records the actor that created the ticket (audit
+	// attribution); CreatedByKeyFp is a SHA-256 fingerprint of the creating
+	// API key. Both feed the self-approval guard: a decision arriving with
+	// the SAME key fingerprint that created the ticket is rejected when the
+	// approval plane is trust-separated (PVM_APPROVER_KEYS), and flagged in
+	// the audit reason otherwise.
+	CreatedBy     string `json:"created_by,omitempty"`
+	CreatedByKeyFp string `json:"created_by_key_fp,omitempty"`
 }
 
 // Manager is the in-memory ticket store. (MVP: process-local. A real deployment

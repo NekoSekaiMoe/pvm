@@ -66,7 +66,7 @@ func TestManager_Start(t *testing.T) {
 		t.Fatalf("failed to create temp dir: %v", err)
 	}
 	defer os.RemoveAll(tempDir)
-	state.RootDir = tempDir
+	state.SetRoot(tempDir)
 
 	cgTempDir, err := os.MkdirTemp("", "uml-cgroup-test")
 	if err != nil {
@@ -123,7 +123,7 @@ func TestManager_Start_Virtio(t *testing.T) {
 		t.Fatalf("failed to create temp dir: %v", err)
 	}
 	defer os.RemoveAll(tempDir)
-	state.RootDir = tempDir
+	state.SetRoot(tempDir)
 
 	cgTempDir, err := os.MkdirTemp("", "uml-cgroup-test-virtio")
 	if err != nil {

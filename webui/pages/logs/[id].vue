@@ -60,10 +60,18 @@ const displayedLogs = computed(() => {
 // rawLogs, but the callback MUST rethrow: usePoll only engages its shared
 // failure backoff (fails/retryAt doubling) when fn rejects — swallowing the
 // error would poll a dead container at full rate forever.
+//
+// INCREMENTAL protocol: each request carries the client's byte offset
+// (?offset=N) and the server answers with only the bytes past it, plus
+// X-PVM-Log-Start (where these bytes begin) and X-PVM-Log-Offset (the new
+// bookmark). Start != the offset we sent means the file rotated/shrank —
+// replace instead of appending. Steady-state polling costs O(delta), not
+// O(filesize) per tick (the old full read moved ~4MB/s for an 8MiB log).
+let logOffset = 0
 const { refresh: fetchLogs } = usePoll(async () => {
   let res
   try {
-    res = await fetch(`/api/containers/${route.params.id}/logs`)
+    res = await fetch(`/api/containers/${route.params.id}/logs?offset=${logOffset}`)
   } catch (e) {
     rawLogs.value = "Error fetching logs."
     throw e // let usePoll record the failure and back off
@@ -72,7 +80,16 @@ const { refresh: fetchLogs } = usePoll(async () => {
     rawLogs.value = "No logs available or container is dead."
     throw new Error(`log fetch failed: HTTP ${res.status}`) // same backoff path
   }
-  rawLogs.value = await res.text()
+  const chunk = await res.text()
+  const start = parseInt(res.headers.get('X-PVM-Log-Start') ?? '0', 10)
+  const next = parseInt(res.headers.get('X-PVM-Log-Offset') ?? '0', 10)
+  if (start !== logOffset) {
+    // Rotation: the server restarted from the top — replace the view.
+    rawLogs.value = chunk
+  } else if (chunk) {
+    rawLogs.value = (rawLogs.value === 'Loading logs...' ? '' : rawLogs.value) + chunk
+  }
+  logOffset = next
   if (autoScroll.value) {
     nextTick(() => {
       if (logContainer.value) {

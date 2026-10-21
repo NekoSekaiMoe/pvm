@@ -46,7 +46,7 @@ import (
 func setupRoots(t *testing.T) {
 	t.Helper()
 	dir := t.TempDir()
-	state.RootDir = filepath.Join(dir, "state")
+	state.SetRoot(filepath.Join(dir, "state"))
 	audit.LedgerRoot = filepath.Join(dir, "audit")
 }
 

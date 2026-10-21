@@ -25,6 +25,13 @@ type portMapRequest struct {
 	GuestPort int    `json:"guest_port"`
 	GuestIP   string `json:"guest_ip"`
 	Protocol  string `json:"protocol"`
+	// AccessToken gates inbound HTTP: requests must carry it in the
+	// X-Access-Token header (or ?access_token= query) or the host-side
+	// ingress proxy answers 401. TCP only.
+	AccessToken string `json:"traffic_access_token"`
+	// MaskRequestHost rewrites the inbound Host header before the request
+	// reaches the guest. TCP only.
+	MaskRequestHost string `json:"mask_request_host"`
 }
 
 func registerPortMapAPI(api *echo.Group) {
@@ -70,11 +77,13 @@ func registerPortMapAPI(api *echo.Group) {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": "no guest IP recorded for the task (bridge dataplane required)"})
 		}
 		m := network.PortMapping{
-			TaskID:    taskID,
-			HostPort:  req.HostPort,
-			GuestPort: req.GuestPort,
-			GuestIP:   guestIP,
-			Protocol:  req.Protocol,
+			TaskID:          taskID,
+			HostPort:        req.HostPort,
+			GuestPort:       req.GuestPort,
+			GuestIP:         guestIP,
+			Protocol:        req.Protocol,
+			AccessToken:     req.AccessToken,
+			MaskRequestHost: req.MaskRequestHost,
 		}
 		if err := network.AddPortMapping(m); err != nil {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})

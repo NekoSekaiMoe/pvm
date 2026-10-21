@@ -179,13 +179,20 @@ func (v *TestsRerunVerifier) Verify(b *Bundle) (bool, string) {
 		// required. Note the go test summary line ("ok\tpkg\t0.5s") contains
 		// none of testRanRe's keywords, so Strict consults testDoneRe
 		// directly and never depends on `ran`.
+		//
+		// TRUST BOUNDARY: in evidence mode (no TestCmd) BuildLog/Trace are
+		// GUEST-CONTROLLED console text — a sandboxed guest can print a
+		// forged runner terminal state. Only the TestCmd re-run path above
+		// executes on the host and is host-verified. Specs whose gate must
+		// actually bar an untrusted guest should set tests.command (re-run),
+		// not rely on evidence mode.
 		if !testDoneRe.MatchString(evidence) {
 			return false, "no trusted test-runner terminal state in evidence (require_tests_passed=true)"
 		}
 		if fails > 0 {
 			return false, fmt.Sprintf("test evidence shows %d failure(s)", fails)
 		}
-		return true, ""
+		return true, "guest-attested evidence (host re-run not configured: set tests.command for a host-verified gate)"
 	}
 	if !ran {
 		return true, "advisory: no test evidence"

@@ -38,6 +38,34 @@ import (
 	"sync"
 )
 
+// validS3Bucket enforces S3 bucket naming rules on the string that becomes
+// s3fs's first positional argument. Without this, PrivateData like
+// "-o,no_check_certificate" would be parsed by s3fs as an option list and
+// could disable TLS verification (leaking the mounted credentials file).
+func validS3Bucket(bucket string) bool {
+	if len(bucket) < 2 || len(bucket) > 63 {
+		return false
+	}
+	for i := 0; i < len(bucket); i++ {
+		c := bucket[i]
+		switch {
+		case c >= 'a' && c <= 'z':
+		case c >= '0' && c <= '9':
+		case c == '.' || c == '-':
+		default:
+			return false
+		}
+	}
+	// Buckets may not start/end with a dot or hyphen, nor contain "..".
+	if bucket[0] == '.' || bucket[0] == '-' || bucket[len(bucket)-1] == '.' || bucket[len(bucket)-1] == '-' {
+		return false
+	}
+	if strings.Contains(bucket, "..") {
+		return false
+	}
+	return true
+}
+
 // S3Plugin implements VolumePlugin over s3fs. It remembers each volume's
 // mountpoint at Attach (the Detach wire form carries no base dir).
 type S3Plugin struct {
@@ -143,6 +171,14 @@ func (p *S3Plugin) Attach(
 	}
 	if bucket == "" {
 		return nil, fmt.Errorf("volume s3: no bucket for volume %q (set private_data to <bucket>[/<prefix>])", req.VolumeID)
+	}
+	// The bucket becomes s3fs's first argv element, where a leading '-'
+	// would be parsed as an OPTION (e.g. "-o,no_check_certificate" would
+	// disable TLS verification and leak the passwd_file credentials to a
+	// network MitM). Enforce the S3 bucket naming rules: lowercase
+	// alphanumerics, dots and hyphens only.
+	if !validS3Bucket(bucket) {
+		return nil, fmt.Errorf("volume s3: invalid bucket name %q (must match [a-z0-9][a-z0-9.-]{1,254}, no leading '-')", bucket)
 	}
 	if _, err := exec.LookPath("s3fs"); err != nil {
 		return nil, fmt.Errorf("volume s3: s3fs binary not found on PATH (install s3fs-fuse)")

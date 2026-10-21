@@ -7,6 +7,40 @@ import (
 	"uml-container/internal/fsjson"
 )
 
+func TestBuildVersionPinning(t *testing.T) {
+	orig := BuildVersions
+	defer func() { BuildVersions = orig }()
+	BuildVersions = func() (string, string) { return "6.18.7-uml", "v1.2.3" }
+
+	s := NewStore(t.TempDir())
+
+	// A record created without explicit versions pins the running build.
+	auto := Record{TemplateID: GenerateTemplateID()}
+	if err := s.Create(auto); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.Get(auto.TemplateID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.KernelVersion != "6.18.7-uml" || got.AgentVersion != "v1.2.3" {
+		t.Fatalf("create did not pin versions: %+v", got)
+	}
+
+	// Explicit values survive (an imported pre-built template).
+	explicit := Record{TemplateID: GenerateTemplateID(), KernelVersion: "5.0-custom", AgentVersion: "v9.9.9"}
+	if err := s.Create(explicit); err != nil {
+		t.Fatal(err)
+	}
+	gotExplicit, err := s.Get(explicit.TemplateID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotExplicit.KernelVersion != "5.0-custom" || gotExplicit.AgentVersion != "v9.9.9" {
+		t.Fatalf("explicit versions overwritten: %+v", gotExplicit)
+	}
+}
+
 // TestStore drives the Store scenarios as a table of named cases executed
 // via t.Run: create + alias resolution, list + delete, and SetAlias
 // claim/clear.

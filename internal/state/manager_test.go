@@ -12,7 +12,7 @@ func TestContainerDir(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	expected := filepath.Join(RootDir, "valid-id_123")
+	expected := filepath.Join(Root(), "valid-id_123")
 	if dir != expected {
 		t.Errorf("Expected %s, got %s", expected, dir)
 	}
@@ -110,9 +110,9 @@ func TestTransition_InvalidEdgeIsDistinctFromTerminal(t *testing.T) {
 
 func TestSaveLoad_RoundTrip(t *testing.T) {
 	tmp := t.TempDir()
-	old := RootDir
-	RootDir = tmp
-	defer func() { RootDir = old }()
+	old := Root()
+	SetRoot(tmp)
+	defer func() { SetRoot(old) }()
 
 	s := &ContainerState{ID: "rt", Status: StatusPending}
 	if err := SaveState("rt", s); err != nil {
@@ -133,9 +133,9 @@ func TestSaveLoad_RoundTrip(t *testing.T) {
 
 func TestListAll_SkipsCorrupt(t *testing.T) {
 	tmp := t.TempDir()
-	old := RootDir
-	RootDir = tmp
-	defer func() { RootDir = old }()
+	old := Root()
+	SetRoot(tmp)
+	defer func() { SetRoot(old) }()
 
 	// one good, one corrupt
 	_ = SaveState("good", &ContainerState{ID: "good", Status: StatusPending})
@@ -157,8 +157,8 @@ func TestListAll_SkipsCorrupt(t *testing.T) {
 // them to honor auto_resume / idle policy). Each combination gets its own
 // state root so subtests are fully independent.
 func TestSaveState_PersistsLifecycleFields(t *testing.T) {
-	origRoot := RootDir
-	t.Cleanup(func() { RootDir = origRoot })
+	origRoot := Root()
+	t.Cleanup(func() { SetRoot(origRoot) })
 
 	tests := []struct {
 		name        string
@@ -173,7 +173,7 @@ func TestSaveState_PersistsLifecycleFields(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			RootDir = t.TempDir()
+			SetRoot(t.TempDir())
 			id := "lifecycle-fields"
 			st := &ContainerState{ID: id, Name: id, Status: StatusRunning, IdleTimeout: tt.idleTimeout, AutoResume: tt.autoResume}
 			if err := SaveState(id, st); err != nil {
@@ -188,5 +188,102 @@ func TestSaveState_PersistsLifecycleFields(t *testing.T) {
 					got.IdleTimeout, tt.idleTimeout, got.AutoResume, tt.autoResume)
 			}
 		})
+	}
+}
+
+// TestSaveState_PersistsMCP is the regression test for snapshotLocked
+// dropping the MCP gateway config: the raw JSON must survive Save -> Load so
+// a guest-side launcher can consume it after a restart.
+func TestSaveState_PersistsMCP(t *testing.T) {
+	origRoot := Root()
+	SetRoot(t.TempDir())
+	t.Cleanup(func() { SetRoot(origRoot) })
+
+	const id = "mcp-state"
+	const mcp = `{"github":{"command":"npx","args":["-y","server-github"]}}`
+	st := &ContainerState{ID: id, Name: id, Status: StatusRunning, MCP: mcp}
+	if err := SaveState(id, st); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	got, err := LoadState(id)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if got.MCP != mcp {
+		t.Fatalf("MCP lost in round trip: %q, want %q", got.MCP, mcp)
+	}
+}
+
+// TestListAll_CacheInvalidationOnSave pins the mtime cache's correctness
+// contract: a SaveState bumps state.json's mtime, so the next ListAll must
+// reflect the NEW status without any manual cache eviction; deleting a
+// task's directory drops it from the listing; a Root switch (tests) drops
+// the whole cache.
+func TestListAll_CacheInvalidationOnSave(t *testing.T) {
+	tmp := t.TempDir()
+	old := Root()
+	SetRoot(tmp)
+	defer SetRoot(old)
+	listMu.Lock()
+	listCache, listCacheRoot = nil, ""
+	listMu.Unlock()
+
+	st := &ContainerState{ID: "c1", Status: StatusPending}
+	if err := SaveState("c1", st); err != nil {
+		t.Fatal(err)
+	}
+	all, err := ListAll()
+	if err != nil || len(all) != 1 || all[0].Status != StatusPending {
+		t.Fatalf("first list: %v %+v", err, all)
+	}
+
+	// Same mtime: second call serves from cache (still correct).
+	all, _ = ListAll()
+	if len(all) != 1 || all[0].Status != StatusPending {
+		t.Fatalf("cached list: %+v", all)
+	}
+
+	// Transition + save: mtime moves; the cache must NOT serve the stale
+	// Pending state.
+	if err := st.Transition(StatusProvisioning, ActorController, "test"); err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveState("c1", st); err != nil {
+		t.Fatal(err)
+	}
+	all, _ = ListAll()
+	if len(all) != 1 || all[0].Status != StatusProvisioning {
+		t.Fatalf("post-save list served stale state: %+v", all)
+	}
+
+	// Directory removal: task disappears from the listing.
+	if err := os.RemoveAll(filepath.Join(tmp, "c1")); err != nil {
+		t.Fatal(err)
+	}
+	all, _ = ListAll()
+	if len(all) != 0 {
+		t.Fatalf("deleted task still listed: %+v", all)
+	}
+}
+
+// TestListAll_CacheDroppedOnRootSwitch verifies the cache does not leak
+// entries across a Root() switch (each test's TempDir is a new root).
+func TestListAll_CacheDroppedOnRootSwitch(t *testing.T) {
+	old := Root()
+	defer SetRoot(old)
+
+	rootA := t.TempDir()
+	SetRoot(rootA)
+	if err := SaveState("a1", &ContainerState{ID: "a1", Status: StatusPending}); err != nil {
+		t.Fatal(err)
+	}
+	rootB := t.TempDir()
+	SetRoot(rootB)
+	all, err := ListAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 0 {
+		t.Fatalf("cache leaked %d task(s) across root switch: %+v", len(all), all)
 	}
 }

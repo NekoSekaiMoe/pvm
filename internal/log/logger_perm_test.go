@@ -15,9 +15,9 @@ import (
 func TestSetupConsoleLog_Permissions(t *testing.T) {
 	// Redirect the state root: the default (/var/lib/uml-container) is only
 	// writable by root, and CI runs unprivileged.
-	orig := state.RootDir
-	state.RootDir = t.TempDir()
-	defer func() { state.RootDir = orig }()
+	orig := state.Root()
+	state.SetRoot(t.TempDir())
+	defer func() { state.SetRoot(orig) }()
 
 	f, err := SetupConsoleLog("c-perm")
 	if err != nil {

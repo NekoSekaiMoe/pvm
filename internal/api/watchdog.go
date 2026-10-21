@@ -35,18 +35,46 @@ import (
 
 var metricWatchdogKills = metrics.Counter("pvm_watchdog_kills_total", "Deadline/TTL expiries enforced", "reason")
 
-// startWatchdog launches the sweeper (idempotent, process-wide).
+// startWatchdog launches the sweeper (idempotent, process-wide). The
+// sweeper observes watchdogStop so a torn-down test server can park it
+// before the next case swaps the state root — state.Root() is atomic, so
+// correctness no longer depends on this, but stopping the sweeper keeps
+// test processes from leaking a ticking goroutine across cases.
 func startWatchdog() {
 	watchdogOnce.Do(func() {
+		watchdogStop = make(chan struct{})
 		go func() {
 			t := time.NewTicker(time.Second)
 			defer t.Stop()
-			for range t.C {
-				sweepDeadlines()
+			for {
+				select {
+				case <-watchdogStop:
+					return
+				case <-t.C:
+					sweepDeadlines()
+				}
 			}
 		}()
 	})
 }
+
+// stopWatchdog parks the process-wide sweeper (idempotent; the process is
+// expected to exit after this — a later startWatchdog no-ops via Once).
+// Called from the server's shutdown path so test servers do not leak a
+// goroutine that races RootDir reassignment in later test cases.
+func stopWatchdog() {
+	watchdogOnceStop.Do(func() {
+		if watchdogStop != nil {
+			close(watchdogStop)
+		}
+	})
+}
+
+var (
+	watchdogOnce     sync.Once
+	watchdogOnceStop sync.Once
+	watchdogStop     chan struct{}
+)
 
 // sweepDeadlines applies every expiry rule once.
 func sweepDeadlines() {
@@ -182,7 +210,6 @@ func taskMetricsView(taskID string) map[string]interface{} {
 	return out
 }
 
-var watchdogOnce sync.Once
 
 // registerWatchdogAPI wires the per-task metrics view.
 func registerWatchdogAPI(api *echo.Group) {

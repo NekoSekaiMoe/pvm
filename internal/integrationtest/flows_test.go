@@ -58,7 +58,7 @@ func setupIsolatedRoots(t *testing.T) {
 		Details:     "test-simulated-full",
 	})
 	dir := t.TempDir()
-	state.RootDir = filepath.Join(dir, "state")
+	state.SetRoot(filepath.Join(dir, "state"))
 	audit.LedgerRoot = filepath.Join(dir, "audit")
 	os.Setenv("PVM_CGROUP_ROOT", filepath.Join(dir, "cg"))
 	t.Cleanup(func() { os.Unsetenv("PVM_CGROUP_ROOT") })

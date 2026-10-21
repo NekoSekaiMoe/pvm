@@ -354,7 +354,14 @@ paths:
     post:
       tags: [tasks]
       summary: Pause (suspend) a running task
-      parameters: [{ $ref: "#/components/parameters/TaskIdPath" }]
+      description: "Freezes the task (shallow) or checkpoints and kills it (?deep=1). A shallow pause also balloons the frozen task's cgroup memory.max down to its current usage so the host reclaims its clean page cache without killing the process; the prior limit is restored on resume."
+      parameters:
+        - { $ref: "#/components/parameters/TaskIdPath" }
+        - name: deep
+          in: query
+          required: false
+          schema: { type: string, enum: ["1"] }
+          description: deep pause (criu checkpoint + kill) instead of a freeze
       responses:
         "200": { $ref: "#/components/responses/OkJson" }
         "404": { $ref: "#/components/responses/NotFound" }
@@ -364,6 +371,7 @@ paths:
     post:
       tags: [tasks]
       summary: Resume a suspended task
+      description: "Thaws a shallow-paused task (restoring its pre-pause memory.max first) or criu-restores a deep-paused one."
       parameters: [{ $ref: "#/components/parameters/TaskIdPath" }]
       responses:
         "200": { $ref: "#/components/responses/OkJson" }
@@ -386,9 +394,27 @@ paths:
     post:
       tags: [tasks]
       summary: Create a task snapshot
-      parameters: [{ $ref: "#/components/parameters/TaskIdPath" }]
+      description: "Captures state + disk overlay, plus a CRIU memory image when the task is running. Set filesystem_only (body field or ?filesystem_only=1) to capture the disk only: the guest is still frozen for a consistent overlay copy, but no memory image is written and a restore boots a fresh guest over the captured disk."
+      parameters:
+        - { $ref: "#/components/parameters/TaskIdPath" }
+        - name: filesystem_only
+          in: query
+          required: false
+          schema: { type: string, enum: ["1", "true"] }
+          description: capture state + disk only (no memory image)
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                event_id: { type: string }
+                audit_hash: { type: string }
+                metadata: { type: object, additionalProperties: { type: string } }
+                filesystem_only: { type: boolean }
       responses:
-        "201":
+        "200":
           description: Created snapshot
           content:
             application/json:
@@ -869,6 +895,50 @@ paths:
         "200": { $ref: "#/components/responses/OkJson" }
         "400": { $ref: "#/components/responses/BadRequest" }
 
+  /api/pool/suspend:
+    post:
+      tags: [pool]
+      summary: Suspend a claimed sandbox (release its memory quota reservation)
+      description: "Moves a claimed sandbox to paused so its memory reservation no longer holds the tenant's quota headroom. Idempotent. The claimed binding survives so /api/pool/resume can re-reserve it."
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id]
+              properties:
+                id: { type: string, description: sandbox id }
+      responses:
+        "200": { $ref: "#/components/responses/OkJson" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404":
+          description: No sandbox with that id
+        "409":
+          description: Sandbox is not in a state that can be suspended
+
+  /api/pool/resume:
+    post:
+      tags: [pool]
+      summary: Resume a paused sandbox (re-reserve its memory quota)
+      description: "Re-reserves the memory Suspend released and returns the sandbox to claimed. Refused with 409 when the tenant's memory quota no longer fits; the sandbox stays paused."
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id]
+              properties:
+                id: { type: string, description: sandbox id }
+      responses:
+        "200": { $ref: "#/components/responses/OkJson" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404":
+          description: No sandbox with that id
+        "409":
+          description: Sandbox is not paused, or the tenant memory quota is exhausted
+
   # ---------------------------------------------------------------- gate
   /api/gate/verify:
     post:
@@ -1273,6 +1343,8 @@ paths:
                 guest_port: { type: integer, minimum: 1, maximum: 65535 }
                 guest_ip: { type: string, description: optional override; defaults to the task's recorded guest IP }
                 protocol: { type: string, enum: [tcp, udp], default: tcp }
+                traffic_access_token: { type: string, description: "TCP only: requests must carry this token in the X-Access-Token header or ?access_token= query, else the host-side ingress proxy answers 401" }
+                mask_request_host: { type: string, description: "TCP only: rewrite the inbound Host header to this value before forwarding to the guest" }
       responses:
         "201": { $ref: "#/components/responses/OkJson" }
         "400": { $ref: "#/components/responses/BadRequest" }
@@ -1427,10 +1499,12 @@ paths:
           application/json:
             schema:
               type: object
+              required: [templateID]
               properties:
-                template_id: { type: string }
+                templateID: { type: string }
                 metadata: { type: object, additionalProperties: true }
-                timeout: { type: integer, description: seconds }
+                timeout: { type: integer, description: "three-value idle TTL: -1 never, 0/omitted default, N>0 seconds" }
+                mcp: { type: object, additionalProperties: true, nullable: true, description: "Opaque MCP server config, persisted verbatim for a guest-side gateway launcher" }
       responses:
         "200":
           description: Created sandbox
@@ -1440,6 +1514,19 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
 
   /sandboxes/{sandboxID}:
+    get:
+      tags: [e2b]
+      summary: E2B compat — get sandbox info (SDK getInfo)
+      security: [{ apiKeyAuth: [] }, { bearerAuth: [] }]
+      parameters:
+        - { name: sandboxID, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: Sandbox info
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Sandbox" }
+        "404": { $ref: "#/components/responses/NotFound" }
     delete:
       tags: [e2b]
       summary: E2B compat — delete a sandbox
@@ -1477,6 +1564,32 @@ paths:
                   sandboxID: { type: string }
                   expires_at: { type: string, format: date-time }
         "404": { $ref: "#/components/responses/NotFound" }
+
+  /sandboxes/{sandboxID}/connect:
+    post:
+      tags: [e2b]
+      summary: E2B compat — connect (resume + optional timeout)
+      description: "Mirrors Sandbox.connect(): resolves the short id, resumes the sandbox when it was paused, optionally resets the deadline (`timeout`: -1 = never, 0 = default window, N>0 = N seconds; omitted = leave the deadline untouched), and returns the info shape getInfo reads."
+      security: [{ apiKeyAuth: [] }, { bearerAuth: [] }]
+      parameters:
+        - { name: sandboxID, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                timeout: { type: integer, description: "three-value TTL: -1 never, 0 default, N>0 seconds" }
+      responses:
+        "200":
+          description: Sandbox info
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Sandbox" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: Sandbox cannot be connected to (terminal state or a failed resume)
 
   # ---------------------------------------------------------------- envd compat
   /process.Process/Start:
@@ -2003,6 +2116,10 @@ components:
         status: { type: string, enum: [PENDING, BUILDING, READY, FAILED] }
         kind: { type: string }
         created_at: { type: string, format: date-time }
+        image_size_bytes: { type: integer }
+        image_sha256: { type: string }
+        kernel_version: { type: string, description: UML kernel version this template was built against }
+        agent_version: { type: string, description: agent build version this template was built against }
 
     BuildProgress:
       type: object

@@ -45,6 +45,108 @@ func TestWarm_AndClaim(t *testing.T) {
 	}
 }
 
+func TestSuspendResumeReleasesMemoryQuota(t *testing.T) {
+	m := NewManager(10, tmpLedger(t))
+	// Memory quota fits exactly ONE 512M sandbox; concurrency has headroom.
+	m.SetQuota("t", Quota{MaxConcurrent: 4, MaxCPU: 99, MaxMemoryMB: 512, MaxTasksPerHour: 99})
+	tmpl := Template{Name: "x", Memory: "512M", CPU: 1}
+	m.Warm(tmpl, 2)
+
+	first, err := m.Claim("t", tmpl, "a")
+	if err != nil {
+		t.Fatalf("first claim: %v", err)
+	}
+	// Memory exhausted: a second claim is refused.
+	if _, err := m.Claim("t", tmpl, "b"); !errors.Is(err, ErrQuotaExceeded) {
+		t.Fatalf("second claim must exhaust memory quota, got %v", err)
+	}
+	// Suspend the first: its memory reservation is released.
+	if err := m.Suspend(first); err != nil {
+		t.Fatalf("suspend: %v", err)
+	}
+	// Now the second claim fits.
+	second, err := m.Claim("t", tmpl, "b")
+	if err != nil {
+		t.Fatalf("claim after suspend must fit: %v", err)
+	}
+	// Resume the first, but the memory is now taken by the second: refused,
+	// and the sandbox stays paused.
+	if err := m.Resume(first); !errors.Is(err, ErrQuotaExceeded) {
+		t.Fatalf("resume over-quota must be refused, got %v", err)
+	}
+	// Releasing the second frees memory; resume now succeeds.
+	if err := m.Release(second, false); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	if err := m.Resume(first); err != nil {
+		t.Fatalf("resume after release: %v", err)
+	}
+	// Suspend is idempotent.
+	if err := m.Suspend(first); err != nil {
+		t.Fatalf("suspend after resume: %v", err)
+	}
+	if err := m.Suspend(first); err != nil {
+		t.Fatalf("second suspend must be a no-op: %v", err)
+	}
+}
+
+func TestSuspendRejectsUnclaimed(t *testing.T) {
+	m := NewManager(10, tmpLedger(t))
+	tmpl := Template{Name: "x", Memory: "128M", CPU: 1}
+	m.Warm(tmpl, 1)
+	ready, _, _ := m.Stats()
+	if ready != 1 {
+		t.Fatalf("warm: %d", ready)
+	}
+	list := m.pool
+	if err := m.Suspend(list[0].ID); err == nil {
+		t.Fatal("suspending an unclaimed sandbox must fail")
+	}
+}
+
+func TestPausedSandboxSurvivesPersistence(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "pool.json")
+	m := NewManager(10, tmpLedger(t))
+	m.SetQuota("t", Quota{MaxConcurrent: 4, MaxCPU: 99, MaxMemoryMB: 512, MaxTasksPerHour: 99})
+	tmpl := Template{Name: "x", Memory: "512M", CPU: 1}
+	m.Warm(tmpl, 2)
+	if err := m.EnablePersistence(path); err != nil {
+		t.Fatal(err)
+	}
+	id, err := m.Claim("t", tmpl, "a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Suspend(id); err != nil {
+		t.Fatal(err)
+	}
+
+	// A fresh manager loads the paused sandbox with its reserved memory.
+	m2 := NewManager(10, tmpLedger(t))
+	if err := m2.EnablePersistence(path); err != nil {
+		t.Fatal(err)
+	}
+	m2.mu.Lock()
+	var sb *Sandbox
+	for _, s := range m2.pool {
+		if s.ID == id {
+			sb = s
+		}
+	}
+	m2.mu.Unlock()
+	if sb == nil {
+		t.Fatalf("paused sandbox %s lost across restart", id)
+	}
+	if sb.State != SandboxPaused || sb.ReservedMemMB != 512 {
+		t.Fatalf("paused sandbox not restored: %+v", sb)
+	}
+	// Its memory is not charged, so a new claim fits.
+	if _, err := m2.Claim("t", tmpl, "b"); err != nil {
+		t.Fatalf("claim after restart must fit (paused memory released): %v", err)
+	}
+}
+
 func TestClaim_QuotaConcurrency(t *testing.T) {
 	m := NewManager(10, tmpLedger(t))
 	m.SetQuota("t", Quota{MaxConcurrent: 1, MaxCPU: 10, MaxMemoryMB: 99999, MaxTasksPerHour: 99})

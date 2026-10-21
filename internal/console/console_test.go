@@ -156,3 +156,37 @@ func TestSessionSinceRingWrapNoResend(t *testing.T) {
 		t.Fatalf("after wrap, Since resent old data: %q", chunk2)
 	}
 }
+
+// TestRingTwoSegmentReadCrossesWrap drives many small writes across the
+// wrap point and verifies every absolute window reads back byte-exact —
+// the two-segment copy path (tail segment + rewound head segment) is where
+// a true ring implementation most easily corrupts data.
+func TestRingTwoSegmentReadCrossesWrap(t *testing.T) {
+	s := newSession("seg-test", 16)
+	// Fill exactly to capacity so the NEXT write starts evicting.
+	s.Write([]byte("ABCDEFGHIJKLMNOP"))
+	for i := 0; i < 40; i++ {
+		b := byte('a' + i%26)
+		if _, err := s.Write([]byte{b}); err != nil {
+			t.Fatal(err)
+		}
+		// Read the full held window and verify it is exactly the last 16
+		// bytes of the stream so far.
+		out, _, err := s.Since(context.Background(), 0, 200*time.Millisecond)
+		if err != nil {
+			t.Fatal(err)
+		}
+		total := int(s.Total())
+		want := make([]byte, 0, 16)
+		for j := total - len(out); j < total; j++ {
+			if j < 16 {
+				want = append(want, byte('A'+j))
+			} else {
+				want = append(want, byte('a'+(j-16)%26))
+			}
+		}
+		if string(out) != string(want) {
+			t.Fatalf("iter %d: window corrupted:\n got %q\nwant %q", i, out, want)
+		}
+	}
+}

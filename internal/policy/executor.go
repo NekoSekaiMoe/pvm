@@ -44,6 +44,15 @@ func ConsoleExecutor(taskID string, sessFn func(taskID string) (*console.Session
 				"duration_ms":  res.Duration.Milliseconds(),
 				"output_bytes": len(res.Stdout),
 				"simulated":    false,
+				// The marker protocol is GUEST-ATTESTED, not host-verified:
+				// a guest that watches the console stream can capture the
+				// random token and forge both output and exit code (see
+				// internal/console's Exec contract). Downstream governance
+				// (approvals, gates) must treat OK=true as the guest's
+				// CLAIM, never as cryptographic evidence. A host-verified
+				// channel (signed guest agent) is the only way to upgrade
+				// this flag.
+				"guest_attested": true,
 			},
 		}, nil
 	}

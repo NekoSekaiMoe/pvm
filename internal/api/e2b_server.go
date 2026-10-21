@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -56,6 +57,9 @@ func NewE2BServer() (*echo.Echo, error) {
 	// pause/resume and activity endpoints below instead of separate instances.
 	cgMgr := cgroup.NewManager()
 	autoMgr := lifecycle.New(cgMgr)
+	// Wire the warm pool's memory accounting onto pause/resume: a paused task
+	// releases its tenant's memory reservation, and resuming re-reserves it.
+	autoMgr.SetQuotaHooks(poolQuotaHooks{})
 	// Autopause timers live in process memory: tasks persisted as Running
 	// by a previous server process have no timers after a restart. Re-arm
 	// them from the persisted IdleTimeout so an idle task still suspends
@@ -66,6 +70,13 @@ func NewE2BServer() (*echo.Echo, error) {
 
 	e.Use(middleware.Logger())
 	e.Use(middleware.Recover())
+	// Whole-API request body cap: per-endpoint LimitReaders exist on the
+	// envd plane, but the control-plane handlers bind JSON bodies directly
+	// — an authenticated client must not be able to OOM the process with a
+	// multi-GB body (metadata/mcp/params are also persisted into state, so
+	// an unbounded body bloats state.json too). 4 MiB covers every
+	// legitimate payload (specs, templates, approval params).
+	e.Use(middleware.BodyLimit("4M"))
 	e.Use(middleware.CORSWithConfig(middleware.CORSConfig{
 		AllowOrigins: []string{"http://localhost:3000", "http://127.0.0.1:3000"},
 	}))
@@ -220,10 +231,46 @@ func NewE2BServer() (*echo.Echo, error) {
 			return c.String(http.StatusBadRequest, err.Error())
 		}
 		logPath := filepath.Join(dir, "logs", "console.log")
-		data, err := os.ReadFile(logPath)
+		// Incremental reads via ?offset=N (the WebUI logs page polls every
+		// 2s; a full-file read each tick means a steady ~4MB/s disk+network
+		// stream for an 8MiB log). X-PVM-Log-Start reports where this
+		// response's bytes begin (== the requested offset, or 0 after a
+		// rotation shrank the file) and X-PVM-Log-Offset where they end —
+		// the client feeds the latter back as its next offset and switches
+		// from append to replace when Start diverges.
+		offset := int64(0)
+		if v := c.QueryParam("offset"); v != "" {
+			n, perr := strconv.ParseInt(v, 10, 64)
+			if perr != nil || n < 0 {
+				return c.String(http.StatusBadRequest, "invalid offset")
+			}
+			offset = n
+		}
+		f, err := os.Open(logPath)
 		if err != nil {
 			return c.String(http.StatusNotFound, "Logs not found or container not started")
 		}
+		defer f.Close()
+		fi, err := f.Stat()
+		if err != nil {
+			return c.String(http.StatusInternalServerError, err.Error())
+		}
+		if offset > fi.Size() {
+			// Rotation (or a fresh log): the file is smaller than the
+			// client's bookmark — restart from the top.
+			offset = 0
+		}
+		if _, err := f.Seek(offset, io.SeekStart); err != nil {
+			return c.String(http.StatusInternalServerError, err.Error())
+		}
+		// Cap one response at 4 MiB: a first view of a huge log streams in
+		// bounded chunks instead of one body.
+		data, err := io.ReadAll(io.LimitReader(f, 4<<20))
+		if err != nil {
+			return c.String(http.StatusInternalServerError, err.Error())
+		}
+		c.Response().Header().Set("X-PVM-Log-Start", strconv.FormatInt(offset, 10))
+		c.Response().Header().Set("X-PVM-Log-Offset", strconv.FormatInt(offset+int64(len(data)), 10))
 		return c.String(http.StatusOK, string(data))
 	})
 
@@ -239,7 +286,7 @@ func NewE2BServer() (*echo.Echo, error) {
 		st, err := state.LoadState(id)
 		if err == nil && st.PID > 0 {
 			if proc, err := os.FindProcess(st.PID); err == nil {
-				if belongs, _ := procBelongsToContainer(st.PID, id); belongs {
+				if belongs, _ := ProcBelongsToContainer(st.PID, id); belongs {
 					if killErr := proc.Kill(); killErr != nil && killErr.Error() != "os: process already finished" {
 						return c.JSON(http.StatusInternalServerError, map[string]string{"error": fmt.Sprintf("failed to kill process %d: %v", st.PID, killErr)})
 					}
@@ -582,14 +629,19 @@ func NewE2BServer() (*echo.Echo, error) {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid task id"})
 		}
 		var req struct {
-			EventID   string            `json:"event_id"`
-			AuditHash string            `json:"audit_hash"`
-			Metadata  map[string]string `json:"metadata"`
+			EventID        string            `json:"event_id"`
+			AuditHash      string            `json:"audit_hash"`
+			Metadata       map[string]string `json:"metadata"`
+			FilesystemOnly bool              `json:"filesystem_only"`
 		}
 		if err := c.Bind(&req); err != nil {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": "bad request: " + err.Error()})
 		}
-		snap, err := snapshot.CreateEventSnapshot(id, req.EventID, req.AuditHash, req.Metadata)
+		if v := c.QueryParam("filesystem_only"); v == "1" || v == "true" {
+			req.FilesystemOnly = true
+		}
+		snap, err := snapshot.CreateEventSnapshotWithOptions(id, req.EventID, req.AuditHash, req.Metadata,
+			snapshot.SnapshotOptions{FilesystemOnly: req.FilesystemOnly})
 		if err != nil {
 			if strings.Contains(err.Error(), "not found") {
 				return c.JSON(http.StatusNotFound, map[string]string{"error": err.Error()})
@@ -828,6 +880,18 @@ func NewE2BServer() (*echo.Echo, error) {
 		if err != nil {
 			resp["error"] = err.Error()
 		}
+		// Anti-truncation watermark health: a missing/corrupt head file
+		// silently disables the truncation check (the hash chain still
+		// verifies) — an attacker deleting the head before truncating is
+		// exactly the scenario it guards. Surface the state so monitoring
+		// can alert; the log line in Verify alone is too easy to miss.
+		if _, _, ok := l.HeadWatermark(); ok {
+			resp["watermark"] = "ok"
+		} else if n > 0 {
+			resp["watermark"] = "missing"
+		} else {
+			resp["watermark"] = "empty"
+		}
 		return c.JSON(http.StatusOK, resp)
 	})
 
@@ -843,10 +907,52 @@ func NewE2BServer() (*echo.Echo, error) {
 	})
 
 	// POST /api/approvals — create a ticket.
+	//
+	// Bind a dedicated DTO instead of the full Ticket: caller-supplied
+	// state (consumed/decided_by/edited_by) must never seed a ticket, and
+	// the creator's actor + key fingerprint are stamped server-side so the
+	// decide endpoint can reject same-key self-approval.
 	api.POST("/approvals", func(c echo.Context) error {
-		var t approval.Ticket
-		if err := c.Bind(&t); err != nil {
+		if reg.HasApproverKeys() && !c.Get("is_approver").(bool) {
+			return c.JSON(http.StatusForbidden, map[string]string{
+				"error": "approval creation requires a PVM_APPROVER_KEYS key (trust-separated approval plane)",
+			})
+		}
+		var body struct {
+			TaskID   string                 `json:"task_id"`
+			Target   string                 `json:"target"`
+			Tool     string                 `json:"tool"`
+			Params   map[string]interface{} `json:"params"`
+			Evidence string                 `json:"evidence"`
+			Why      string                 `json:"why"`
+			Rollback string                 `json:"rollback"`
+			Deadline string                 `json:"deadline"`
+		}
+		if err := c.Bind(&body); err != nil {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+		}
+		actor, _ := c.Get("actor").(string)
+		if actor == "" {
+			actor = "operator"
+		}
+		keyFp, _ := c.Get("key_fp").(string)
+		t := approval.Ticket{
+			TaskID:          body.TaskID,
+			Target:          body.Target,
+			Tool:            body.Tool,
+			Params:          body.Params,
+			Evidence:        body.Evidence,
+			Why:             body.Why,
+			Rollback:        body.Rollback,
+			CreatedBy:       actor,
+			CreatedByKeyFp: keyFp,
+		}
+		if body.Deadline != "" {
+			d, err := time.Parse(time.RFC3339, body.Deadline)
+			if err != nil {
+				return c.JSON(http.StatusBadRequest, map[string]string{"error": "deadline must be RFC3339"})
+			}
+			t.Deadline = d
 		}
 		id, err := currentApprovals().Create(t)
 		if err != nil {
@@ -861,6 +967,11 @@ func NewE2BServer() (*echo.Echo, error) {
 	})
 
 	// POST /api/approvals/:id/decide — approve/reject. Body: {approved: bool}.
+	//
+	// With PVM_APPROVER_KEYS configured the decision must come from an
+	// approver key, and no key may decide a ticket it created itself —
+	// otherwise an SDK key that triggered an approval_required intercept
+	// could simply self-approve and re-run the gated tool.
 	api.POST("/approvals/:id/decide", func(c echo.Context) error {
 		id := c.Param("id")
 		var req struct {
@@ -870,11 +981,32 @@ func NewE2BServer() (*echo.Echo, error) {
 		if err := c.Bind(&req); err != nil {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
 		}
+		if reg.HasApproverKeys() && !c.Get("is_approver").(bool) {
+			return c.JSON(http.StatusForbidden, map[string]string{
+				"error": "approval decisions require a PVM_APPROVER_KEYS key (trust-separated approval plane)",
+			})
+		}
 		actor, _ := c.Get("actor").(string)
 		if actor == "" {
 			actor = "operator"
 		}
+		if req.By != "" {
+			actor = req.By
+		}
+		keyFp, _ := c.Get("key_fp").(string)
 		m := currentApprovals()
+		// Self-approval guard (strong mode only): with PVM_APPROVER_KEYS
+		// configured, a key that created a ticket may not also decide it —
+		// the whole point of the separated approval plane is a second
+		// party. In weak mode (no approver keys) single-operator
+		// create+decide with one key stays a documented convenience.
+		if reg.HasApproverKeys() {
+			if t, err := m.Get(id); err == nil && t != nil && t.CreatedByKeyFp != "" && t.CreatedByKeyFp == keyFp {
+				return c.JSON(http.StatusForbidden, map[string]string{
+					"error": "self-approval rejected: this API key created the ticket it is asked to decide",
+				})
+			}
+		}
 		if err := m.Decide(id, req.Approved, actor); err != nil {
 			return c.JSON(http.StatusConflict, map[string]string{"error": err.Error()})
 		}
@@ -974,6 +1106,44 @@ func NewE2BServer() (*echo.Echo, error) {
 			return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		}
 		return c.JSON(http.StatusOK, map[string]string{"status": "ok"})
+	})
+
+	// POST /api/pool/suspend — pause a claimed sandbox: release its memory
+	// quota reservation while keeping its binding, so the tenant's memory
+	// headroom is not held by a paused task. Body: {id}.
+	api.POST("/pool/suspend", func(c echo.Context) error {
+		var req struct {
+			ID string `json:"id"`
+		}
+		if err := c.Bind(&req); err != nil {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+		}
+		if req.ID == "" {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "id required"})
+		}
+		if err := currentPool().Suspend(req.ID); err != nil {
+			return c.JSON(poolMutationStatus(err), map[string]string{"error": err.Error()})
+		}
+		return c.JSON(http.StatusOK, map[string]string{"status": "paused"})
+	})
+
+	// POST /api/pool/resume — re-reserve a paused sandbox's memory quota and
+	// return it to claimed. Body: {id}. Refused (409) when the tenant's memory
+	// quota no longer fits (ErrQuotaExceeded), leaving the sandbox paused.
+	api.POST("/pool/resume", func(c echo.Context) error {
+		var req struct {
+			ID string `json:"id"`
+		}
+		if err := c.Bind(&req); err != nil {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+		}
+		if req.ID == "" {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "id required"})
+		}
+		if err := currentPool().Resume(req.ID); err != nil {
+			return c.JSON(poolMutationStatus(err), map[string]string{"error": err.Error()})
+		}
+		return c.JSON(http.StatusOK, map[string]string{"status": "claimed"})
 	})
 
 	// --- Artifact Gate (plan.md §7) ---
@@ -1628,6 +1798,13 @@ func NewE2BServer() (*echo.Echo, error) {
 			reArm()
 			return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		}
+		// Reclaim the now-frozen task's clean page cache without killing it
+		// (best effort; a missing cgroup is fine and the pause stands).
+		_ = autoMgr.BalloonPause(id)
+		// Release the tenant's memory reservation: the pause is durable, so
+		// keeping it would hold quota the host has already reclaimed. Best
+		// effort, and a no-op for tasks that never came from the warm pool.
+		_, _ = currentPool().SuspendByTask(id)
 		return c.NoContent(http.StatusNoContent)
 	})
 	api.POST("/tasks/:id/resume", func(c echo.Context) error {
@@ -1747,7 +1924,7 @@ func lifecycleActivity(taskID string, autoMgr *lifecycle.Manager, st *state.Cont
 	}
 }
 
-// procBelongsToContainer reports whether the process with the given pid still
+// ProcBelongsToContainer reports whether the process with the given pid still
 // belongs to the container's cgroup v2 path. We avoid trusting a persisted PID
 // blindly because PIDs get recycled; a recycled PID could point at an
 // unrelated host process.
@@ -1756,14 +1933,17 @@ func lifecycleActivity(taskID string, autoMgr *lifecycle.Manager, st *state.Cont
 // container's cgroup leaf (/<root>/.../<id>). On any parse failure or when the
 // process is gone, it returns (false, nil) so callers err on the side of NOT
 // killing.
-func procBelongsToContainer(pid int, containerID string) (bool, error) {
+func ProcBelongsToContainer(pid int, containerID string) (bool, error) {
 	f, err := os.Open(fmt.Sprintf("/proc/%d/cgroup", pid))
 	if err != nil {
 		return false, err
 	}
 	defer f.Close()
 
-	want := "/" + containerID
+	// Container ids may contain '-' (idRegex allows [a-zA-Z0-9_-]), so a
+	// suffix match on "/"+id confuses sibling leaves ("/uml/foo-bar" ends
+	// with "/bar"). Compare the exact path SEGMENTS instead: the leaf, or
+	// any ancestor directory, must equal the id.
 	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -1772,9 +1952,10 @@ func procBelongsToContainer(pid int, containerID string) (bool, error) {
 		if len(fields) != 3 {
 			continue
 		}
-		path := fields[2]
-		if strings.HasSuffix(path, want) || strings.Contains(path, want+"/") {
-			return true, nil
+		for _, seg := range strings.Split(fields[2], "/") {
+			if seg == containerID {
+				return true, nil
+			}
 		}
 	}
 	return false, scanner.Err()
@@ -2082,4 +2263,18 @@ func currentPool() *pool.Manager {
 	planesMu.RLock()
 	defer planesMu.RUnlock()
 	return globalPool
+}
+
+// poolMutationStatus maps a pool Suspend/Resume error onto an HTTP status:
+// an unknown sandbox is 404, a quota refusal or a wrong-state target is a
+// 409 conflict, and anything else is an internal error.
+func poolMutationStatus(err error) int {
+	switch {
+	case errors.Is(err, pool.ErrSandboxNotFound):
+		return http.StatusNotFound
+	case errors.Is(err, pool.ErrQuotaExceeded), errors.Is(err, pool.ErrBadState):
+		return http.StatusConflict
+	default:
+		return http.StatusInternalServerError
+	}
 }

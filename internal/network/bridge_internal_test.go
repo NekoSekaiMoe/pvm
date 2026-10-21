@@ -88,6 +88,16 @@ func TestDeleteBridge_ValidCIDRTeardown(t *testing.T) {
 	}
 	want := []string{
 		"iptables -t nat -D POSTROUTING -s 10.200.1.0/24 ! -o pvmtest0 -j MASQUERADE",
+		"iptables -D FORWARD -s 10.200.1.0/24 -d 0.0.0.0/8 -j DROP",
+		"iptables -D FORWARD -s 10.200.1.0/24 -d 10.0.0.0/8 -j DROP",
+		"iptables -D FORWARD -s 10.200.1.0/24 -d 100.64.0.0/10 -j DROP",
+		"iptables -D FORWARD -s 10.200.1.0/24 -d 127.0.0.0/8 -j DROP",
+		"iptables -D FORWARD -s 10.200.1.0/24 -d 169.254.0.0/16 -j DROP",
+		"iptables -D FORWARD -s 10.200.1.0/24 -d 172.16.0.0/12 -j DROP",
+		"iptables -D FORWARD -s 10.200.1.0/24 -d 192.168.0.0/16 -j DROP",
+		"iptables -D FORWARD -s 10.200.1.0/24 -d 198.18.0.0/15 -j DROP",
+		"iptables -D FORWARD -s 10.200.1.0/24 -d 224.0.0.0/4 -j DROP",
+		"iptables -D FORWARD -s 10.200.1.0/24 -d 240.0.0.0/4 -j DROP",
 		"iptables -D FORWARD -s 10.200.1.0/24 -j ACCEPT",
 		"iptables -D FORWARD -d 10.200.1.0/24 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT",
 		"ip link set pvmtest0 down",
@@ -228,6 +238,8 @@ func TestSetupBridge_RollbackAfterRefcount(t *testing.T) {
 	gotCalls := strings.Join(*calls, "\n")
 	for _, want := range []string{
 		"iptables -t nat -D POSTROUTING -s 10.0.0.0/24",
+		"iptables -D FORWARD -s 10.0.0.0/24 -d 10.0.0.0/8 -j DROP",
+		"iptables -D FORWARD -s 10.0.0.0/24 -d 169.254.0.0/16 -j DROP",
 		"iptables -D FORWARD -s 10.0.0.0/24 -j ACCEPT",
 		"ip link delete pvmbr1 type bridge",
 	} {
@@ -336,5 +348,69 @@ func TestSetupQoS_RejectsNonRateArg(t *testing.T) {
 				t.Errorf("SetupQoS(rate %q) = %v, want invalid-rate error", bad, err)
 			}
 		})
+	}
+}
+
+// TestForwardFloorRules_GrammarConstraints pins the iptables grammar
+// lesson from CI (tests/47): xtables basic matches (-s/-d) may appear at
+// most ONCE per rule — stacking "! -d A ! -d B …" in a single rule is a
+// hard syntax error (exit 2). The floor must therefore be expressed as one
+// DROP rule per reserved range, then the ACCEPT. This test fails if a
+// future change reintroduces stacked destinations.
+func TestForwardFloorRules_GrammarConstraints(t *testing.T) {
+	rules := forwardFloorRules("-A", "10.0.0.0/24")
+	if len(rules) != len(forwardReservedNets)+1 {
+		t.Fatalf("got %d rules, want %d DROPs + 1 ACCEPT", len(rules), len(forwardReservedNets))
+	}
+	for i, r := range rules {
+		joined := strings.Join(r, " ")
+		count := strings.Count(joined, " -d ")
+		if count > 1 {
+			t.Errorf("rule %d stacks %d -d options (iptables allows one): %s", i, count, joined)
+		}
+		if strings.Count(joined, " -s ") > 1 {
+			t.Errorf("rule %d stacks -s options: %s", i, joined)
+		}
+		if strings.Count(joined, "-j ") > 1 {
+			t.Errorf("rule %d stacks jump targets: %s", i, joined)
+		}
+	}
+	// The terminal rule is the plain ACCEPT; everything before it DROPs.
+	for i, r := range rules[:len(rules)-1] {
+		if r[len(r)-2] != "-j" || r[len(r)-1] != "DROP" {
+			t.Errorf("floor rule %d must DROP: %v", i, r)
+		}
+	}
+	last := rules[len(rules)-1]
+	if last[len(last)-2] != "-j" || last[len(last)-1] != "ACCEPT" {
+		t.Errorf("terminal rule must ACCEPT: %v", last)
+	}
+	// Every reserved net is actually covered (no floor gaps).
+	covered := map[string]bool{}
+	for _, r := range rules[:len(rules)-1] {
+		for j, tok := range r {
+			if tok == "-d" {
+				covered[r[j+1]] = true
+			}
+		}
+	}
+	for _, net := range forwardReservedNets {
+		if !covered[net] {
+			t.Errorf("reserved net %s not covered by any DROP rule", net)
+		}
+	}
+	// -A and -D builds differ ONLY in the op token (byte-identical rules
+	// are what makes iptables -D actually match what -A added).
+	del := forwardFloorRules("-D", "10.0.0.0/24")
+	if len(del) != len(rules) {
+		t.Fatalf("-D build has %d rules, -A has %d", len(del), len(rules))
+	}
+	for i := range rules {
+		if rules[i][0] != "-A" || del[i][0] != "-D" {
+			t.Fatalf("rule %d ops: -A=%q -D=%q", i, rules[i][0], del[i][0])
+		}
+		if strings.Join(rules[i][1:], " ") != strings.Join(del[i][1:], " ") {
+			t.Errorf("rule %d body differs between -A and -D builds", i)
+		}
 	}
 }

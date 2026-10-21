@@ -9,9 +9,9 @@ import (
 
 func TestSetupConsoleLog_CreatesFile(t *testing.T) {
 	root := t.TempDir()
-	orig := state.RootDir
-	state.RootDir = root
-	defer func() { state.RootDir = orig }()
+	orig := state.Root()
+	state.SetRoot(root)
+	defer func() { state.SetRoot(orig) }()
 
 	f, err := SetupConsoleLog("c-log")
 	if err != nil {

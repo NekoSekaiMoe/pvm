@@ -2,15 +2,49 @@
 // Every page calls useApi() to get typed wrappers with the bearer secret.
 const API_SECRET = typeof import.meta !== 'undefined' && import.meta.env && import.meta.env.VITE_API_SECRET
 
-// The api secret is read at runtime from the page if served with a meta tag,
-// otherwise defaults to 'secret' (matches the server default).
+// The api secret is read at runtime from the page if served with a meta
+// tag, or from sessionStorage after the operator entered it once (the
+// 401 prompt). There is NO fallback default: the server refuses weak
+// default secrets, and a hardcoded one here would silently authenticate
+// as master against any deployment that regressed to it.
+const SESSION_KEY = 'pvm.api-key'
+let prompted = false
+
 export function apiKey() {
   if (API_SECRET) return API_SECRET
   if (typeof document !== 'undefined') {
     const m = document.querySelector('meta[name="api-secret"]')
     if (m) return m.content
   }
-  return 'secret'
+  if (typeof sessionStorage !== 'undefined') {
+    return sessionStorage.getItem(SESSION_KEY) || ''
+  }
+  return ''
+}
+
+// setApiKey stores the operator-entered key for this browser session only
+// (sessionStorage: cleared when the tab closes — a deliberate choice over
+// localStorage so a forgotten console does not keep master credentials).
+export function setApiKey(k) {
+  if (typeof sessionStorage !== 'undefined') {
+    sessionStorage.setItem(SESSION_KEY, k)
+  }
+}
+
+// ensureApiKey prompts for the key exactly once when a request 401s and
+// no key is configured. Returns the (possibly updated) key or '' when the
+// operator dismissed the prompt.
+export async function ensureApiKey() {
+  const k = apiKey()
+  if (k) return k
+  if (prompted || typeof window === 'undefined') return ''
+  prompted = true
+  const entered = window.prompt('PVM API key required (this server has no embedded secret)')
+  if (entered && entered.trim()) {
+    setApiKey(entered.trim())
+    return entered.trim()
+  }
+  return ''
 }
 
 // apiFetch normalizes the response. 202 (Accepted) is a business-level
@@ -19,12 +53,22 @@ export function apiKey() {
 // already-decided, invalid state) and is thrown with the server's reason so
 // the caller can surface it instead of silently treating it as success.
 export async function apiFetch(path, opts = {}) {
-  const headers = { Authorization: `Bearer ${apiKey()}`, ...(opts.headers || {}) }
+  let headers = { Authorization: `Bearer ${apiKey()}`, ...(opts.headers || {}) }
   if (opts.body && typeof opts.body === 'object') {
     headers['Content-Type'] = 'application/json'
     opts.body = JSON.stringify(opts.body)
   }
-  const res = await fetch(path, { ...opts, headers })
+  let res = await fetch(path, { ...opts, headers })
+  if (res.status === 401 && !API_SECRET) {
+    // No usable key: offer the operator a one-time prompt and retry once
+    // with what they entered (or the meta tag value if the server set one
+    // but the operator's session lacked it).
+    const k = await ensureApiKey()
+    if (k) {
+      headers = { ...headers, Authorization: `Bearer ${k}` }
+      res = await fetch(path, { ...opts, headers })
+    }
+  }
   if (!res.ok && res.status !== 202) {
     let msg = res.statusText
     try { const j = await res.json(); msg = j.error || msg } catch (e) {}

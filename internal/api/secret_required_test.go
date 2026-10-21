@@ -12,7 +12,7 @@ import (
 // silently authenticating everyone who guesses the old "secret" fallback.
 func TestStartE2BServer_MissingSecretRefusesToStart(t *testing.T) {
 	t.Setenv("API_SECRET", "")
-	state.RootDir = t.TempDir()
+	state.SetRoot(t.TempDir())
 	port := freePort(t)
 	err := StartE2BServer(port)
 	if err == nil {

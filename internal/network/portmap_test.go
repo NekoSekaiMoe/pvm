@@ -88,7 +88,7 @@ func TestValidatePortMapping(t *testing.T) {
 
 // TestPortMapRegistryHonorsStateRootEnv pins the 404-vs-500 contract:
 // the lazy callers pass no explicit root, so the registry MUST follow
-// $PVM_STATE_ROOT (mirroring state.RootDir). With the historical
+// $PVM_STATE_ROOT (mirroring state.Root()). With the historical
 // hardcoded /var/lib/uml-container default, an unprivileged runner
 // (e.g. a Bazel sh_test) could not create the directory and every portmap
 // request surfaced the mkdir error instead — DELETE of a nonexistent

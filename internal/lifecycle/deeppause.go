@@ -119,6 +119,9 @@ func (m *Manager) DeepPause(taskID string) error {
 		}
 	}
 	m.Disarm(taskID)
+	// The process is gone and its memory now lives on disk: release the
+	// pool's memory reservation for this task.
+	m.releaseQuota(taskID)
 	return nil
 }
 
@@ -139,13 +142,21 @@ func (m *Manager) DeepResume(taskID string) error {
 	if _, err := os.Stat(memDir); err != nil {
 		return fmt.Errorf("lifecycle: deep resume %s: memory images missing: %w", taskID, err)
 	}
+	// Re-reserve the memory the deep pause released BEFORE restoring: the
+	// guest's pages are about to become resident again, and a quota refusal
+	// must leave the task suspended rather than overcommit the tenant.
+	if err := m.reserveQuota(taskID); err != nil {
+		return fmt.Errorf("lifecycle: deep resume %s: %w", taskID, err)
+	}
 	if err := st.Transition(state.StatusResuming, state.ActorSystem, "deep resume"); err != nil {
+		m.releaseQuota(taskID)
 		return fmt.Errorf("lifecycle: deep resume %s: %w", taskID, err)
 	}
 	restoredPID, err := snapshot.RestoreMemory(memDir)
 	if err != nil {
 		// Back to Suspended: the images (and the deep mode) survive for a
 		// retry or an operator's fresh-boot rollback.
+		m.releaseQuota(taskID)
 		_ = st.Transition(state.StatusSuspended, state.ActorSystem, "deep resume failed: "+err.Error())
 		_ = state.SaveState(taskID, st)
 		return fmt.Errorf("lifecycle: deep resume %s: %w", taskID, err)
@@ -160,9 +171,16 @@ func (m *Manager) DeepResume(taskID string) error {
 	state.StampPID(st, restoredPID)
 	if err := st.Transition(state.StatusRunning, state.ActorSystem,
 		"deep resume complete"); err != nil {
+		m.releaseQuota(taskID)
 		return fmt.Errorf("lifecycle: deep resume %s: %w", taskID, err)
 	}
-	return state.SaveState(taskID, st)
+	if err := state.SaveState(taskID, st); err != nil {
+		// The guest is already restored and resident, so the reservation
+		// stands: the caller sees the persist failure and can retry the
+		// save, while quota stays consistent with the running process.
+		return err
+	}
+	return nil
 }
 
 // IsDeepPaused reports whether the task's persisted state is a deep pause

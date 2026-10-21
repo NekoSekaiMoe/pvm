@@ -15,9 +15,9 @@ import (
 func setupRunning(t *testing.T, id string) *Manager {
 	t.Helper()
 	dir := t.TempDir()
-	origRoot := state.RootDir
-	state.RootDir = dir
-	t.Cleanup(func() { state.RootDir = origRoot })
+	origRoot := state.Root()
+	state.SetRoot(dir)
+	t.Cleanup(func() { state.SetRoot(origRoot) })
 
 	cgRoot := filepath.Join(t.TempDir(), "cgroot-is-a-file")
 	if err := os.WriteFile(cgRoot, []byte("x"), 0644); err != nil {

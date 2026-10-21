@@ -59,3 +59,15 @@ This repo uses **Conventional Commits** (verified against `git log`): `feat:`, `
 - Title the PR like the squashed commit (e.g. `feat: add X for Y`).
 - Confirm CI (`go test -v ./...`, eBPF generate, `test_integration.sh`) passes locally before requesting review.
 - Generated files (`bpf_bpf*.go`, `webui/.output/`) must not be hand-edited; rerun code generation instead.
+
+## Security Trust Boundaries (console exec & evidence)
+
+- `console.Session.Exec` (marker protocol) results are **guest-attested, not host-verified**: a guest watching its console stream can capture the random marker token and forge both stdout and exit code. `policy.ConsoleExecutor` marks this explicitly via `Result["guest_attested"] = true`; governance consumers (approvals, gates, dashboards) must treat `OK=true` as the guest's claim, never as cryptographic evidence. Upgrading this requires a signed guest-side agent — do not "fix" it by strengthening the marker alone. Full analysis: `docs/attested-exec.md`.
+- `artifact.TestsRerunVerifier` in evidence mode (no `tests.command`) reads guest-controlled console text; only the `tests.command` re-run path executes on the host and is host-verified. Specs that must actually bar an untrusted guest should set `tests.command`.
+- Audit signing is ON by default (`PVM_AUDIT_SIGNING=0` opts out); the ed25519 key is generated on first use under the audit root.
+
+## Performance Notes (evaluated paths)
+
+- **virtio-blk multi-queue is N/A here by design**: the UML frontend (`virtio_uml` driver) negotiates a single virtqueue, so a multi-queue vhost-user backend would be dead code — see the scope note in `internal/vhost/vu/proto.go`. Parallel IO is achieved per-device instead (one vhost-user-blk backend per task/disk), plus host-side parallelism in the CoW layer.
+- **Snapshot incrementality is already structural**: disk captures are qcow2 CoW branches (`cow.CreateOverlay` — O(1) metadata, zero cluster copies) and memory dumps chain CRIU `--track-mem` incremental images when `PVM_SNAPSHOT_INCREMENTAL=1` (see `internal/snapshot/event.go`). Full-file copying only exists as a fallback and in tar export (pigz-accelerated when available).
+- **`state.RootDir` is atomic** (`state.Root()`/`state.SetRoot()`): background sweepers read it every tick and tests reassign it between cases; a plain global there is a data race under `-race`. New code must use the accessors, never a package-level variable of its own for the same reason.

@@ -37,7 +37,15 @@ func Export(containerID string, destTgz string) error {
 		os.Remove(tmpName)
 	}
 
-	cmd := exec.Command("tar", "-czf", tmpName, "-C", dir, ".")
+	// Compress with pigz when available: same gzip FORMAT (Import's
+	// gzip.Reader is unchanged), but multi-threaded — single-threaded gzip
+	// caps GB-scale overlay exports at ~20-40MB/s, dominating the export
+	// wall time. Falls back to tar's built-in gzip otherwise.
+	args := []string{"-czf", tmpName, "-C", dir, "."}
+	if _, lerr := exec.LookPath("pigz"); lerr == nil {
+		args = []string{"--use-compress-program=pigz", "-cf", tmpName, "-C", dir, "."}
+	}
+	cmd := exec.Command("tar", args...)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		cleanup()
 		return fmt.Errorf("tar export failed: %v, output: %s", err, string(out))

@@ -19,9 +19,9 @@ import (
 func setupStateRoot(t *testing.T) string {
 	t.Helper()
 	root := t.TempDir()
-	oldRoot := state.RootDir
-	state.RootDir = root
-	t.Cleanup(func() { state.RootDir = oldRoot })
+	oldRoot := state.Root()
+	state.SetRoot(root)
+	t.Cleanup(func() { state.SetRoot(oldRoot) })
 	t.Setenv("PVM_STATE_ROOT", root)
 	t.Setenv("PVM_COW_ROOT", filepath.Join(root, "cow"))
 	return root

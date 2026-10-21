@@ -2,6 +2,7 @@ package egress
 
 import (
 	"net/http"
+	"strings"
 	"testing"
 )
 
@@ -130,6 +131,33 @@ func TestApplyInject_PlaintextHTTPRefused(t *testing.T) {
 	g.ApplyInject(secure, viewFromHTTP(secure), pol)
 	if got := secure.Header.Get("Authorization"); got != "Bearer s3cret" {
 		t.Fatalf("https request should receive credentials, got %q", got)
+	}
+}
+
+func TestApplyInject_ValueCap(t *testing.T) {
+	allow := true
+	g := &Gateway{}
+
+	atCap := strings.Repeat("a", maxInjectValueBytes)
+	polCap := &Policy{Rules: []EgressRule{
+		{Name: "cap", Host: "api.example.com", Allow: &allow,
+			Inject: &EgressInject{Header: "X-Secret", Secret: atCap}},
+	}}
+	reqCap := mustReq(t, "GET", "https://api.example.com/x")
+	g.ApplyInject(reqCap, viewFromHTTP(reqCap), polCap)
+	if got := reqCap.Header.Get("X-Secret"); got != atCap {
+		t.Fatalf("2048-byte value must inject, got len %d", len(got))
+	}
+
+	over := strings.Repeat("b", maxInjectValueBytes+1)
+	polOver := &Policy{Rules: []EgressRule{
+		{Name: "over", Host: "api.example.com", Allow: &allow,
+			Inject: &EgressInject{Header: "X-Secret", Secret: over}},
+	}}
+	reqOver := mustReq(t, "GET", "https://api.example.com/x")
+	g.ApplyInject(reqOver, viewFromHTTP(reqOver), polOver)
+	if got := reqOver.Header.Get("X-Secret"); got != "" {
+		t.Fatalf("2049-byte value must be refused, got len %d", len(got))
 	}
 }
 

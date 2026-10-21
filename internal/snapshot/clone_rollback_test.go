@@ -11,9 +11,9 @@ import (
 
 func TestClone(t *testing.T) {
 	tmpDir := t.TempDir()
-	orig := state.RootDir
-	state.RootDir = tmpDir
-	defer func() { state.RootDir = orig }()
+	orig := state.Root()
+	state.SetRoot(tmpDir)
+	defer func() { state.SetRoot(orig) }()
 
 	srcID := "source-task"
 	cDir, err := state.ContainerDir(srcID)
@@ -92,9 +92,9 @@ func TestClone(t *testing.T) {
 
 func TestRollback(t *testing.T) {
 	tmpDir := t.TempDir()
-	orig := state.RootDir
-	state.RootDir = tmpDir
-	defer func() { state.RootDir = orig }()
+	orig := state.Root()
+	state.SetRoot(tmpDir)
+	defer func() { state.SetRoot(orig) }()
 
 	taskID := "task-rollback-test"
 	cDir, err := state.ContainerDir(taskID)

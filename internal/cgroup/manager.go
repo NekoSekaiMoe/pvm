@@ -168,6 +168,67 @@ func (m *Manager) enableControllers(wantMemory, wantCPU bool) error {
 	return nil
 }
 
+// MemoryUnlimited is the sentinel MemoryMax returns for a cgroup whose
+// memory.max is the literal "max" (no limit).
+const MemoryUnlimited int64 = -1
+
+// MemoryMax reads the cgroup's memory.max in bytes. It returns
+// MemoryUnlimited for "max". A missing file (cgroup gone) surfaces the
+// os error so callers can distinguish "no limit" from "no cgroup".
+func (m *Manager) MemoryMax(containerID string) (int64, error) {
+	if !validContainerID.MatchString(containerID) {
+		return 0, fmt.Errorf("invalid container ID")
+	}
+	raw, err := os.ReadFile(filepath.Join(m.CgroupRoot, containerID, "memory.max"))
+	if err != nil {
+		return 0, err
+	}
+	return parseMemoryLimit(strings.TrimSpace(string(raw)))
+}
+
+// MemoryCurrent reads the cgroup's memory.current (bytes) — live usage
+// including reclaimable page cache.
+func (m *Manager) MemoryCurrent(containerID string) (int64, error) {
+	if !validContainerID.MatchString(containerID) {
+		return 0, fmt.Errorf("invalid container ID")
+	}
+	raw, err := os.ReadFile(filepath.Join(m.CgroupRoot, containerID, "memory.current"))
+	if err != nil {
+		return 0, err
+	}
+	v, cerr := strconv.ParseInt(strings.TrimSpace(string(raw)), 10, 64)
+	if cerr != nil {
+		return 0, fmt.Errorf("parse memory.current: %w", cerr)
+	}
+	return v, nil
+}
+
+// SetMemoryMax writes the cgroup's memory.max. A negative bytes value writes
+// the literal "max" (unlimited); otherwise the byte count is written.
+func (m *Manager) SetMemoryMax(containerID string, bytes int64) error {
+	if !validContainerID.MatchString(containerID) {
+		return fmt.Errorf("invalid container ID")
+	}
+	val := strconv.FormatInt(bytes, 10)
+	if bytes < 0 {
+		val = "max"
+	}
+	return os.WriteFile(filepath.Join(m.CgroupRoot, containerID, "memory.max"), []byte(val), 0644)
+}
+
+// parseMemoryLimit parses a cgroup v2 memory.max value: the literal "max"
+// maps to MemoryUnlimited, otherwise a non-negative byte count.
+func parseMemoryLimit(s string) (int64, error) {
+	if s == "max" {
+		return MemoryUnlimited, nil
+	}
+	v, err := strconv.ParseInt(s, 10, 64)
+	if err != nil || v < 0 {
+		return 0, fmt.Errorf("parse memory.max %q", s)
+	}
+	return v, nil
+}
+
 // Freeze suspends all processes in the cgroup
 func (m *Manager) Freeze(containerID string) error {
 	if !validContainerID.MatchString(containerID) {

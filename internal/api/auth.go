@@ -31,7 +31,10 @@ package api
 // Comparison is constant-time per candidate.
 
 import (
+	"context"
+	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -59,6 +62,11 @@ type APIKey struct {
 	Key      string
 	Operator string
 	Tenant   string
+	// IsApprover marks a key listed in PVM_APPROVER_KEYS: it is authorized
+	// to create and decide approval tickets even when the approval plane is
+	// separated from the execution plane (strong mode). Regular keys stay
+	// auditable actors but lose approval authority once approver keys exist.
+	IsApprover bool
 }
 
 // Callback POST budget: the raw key rides in the body, so the exchange
@@ -74,8 +82,18 @@ const (
 type KeyRegistry struct {
 	keys     []APIKey
 	callback string
-	client   *http.Client
-	cbSem    chan struct{}
+	// callbackCleartext marks a callback whose URL survived the
+	// PVM_AUTH_CALLBACK_ALLOW_HTTP=1 private-network opt-in. Every dial is
+	// re-checked against the private-net floor at connect time so a DNS
+	// rebinding between the load-time validation and the POST cannot ship
+	// the raw key to a public listener.
+	callbackCleartext bool
+	client            *http.Client
+	cbSem             chan struct{}
+	// approverKeys is the optional PVM_APPROVER_KEYS set. When non-empty,
+	// the approval endpoints require one of these keys (trust separation
+	// between the execution plane and the human approval plane).
+	approverKeys []string
 }
 
 // LoadKeyRegistry builds the registry from the environment. The master
@@ -84,7 +102,6 @@ type KeyRegistry struct {
 func LoadKeyRegistry() *KeyRegistry {
 	r := &KeyRegistry{
 		callback: strings.TrimSpace(os.Getenv("PVM_AUTH_CALLBACK_URL")),
-		client:   newCallbackClient(),
 		cbSem:    make(chan struct{}, callbackConcurrency),
 	}
 	if master := os.Getenv("API_SECRET"); master != "" {
@@ -108,17 +125,71 @@ func LoadKeyRegistry() *KeyRegistry {
 			}
 		}
 	}
+	// Approval-plane trust separation (PVM_APPROVER_KEYS): when set, only
+	// these keys may create/decide approval tickets — SDK/agent keys that
+	// triggered an approval_required intercept can no longer self-approve
+	// the same gate. Keys are raw secrets (no operator annotation).
+	for _, entry := range parseKeyEntries(os.Getenv("PVM_APPROVER_KEYS")) {
+		if entry.Key != "" {
+			r.approverKeys = append(r.approverKeys, entry.Key)
+		}
+	}
+	if len(r.approverKeys) > 0 {
+		for i := range r.keys {
+			for _, ak := range r.approverKeys {
+				if subtle.ConstantTimeCompare([]byte(r.keys[i].Key), []byte(ak)) == 1 {
+					r.keys[i].IsApprover = true
+					break
+				}
+			}
+		}
+	}
 	r.callback = secureCallback(r.callback)
+	// Cleartext callbacks (the ALLOW_HTTP private-net opt-in) get a dialing
+	// transport that re-verifies the private-net floor on every connect —
+	// the load-time hostPrivatenetOnly check alone is TOCTOU-vulnerable to
+	// rebinding between validation and use.
+	r.callbackCleartext = r.callback != "" && !strings.HasPrefix(r.callback, "https://")
+	r.client = newCallbackClient(r.callbackCleartext)
 	return r
 }
 
 // newCallbackClient builds the hardened exchange for callback POSTs:
 // bounded in time and never redirected — the body carries the RAW API
 // key, so a 307/308 (or any 3xx the client would upgrade) must never
-// replay it to another location.
-func newCallbackClient() *http.Client {
+// replay it to another location. When privateOnly is set (cleartext
+// callback opt-in), every dial is re-checked: the connection must land
+// on a loopback/RFC1918/ULA address or it is aborted before a single
+// byte of the key-bearing body leaves the process.
+func newCallbackClient(privateOnly bool) *http.Client {
+	transport := &http.Transport{
+		// Defaults comparable to http.DefaultTransport, minus proxy env
+		// trust: the callback destination is configuration, not something
+		// an ambient HTTP_PROXY should be able to hijack.
+		Proxy:               nil,
+		DialContext:         (&net.Dialer{Timeout: callbackTimeout}).DialContext,
+		MaxIdleConns:        2,
+		IdleConnTimeout:     30 * time.Second,
+		TLSHandshakeTimeout: callbackTimeout,
+	}
+	if privateOnly {
+		base := transport.DialContext
+		transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			c, err := base(ctx, network, addr)
+			if err != nil {
+				return nil, err
+			}
+			if ta, ok := c.RemoteAddr().(*net.TCPAddr); !ok || ta.IP == nil ||
+				!(ta.IP.IsLoopback() || ta.IP.IsPrivate()) {
+				_ = c.Close()
+				return nil, fmt.Errorf("auth: callback dial to %s landed on non-private %v — rebinding guard (fail-closed)", addr, c.RemoteAddr())
+			}
+			return c, nil
+		}
+	}
 	return &http.Client{
 		Timeout: callbackTimeout,
+		Transport: transport,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
@@ -267,7 +338,22 @@ func (r *KeyRegistry) Lookup(key string) (APIKey, bool) {
 			return k, true
 		}
 	}
+	// A raw PVM_APPROVER_KEYS entry that was not ALSO loaded as a regular
+	// key still authenticates (operator name falls back to "approver"),
+	// so an approver-only key can call the API without being the master.
+	for _, ak := range r.approverKeys {
+		if subtle.ConstantTimeCompare([]byte(key), []byte(ak)) == 1 {
+			return APIKey{Key: key, Operator: "approver", IsApprover: true}, true
+		}
+	}
 	return APIKey{}, false
+}
+
+// HasApproverKeys reports whether the approval plane is running in strong
+// (trust-separated) mode: PVM_APPROVER_KEYS was configured and every
+// approval create/decide must present one of those keys.
+func (r *KeyRegistry) HasApproverKeys() bool {
+	return len(r.approverKeys) > 0
 }
 
 // callbackRequest is the JSON body posted to the auth callback.
@@ -288,7 +374,7 @@ func (r *KeyRegistry) Authenticate(key, path, method string) (APIKey, error) {
 	}
 	client := r.client
 	if client == nil {
-		client = newCallbackClient()
+		client = newCallbackClient(r.callbackCleartext)
 	}
 	// Cap in-flight callbacks (junk keys are free to send; the IdP is
 	// not). A saturated cap fails closed like an unreachable IdP.
@@ -367,6 +453,11 @@ func keyAuthMiddleware(reg *KeyRegistry) echo.MiddlewareFunc {
 				return authError(c, err)
 			}
 			c.Set("actor", id.Operator)
+			c.Set("is_approver", id.IsApprover)
+			// Key fingerprint (never the raw key) for same-key comparisons
+			// on the approval plane.
+			sum := sha256.Sum256([]byte(key))
+			c.Set("key_fp", hex.EncodeToString(sum[:]))
 			if id.Tenant != "" {
 				c.Set("tenant", id.Tenant)
 			}

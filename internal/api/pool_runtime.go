@@ -31,7 +31,7 @@ var (
 
 func initPoolRuntime() {
 	m := currentPool()
-	if root := state.RootDir; root != "" {
+	if root := state.Root(); root != "" {
 		if err := m.EnablePersistence(filepath.Join(root, "pool.json")); err != nil {
 			log.Printf("pool: persistence disabled: %v", err)
 		}

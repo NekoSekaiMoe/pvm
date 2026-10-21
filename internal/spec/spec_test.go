@@ -484,3 +484,50 @@ func TestValidateHostPathField(t *testing.T) {
 		})
 	}
 }
+
+func TestValidate_PortMappingIngressL7(t *testing.T) {
+	base := func(pm PortMappingSpec) *TaskSpec {
+		return &TaskSpec{Version: 1, Caller: "x", Network: NetworkSpec{Enabled: true, Dataplane: DataplaneBridge, PortMappings: []PortMappingSpec{pm}}}
+	}
+	// Token + host mask on a TCP mapping validates.
+	if err := base(PortMappingSpec{HostPort: 8080, GuestPort: 80, Protocol: "tcp", AccessToken: "tok", MaskRequestHost: "internal.local"}).Validate(); err != nil {
+		t.Fatalf("valid L7 mapping rejected: %v", err)
+	}
+	// UDP cannot carry L7 fields.
+	err := base(PortMappingSpec{HostPort: 5353, GuestPort: 53, Protocol: "udp", AccessToken: "tok"}).Validate()
+	if err == nil || !strings.Contains(err.Error(), "HTTP (tcp) only") {
+		t.Fatalf("udp L7 mapping not rejected: %v", err)
+	}
+}
+
+func TestLoadFile_PortMappingIngressTOML(t *testing.T) {
+	doc := `
+version = 1
+caller = "alice"
+[runtime]
+name = "web"
+[workspace]
+base_image = "alpine.img"
+init = "/init.sh"
+[network]
+enabled = true
+dataplane = "bridge"
+[[network.port_mappings]]
+host_port = 8080
+guest_port = 80
+protocol = "tcp"
+traffic_access_token = "s3cr3t"
+mask_request_host = "internal.local"
+`
+	s, err := LoadFile(writeTemp(t, doc))
+	if err != nil {
+		t.Fatalf("L7 port mapping TOML rejected: %v", err)
+	}
+	if len(s.Network.PortMappings) != 1 {
+		t.Fatalf("got %d mappings, want 1", len(s.Network.PortMappings))
+	}
+	pm := s.Network.PortMappings[0]
+	if pm.AccessToken != "s3cr3t" || pm.MaskRequestHost != "internal.local" {
+		t.Fatalf("L7 fields not decoded: %+v", pm)
+	}
+}

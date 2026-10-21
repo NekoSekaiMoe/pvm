@@ -42,7 +42,7 @@ type NetworkRegistry struct {
 
 // LoadNetworkRegistry opens (or creates) the registry under stateRoot.
 // An empty stateRoot honors $PVM_STATE_ROOT first (mirroring
-// state.RootDir and the portmap registry) so test/non-root trees never
+// state.Root() and the portmap registry) so test/non-root trees never
 // touch the production default.
 func LoadNetworkRegistry(stateRoot string) (*NetworkRegistry, error) {
 	if stateRoot == "" {

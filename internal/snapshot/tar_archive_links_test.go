@@ -37,7 +37,7 @@ func writeTgz(t *testing.T, path string, entries []tar.Header) {
 // symlinks and hard links must be restored instead of silently skipped.
 func TestImport_SymlinkAndHardlink(t *testing.T) {
 	root := t.TempDir()
-	state.RootDir = root
+	state.SetRoot(root)
 
 	tgz := filepath.Join(t.TempDir(), "snap.tgz")
 	writeTgz(t, tgz, []tar.Header{
@@ -75,7 +75,7 @@ func TestImport_SymlinkAndHardlink(t *testing.T) {
 // (e.g. a device node) causes Import to fail and leave no half-populated dir.
 func TestImport_UnsupportedEntryErrors(t *testing.T) {
 	root := t.TempDir()
-	state.RootDir = root
+	state.SetRoot(root)
 
 	tgz := filepath.Join(t.TempDir(), "snap.tgz")
 	writeTgz(t, tgz, []tar.Header{
@@ -101,7 +101,7 @@ func TestImport_UnsupportedEntryErrors(t *testing.T) {
 // the destination directory or file writes traversing a symlink directory are rejected.
 func TestImport_SymlinkPivotRejection(t *testing.T) {
 	root := t.TempDir()
-	state.RootDir = root
+	state.SetRoot(root)
 
 	outsideDir := t.TempDir()
 

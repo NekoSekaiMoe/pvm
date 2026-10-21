@@ -2,6 +2,13 @@
 // (bucket-2 gap: console.log grew unbounded). Rotation keeps N suffix
 // generations (.1 newest .. .N oldest) and reopens atomically; writes that
 // race the rotate are serialized by the rotator's mutex.
+//
+// Writes are BUFFERED (64 KiB) with a 500 ms flush ticker and a
+// flush-on-rotate/Close: the console tee fans every guest output chunk
+// into console.log + console.out.log, and the unbuffered form issued two
+// raw pwrite syscalls per chunk (tens of bytes each) on the hot path.
+// Durability of console logs is best-effort (they are diagnostics, not
+// the audit ledger), so no fsync is added.
 package logx
 
 import (
@@ -10,12 +17,17 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 )
 
 // Defaults; overridable via PVM_LOG_MAX_BYTES / PVM_LOG_KEEP.
 const (
 	DefaultMaxBytes = 8 << 20 // 8 MiB
 	DefaultKeep     = 3
+	// bufSize is the write coalescing buffer; flushInterval bounds how
+	// long a partial buffer may wait before landing on disk.
+	bufSize       = 64 << 10
+	flushInterval = 500 * time.Millisecond
 )
 
 // Rotator is a size-rotating file writer (io.Writer + io.Closer).
@@ -26,6 +38,10 @@ type Rotator struct {
 	keep     int
 	f        *os.File
 	written  int64
+	// buf coalesces writes; flusher is the ticker goroutine draining it.
+	buf     []byte
+	flusher *time.Ticker
+	stopped chan struct{}
 }
 
 // NewRotator opens (creating if needed) path with rotation policy.
@@ -48,17 +64,69 @@ func NewRotator(path string, maxBytes int64, keep int) (*Rotator, error) {
 	if err == nil {
 		written = fi.Size()
 	}
-	return &Rotator{path: path, maxBytes: maxBytes, keep: keep, f: f, written: written}, nil
+	r := &Rotator{
+		path: path, maxBytes: maxBytes, keep: keep, f: f, written: written,
+		buf: make([]byte, 0, bufSize), stopped: make(chan struct{}),
+	}
+	r.flusher = time.NewTicker(flushInterval)
+	go r.flushLoop()
+	return r, nil
 }
 
 // Write appends p, rotating first when the current generation would exceed
 // maxBytes. A single write larger than maxBytes still lands whole (rotation
-// happens before, never mid-write).
+// happens before, never mid-write). p is coalesced into the write buffer
+// and lands on disk when the buffer fills, the flush ticker fires, a
+// rotation happens, or Close is called. The rotation check uses
+// buffered+incoming bytes so the generation boundary granularity matches
+// the unbuffered behavior.
 func (r *Rotator) Write(p []byte) (int, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.f == nil {
 		return 0, os.ErrClosed
+	}
+	// Oversized write: bypass the buffer entirely (no point copying it).
+	if len(p) >= bufSize {
+		if err := r.writeLocked(p); err != nil {
+			return 0, err
+		}
+		return len(p), nil
+	}
+	// Would adding p exceed the generation cap? Flush what's buffered and
+	// rotate first — this keeps per-write rotation semantics identical to
+	// the unbuffered implementation.
+	if r.written+int64(len(r.buf))+int64(len(p)) > r.maxBytes {
+		if err := r.writeLocked(nil); err != nil {
+			return 0, err
+		}
+		if r.written+int64(len(p)) > r.maxBytes {
+			if err := r.rotateLocked(); err != nil && r.f == nil {
+				return 0, err
+			}
+		}
+	}
+	if len(r.buf)+len(p) > bufSize {
+		if err := r.writeLocked(nil); err != nil {
+			return 0, err
+		}
+	}
+	r.buf = append(r.buf, p...)
+	return len(p), nil
+}
+
+// writeLocked flushes the buffered bytes (if any) and writes p, rotating
+// when the generation cap would be exceeded. Callers hold mu.
+func (r *Rotator) writeLocked(p []byte) error {
+	if len(r.buf) > 0 {
+		if _, err := r.f.Write(r.buf); err != nil {
+			return err
+		}
+		r.written += int64(len(r.buf))
+		r.buf = r.buf[:0]
+	}
+	if len(p) == 0 {
+		return nil
 	}
 	if r.written+int64(len(p)) > r.maxBytes {
 		if err := r.rotateLocked(); err != nil && r.f == nil {
@@ -66,23 +134,51 @@ func (r *Rotator) Write(p []byte) (int, error) {
 			// report the error instead of panicking on the nil handle. The
 			// caller can retry once the underlying issue (permissions, disk)
 			// is fixed; this line is lost, the process is not.
-			return 0, err
+			return err
 		}
 	}
 	n, err := r.f.Write(p)
 	r.written += int64(n)
-	return n, err
+	return err
 }
 
-// Close closes the current generation.
+// flushLoop drains the write buffer on the ticker until stopped.
+func (r *Rotator) flushLoop() {
+	for {
+		select {
+		case <-r.stopped:
+			return
+		case <-r.flusher.C:
+			r.mu.Lock()
+			if r.f != nil && len(r.buf) > 0 {
+				_ = r.writeLocked(nil)
+			}
+			r.mu.Unlock()
+		}
+	}
+}
+
+// Close flushes any buffered bytes, stops the flusher, and closes the
+// current generation.
 func (r *Rotator) Close() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.f == nil {
 		return nil
 	}
+	r.flusher.Stop()
+	close(r.stopped)
+	var firstErr error
+	if len(r.buf) > 0 {
+		if err := r.writeLocked(nil); err != nil {
+			firstErr = err
+		}
+	}
 	err := r.f.Close()
 	r.f = nil
+	if firstErr != nil {
+		return firstErr
+	}
 	return err
 }
 

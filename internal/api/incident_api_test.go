@@ -19,9 +19,9 @@ func TestIncidentReportAndList(t *testing.T) {
 	// RootDir resolves at package init; the env swap above does not move it.
 	// Isolate the global so later tests never rebuild controllers against a
 	// deleted temp dir (currentIncident/CurrentIdentity cache by RootDir).
-	oldRoot := state.RootDir
-	state.RootDir = t.TempDir()
-	t.Cleanup(func() { state.RootDir = oldRoot })
+	oldRoot := state.Root()
+	state.SetRoot(t.TempDir())
+	t.Cleanup(func() { state.SetRoot(oldRoot) })
 
 	e := echo.New()
 	api := e.Group("/api", func(next echo.HandlerFunc) echo.HandlerFunc {
@@ -75,9 +75,9 @@ func TestIncidentEgressDenyAll(t *testing.T) {
 	// The env var is only resolved at package init; swap the package var so
 	// CurrentIdentity/currentIncident rebuild against a live directory,
 	// and restore it so later tests keep a sane global.
-	oldRoot := state.RootDir
-	state.RootDir = t.TempDir()
-	t.Cleanup(func() { state.RootDir = oldRoot })
+	oldRoot := state.Root()
+	state.SetRoot(t.TempDir())
+	t.Cleanup(func() { state.SetRoot(oldRoot) })
 	// A registered gateway gets deny-alled by a high-severity incident.
 	g := egress.NewGateway()
 	RegisterEgressGateway("t-egress", g)

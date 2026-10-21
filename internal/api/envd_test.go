@@ -26,7 +26,7 @@ func b64decode(s string) ([]byte, error) { return base64.StdEncoding.DecodeStrin
 // mkdirTaskState seeds a task state record for envd tests.
 func mkdirTaskState(t *testing.T, id, status string) {
 	t.Helper()
-	dir := filepath.Join(state.RootDir, id)
+	dir := filepath.Join(state.Root(), id)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -38,9 +38,9 @@ func mkdirTaskState(t *testing.T, id, status string) {
 
 func envdTestMux(t *testing.T) *http.ServeMux {
 	t.Helper()
-	oldRoot := state.RootDir
-	state.RootDir = t.TempDir()
-	t.Cleanup(func() { state.RootDir = oldRoot })
+	oldRoot := state.Root()
+	state.SetRoot(t.TempDir())
+	t.Cleanup(func() { state.SetRoot(oldRoot) })
 	t.Setenv("PVM_EXEC_SIM", "1")
 	t.Setenv("PVM_ENVD_PORT", "0")
 	mux := http.NewServeMux()
