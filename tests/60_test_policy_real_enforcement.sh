@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # 60_test_policy_real_enforcement.sh — policy 真断言伴生（对应 14/45 sim）。
 # 关键区别：全程不设 PVM_EXEC_SIM（无 sim 后端），断言决策层与执行层分离：
-#   1. deny 规则必须 403，且审计只有 tool:pay/deny、绝无 allow（真没跑起来）；
-#   2. approve 规则未审批前必须 202，且同样无 allow；
+#   1. deny 规则必须 403，且审计只有 exec:deny、绝无 exec:ok（真没跑起来）；
+#   2. approve 规则未审批前必须 202，且同样无 exec:ok；
 #   3. 审批通过后恰好放行一次（Allow once），第二次回到 202/403（无粘滞放行）。
 # CI-safe：无内核、无 guest；console 缺席正是断言点（sim 下反而看不出来）。
 set -euo pipefail
@@ -25,6 +25,7 @@ API="http://127.0.0.1:$PORT/api"
 AUTH="Authorization: Bearer secret"
 export API_SECRET="secret"
 
+# Print the failure message in $1 to stdout and exit the script with status 1.
 fail() { echo "❌ $1"; exit 1; }
 
 if [ -n "${AGENTPVM_BIN:-}" ]; then
@@ -56,33 +57,33 @@ curl -sf -X POST "$API/policy/$TASK" -H "$AUTH" -H "Content-Type: application/js
     {"name":"*","action":"deny","reason":"default deny"}
   ], "force": true}' >/dev/null || fail "policy register"
 
-echo "--- 2. deny 403 且无 tool allow（真没执行）"
+echo "--- 2. deny 403 且无 exec:ok（真没执行）"
 CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$API/exec?task=$TASK" -H "$AUTH" -H "Content-Type: application/json" \
     -d '{"cmd":"pay amount=100"}')
 [ "$CODE" = "403" ] || fail "deny must 403, got $CODE"
 AUD=$(curl -sf -H "$AUTH" "$API/audit/$TASK")
 echo "$AUD" | jq -e 'any(.action == "tool:pay" and .decision == "deny")' >/dev/null || fail "deny must leave an audit deny row: $AUD"
-echo "$AUD" | jq -e '[.[] | select(.decision == "allow")] | length == 0' >/dev/null \
-    || fail "deny must never produce allow: $AUD"
+echo "$AUD" | jq -e 'any(.phase == "execution" and (.decision == "allow" or .decision == "constrain")) | not' >/dev/null \
+    || fail "deny must never produce exec:ok: $AUD"
 
-echo "--- 3. approve 未审批前 202，且无 allow"
+echo "--- 3. approve 未审批前 202，且无 exec:ok"
 CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$API/exec?task=$TASK" -H "$AUTH" -H "Content-Type: application/json" \
     -d '{"cmd":"deploy env=prod effect=prod"}')
 [ "$CODE" = "202" ] || fail "approve-class must 202, got $CODE"
 AUD2=$(curl -sf -H "$AUTH" "$API/audit/$TASK")
-echo "$AUD2" | jq -e '[.[] | select(.decision == "allow")] | length == 0' >/dev/null \
+echo "$AUD2" | jq -e 'any(.phase == "execution" and (.decision == "allow" or .decision == "constrain")) | not' >/dev/null \
     || fail "pre-approval must not execute: $AUD2"
 
 echo "--- 4. 审批后恰好放行一次，第二次回到 202/403"
 TICKET=$(curl -sf -X POST "$API/approvals" -H "$AUTH" -H "Content-Type: application/json" \
-    -d "{\"task_id\":\"$TASK\",\"tool\":\"deploy\",\"target\":\"prod\",\"params\":{\"env\":\"prod\"}}")
+    -d "{\"task_id\":\"$TASK\",\"tool\":\"deploy\",\"params\":{\"env\":\"prod\"}}")
 TID=$(echo "$TICKET" | jq -r '.id // .ticket.id // empty')
 [ -n "$TID" ] || fail "ticket create failed: $TICKET"
 curl -sf -X POST "$API/approvals/$TID/decide" -H "$AUTH" -H "Content-Type: application/json" \
-    -d '{"approved":true,"by":"op"}' >/dev/null || fail "ticket approve failed"
+    -d '{"approved":true}' >/dev/null || fail "ticket approve failed"
 CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$API/exec?task=$TASK" -H "$AUTH" -H "Content-Type: application/json" \
     -d '{"cmd":"deploy env=prod effect=prod"}')
-case "$CODE" in 200|202) : ;; *) fail "post-approval first exec must 200/202, got $CODE" ;; esac
+[ "$CODE" = "200" ] || fail "post-approval first exec must 200, got $CODE"
 CODE2=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$API/exec?task=$TASK" -H "$AUTH" -H "Content-Type: application/json" \
     -d '{"cmd":"deploy env=prod effect=prod"}')
 case "$CODE2" in 202|403) : ;; *) fail "second exec must return to 202/403 (Allow once), got $CODE2" ;; esac
