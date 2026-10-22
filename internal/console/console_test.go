@@ -3,6 +3,8 @@ package console
 import (
 	"bufio"
 	"context"
+	"errors"
+	"io"
 	"os"
 	"strings"
 	"testing"
@@ -48,6 +50,150 @@ func TestExecNoStdin(t *testing.T) {
 	sess := m.Attach("t-2")
 	if _, err := sess.Exec(context.Background(), "ls", time.Second); err != ErrNoStdin {
 		t.Fatalf("expected ErrNoStdin, got %v", err)
+	}
+}
+
+type execTestStdin func([]byte) (int, error)
+
+func (w execTestStdin) Write(p []byte) (int, error) { return w(p) }
+func (w execTestStdin) Close() error                { return nil }
+
+func TestExecQueuedContextCancellation(t *testing.T) {
+	for _, deadline := range []bool{false, true} {
+		name := "cancel"
+		if deadline {
+			name = "deadline"
+		}
+		t.Run(name, func(t *testing.T) {
+			sess := newSession("queued-"+name, defaultRingSize)
+			writes := make(chan struct{}, 2)
+			release := make(chan struct{})
+			sess.SetStdin(execTestStdin(func(p []byte) (int, error) {
+				writes <- struct{}{}
+				<-release
+				return 0, io.ErrClosedPipe
+			}))
+			activeDone := make(chan error, 1)
+			go func() {
+				_, err := sess.Exec(context.Background(), "active", time.Second)
+				activeDone <- err
+			}()
+			t.Cleanup(func() {
+				close(release)
+				select {
+				case err := <-activeDone:
+					if !errors.Is(err, io.ErrClosedPipe) {
+						t.Errorf("active exec: %v", err)
+					}
+				case <-time.After(2 * time.Second):
+					t.Error("active exec did not finish after stdin was released")
+				}
+				// The stdin error must also release the execution slot.
+				sess.SetStdin(nil)
+				ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+				defer cancel()
+				if _, err := sess.Exec(ctx, "next", time.Second); err != ErrNoStdin {
+					t.Errorf("exec after stdin error: %v", err)
+				}
+			})
+			select {
+			case <-writes:
+			case <-time.After(2 * time.Second):
+				t.Fatal("active exec did not reach stdin")
+			}
+
+			ctx, cancel := context.WithCancel(context.Background())
+			wantErr := context.Canceled
+			if deadline {
+				cancel()
+				ctx, cancel = context.WithTimeout(context.Background(), 50*time.Millisecond)
+				wantErr = context.DeadlineExceeded
+			}
+			defer cancel()
+			done := make(chan error, 1)
+			go func() {
+				_, err := sess.Exec(ctx, "queued", time.Second)
+				done <- err
+			}()
+			if !deadline {
+				cancel()
+			}
+			select {
+			case err := <-done:
+				if !errors.Is(err, wantErr) {
+					t.Fatalf("queued exec: got %v, want %v", err, wantErr)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("queued exec did not return while active stdin was blocked")
+			}
+			select {
+			case <-writes:
+				t.Fatal("canceled queued exec wrote to stdin")
+			default:
+			}
+		})
+	}
+}
+
+func TestExecSerializesWithoutChargingQueueTime(t *testing.T) {
+	sess := newSession("serialized", defaultRingSize)
+	writes := make(chan string, 2)
+	release := make(chan struct{})
+	defer func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	}()
+	sess.SetStdin(execTestStdin(func(p []byte) (int, error) {
+		lines := strings.Split(string(p), "\n")
+		cmd := lines[2]
+		writes <- cmd
+		if cmd == "first" {
+			<-release
+		}
+		begin := strings.Trim(strings.TrimPrefix(lines[1], "echo "), `"`)
+		end := strings.Trim(strings.TrimPrefix(lines[3], "echo "), `"`)
+		_, err := sess.Write([]byte(begin + "\n" + cmd + "\n" + strings.Replace(end, "$?", "0", 1) + "\n"))
+		return len(p), err
+	}))
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	firstDone := make(chan error, 1)
+	secondDone := make(chan error, 1)
+	run := func(cmd string, done chan<- error) {
+		res, err := sess.Exec(ctx, cmd, 100*time.Millisecond)
+		if err == nil && (res.Stdout != cmd+"\n" || res.ExitCode != 0) {
+			err = errors.New("exec returned incorrect output or exit code")
+		}
+		done <- err
+	}
+	go run("first", firstDone)
+	select {
+	case <-writes:
+	case <-ctx.Done():
+		t.Fatal("first exec did not reach stdin")
+	}
+	go run("second", secondDone)
+	// Keep the first exec blocked longer than the second exec's timeout.
+	select {
+	case cmd := <-writes:
+		t.Fatalf("exec %q wrote before the first exec completed", cmd)
+	case err := <-secondDone:
+		t.Fatalf("queued exec returned before acquiring its slot: %v", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+	close(release)
+	for _, done := range []<-chan error{firstDone, secondDone} {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Errorf("exec: %v", err)
+			}
+		case <-ctx.Done():
+			t.Fatal("exec did not finish after the first stdin write was released")
+		}
 	}
 }
 

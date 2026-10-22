@@ -69,11 +69,11 @@ type Session struct {
 	stdinMu sync.Mutex
 	stdin   io.WriteCloser
 
-	// execMu serializes Exec calls on one session: concurrent Execs would
+	// execSem serializes Exec calls on one session: concurrent Execs would
 	// interleave two marker scripts in the same stdin stream and attribute
 	// output/exit codes to the wrong caller (the BEGIN/END markers of one
 	// run could bracket the other's output).
-	execMu sync.Mutex
+	execSem chan struct{}
 
 	closed bool
 }
@@ -86,7 +86,10 @@ func newSession(id string, ringSize int) *Session {
 	if ringSize <= 0 {
 		ringSize = defaultRingSize
 	}
-	s := &Session{id: id, ring: make([]byte, ringSize), maxLen: ringSize}
+	s := &Session{
+		id: id, ring: make([]byte, ringSize), maxLen: ringSize,
+		execSem: make(chan struct{}, 1),
+	}
 	s.cond = sync.NewCond(&s.mu)
 	return s
 }
@@ -345,9 +348,9 @@ func findMarkerEnd(collected []byte, token string) (int, int, int) {
 // seconds and bounds the marker wait after stdin is written, excluding time
 // waiting for another Exec or writing stdin. Cancellation or timeout does
 // not stop the guest command. Missing stdin returns ErrNoStdin; token and
-// stdin write failures propagate. Cancellation checked before a tail wait
-// returns ctx.Err(); tail-wait errors, including closure or cancellation,
-// are converted to an exec timeout error.
+// stdin write failures propagate. Cancellation while waiting for another Exec
+// or checked before a tail wait returns ctx.Err(); tail-wait errors, including
+// closure or cancellation, are converted to an exec timeout error.
 func (s *Session) Exec(ctx context.Context, cmd string, timeout time.Duration) (*Result, error) {
 	if timeout <= 0 {
 		timeout = 30 * time.Second
@@ -355,8 +358,12 @@ func (s *Session) Exec(ctx context.Context, cmd string, timeout time.Duration) (
 	// One marker protocol at a time per session: concurrent scripts would
 	// interleave in the shared stdin/stdout stream and cross-attribute
 	// output and exit codes between callers.
-	s.execMu.Lock()
-	defer s.execMu.Unlock()
+	select {
+	case s.execSem <- struct{}{}:
+		defer func() { <-s.execSem }()
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 	w := s.Stdin()
 	if w == nil {
 		return nil, ErrNoStdin
