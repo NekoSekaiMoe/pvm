@@ -24,10 +24,10 @@ func setupTestServer(t *testing.T) (*echo.Echo, string) {
 	t.Setenv("PVM_VOLUME_ROOT", filepath.Join(tmp, "volumes"))
 	t.Setenv("API_SECRET", "test-secret")
 
-	origStateRoot := state.RootDir
-	state.RootDir = filepath.Join(tmp, "containers")
+	origStateRoot := state.Root()
+	state.SetRoot(filepath.Join(tmp, "containers"))
 	t.Cleanup(func() {
-		state.RootDir = origStateRoot
+		state.SetRoot(origStateRoot)
 	})
 
 	e, err := NewE2BServer()

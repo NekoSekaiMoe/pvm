@@ -17,9 +17,9 @@ import (
 // timers, so the result is deterministic.
 func TestAutopause_StaleCallbackCannotPause(t *testing.T) {
 	dir := t.TempDir()
-	origRoot := state.RootDir
-	state.RootDir = dir
-	t.Cleanup(func() { state.RootDir = origRoot })
+	origRoot := state.Root()
+	state.SetRoot(dir)
+	t.Cleanup(func() { state.SetRoot(origRoot) })
 	t.Setenv("PVM_CGROUP_ROOT", t.TempDir())
 
 	id := "stale-cb"
@@ -63,9 +63,9 @@ func TestAutopause_StaleCallbackCannotPause(t *testing.T) {
 
 func TestAutopause_FiresAndResume(t *testing.T) {
 	dir := t.TempDir()
-	origRoot := state.RootDir
-	state.RootDir = dir
-	t.Cleanup(func() { state.RootDir = origRoot })
+	origRoot := state.Root()
+	state.SetRoot(dir)
+	t.Cleanup(func() { state.SetRoot(origRoot) })
 	cgRoot := t.TempDir()
 	t.Setenv("PVM_CGROUP_ROOT", cgRoot)
 
@@ -104,9 +104,9 @@ func TestAutopause_FiresAndResume(t *testing.T) {
 // permanently exempted the task from autopause.
 func TestAutopause_ResumeRearmsIdleTimer(t *testing.T) {
 	dir := t.TempDir()
-	origRoot := state.RootDir
-	state.RootDir = dir
-	t.Cleanup(func() { state.RootDir = origRoot })
+	origRoot := state.Root()
+	state.SetRoot(dir)
+	t.Cleanup(func() { state.SetRoot(origRoot) })
 	t.Setenv("PVM_CGROUP_ROOT", t.TempDir())
 
 	id := "resume-rearm"
@@ -138,9 +138,9 @@ func TestAutopause_ResumeRearmsIdleTimer(t *testing.T) {
 // "never armed" behavior.
 func TestAutopause_ResumeWithoutTimeoutStaysUnarmed(t *testing.T) {
 	dir := t.TempDir()
-	origRoot := state.RootDir
-	state.RootDir = dir
-	t.Cleanup(func() { state.RootDir = origRoot })
+	origRoot := state.Root()
+	state.SetRoot(dir)
+	t.Cleanup(func() { state.SetRoot(origRoot) })
 	t.Setenv("PVM_CGROUP_ROOT", t.TempDir())
 
 	id := "resume-notimeout"
@@ -187,9 +187,9 @@ func waitForStatus(t *testing.T, id string, want state.Status, within time.Durat
 
 func TestAutopause_ResetBumpsDeadline(t *testing.T) {
 	dir := t.TempDir()
-	origRoot := state.RootDir
-	state.RootDir = dir
-	t.Cleanup(func() { state.RootDir = origRoot })
+	origRoot := state.Root()
+	state.SetRoot(dir)
+	t.Cleanup(func() { state.SetRoot(origRoot) })
 	cgRoot := t.TempDir()
 	t.Setenv("PVM_CGROUP_ROOT", cgRoot)
 
@@ -250,9 +250,9 @@ func mustStatus(t *testing.T, id string) state.Status {
 // involved.
 func TestAutopause_EpochChangeAfterFreezeCannotCommit(t *testing.T) {
 	dir := t.TempDir()
-	origRoot := state.RootDir
-	state.RootDir = dir
-	t.Cleanup(func() { state.RootDir = origRoot })
+	origRoot := state.Root()
+	state.SetRoot(dir)
+	t.Cleanup(func() { state.SetRoot(origRoot) })
 	t.Setenv("PVM_CGROUP_ROOT", t.TempDir())
 
 	id := "epoch-commit"
@@ -290,9 +290,9 @@ func TestAutopause_EpochChangeAfterFreezeCannotCommit(t *testing.T) {
 // a retry is scheduled instead.
 func TestAutopause_SaveFailureThawsAndRearms(t *testing.T) {
 	root := t.TempDir()
-	origRoot := state.RootDir
-	state.RootDir = root
-	t.Cleanup(func() { state.RootDir = origRoot })
+	origRoot := state.Root()
+	state.SetRoot(root)
+	t.Cleanup(func() { state.SetRoot(origRoot) })
 	t.Setenv("PVM_CGROUP_ROOT", t.TempDir())
 
 	// Pre-create <root>/<id> as a regular file so SaveState's MkdirAll
@@ -325,9 +325,9 @@ func TestAutopause_SaveFailureThawsAndRearms(t *testing.T) {
 // since pause only suspends Running tasks.
 func TestAutopause_EpochChangeAfterPersistRolledBack(t *testing.T) {
 	dir := t.TempDir()
-	origRoot := state.RootDir
-	state.RootDir = dir
-	t.Cleanup(func() { state.RootDir = origRoot })
+	origRoot := state.Root()
+	state.SetRoot(dir)
+	t.Cleanup(func() { state.SetRoot(origRoot) })
 	t.Setenv("PVM_CGROUP_ROOT", t.TempDir())
 
 	id := "epoch-after-persist"
@@ -380,9 +380,9 @@ func TestAutopause_EpochChangeAfterPersistRolledBack(t *testing.T) {
 // Manager.Resume precisely so this recovery lives in exactly one place.
 func TestAutopause_ResumeCompensatesSaveFailure(t *testing.T) {
 	dir := t.TempDir()
-	origRoot := state.RootDir
-	state.RootDir = dir
-	t.Cleanup(func() { state.RootDir = origRoot })
+	origRoot := state.Root()
+	state.SetRoot(dir)
+	t.Cleanup(func() { state.SetRoot(origRoot) })
 	t.Setenv("PVM_CGROUP_ROOT", t.TempDir())
 
 	id := "resume-savefail"

@@ -2,6 +2,7 @@ package snapshot
 
 import (
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -10,9 +11,9 @@ import (
 
 func TestEventSnapshot_CreateListGetDelete(t *testing.T) {
 	tmpDir := t.TempDir()
-	orig := state.RootDir
-	state.RootDir = tmpDir
-	defer func() { state.RootDir = orig }()
+	orig := state.Root()
+	state.SetRoot(tmpDir)
+	defer func() { state.SetRoot(orig) }()
 
 	taskID := "test-event-task"
 	cDir, err := state.ContainerDir(taskID)
@@ -99,9 +100,9 @@ func TestEventSnapshot_CreateListGetDelete(t *testing.T) {
 
 func TestEventSnapshot_Validation(t *testing.T) {
 	tmpDir := t.TempDir()
-	orig := state.RootDir
-	state.RootDir = tmpDir
-	defer func() { state.RootDir = orig }()
+	orig := state.Root()
+	state.SetRoot(tmpDir)
+	defer func() { state.SetRoot(orig) }()
 
 	cases := []struct {
 		name    string
@@ -122,5 +123,57 @@ func TestEventSnapshot_Validation(t *testing.T) {
 				t.Errorf("ListEventSnapshots(%q) err = %v, wantErr = %v", tc.taskID, err, tc.wantErr)
 			}
 		})
+	}
+}
+
+// TestEventSnapshot_FilesystemOnly verifies the disk-only capture mode: no
+// CRIU memory images are written and the snapshot is tagged with its scope,
+// even for a Running task with a live pid.
+func TestEventSnapshot_FilesystemOnly(t *testing.T) {
+	tmpDir := t.TempDir()
+	orig := state.Root()
+	state.SetRoot(tmpDir)
+	defer func() { state.SetRoot(orig) }()
+
+	taskID := "test-fs-only"
+	cDir, err := state.ContainerDir(taskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(cDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// A dummy overlay so the disk capture has something to branch/copy.
+	if err := os.WriteFile(cDir+"/overlay.qcow2", []byte("not-a-real-qcow2"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	st := &state.ContainerState{
+		ID:        taskID,
+		Status:    state.StatusRunning,
+		StartedAt: time.Now().UTC(),
+	}
+	if err := state.SaveState(taskID, st); err != nil {
+		t.Fatal(err)
+	}
+
+	snap, err := CreateEventSnapshotWithOptions(taskID, "ev-fs", "", nil,
+		SnapshotOptions{FilesystemOnly: true})
+	if err != nil {
+		t.Fatalf("filesystem-only snapshot: %v", err)
+	}
+	if snap.Metadata["snapshot_scope"] != "filesystem" {
+		t.Errorf("scope = %q, want filesystem", snap.Metadata["snapshot_scope"])
+	}
+	if snap.Metadata["memory_state"] != string(MemoryNotAttempt) {
+		t.Errorf("memory_state = %q, want %q", snap.Metadata["memory_state"], MemoryNotAttempt)
+	}
+	// The disk overlay must still have been captured.
+	if _, err := os.Stat(snap.DiskOverlay); err != nil {
+		t.Errorf("disk overlay not captured: %v", err)
+	}
+	// No memory images directory was written alongside the snapshot.
+	snapDir := filepath.Dir(snap.DiskOverlay)
+	if _, err := os.Stat(MemoryImagesDir(snapDir)); !os.IsNotExist(err) {
+		t.Errorf("filesystem-only snapshot wrote a criu memory dir (err=%v)", err)
 	}
 }

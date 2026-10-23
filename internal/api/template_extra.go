@@ -185,7 +185,7 @@ func sanitizePreviewName(id string) string {
 // cleanupPreview kills the preview container and removes its state.
 func cleanupPreview(name string) {
 	if st, err := state.LoadState(name); err == nil && st.PID > 0 {
-		if belongs, _ := procBelongsToContainer(st.PID, name); belongs {
+		if belongs, _ := ProcBelongsToContainer(st.PID, name); belongs {
 			_ = syscall.Kill(st.PID, syscall.SIGKILL)
 		}
 	}

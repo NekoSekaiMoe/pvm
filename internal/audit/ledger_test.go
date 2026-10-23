@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestLedger_ChainAndVerify(t *testing.T) {
@@ -48,6 +49,9 @@ func TestLedger_TamperDetected(t *testing.T) {
 	l, _ := Open("task-2")
 	l.Append(Record{Phase: PhaseExec, Subject: "agent", Action: "read", Decision: DecisionAllow})
 	l.Append(Record{Phase: PhaseExec, Subject: "agent", Action: "write", Decision: DecisionDeny, Reason: "outside branch"})
+	// Group commit: ensure the async watermark flusher has caught up before
+	// the on-disk bytes are tampered with.
+	l.FlushHead()
 
 	// tamper: rewrite the file with a modified reason on row 2
 	path := filepath.Join(tmp, "task-2", "ledger.jsonl")
@@ -76,6 +80,9 @@ func TestLedger_HeadAtomicWrite(t *testing.T) {
 	if err := l.Append(Record{Phase: PhaseExec, Subject: "agent", Action: "read", Decision: DecisionAllow}); err != nil {
 		t.Fatalf("append 1: %v", err)
 	}
+	// The head watermark is group-committed (async flusher): wait for the
+	// durable write rather than assuming synchronous visibility.
+	waitForHeadFlush(t, l, 1)
 	oldSeq, oldHash, ok := l.readHead()
 	if !ok || oldSeq != 1 {
 		t.Fatalf("after first append: readHead ok=%v seq=%d want seq=1", ok, oldSeq)
@@ -102,6 +109,7 @@ func TestLedger_HeadAtomicWrite(t *testing.T) {
 	if err != nil || len(recs) != 2 {
 		t.Fatalf("readall: %v len=%d", err, len(recs))
 	}
+	waitForHeadFlush(t, l, 2)
 	seq, hash, ok := l.readHead()
 	if !ok || seq != 2 || hash != recs[1].ThisHash || hash == oldHash {
 		t.Fatalf("readHead after atomic replace: ok=%v seq=%d hash mismatch", ok, seq)
@@ -136,6 +144,31 @@ func TestLedger_HeadAtomicWrite(t *testing.T) {
 	if n, err := l2.Verify(); err != nil || n != 2 {
 		t.Fatalf("verify after atomic writes: n=%d err=%v", n, err)
 	}
+}
+
+// waitForHeadFlush blocks until the group-commit flusher has durably
+// written the watermark for seq (bounded; the flusher runs at
+// groupCommitInterval granularity).
+func waitForHeadFlush(t *testing.T, l *Ledger, wantSeq int64) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if seq, _, ok := l.readHead(); ok && seq >= wantSeq {
+			return
+		}
+		l.mu.Lock()
+		dirty := l.headDirty
+		l.mu.Unlock()
+		if !dirty {
+			// Already flushed (or never dirtied): read again to close the
+			// race between the check above and this one.
+			if seq, _, ok := l.readHead(); ok && seq >= wantSeq {
+				return
+			}
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("head watermark for seq %d did not flush within 5s", wantSeq)
 }
 
 func TestLedger_CrossTaskIsolation(t *testing.T) {

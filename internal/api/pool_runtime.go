@@ -29,9 +29,12 @@ var (
 	poolTotalGauge   = metrics.Gauge("pvm_pool_total", "Total sandboxes tracked by the warm pool")
 )
 
+// initPoolRuntime attempts to enable pool persistence under the state root,
+// registers pool metrics, and supplies state-recording factory and destroyer
+// callbacks where none are configured. Persistence failures do not abort setup.
 func initPoolRuntime() {
 	m := currentPool()
-	if root := state.RootDir; root != "" {
+	if root := state.Root(); root != "" {
 		if err := m.EnablePersistence(filepath.Join(root, "pool.json")); err != nil {
 			log.Printf("pool: persistence disabled: %v", err)
 		}

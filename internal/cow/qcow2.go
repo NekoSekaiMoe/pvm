@@ -1107,7 +1107,10 @@ func convertToRaw(ctx context.Context, srcPath, destPath string) error {
 		return err
 	}
 
-	out, err := os.OpenFile(destPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+	// O_NOFOLLOW: destPath is built from state-root pieces, but a
+	// pre-planted symlink at the final component would otherwise make
+	// O_TRUNC clobber the link target (createQcow2 has the same guard).
+	out, err := os.OpenFile(destPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC|syscall.O_NOFOLLOW, 0644)
 	if err != nil {
 		return fmt.Errorf("cow: create dest: %w", err)
 	}

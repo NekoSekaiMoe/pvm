@@ -972,6 +972,13 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 			})
 		}
 		m.Egress.SetPolicy(taskID, pol)
+		// Wire the DNS-learn plane into the gateway exactly once: the
+		// checker is a stateless view over the per-task learner registry,
+		// so re-attaching it for every task is idempotent. Without this
+		// the rebinding guard (and the transparent-TLS SNI consistency
+		// requirement) never engages in production — the checker defaults
+		// to nil and every dialset lookup fails open.
+		m.Egress.SetLearnedChecker(dnslearn.Checker{})
 		// Transparent L7 interception (bridge plane only): when a policy is
 		// declared, a second per-task listener accepts iptables-REDIRECTed
 		// :80/:443 traffic so the guest needs NO proxy configuration. The
@@ -1283,11 +1290,13 @@ func (m *Manager) StartTask(ctx context.Context, taskID string, s *spec.TaskSpec
 			if bridgePlane && !dpAttached {
 				for _, pm := range s.Network.PortMappings {
 					if err := network.AddPortMapping(network.PortMapping{
-						TaskID:    taskID,
-						HostPort:  pm.HostPort,
-						GuestPort: pm.GuestPort,
-						GuestIP:   guestIP,
-						Protocol:  pm.Protocol,
+						TaskID:          taskID,
+						HostPort:        pm.HostPort,
+						GuestPort:       pm.GuestPort,
+						GuestIP:         guestIP,
+						Protocol:        pm.Protocol,
+						AccessToken:     pm.AccessToken,
+						MaskRequestHost: pm.MaskRequestHost,
 					}); err != nil {
 						cleanupVolumes()
 						_ = st.Transition(state.StatusFailed, state.ActorController, "port mapping failed: "+err.Error())

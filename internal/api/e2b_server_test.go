@@ -14,6 +14,7 @@ import (
 	"time"
 	"uml-container/internal/lifecycle"
 	"uml-container/internal/policy"
+	"uml-container/internal/pool"
 	"uml-container/internal/state"
 	"uml-container/internal/template"
 )
@@ -37,8 +38,16 @@ func bootServer(t *testing.T) string {
 	// The server refuses to start without a secret (no default credential);
 	// tests authenticate with this one.
 	t.Setenv("API_SECRET", "secret")
-	state.RootDir = t.TempDir()
+	state.SetRoot(t.TempDir())
 	port := freePort(t)
+	// Park the process-wide watchdog sweeper before the NEXT case
+	// reassigns state.Root(): the sweeper goroutine outlives this server
+	// and reads the global on every 1s tick — an unsynchronized read/write
+	// pair -race flags. Production never reassigns RootDir, so stopping is
+	// purely a test-lifecycle concern (the sweeper restarts with the next
+	// server via the Once... which is spent, so sweeps end for the process:
+	// individual sweeps are still exercised directly by watchdog tests).
+	t.Cleanup(stopWatchdog)
 
 	ready := make(chan struct{})
 	go func() {
@@ -175,9 +184,9 @@ var _ = context.Background
 // (observable by the task actually suspending), while suspended tasks,
 // running tasks without a timeout, and unparseable timeouts stay untouched.
 func TestRearmAllAutopause(t *testing.T) {
-	origRoot := state.RootDir
-	state.RootDir = t.TempDir()
-	t.Cleanup(func() { state.RootDir = origRoot })
+	origRoot := state.Root()
+	state.SetRoot(t.TempDir())
+	t.Cleanup(func() { state.SetRoot(origRoot) })
 	t.Setenv("PVM_CGROUP_ROOT", t.TempDir())
 
 	save := func(id string, status state.Status, idle string) {
@@ -480,5 +489,55 @@ func TestValidateAPIRootfs_ResolvesSymlinksAndKeepsFormatChecks(t *testing.T) {
 	if _, err := validateRootfsUnder(filepath.Join(aliasDir, "swapped", "evil.img"), aliasDir); err == nil ||
 		!strings.Contains(err.Error(), "rootfs must live under") {
 		t.Fatalf("symlink-swapped rootfs must be rejected post-resolution, got %v", err)
+	}
+}
+
+// TestAPI_PoolSuspendResume exercises the quota-release-on-pause management
+// endpoints: a claimed sandbox can be suspended (memory reservation released)
+// and resumed (re-reserved), and the error paths map to the right status.
+func TestAPI_PoolSuspendResume(t *testing.T) {
+	base := bootServer(t)
+
+	m := pool.NewManager(4, nil)
+	m.SetQuota("t", pool.Quota{MaxConcurrent: 4, MaxCPU: 4, MaxMemoryMB: 512, MaxTasksPerHour: 10})
+	tmpl := pool.Template{Name: "alpine", Memory: "512M", CPU: 1}
+	m.Warm(tmpl, 1)
+	id, err := m.Claim("t", tmpl, "task-pool-1")
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	RegisterPoolManager(m)
+	t.Cleanup(func() { RegisterPoolManager(pool.NewManager(16, nil)) })
+
+	post := func(path, body string) int {
+		req, _ := http.NewRequest(http.MethodPost, base+path, strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer secret")
+		req.Header.Set("Content-Type", "application/json")
+		resp, derr := http.DefaultClient.Do(req)
+		if derr != nil {
+			t.Fatalf("POST %s: %v", path, derr)
+		}
+		defer resp.Body.Close()
+		io.Copy(io.Discard, resp.Body)
+		return resp.StatusCode
+	}
+
+	body := `{"id":"` + id + `"}`
+	if code := post("/api/pool/suspend", body); code != http.StatusOK {
+		t.Fatalf("suspend: want 200, got %d", code)
+	}
+	// Suspending an already-paused sandbox is idempotent.
+	if code := post("/api/pool/suspend", body); code != http.StatusOK {
+		t.Fatalf("idempotent suspend: want 200, got %d", code)
+	}
+	if code := post("/api/pool/resume", body); code != http.StatusOK {
+		t.Fatalf("resume: want 200, got %d", code)
+	}
+	// An unknown id is 404, a missing id 400.
+	if code := post("/api/pool/suspend", `{"id":"nope"}`); code != http.StatusNotFound {
+		t.Fatalf("unknown id: want 404, got %d", code)
+	}
+	if code := post("/api/pool/suspend", `{}`); code != http.StatusBadRequest {
+		t.Fatalf("missing id: want 400, got %d", code)
 	}
 }

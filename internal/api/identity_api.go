@@ -30,24 +30,24 @@ var (
 
 // CurrentIdentity lazily constructs the global broker with persistence.
 // The cache is keyed to the CURRENT state root: tests swap PVM_STATE_ROOT
-// (and state.RootDir) between cases, and a stale broker would read/write
+// (and state.Root()) between cases, and a stale broker would read/write
 // key files in a deleted temp dir.
 func CurrentIdentity() (*identity.Broker, error) {
 	globalIdentityMu.RLock()
 	b, cachedRoot := globalIdentity, globalIdentityRoot
 	globalIdentityMu.RUnlock()
-	if b != nil && cachedRoot == state.RootDir {
+	if b != nil && cachedRoot == state.Root() {
 		return b, nil
 	}
 	globalIdentityMu.Lock()
 	defer globalIdentityMu.Unlock()
 	// Re-check BOTH cache slots: an injected or previously built broker is
 	// only valid while the state root is unchanged (see RegisterIdentityManager).
-	if globalIdentity != nil && globalIdentityRoot == state.RootDir {
+	if globalIdentity != nil && globalIdentityRoot == state.Root() {
 		return globalIdentity, nil
 	}
-	keyPath := filepath.Join(state.RootDir, "identity.key")
-	revPath := filepath.Join(state.RootDir, "identity-revocations.json")
+	keyPath := filepath.Join(state.Root(), "identity.key")
+	revPath := filepath.Join(state.Root(), "identity-revocations.json")
 	key, err := identity.LoadOrCreateKey(keyPath)
 	if err != nil {
 		return nil, err
@@ -61,7 +61,7 @@ func CurrentIdentity() (*identity.Broker, error) {
 		os.Stderr.WriteString("identity: revocation persistence disabled: " + err.Error() + "\n")
 	}
 	globalIdentity = b
-	globalIdentityRoot = state.RootDir
+	globalIdentityRoot = state.Root()
 	return b, nil
 }
 
@@ -71,7 +71,7 @@ func CurrentIdentity() (*identity.Broker, error) {
 func RegisterIdentityManager(b *identity.Broker) {
 	globalIdentityMu.Lock()
 	globalIdentity = b
-	globalIdentityRoot = state.RootDir
+	globalIdentityRoot = state.Root()
 	globalIdentityMu.Unlock()
 }
 

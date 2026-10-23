@@ -31,7 +31,7 @@ func (t *trackingLauncher) Wait(*uml.Process) error { return nil }
 
 func newTestManager(t *testing.T) (*Manager, *trackingLauncher) {
 	t.Helper()
-	state.RootDir = t.TempDir()
+	state.SetRoot(t.TempDir())
 	audit.LedgerRoot = t.TempDir()
 	os.Setenv("PVM_CGROUP_ROOT", t.TempDir()) // throwaway, no real cgroup writes
 	jail.ResetHostCapabilitiesForTest(&jail.HostCapabilities{

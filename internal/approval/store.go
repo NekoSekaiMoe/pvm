@@ -86,7 +86,9 @@ func (m *Manager) persistLocked() error {
 // EnableWebhook registers a best-effort HTTP JSON notification endpoint.
 // Ticket create/decide/edit events are POSTed asynchronously; delivery
 // failures are logged and dropped (the audit ledger remains the durable
-// record).
+// record). The exchange never follows redirects — ticket params can
+// carry sensitive context, and a 30x (or a scheme downgrade) must not
+// replay them to a third party.
 func (m *Manager) EnableWebhook(url string) {
 	if url == "" {
 		return
@@ -94,6 +96,19 @@ func (m *Manager) EnableWebhook(url string) {
 	m.webhookURL = url
 }
 
+// webhookClient is the shared hardened exchange for approval webhook
+// POSTs: bounded in time and redirect-refusing (http.ErrUseLastResponse
+// turns any 3xx into a plain response that notify() discards).
+var webhookClient = &http.Client{
+	Timeout: 5 * time.Second,
+	CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		return http.ErrUseLastResponse
+	},
+}
+
+// notify asynchronously POSTs the event and ticket to the configured webhook.
+// It is a no-op without a webhook URL. Delivery is best effort: errors do not
+// reach callers, responses are discarded, and redirects are not followed.
 func (m *Manager) notify(event string, t Ticket) {
 	url := m.webhookURL
 	if url == "" {
@@ -101,8 +116,7 @@ func (m *Manager) notify(event string, t Ticket) {
 	}
 	go func() {
 		body, _ := json.Marshal(map[string]interface{}{"event": event, "ticket": t})
-		client := &http.Client{Timeout: 5 * time.Second}
-		resp, err := client.Post(url, "application/json", bytes.NewReader(body))
+		resp, err := webhookClient.Post(url, "application/json", bytes.NewReader(body))
 		if err != nil {
 			log.Printf("approval: webhook %s failed: %v", url, err)
 			return

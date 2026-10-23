@@ -183,7 +183,7 @@ func registerExecRuntimeExtras(api *echo.Group) {
 // root (same semantics as the E2B sandbox short-id resolution). Defined here
 // until the tasks endpoints migrate onto it.
 func resolveTaskID(idOrPrefix string) (string, error) {
-	root := state.RootDir
+	root := state.Root()
 	entries, err := os.ReadDir(root)
 	if err != nil {
 		return "", err
@@ -217,7 +217,7 @@ func (e *ambiguousIDError) Error() string { return "task id prefix is ambiguous"
 // storage and (optional) webhook notifications.
 func initApprovalPersistence() {
 	m := currentApprovals()
-	if root := state.RootDir; root != "" {
+	if root := state.Root(); root != "" {
 		if err := m.EnablePersistence(filepath.Join(root, "approvals.json")); err != nil {
 			// Persistence is a hardening feature: the plane keeps running
 			// in-memory, but say so.

@@ -29,6 +29,7 @@ import (
 	"net"
 	"net/http"
 	"path"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -92,6 +93,16 @@ const (
 	DecisionReview
 )
 
+const (
+	// upstreamHeaderTimeout is how long the proxy waits for the first
+	// upstream response header (TTFB). Sized for LLM/tool streams that
+	// think for minutes before the first byte.
+	upstreamHeaderTimeout = 2 * time.Hour
+	// maxInjectValueBytes is the hard ceiling on an injected header value.
+	// Oversized secrets are refused rather than truncated.
+	maxInjectValueBytes = 2048
+)
+
 // verdictString mirrors audit decisions for ledger rows.
 func (d Decision) String() string {
 	return [...]string{"allow", "block", "review"}[d]
@@ -119,6 +130,14 @@ type Gateway struct {
 	// keep-alives ON). Created lazily so a bare &Gateway{} (unit tests) works.
 	transport *http.Transport
 
+	// learnedTransports caches the rebinding-guard transports per
+	// (task, host): the guard only matters at DIAL time, so the clone (with
+	// its learned-set dial check) is reusable until the learned set itself
+	// changes — the set's fingerprint rides along as the cache key's third
+	// component. A per-request clone (the old design) disabled keep-alives
+	// and paid a fresh TCP+TLS handshake on every constrained request.
+	learnedTransports map[string]learnedTransportEntry
+
 	// ssrfBypass is a test-only escape hatch that disables the SSRF IP-floor
 	// on handleHTTP so unit tests can point at httptest's 127.0.0.1 backends.
 	// Production code MUST NOT set this; it's unexported and only written via
@@ -126,8 +145,8 @@ type Gateway struct {
 	ssrfBypass bool
 
 	// learnChecker, when non-nil, closes the DNS-rebinding gap for
-	// DNS-learned hosts (todo.md P1-B): if a host's IPs were learned from the
-	// guest's own DNS traffic, a dial that lands on an IP OUTSIDE the learned
+	// DNS-learned hosts (todo.md P1-B): if a host's IPs were learned from
+	// the guest's own DNS traffic, a dial that lands on an IP OUTSIDE the learned
 	// set is rejected — the proxy's own resolver must not be able to roam to
 	// an address the guest never saw. Implemented by the dnslearn registry.
 	learnChecker LearnedIPChecker
@@ -137,11 +156,20 @@ type Gateway struct {
 	rebindGuardOff bool
 }
 
+// learnedTransportEntry is one cached (task, host) constrained transport.
+type learnedTransportEntry struct {
+	fingerprint string // ordered join of the learned IP set it was built from
+	transport   *http.Transport
+}
+
 // LearnedIPChecker reports the live DNS-learned IP set for a (task, host)
 // pair. An empty/nil result means "no learned constraint" and the dial is
-// checked only against the SSRF floor. dnslearn.RegistryFor implements this.
+// checked only against the SSRF floor. TaskLearned reports whether the
+// task runs a DNS learner at all (deployments can mix learning and
+// non-learning tasks behind one gateway). dnslearn.Checker implements this.
 type LearnedIPChecker interface {
 	LearnedIPs(task, host string) []net.IP
+	TaskLearned(task string) bool
 }
 
 // SetLearnedChecker attaches the DNS-learn plane's checker. Nil disables.
@@ -151,8 +179,9 @@ func (g *Gateway) SetLearnedChecker(c LearnedIPChecker) {
 	g.learnChecker = c
 }
 
-// SetRebindingGuard toggles the learned-IP dial check (default on). It only
-// takes effect once a LearnedIPChecker is attached.
+// SetRebindingGuard toggles the learned-IP dial check. The default is ON
+// (zero value) but is inert until a checker is attached, so bare
+// &Gateway{} unit tests are unaffected.
 func (g *Gateway) SetRebindingGuard(enabled bool) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -178,6 +207,24 @@ func (g *Gateway) learnedDialSet(task, host string) map[string]struct{} {
 		set[ip.String()] = struct{}{}
 	}
 	return set
+}
+
+// sniGuardActive reports whether the transparent-TLS splice must prove
+// SNI↔destination consistency for this task: a checker is attached, the
+// guard is not disabled, and the task itself runs a DNS learner (its
+// allowlisted domains are resolvable through the learned table). For such
+// tasks an SNI whose host was never DNS-learned cannot be verified against
+// the dialed IP at all — the SNI is then purely client-asserted, and
+// splicing to the original destination would let a guest tunnel to any
+// IP by claiming an allowlisted name.
+func (g *Gateway) sniGuardActive(task string) bool {
+	g.mu.RLock()
+	checker, off := g.learnChecker, g.rebindGuardOff
+	g.mu.RUnlock()
+	if checker == nil || off {
+		return false
+	}
+	return checker.TaskLearned(task)
 }
 
 // learnedSetContainsIP reports whether addr's IP is in the learned set.
@@ -342,12 +389,13 @@ func (g *Gateway) Listen(ctx context.Context, addr string) (string, error) {
 	g.listener = ln
 	g.server = &http.Server{
 		Handler: http.HandlerFunc(g.handle),
-		// Tight timeouts: a sandbox should not hold a proxy idle for long.
 		// ReadHeaderTimeout bounds the headers; ReadTimeout bounds the whole
-		// request (incl. body) so a slow-body attacker can't pin a goroutine.
+		// inbound request (incl. body) so a slow-body attacker can't pin a
+		// goroutine. WriteTimeout is left unset: a 60s write deadline would
+		// truncate long upstream streams (and a TTFB up to
+		// upstreamHeaderTimeout) before the first byte lands.
 		ReadTimeout:       60 * time.Second,
 		ReadHeaderTimeout: 10 * time.Second,
-		WriteTimeout:      60 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
 	g.mu.Unlock()
@@ -432,7 +480,6 @@ func (g *Gateway) ListenForTaskOn(ctx context.Context, taskID, addr string) (*ta
 		}),
 		ReadTimeout:       60 * time.Second,
 		ReadHeaderTimeout: 10 * time.Second,
-		WriteTimeout:      60 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
 	go tl.server.Serve(ln)
@@ -777,7 +824,7 @@ func (g *Gateway) dialCheckedTransport() *http.Transport {
 			}
 			return conn, nil
 		},
-		ResponseHeaderTimeout: 30 * time.Second,
+		ResponseHeaderTimeout: upstreamHeaderTimeout,
 		// Bound the TLS handshake separately from the dial timeout: without
 		// it a TLS endpoint that accepts TCP but stalls the handshake pins a
 		// connection (and its goroutine) indefinitely.
@@ -800,23 +847,51 @@ var errLearnedIPMismatch = errors.New("egress: dialed IP not in DNS-learned set"
 
 // transportForTask returns the transport handleHTTP must use for this
 // request: the shared SSRF-checked transport normally, or — when the
-// rebinding guard has a learned-IP constraint for (task, host) — a clone
-// whose DialContext additionally rejects dialed IPs outside the learned
-// set. Cloning per constrained request intentionally forfeits keep-alive
-// pooling for DNS-learned hosts: a pooled connection could otherwise
-// smuggle a stale, pre-guard dial past the check.
+// rebinding guard has a learned-IP constraint for (task, host) — a
+// constrained clone whose DialContext additionally rejects dialed IPs
+// outside the learned set.
+//
+// The constrained transport is CACHED per (task, host) until the learned
+// set changes: the dial-time check is exactly what the rebinding guard
+// needs, and an established connection's IP cannot change afterwards, so
+// keep-alive pooling on the cached clone is safe AND saves a TCP+TLS
+// handshake per request (the previous per-request clone disabled
+// keep-alives entirely, taxing every LLM API call 50-200ms). The cache
+// key embeds the learned set's fingerprint so a DNS re-learn rebuilds the
+// transport with the fresh set.
 func (g *Gateway) transportForTask(task, host string) *http.Transport {
 	base := g.dialCheckedTransport()
 	set := g.learnedDialSet(task, host)
 	if set == nil {
 		return base
 	}
+	fp := learnedSetFingerprint(set)
+	cacheKey := task + "\x00" + host + "\x00" + fp
+
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.learnedTransports == nil {
+		g.learnedTransports = make(map[string]learnedTransportEntry)
+	}
+	// Rebuild when the learned set moved (cache hit on an old fingerprint
+	// must not serve a stale guard). The previous transport's pooled
+	// connections are closed by CloseIdleConnections; in-flight ones die
+	// with their request.
+	if e, ok := g.learnedTransports[cacheKey]; ok && e.fingerprint == fp {
+		return e.transport
+	}
+	for k, e := range g.learnedTransports {
+		if strings.HasPrefix(k, task+"\x00"+host+"\x00") && e.fingerprint != fp {
+			e.transport.CloseIdleConnections()
+			delete(g.learnedTransports, k)
+		}
+	}
+	if e, ok := g.learnedTransports[cacheKey]; ok {
+		return e.transport
+	}
 	t := base.Clone()
-	// The clone is per-request, so its (independent) idle-conn pool would
-	// strand readLoop/writeLoop goroutines for the inherited 90s
-	// IdleConnTimeout on every constrained request. Connections close as
-	// soon as the response is read instead.
-	t.DisableKeepAlives = true
+	// Keep-alives stay ON: the dial check runs on every NEW connection, and
+	// a pooled connection's remote IP was already verified at dial time.
 	orig := t.DialContext
 	t.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
 		conn, err := orig(ctx, network, addr)
@@ -829,7 +904,19 @@ func (g *Gateway) transportForTask(task, host string) *http.Transport {
 		}
 		return conn, nil
 	}
+	g.learnedTransports[cacheKey] = learnedTransportEntry{fingerprint: fp, transport: t}
 	return t
+}
+
+// learnedSetFingerprint renders a learned IP set into a stable, order-
+// independent string for cache keying.
+func learnedSetFingerprint(set map[string]struct{}) string {
+	ips := make([]string, 0, len(set))
+	for ip := range set {
+		ips = append(ips, ip)
+	}
+	sort.Strings(ips)
+	return strings.Join(ips, ",")
 }
 
 // isSSRFDialError reports whether err is the SSRF-floor rejection.
@@ -1009,13 +1096,12 @@ func (g *Gateway) decideDomain(v requestView, pol *Policy) Decision {
 }
 
 // ApplyInject adds credential headers from the FIRST fully matching rule.
-// Credentials are injected ONLY when the request travels over HTTPS
-// (v.scheme == "https"): writing a secret onto a plaintext HTTP request
-// would leak it to every hop on the wire, so even a rule with no Scheme
-// constraint of its own must not inject over http. Call after decideDomain
-// returned Allow; it mutates outReq.Header in place. A rule that matches but
-// carries no Inject stops the walk: a later, broader rule must never leak
-// its credentials into this request.
+// Credentials are injected over HTTPS, or over plaintext only when the
+// first fully matching rule's Inject.AllowPlainHTTP explicitly opts in. The
+// rendered header value is refused (not truncated) when it exceeds maxInjectValueBytes.
+// Call after decideDomain returned Allow; it mutates outReq.Header in
+// place. A rule that matches but carries no Inject stops the walk: a
+// later, broader rule must never leak its credentials into this request.
 //
 // Limitation (by construction): CONNECT tunnels never receive injections.
 // handleConnect relays opaque TLS bytes with no readable header, so an
@@ -1056,6 +1142,9 @@ func (g *Gateway) ApplyInject(outReq *http.Request, v requestView, pol *Policy) 
 			format = "${SECRET}"
 		}
 		val := strings.ReplaceAll(format, "${SECRET}", owner.Inject.Secret)
+		if len(val) > maxInjectValueBytes {
+			return
+		}
 		outReq.Header.Set(owner.Inject.Header, val)
 	}
 	// owner is the first fully matching rule (first-match-wins
@@ -1277,7 +1366,11 @@ func (g *Gateway) record(task string, r *http.Request, d Decision, reason string
 // --- helpers ---
 
 // isPrivate reports whether a TCP address resolves to RFC1918 / loopback /
-// link-local — the SSRF floor. Mirrors bpf/egress.c's behavior at L3.
+// link-local / CGNAT / reserved — the SSRF floor. Mirrors bpf/egress.c's
+// behavior at L3: the net masks there cover 127/8, 169.254/16, RFC1918,
+// 100.64/10 (CGNAT — cloud metadata endpoints like 100.100.100.200), 0/8,
+// 224/4, 240/4 and 198.18/15; net.IP's IsPrivate misses the non-RFC1918
+// half, so they are spelled out here.
 func isPrivate(addr net.Addr) bool {
 	tcp, ok := addr.(*net.TCPAddr)
 	if !ok {
@@ -1289,6 +1382,24 @@ func isPrivate(addr net.Addr) bool {
 	}
 	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
 		return true
+	}
+	if ip4 := ip.To4(); ip4 != nil {
+		if ip.IsUnspecified() || ip.IsMulticast() {
+			return true
+		}
+		// CGNAT 100.64.0.0/10
+		if ip4[0] == 100 && ip4[1]&0xC0 == 64 {
+			return true
+		}
+		// 240.0.0.0/4 reserved (IsUnspecified only covers 0.0.0.0 itself;
+		// 0/8 is unreachable via routing but blocked for parity).
+		if ip4[0] == 0 || ip4[0] >= 240 {
+			return true
+		}
+		// Benchmarking 198.18.0.0/15
+		if ip4[0] == 198 && ip4[1]&0xFE == 18 {
+			return true
+		}
 	}
 	return false
 }

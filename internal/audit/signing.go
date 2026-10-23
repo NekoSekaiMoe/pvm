@@ -168,19 +168,22 @@ var (
 	signerCache = map[string]*Signer{}
 )
 
-// SignerForRoot returns the signer for an audit root, creating it when
-// PVM_AUDIT_SIGNING=1 (or a key already exists). nil when signing is off.
+// SignerForRoot returns the signer for an audit root. Signing is ON by
+// default: the ed25519 signature is the only tamper-evidence that holds
+// against an attacker with write access to the ledger directory itself
+// (the hash chain alone can be recomputed wholesale from the tampered
+// records). The key is generated on first use (O_EXCL, race-safe — see
+// LoadOrCreateSigner). PVM_AUDIT_SIGNING=0 is the explicit opt-out for
+// deployments that cannot keep a persistent key on disk; a signer load
+// failure (read-only root, permissions) degrades to unsigned with a log
+// line, never fails the ledger itself.
 func SignerForRoot(root string) *Signer {
 	signerMu.Lock()
 	defer signerMu.Unlock()
 	if s, ok := signerCache[root]; ok {
 		return s
 	}
-	keyExists := false
-	if _, err := os.Stat(filepath.Join(root, signingKeyFile)); err == nil {
-		keyExists = true
-	}
-	if !keyExists && os.Getenv("PVM_AUDIT_SIGNING") != "1" {
+	if os.Getenv("PVM_AUDIT_SIGNING") == "0" {
 		return nil
 	}
 	s, err := LoadOrCreateSigner(root)
@@ -223,10 +226,12 @@ func unregisterLedger(l *Ledger) {
 	openLedgersMu.Unlock()
 }
 
-// Close unregisters this ledger from the online verification monitor. The
-// ledger file stays on disk; holders should call Close once the task is gone
-// so periodic re-verification does not sweep dead ledgers forever.
-func (l *Ledger) Close() { unregisterLedger(l) }
+// unregisterLedgerNow removes this ledger from the online verification
+// monitor. Called by Ledger.Close (ledger.go), which also flushes the
+// pending head watermark and releases the append fd. The ledger file
+// stays on disk; holders should call Close once the task is gone so
+// periodic re-verification does not sweep dead ledgers forever.
+func (l *Ledger) unregisterLedgerNow() { unregisterLedger(l) }
 
 // StartOnlineVerify launches the periodic re-verification loop (idempotent).
 // A failing ledger is logged and counted; it never panics the process — the

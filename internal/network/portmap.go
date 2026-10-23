@@ -53,6 +53,24 @@ type PortMapping struct {
 	GuestIP   string    `json:"guest_ip"`
 	Protocol  string    `json:"protocol"` // "tcp" | "udp"
 	CreatedAt time.Time `json:"created_at"`
+
+	// AccessToken, when set, gates inbound HTTP: the host-side ingress
+	// proxy (ingress.go) requires the token in the X-Access-Token header
+	// or the ?access_token= query before forwarding to the guest. A
+	// mapping carrying it (or MaskRequestHost) is served by the proxy
+	// instead of a bare DNAT rule, so the connection terminates at the
+	// host. TCP/HTTP only.
+	AccessToken string `json:"traffic_access_token,omitempty"`
+	// MaskRequestHost, when set, rewrites the inbound Host header to this
+	// value before forwarding to the guest, so the guest never learns the
+	// public hostname. TCP/HTTP only.
+	MaskRequestHost string `json:"mask_request_host,omitempty"`
+}
+
+// hasIngressL7 reports whether the mapping needs the host-side L7 ingress
+// proxy (token check and/or Host masking) rather than a bare DNAT rule.
+func (m PortMapping) hasIngressL7() bool {
+	return m.AccessToken != "" || m.MaskRequestHost != ""
 }
 
 // portMapRegistry is the durable task → mappings index.
@@ -82,7 +100,7 @@ func LoadPortMapRegistry(stateRoot string) (*portMapRegistry, error) {
 		return portMapRegistry_, nil
 	}
 	if stateRoot == "" {
-		// Mirror state.RootDir: non-root and test runs redirect all
+		// Mirror state.Root(): non-root and test runs redirect all
 		// durable state via $PVM_STATE_ROOT. Without this the lazy API
 		// callers would try to create /var/lib/uml-container on
 		// unprivileged runners and every portmap request would fail
@@ -143,6 +161,30 @@ func portMapRules(m PortMapping, apply bool) [][]string {
 	}
 }
 
+// L7 ingress limits: bound the persisted token/host so a config typo
+// cannot bloat the registry or the forwarded Host header.
+const (
+	maxIngressTokenBytes = 512
+	maxIngressHostBytes  = 255
+)
+
+// ingressPortMapRules returns the iptables argv sets for an L7 mapping:
+// unlike a DNAT mapping, the host-side proxy terminates the connection
+// and dials the guest itself, so only the host OUTPUT/FORWARD accept
+// rules for the guest target are needed (no PREROUTING/OUTPUT DNAT — a
+// DNAT on the published port would steal the connections before they
+// reach the local listener).
+func ingressPortMapRules(m PortMapping, apply bool) [][]string {
+	action := "-A"
+	if !apply {
+		action = "-D"
+	}
+	return [][]string{
+		{"iptables", action, "OUTPUT", "-d", m.GuestIP + "/32", "-p", "tcp", "--dport", strconv.Itoa(m.GuestPort), "-j", "ACCEPT"},
+		{"iptables", action, "FORWARD", "-d", m.GuestIP + "/32", "-p", "tcp", "--dport", strconv.Itoa(m.GuestPort), "-j", "ACCEPT"},
+	}
+}
+
 // validatePortMapping checks the invariants before anything touches
 // iptables or the registry.
 func validatePortMapping(m PortMapping) error {
@@ -159,6 +201,20 @@ func validatePortMapping(m PortMapping) error {
 	case "", "tcp", "udp":
 	default:
 		return fmt.Errorf("network: port mapping protocol %q must be tcp or udp", m.Protocol)
+	}
+	if m.hasIngressL7() {
+		if m.Protocol == "udp" {
+			return errors.New("network: traffic_access_token/mask_request_host require a TCP (HTTP) mapping")
+		}
+		if len(m.AccessToken) > maxIngressTokenBytes {
+			return fmt.Errorf("network: traffic_access_token exceeds %d bytes", maxIngressTokenBytes)
+		}
+		if len(m.MaskRequestHost) > maxIngressHostBytes {
+			return fmt.Errorf("network: mask_request_host exceeds %d bytes", maxIngressHostBytes)
+		}
+		if m.MaskRequestHost != "" && strings.ContainsAny(m.MaskRequestHost, " \t\r\n/") {
+			return fmt.Errorf("network: mask_request_host %q is not a valid host", m.MaskRequestHost)
+		}
 	}
 	ip := net.ParseIP(m.GuestIP)
 	if ip == nil || ip.To4() == nil {
@@ -247,7 +303,10 @@ func argvValid(argv []string) error {
 }
 
 // AddPortMapping validates, applies and records one mapping. Duplicate
-// (task, protocol, hostPort) is a conflict.
+// (protocol, hostPort) conflicts across all tasks. An empty protocol defaults
+// to TCP. A token or Host mask starts an HTTP proxy; other mappings use DNAT.
+// Validation, registry, iptables, listener, and persistence errors propagate.
+// A save failure can leave the rules, proxy, and in-memory mapping active.
 func AddPortMapping(m PortMapping) error {
 	if m.Protocol == "" {
 		m.Protocol = "tcp"
@@ -272,18 +331,33 @@ func AddPortMapping(m PortMapping) error {
 			}
 		}
 	}
-	for _, argv := range portMapRules(m, true) {
+	rules := portMapRules(m, true)
+	if m.hasIngressL7() {
+		rules = ingressPortMapRules(m, true)
+	}
+	for _, argv := range rules {
 		if err := runIptables(argv); err != nil {
 			// Roll back the rules already applied.
-			for _, back := range portMapRules(m, false) {
+			for _, back := range rules {
 				_ = runIptablesDelete(back)
 			}
 			return fmt.Errorf("network: apply port mapping: %w", err)
 		}
 	}
+	if m.hasIngressL7() {
+		if err := startIngressProxy(m); err != nil {
+			for _, back := range rules {
+				_ = runIptablesDelete(back)
+			}
+			return err
+		}
+	}
 	m.CreatedAt = time.Now().UTC()
 	r.mappings[m.TaskID] = append(r.mappings[m.TaskID], m)
-	return r.save()
+	if err := r.save(); err != nil {
+		return err
+	}
+	return nil
 }
 
 // DeletePortMapping removes one mapping (rules + record). Missing mapping
@@ -301,10 +375,17 @@ func DeletePortMapping(taskID string, hostPort int, proto string) error {
 	ms := r.mappings[taskID]
 	for i, ex := range ms {
 		if ex.Protocol == proto && ex.HostPort == hostPort {
-			for _, argv := range portMapRules(ex, false) {
+			rules := portMapRules(ex, false)
+			if ex.hasIngressL7() {
+				rules = ingressPortMapRules(ex, false)
+			}
+			for _, argv := range rules {
 				if err := runIptablesDelete(argv); err != nil {
 					return fmt.Errorf("network: remove port mapping: %w", err)
 				}
+			}
+			if ex.hasIngressL7() {
+				stopIngressProxy(taskID, hostPort)
 			}
 			r.mappings[taskID] = append(ms[:i], ms[i+1:]...)
 			if len(r.mappings[taskID]) == 0 {
@@ -329,10 +410,15 @@ func CleanupTaskPortMappings(taskID string) error {
 		return nil
 	}
 	for _, m := range ms {
-		for _, argv := range portMapRules(m, false) {
+		rules := portMapRules(m, false)
+		if m.hasIngressL7() {
+			rules = ingressPortMapRules(m, false)
+		}
+		for _, argv := range rules {
 			_ = runIptablesDelete(argv) // best-effort
 		}
 	}
+	stopTaskIngressProxies(taskID)
 	delete(r.mappings, taskID)
 	return r.save()
 }

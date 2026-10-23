@@ -10,9 +10,9 @@ import (
 // explicitly, and the memory_state marker must land in the snapshot
 // metadata so restores can tell full from degraded apart.
 func TestEventSnapshotMemoryStateMarkers(t *testing.T) {
-	oldRoot := state.RootDir
-	state.RootDir = t.TempDir()
-	t.Cleanup(func() { state.RootDir = oldRoot })
+	oldRoot := state.Root()
+	state.SetRoot(t.TempDir())
+	t.Cleanup(func() { state.SetRoot(oldRoot) })
 
 	// Running task with a pid: no criu on this host -> degraded.
 	mkdirState(t, "t-mem", state.StatusRunning, 4242)

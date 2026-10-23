@@ -12,11 +12,19 @@ import (
 
 // staticChecker is a fixed LearnedIPChecker for rebinding-guard tests.
 type staticChecker struct {
-	ips map[string][]net.IP // "task\x00host" -> learned IPs
+	ips      map[string][]net.IP // "task\x00host" -> learned IPs
+	learning map[string]bool     // task -> has a learner (nil: all tasks do)
 }
 
 func (c staticChecker) LearnedIPs(task, host string) []net.IP {
 	return c.ips[task+"\x00"+host]
+}
+
+func (c staticChecker) TaskLearned(task string) bool {
+	if c.learning == nil {
+		return true // by default every task "has" a learner in tests
+	}
+	return c.learning[task]
 }
 
 // proxyGet issues one GET through the gateway and returns the status.

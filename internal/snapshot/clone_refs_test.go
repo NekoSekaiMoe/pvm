@@ -13,11 +13,11 @@ import (
 // lifecycle: cloning records the parent link, deleting the parent is vetoed
 // while the clone lives, and deleting the clone releases the claim.
 func TestPrepareDelete_GuardsParentOfClones(t *testing.T) {
-	oldRoot := state.RootDir
-	state.RootDir = t.TempDir()
-	t.Cleanup(func() { state.RootDir = oldRoot })
+	oldRoot := state.Root()
+	state.SetRoot(t.TempDir())
+	t.Cleanup(func() { state.SetRoot(oldRoot) })
 
-	srcDir := filepath.Join(state.RootDir, "src-a")
+	srcDir := filepath.Join(state.Root(), "src-a")
 	if err := os.MkdirAll(srcDir, 0755); err != nil {
 		t.Fatal(err)
 	}
@@ -79,11 +79,11 @@ func TestPrepareDelete_GuardsParentOfClones(t *testing.T) {
 // disk dependency (no overlay.qcow2 / rootfs.img in the source): those must
 // not leave a marker — nothing branches from them, so deletion stays free.
 func TestPrepareDelete_NoStorageDependency(t *testing.T) {
-	oldRoot := state.RootDir
-	state.RootDir = t.TempDir()
-	t.Cleanup(func() { state.RootDir = oldRoot })
+	oldRoot := state.Root()
+	state.SetRoot(t.TempDir())
+	t.Cleanup(func() { state.SetRoot(oldRoot) })
 
-	srcDir := filepath.Join(state.RootDir, "src-b")
+	srcDir := filepath.Join(state.Root(), "src-b")
 	if err := os.MkdirAll(srcDir, 0755); err != nil {
 		t.Fatal(err)
 	}

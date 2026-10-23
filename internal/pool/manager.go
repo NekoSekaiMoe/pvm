@@ -26,6 +26,7 @@ type SandboxState string
 const (
 	SandboxReady      SandboxState = "ready"   // pre-created, unattached
 	SandboxClaimed    SandboxState = "claimed" // attached to a task
+	SandboxPaused     SandboxState = "paused"  // claimed but suspended: memory quota released
 	SandboxWarming    SandboxState = "warming" // being created
 	SandboxDestroying SandboxState = "destroying"
 )
@@ -50,6 +51,10 @@ type Sandbox struct {
 	MemMB     int    // memory reserved at claim (for accurate Release accounting)
 	CreatedAt time.Time
 	ClaimedAt time.Time
+	// ReservedMemMB is the memory reservation Suspend moved out of the
+	// tenant's live quota; Resume re-reserves exactly this amount. Zero for
+	// a never-suspended sandbox.
+	ReservedMemMB int `json:"reserved_mem_mb,omitempty"`
 }
 
 // Quota is a tenant's resource ceiling (plan.md §12.3).
@@ -109,6 +114,12 @@ func DefaultQuota() Quota {
 var (
 	ErrQuotaExceeded = errors.New("pool: tenant quota exceeded")
 	ErrNoCapacity    = errors.New("pool: no warm sandbox available and pool at capacity")
+	// ErrSandboxNotFound is returned by the by-id mutations (Suspend/Resume)
+	// when no sandbox carries the requested id.
+	ErrSandboxNotFound = errors.New("pool: sandbox not found")
+	// ErrBadState is returned when a mutation targets a sandbox in the wrong
+	// lifecycle state (e.g. suspending an unclaimed one).
+	ErrBadState = errors.New("pool: sandbox in unexpected state")
 )
 
 // Manager owns the warm pool and per-tenant quota counters.
@@ -292,6 +303,11 @@ func recordDecision(out *[]decisionLog, tenant, why string, allow bool) {
 	*out = append(*out, decisionLog{allow: allow, tenant: tenant, note: why})
 }
 
+// claim reserves tenant quota and binds a warm or newly created sandbox to
+// taskID, returning its ID. It collects decisions in logs for the caller to
+// flush. Invalid template memory and persistence failures are returned;
+// quota refusal wraps ErrQuotaExceeded, while capacity or factory failures
+// return or wrap ErrNoCapacity.
 func (m *Manager) claim(tenant string, tmpl Template, taskID string, logs *[]decisionLog) (string, error) {
 	// ---- phase 1: quota check under lock ----
 	m.mu.Lock()
@@ -350,6 +366,7 @@ func (m *Manager) claim(tenant string, tmpl Template, taskID string, logs *[]dec
 		sb.Tenant = tenant
 		sb.CPU = tmpl.CPU
 		sb.MemMB = wantMB
+		sb.ReservedMemMB = 0
 		sb.ClaimedAt = now
 		m.accountClaim(tenant, tmpl.CPU, wantMB, now)
 		if err := m.persistLocked(); err != nil {
@@ -358,6 +375,7 @@ func (m *Manager) claim(tenant string, tmpl Template, taskID string, logs *[]dec
 			m.rollbackClaimLocked(tenant, tmpl.CPU, wantMB, now)
 			sb.State = SandboxReady
 			sb.TaskID, sb.Tenant, sb.CPU, sb.MemMB = "", "", 0, 0
+			sb.ReservedMemMB = 0
 			sb.ClaimedAt = time.Time{}
 			recordDecision(logs, tenant, "claimed-warm persist failed", false)
 			m.mu.Unlock()
@@ -565,6 +583,7 @@ func (m *Manager) Release(id string, recycle bool) error {
 			s.Tenant = ""
 			s.CPU = 0
 			s.MemMB = 0
+			s.ReservedMemMB = 0
 			s.ClaimedAt = time.Time{}
 			if err := m.persistLocked(); err != nil {
 				// Restore the claimed state and the counters the release had
@@ -607,6 +626,135 @@ func (m *Manager) Release(id string, recycle bool) error {
 	}
 	m.mu.Unlock()
 	return fmt.Errorf("pool: sandbox %s not found", id)
+}
+
+// Suspend marks a claimed sandbox as paused and releases its memory quota
+// reservation. CPU, concurrency, and the task binding remain reserved for
+// Resume. This changes accounting only; the lifecycle caller pauses the guest.
+// An already-paused sandbox is a no-op. It returns ErrBadState for other states,
+// ErrSandboxNotFound for an unknown ID, or a wrapped persistence error; a
+// persistence failure restores the prior accounting and sandbox state.
+func (m *Manager) Suspend(id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, s := range m.pool {
+		if s.ID != id {
+			continue
+		}
+		switch s.State {
+		case SandboxPaused:
+			return nil // already suspended
+		case SandboxClaimed:
+		default:
+			return fmt.Errorf("%w: sandbox %s is %s, not claimed", ErrBadState, id, s.State)
+		}
+		prev := *s
+		released := s.MemMB
+		s.ReservedMemMB = released
+		s.MemMB = 0
+		s.State = SandboxPaused
+		if s.Tenant != "" {
+			m.memMB[s.Tenant] -= released
+			if m.memMB[s.Tenant] < 0 {
+				m.memMB[s.Tenant] = 0
+			}
+		}
+		if err := m.persistLocked(); err != nil {
+			*s = prev
+			if prev.Tenant != "" {
+				m.memMB[prev.Tenant] += released
+			}
+			return fmt.Errorf("pool: suspend persist: %w", err)
+		}
+		return nil
+	}
+	return fmt.Errorf("%w: %s", ErrSandboxNotFound, id)
+}
+
+// SuspendByTask suspends the claimed sandbox currently bound to taskID. It
+// reports whether such a sandbox exists, so the pause lifecycle can release
+// the tenant's memory reservation without caring whether the task came from
+// the warm pool at all.
+func (m *Manager) SuspendByTask(taskID string) (bool, error) {
+	id, ok := m.sandboxIDForTask(taskID)
+	if !ok {
+		return false, nil
+	}
+	return true, m.Suspend(id)
+}
+
+// ResumeByTask re-reserves the memory of a sandbox paused for taskID,
+// reporting whether one exists.
+func (m *Manager) ResumeByTask(taskID string) (bool, error) {
+	id, ok := m.sandboxIDForTask(taskID)
+	if !ok {
+		return false, nil
+	}
+	return true, m.Resume(id)
+}
+
+// sandboxIDForTask finds the sandbox bound to taskID under the lock.
+func (m *Manager) sandboxIDForTask(taskID string) (string, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if taskID == "" {
+		return "", false
+	}
+	for _, s := range m.pool {
+		if s.TaskID == taskID {
+			return s.ID, true
+		}
+	}
+	return "", false
+}
+
+// Resume returns a paused sandbox to claimed, re-reserving the memory quota
+// Suspend released. When the tenant's memory quota has since been consumed
+// by other sandboxes, the re-reservation is refused (ErrQuotaExceeded) and
+// the sandbox stays paused — the caller can free quota and retry. It returns
+// ErrBadState unless paused, ErrSandboxNotFound for an unknown ID, and wrapped
+// persistence errors. A persistence failure restores the paused accounting.
+// This changes accounting only; the lifecycle caller restores or thaws the guest.
+func (m *Manager) Resume(id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, s := range m.pool {
+		if s.ID != id {
+			continue
+		}
+		if s.State != SandboxPaused {
+			return fmt.Errorf("%w: sandbox %s is %s, not paused", ErrBadState, id, s.State)
+		}
+		want := s.ReservedMemMB
+		if s.Tenant != "" && want > 0 {
+			q, ok := m.quotas[s.Tenant]
+			if !ok {
+				q = DefaultQuota()
+			}
+			if memExceeded(q.MaxMemoryMB, m.memMB[s.Tenant], want) {
+				return fmt.Errorf("%w: memory for tenant %s on resume", ErrQuotaExceeded, s.Tenant)
+			}
+		}
+		prev := *s
+		s.State = SandboxClaimed
+		s.MemMB = want
+		s.ReservedMemMB = 0
+		if s.Tenant != "" {
+			m.memMB[s.Tenant] += want
+		}
+		if err := m.persistLocked(); err != nil {
+			*s = prev
+			if prev.Tenant != "" {
+				m.memMB[prev.Tenant] -= want
+				if m.memMB[prev.Tenant] < 0 {
+					m.memMB[prev.Tenant] = 0
+				}
+			}
+			return fmt.Errorf("pool: resume persist: %w", err)
+		}
+		return nil
+	}
+	return fmt.Errorf("%w: %s", ErrSandboxNotFound, id)
 }
 
 // releaseQuotaLocked decrements the per-tenant counters recorded at Claim

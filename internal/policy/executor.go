@@ -18,6 +18,10 @@ import (
 // (e.g. `bash -lc '...'`); otherwise the tool name itself runs as the
 // command. Output is capped in the summary; the full exit code and duration
 // ride in Result. Secrets scrubbing happens in the gateway's sanitize step.
+// Results carry guest_attested=true: the guest can forge console markers, so
+// OK reports the guest's claimed exit status. Session lookup and console exec
+// errors reach the caller; a nonzero guest exit code sets OK=false without
+// returning an error.
 func ConsoleExecutor(taskID string, sessFn func(taskID string) (*console.Session, error)) func(req ToolRequest) (ToolResponse, error) {
 	return func(req ToolRequest) (ToolResponse, error) {
 		sess, err := sessFn(taskID)
@@ -44,6 +48,15 @@ func ConsoleExecutor(taskID string, sessFn func(taskID string) (*console.Session
 				"duration_ms":  res.Duration.Milliseconds(),
 				"output_bytes": len(res.Stdout),
 				"simulated":    false,
+				// The marker protocol is GUEST-ATTESTED, not host-verified:
+				// a guest that watches the console stream can capture the
+				// random token and forge both output and exit code (see
+				// internal/console's Exec contract). Downstream governance
+				// (approvals, gates) must treat OK=true as the guest's
+				// CLAIM, never as cryptographic evidence. A host-verified
+				// channel (signed guest agent) is the only way to upgrade
+				// this flag.
+				"guest_attested": true,
 			},
 		}, nil
 	}

@@ -9,8 +9,8 @@ import (
 )
 
 func TestSnapshot_ExportImport(t *testing.T) {
-	// Setup test environment using configured state.RootDir
-	baseDir := state.RootDir
+	// Setup test environment using configured state.Root()
+	baseDir := state.Root()
 	if err := os.MkdirAll(baseDir, 0755); err != nil {
 		t.Skipf("Skipping test due to permission error on %s: %v", baseDir, err)
 	}
@@ -65,7 +65,7 @@ func TestSnapshot_ExportImport(t *testing.T) {
 // directory that already exists, so a repeated restore cannot overlay files
 // onto a previous container's rootfs.
 func TestImport_RejectsExistingDir(t *testing.T) {
-	baseDir := state.RootDir
+	baseDir := state.Root()
 	if err := os.MkdirAll(baseDir, 0755); err != nil {
 		t.Skipf("Skipping test due to permission error on %s (run as root): %v", baseDir, err)
 	}

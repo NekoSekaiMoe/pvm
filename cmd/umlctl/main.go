@@ -71,6 +71,8 @@ func ephemeralFalseExplicit(fs *flag.FlagSet) bool {
 	return boolFalseExplicit(fs, "ephemeral")
 }
 
+// main dispatches the umlctl subcommand selected by the command-line arguments.
+// Usage and command errors are reported through a nonzero process exit status.
 func main() {
 	if len(os.Args) < 2 {
 		fmt.Println("Usage: umlctl [start|image|logs|ps|network]")
@@ -370,7 +372,7 @@ func main() {
 		io.Copy(os.Stdout, file)
 
 	case "ps":
-		dirs, err := os.ReadDir(state.RootDir)
+		dirs, err := os.ReadDir(state.Root())
 		if err != nil {
 			fmt.Printf("Failed to read containers directory: %v\n", err)
 			os.Exit(1)

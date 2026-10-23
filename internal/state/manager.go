@@ -21,12 +21,33 @@ import (
 	"path/filepath"
 	"regexp"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
-// RootDir is the on-disk root for all task state. Overridable for tests and
-// non-root runs via $PVM_STATE_ROOT.
-var RootDir = resolveStateRoot()
+// rootDir holds the on-disk root for all task state, overridable for tests
+// and non-root runs via $PVM_STATE_ROOT. It is stored atomically because
+// background goroutines (watchdog sweeper, metrics collectors) read it on
+// every tick while tests reassign it between cases — a plain global made
+// that pair a data race under -race. Production code sets it exactly once
+// at init.
+var rootDir atomic.Value // string
+
+// init sets the initial state root from PVM_STATE_ROOT or the default path.
+func init() { rootDir.Store(resolveStateRoot()) }
+
+// Root returns the current state root (atomic; safe from background
+// goroutines).
+func Root() string {
+	if v, ok := rootDir.Load().(string); ok {
+		return v
+	}
+	return ""
+}
+
+// SetRoot atomically switches the state root. Test-only in practice:
+// production resolves the root once from PVM_STATE_ROOT at init.
+func SetRoot(dir string) { rootDir.Store(dir) }
 
 func resolveStateRoot() string {
 	if v := os.Getenv("PVM_STATE_ROOT"); v != "" {
@@ -37,11 +58,14 @@ func resolveStateRoot() string {
 
 var idRe = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 
+// ContainerDir returns the path for id under the current state root without
+// creating it. Empty IDs or characters outside letters, digits, underscores,
+// and hyphens return an error.
 func ContainerDir(id string) (string, error) {
 	if !idRe.MatchString(id) {
 		return "", fmt.Errorf("invalid container ID")
 	}
-	return filepath.Join(RootDir, id), nil
+	return filepath.Join(Root(), id), nil
 }
 
 // Status is a lifecycle FSM state (plan.md §8.2).
@@ -112,6 +136,11 @@ type ContainerState struct {
 	// can honor idle/resume policy without re-reading the spec file.
 	IdleTimeout string `json:"idle_timeout,omitempty"`
 	AutoResume  bool   `json:"auto_resume,omitempty"`
+
+	// MCP is the opaque MCP server config accepted by the E2B create
+	// request, stored as raw JSON so a guest-side gateway launcher can
+	// consume it verbatim (mirrors E2B's pass-through Mcp object).
+	MCP string `json:"mcp,omitempty"`
 
 	// lifecycle bookkeeping
 	Transitions []Transition `json:"transitions,omitempty"`
@@ -226,7 +255,24 @@ func SaveState(id string, st *ContainerState) error {
 		return err
 	}
 	tmp.Close()
-	return os.Rename(tmpName, filepath.Join(dir, "state.json"))
+	if err := os.Rename(tmpName, filepath.Join(dir, "state.json")); err != nil {
+		return err
+	}
+	// Write-path cache invalidation: mtime granularity is filesystem-
+	// dependent (tmpfs/overlayfs can be coarse), so a second Save within
+	// the same tick would otherwise compare equal and serve a stale
+	// cached entry. Bumping the version forces the next ListAll to reload
+	// THIS task regardless of mtime.
+	invalidateListCache(id)
+	return nil
+}
+
+// invalidateListCache drops id's ListAll cache slot (write-path
+// invalidation; see SaveState).
+func invalidateListCache(id string) {
+	listMu.Lock()
+	delete(listCache, id)
+	listMu.Unlock()
 }
 
 // snapshotLocked returns a deep copy of the fields json.Marshal would serialize,
@@ -247,6 +293,7 @@ func (s *ContainerState) snapshotLocked() *ContainerState {
 		SpecFP:      s.SpecFP,
 		IdleTimeout: s.IdleTimeout,
 		AutoResume:  s.AutoResume,
+		MCP:         s.MCP,
 		Retries:     s.Retries,
 		Deadline:    s.Deadline,
 		NetworkTap:  s.NetworkTap,
@@ -283,23 +330,84 @@ func LoadState(id string) (*ContainerState, error) {
 	return &st, nil
 }
 
-// ListAll returns the state of every known task under RootDir. Tasks whose
-// state.json is missing/corrupt are skipped (never panic the listing).
+// ListAll returns states for task directories under Root(), with a non-nil
+// empty slice when none are readable. Root directory read errors are returned;
+// missing, unreadable, or corrupt task state files are skipped when loaded.
+//
+// States are cached by file modification time; SaveState invalidates the task's
+// entry, and changing roots clears the cache. External writes that preserve
+// mtime may remain unseen. Returned pointers can be shared with later listings;
+// mutating them also changes the cached values.
 func ListAll() ([]*ContainerState, error) {
-	dirs, err := os.ReadDir(RootDir)
+	root := Root()
+	listMu.Lock()
+	defer listMu.Unlock()
+	if listCacheRoot != root || listCache == nil {
+		listCache = make(map[string]cachedState)
+		listCacheRoot = root
+	}
+
+	dirs, err := os.ReadDir(root)
 	if err != nil {
 		return nil, err
 	}
-	// Non-nil even when empty: JSON clients (/api/containers, /api/tasks)
-	// must see [], not null.
-	out := make([]*ContainerState, 0, len(dirs))
+
+	// Validity key is the FILE mtime (a directory touch without a
+	// state.json write must not invalidate), so stat it explicitly.
+	type entry struct {
+		mtime time.Time
+	}
+	live := make(map[string]entry, len(dirs))
+	var order []string
 	for _, d := range dirs {
 		if !d.IsDir() {
 			continue
 		}
-		if st, err := LoadState(d.Name()); err == nil {
+		fi, serr := os.Stat(filepath.Join(root, d.Name(), "state.json"))
+		if serr != nil {
+			continue // no state.json: LoadState would fail anyway
+		}
+		live[d.Name()] = entry{mtime: fi.ModTime()}
+		order = append(order, d.Name())
+	}
+
+	// Reuse cached parses whose mtime matches; reload the rest. Tasks whose
+	// directories vanished fall out by construction.
+	out := make([]*ContainerState, 0, len(order)) // non-nil: JSON clients see [], not null
+	changed := false
+	for _, name := range order {
+		ent := live[name]
+		if c, ok := listCache[name]; ok && c.mtime.Equal(ent.mtime) {
+			out = append(out, c.st)
+			continue
+		}
+		if st, lerr := LoadState(name); lerr == nil {
 			out = append(out, st)
+			listCache[name] = cachedState{mtime: ent.mtime, st: st}
+			changed = true
+		} else if _, ok := listCache[name]; ok {
+			delete(listCache, name)
+			changed = true
+		}
+	}
+	if changed {
+		for name := range listCache {
+			if _, ok := live[name]; !ok {
+				delete(listCache, name)
+			}
 		}
 	}
 	return out, nil
 }
+
+// cachedState is one ListAll cache slot.
+type cachedState struct {
+	mtime time.Time
+	st    *ContainerState
+}
+
+var (
+	listMu        sync.Mutex
+	listCache     map[string]cachedState
+	listCacheRoot string
+)

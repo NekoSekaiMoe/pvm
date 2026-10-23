@@ -13,9 +13,9 @@ import (
 func useTempState(t *testing.T) {
 	t.Helper()
 	root := t.TempDir()
-	orig := state.RootDir
-	state.RootDir = root
-	t.Cleanup(func() { state.RootDir = orig })
+	orig := state.Root()
+	state.SetRoot(root)
+	t.Cleanup(func() { state.SetRoot(orig) })
 }
 
 // TestStartBlk_GoBackend: the default (pure-Go) backend serves a socket
@@ -81,9 +81,9 @@ func TestStartBlk_QemuDaemonMissing(t *testing.T) {
 // container dir must be created (prepareSocket before opening the image).
 func TestStartBlk_PrepareStateDir(t *testing.T) {
 	root := t.TempDir()
-	orig := state.RootDir
-	state.RootDir = root
-	defer func() { state.RootDir = orig }()
+	orig := state.Root()
+	state.SetRoot(root)
+	defer func() { state.SetRoot(orig) }()
 
 	_, _, _ = StartBlk("c-prep", "/tmp/nope.img")
 	dir := filepath.Join(root, "c-prep")

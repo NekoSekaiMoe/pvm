@@ -187,6 +187,13 @@ func (g *Gateway) serveTransparent(conn net.Conn, taskID string) {
 // the one-conn http.Server frames requests, the wrapper upgrades them to
 // proxy-form (absolute URL from the Host header) and injects X-Task-Id so
 // handle() attributes and audits correctly.
+//
+// NOTE: the http.Server is intentionally constructed per connection. It
+// looks poolable (fixed timeouts, only Handler varies) but is NOT: Serve()
+// reads srv.Handler for every keep-alive request on the connection, so a
+// pooled struct whose Handler is reset/replaced by another connection's
+// goroutine is a data race (verified with -race). The struct is small and
+// short-lived; GC handles it fine.
 func (g *Gateway) serveTransparentHTTP(conn net.Conn, taskID string, dst *net.TCPAddr) {
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		r.Header.Set("X-Task-Id", taskID)
@@ -209,7 +216,6 @@ func (g *Gateway) serveTransparentHTTP(conn net.Conn, taskID string, dst *net.TC
 		// the one-conn listener loops over keep-alive requests.)
 		ReadHeaderTimeout: 30 * time.Second,
 		ReadTimeout:       5 * time.Minute,
-		WriteTimeout:      5 * time.Minute,
 		IdleTimeout:       60 * time.Second,
 	}
 	_ = srv.Serve(&oneConnListener{conn: conn})
@@ -255,7 +261,25 @@ func (g *Gateway) serveTransparentTLS(conn net.Conn, br *bufio.Reader, taskID st
 		g.recordRaw(taskID, "transparent-tls", DecisionBlock, "target is private IP (SSRF floor)")
 		return
 	}
-	if set := g.learnedDialSet(taskID, sni); set != nil && !learnedSetContainsIP(set, target.RemoteAddr()) {
+	// For tasks that run a DNS learner, the SNI↔destination consistency is
+	// a hard requirement: the dialed IP must belong to the host's
+	// DNS-learned set. A host that was never learned leaves the SNI purely
+	// client-asserted — splicing would let the guest tunnel to ANY IP by
+	// naming an allowlisted domain in the ClientHello, so such splices are
+	// refused outright instead of failing open. Tasks without a learner
+	// (deployment choice) keep the weaker dial-set check: the L7 policy
+	// still gates the domain, only the IP consistency is unprovable.
+	if g.sniGuardActive(taskID) {
+		set := g.learnedDialSet(taskID, sni)
+		if set == nil {
+			g.recordRaw(taskID, "transparent-tls", DecisionBlock, "SNI host not DNS-learned for task (unverifiable SNI to destination)")
+			return
+		}
+		if !learnedSetContainsIP(set, target.RemoteAddr()) {
+			g.recordRaw(taskID, "transparent-tls", DecisionBlock, "dialed IP not in DNS-learned set (rebinding guard)")
+			return
+		}
+	} else if set := g.learnedDialSet(taskID, sni); set != nil && !learnedSetContainsIP(set, target.RemoteAddr()) {
 		g.recordRaw(taskID, "transparent-tls", DecisionBlock, "dialed IP not in DNS-learned set (rebinding guard)")
 		return
 	}

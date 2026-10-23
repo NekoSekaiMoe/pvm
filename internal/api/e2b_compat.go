@@ -5,8 +5,10 @@
 //
 //	GET    /sandboxes                        list sandboxes
 //	POST   /sandboxes                        create sandbox
+//	GET    /sandboxes/{sandboxID}            sandbox info (getInfo)
 //	DELETE /sandboxes/{sandboxID}            kill sandbox
 //	POST   /sandboxes/{sandboxID}/refreshes  keep-alive {duration} seconds
+//	POST   /sandboxes/{sandboxID}/connect    resume + optional {timeout}
 //
 // They authenticate with the X-API-KEY header and build the base URL as
 // https://api.{E2B_DOMAIN} — or http://localhost:3000 when E2B_DEBUG is set
@@ -23,6 +25,7 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -38,6 +41,15 @@ import (
 	"uml-container/internal/lifecycle"
 	"uml-container/internal/snapshot"
 	"uml-container/internal/state"
+)
+
+const (
+	// neverTimeoutSentinel is the three-value timeout's "never reclaim"
+	// marker (SDK NeverTimeout / E2B NEVER_TIMEOUT).
+	neverTimeoutSentinel = -1
+	// defaultSandboxTimeout is applied when create omits timeout or
+	// sends 0 (server default).
+	defaultSandboxTimeout = 5 * time.Minute
 )
 
 // e2bCompatKeyAuth authenticates the /sandboxes group. Unlike the /api
@@ -79,6 +91,72 @@ type e2bSandboxView struct {
 	Alias      string            `json:"alias,omitempty"`
 	Metadata   map[string]string `json:"metadata,omitempty"`
 	StartedAt  time.Time         `json:"startedAt"`
+}
+
+// e2bSandboxInfoView is GET /sandboxes/{sandboxID} — the shape the SDKs'
+// getInfo() reads. state is the SDK's two-value view ("running"/"paused");
+// endAt mirrors the persisted Deadline (a zero Deadline means "never
+// reclaimed", surfaced as the far-future sentinel the SDKs format). Labels,
+// template and lifecycle survive a pause because they live in the same
+// persisted ContainerState the info read loads.
+type e2bSandboxInfoView struct {
+	SandboxID   string            `json:"sandboxID"`
+	TemplateID  string            `json:"templateID"`
+	Alias       string            `json:"alias,omitempty"`
+	Metadata    map[string]string `json:"metadata,omitempty"`
+	EnvdVersion string            `json:"envdVersion"`
+	StartedAt   time.Time         `json:"startedAt"`
+	EndAt       time.Time         `json:"endAt"`
+	State       string            `json:"state"`
+	CPUCount    int               `json:"cpuCount"`
+	MemoryMB    int64             `json:"memoryMB"`
+	Lifecycle   *e2bLifecycleView `json:"lifecycle,omitempty"`
+}
+
+type e2bLifecycleView struct {
+	OnTimeout  string `json:"onTimeout"`
+	AutoResume bool   `json:"autoResume"`
+}
+
+// e2bNeverEndAt is the endAt surfaced for a never-reclaimed sandbox (zero
+// Deadline): the SDKs render it as a far-future date rather than a bogus
+// epoch. Kept well inside year 9999 so JS Date formatting stays sane.
+var e2bNeverEndAt = time.Date(9999, 12, 31, 23, 59, 59, 0, time.UTC)
+
+// e2bSandboxState maps a PVM lifecycle status onto the SDK's two-value
+// state. A suspended task (shallow freeze or deep pause) reads as "paused";
+// everything else the SDK can connect to reads as "running".
+func e2bSandboxState(st *state.ContainerState) string {
+	if st.Status == state.StatusSuspended {
+		return "paused"
+	}
+	return "running"
+}
+
+// buildE2BSandboxInfo renders the info view for a loaded task state. The
+// template/alias/metadata/lifecycle fields are read from the persisted
+// state, so a paused sandbox keeps reporting its labels and template.
+func buildE2BSandboxInfo(st *state.ContainerState) e2bSandboxInfoView {
+	endAt := st.Deadline
+	if endAt.IsZero() {
+		endAt = e2bNeverEndAt
+	}
+	lc := &e2bLifecycleView{AutoResume: st.AutoResume}
+	if st.AutoResume {
+		lc.OnTimeout = "pause"
+	} else {
+		lc.OnTimeout = "kill"
+	}
+	return e2bSandboxInfoView{
+		SandboxID:   st.ID,
+		TemplateID:  st.Name,
+		Metadata:    st.Metadata,
+		EnvdVersion: envdCompatVersion(),
+		StartedAt:   st.StartedAt,
+		EndAt:       endAt,
+		State:       e2bSandboxState(st),
+		Lifecycle:   lc,
+	}
 }
 
 // resolveSandboxID maps the ID the SDK sends to a PVM task ID. E2B SDKs call
@@ -147,16 +225,36 @@ func registerE2BCompat(e *echo.Echo, reg *KeyRegistry, autoMgr *lifecycle.Manage
 	// to PVM's rootfs concept. Mirrors POST /api/containers/start's validation
 	// and launch path; without a UML kernel (CI) launch fails and surfaces as
 	// E2B's "server error" (500 + message), which the SDKs report cleanly.
+	//
+	// timeout (query `timeout` or JSON `timeout`) is the three-value idle
+	// TTL: omitted/0 = defaultSandboxTimeout, -1 = never, N>0 = N seconds.
 	e.POST("/sandboxes", func(c echo.Context) error {
 		var req struct {
 			TemplateID string            `json:"templateID"`
 			Metadata   map[string]string `json:"metadata"`
+			Timeout    *int              `json:"timeout"`
+			// MCP is the opaque MCP server config (E2B passes it through to
+			// the sandbox's mcp-gateway). Persisted verbatim so a guest-side
+			// launcher can consume it.
+			MCP json.RawMessage `json:"mcp"`
 		}
 		if err := c.Bind(&req); err != nil {
 			return c.JSON(http.StatusBadRequest, map[string]string{"message": err.Error()})
 		}
 		if strings.TrimSpace(req.TemplateID) == "" {
 			return c.JSON(http.StatusBadRequest, map[string]string{"message": "templateID is required"})
+		}
+		mcpJSON, err := normalizeMCPConfig(req.MCP)
+		if err != nil {
+			return c.JSON(http.StatusBadRequest, map[string]string{"message": err.Error()})
+		}
+		timeoutRaw := c.QueryParam("timeout")
+		if timeoutRaw == "" && req.Timeout != nil {
+			timeoutRaw = strconv.Itoa(*req.Timeout)
+		}
+		idleFor, neverExpire, err := parseSandboxTimeout(timeoutRaw)
+		if err != nil {
+			return c.JSON(http.StatusBadRequest, map[string]string{"message": err.Error()})
 		}
 		resolvedRootfs, err := validateAPIRootfs(req.TemplateID)
 		if err != nil {
@@ -188,26 +286,35 @@ func registerE2BCompat(e *echo.Echo, reg *KeyRegistry, autoMgr *lifecycle.Manage
 		if err != nil {
 			return c.JSON(http.StatusInternalServerError, map[string]string{"message": err.Error()})
 		}
-		// Persist SDK metadata into the task state so GET /sandboxes can
-		// reflect it back (E2B metadata is a create-time label set).
+		// Persist SDK metadata and the create-time timeout into the task
+		// state so GET /sandboxes / the watchdog can honor them. Always
+		// reload: even with empty metadata the deadline must land on disk.
+		st, lerr := state.LoadState(name)
+		if lerr != nil {
+			// Boot persisted state moments ago; failing to reload it
+			// means the state dir is broken. Do not report create
+			// success for a sandbox whose metadata cannot be persisted:
+			// tear it down (kill + synchronous reap + remove) instead
+			// of leaving an orphaned VM behind.
+			teardownBootedSandbox(mgr, name, b)
+			return c.JSON(http.StatusInternalServerError, map[string]string{
+				"message": fmt.Sprintf("sandbox started but state reload failed; sandbox rolled back: %v", lerr),
+			})
+		}
 		if len(req.Metadata) > 0 {
-			st, lerr := state.LoadState(name)
-			if lerr != nil {
-				// Boot persisted state moments ago; failing to reload it
-				// means the state dir is broken. Do not report create
-				// success for a sandbox whose metadata cannot be persisted:
-				// tear it down (kill + synchronous reap + remove) instead
-				// of leaving an orphaned VM behind.
-				teardownBootedSandbox(mgr, name, b)
-				return c.JSON(http.StatusInternalServerError, map[string]string{
-					"message": fmt.Sprintf("sandbox started but state reload failed; sandbox rolled back: %v", lerr),
-				})
-			}
 			st.Metadata = req.Metadata
-			if serr := state.SaveState(name, st); serr != nil {
-				go func() { _ = mgr.WaitExit(name, b) }()
-				return c.JSON(http.StatusInternalServerError, map[string]string{"message": serr.Error()})
-			}
+		}
+		if mcpJSON != "" {
+			st.MCP = mcpJSON
+		}
+		if neverExpire {
+			st.Deadline = time.Time{}
+		} else {
+			st.Deadline = time.Now().UTC().Add(idleFor)
+		}
+		if serr := state.SaveState(name, st); serr != nil {
+			go func() { _ = mgr.WaitExit(name, b) }()
+			return c.JSON(http.StatusInternalServerError, map[string]string{"message": serr.Error()})
 		}
 		// Reap the process and record the terminal status in the background
 		// so the create response can return immediately after startup.
@@ -217,6 +324,29 @@ func registerE2BCompat(e *echo.Echo, reg *KeyRegistry, autoMgr *lifecycle.Manage
 			"clientID":   "",
 			"templateID": req.TemplateID,
 		})
+	}, auth)
+
+	// GET /sandboxes/:sandboxID — the SDKs' getInfo(). Resolves the short
+	// ID the same way kill does, then renders the persisted state: labels,
+	// template and lifecycle survive a pause, and a paused sandbox reports
+	// state="paused" with its endAt (Deadline) intact.
+	e.GET("/sandboxes/:sandboxID", func(c echo.Context) error {
+		shortID := c.Param("sandboxID")
+		if !idRegex.MatchString(shortID) {
+			return c.JSON(http.StatusBadRequest, map[string]string{"message": "invalid sandbox ID"})
+		}
+		id, err := resolveSandboxID(shortID)
+		if errors.Is(err, os.ErrNotExist) {
+			return c.JSON(http.StatusNotFound, map[string]string{"message": "sandbox not found"})
+		}
+		if err != nil {
+			return c.JSON(http.StatusConflict, map[string]string{"message": err.Error()})
+		}
+		st, err := state.LoadState(id)
+		if err != nil {
+			return c.JSON(http.StatusNotFound, map[string]string{"message": "sandbox not found"})
+		}
+		return c.JSON(http.StatusOK, buildE2BSandboxInfo(st))
 	}, auth)
 
 	// DELETE /sandboxes/:sandboxID — kill + remove, mirroring the semantics
@@ -245,7 +375,7 @@ func registerE2BCompat(e *echo.Echo, reg *KeyRegistry, autoMgr *lifecycle.Manage
 		st, err := state.LoadState(id)
 		if err == nil && st.PID > 0 {
 			if proc, perr := os.FindProcess(st.PID); perr == nil {
-				if belongs, _ := procBelongsToContainer(st.PID, id); belongs {
+				if belongs, _ := ProcBelongsToContainer(st.PID, id); belongs {
 					if killErr := proc.Kill(); killErr != nil && killErr.Error() != "os: process already finished" {
 						return c.JSON(http.StatusInternalServerError, map[string]string{
 							"message": fmt.Sprintf("failed to kill process %d: %v", st.PID, killErr),
@@ -311,6 +441,129 @@ func registerE2BCompat(e *echo.Echo, reg *KeyRegistry, autoMgr *lifecycle.Manage
 		}
 		return c.JSON(http.StatusOK, map[string]string{"message": "ok"})
 	}, auth)
+
+	// POST /sandboxes/:sandboxID/connect — the SDKs' Sandbox.connect():
+	// resolve the (possibly short) id, resume the sandbox when it was
+	// paused, optionally extend its lifetime by `timeout` seconds (same
+	// three-value contract as create), and return the info shape getInfo()
+	// reads. An omitted body/field means "just connect", which leaves the
+	// deadline untouched.
+	e.POST("/sandboxes/:sandboxID/connect", func(c echo.Context) error {
+		shortID := c.Param("sandboxID")
+		if !idRegex.MatchString(shortID) {
+			return c.JSON(http.StatusBadRequest, map[string]string{"message": "invalid sandbox ID"})
+		}
+		var req struct {
+			Timeout *int `json:"timeout"`
+		}
+		if err := c.Bind(&req); err != nil {
+			return c.JSON(http.StatusBadRequest, map[string]string{"message": err.Error()})
+		}
+		timeoutRaw := c.QueryParam("timeout")
+		if timeoutRaw == "" && req.Timeout != nil {
+			timeoutRaw = strconv.Itoa(*req.Timeout)
+		}
+		idleFor, neverExpire, terr := parseSandboxTimeout(timeoutRaw)
+		if terr != nil {
+			return c.JSON(http.StatusBadRequest, map[string]string{"message": terr.Error()})
+		}
+		id, err := resolveSandboxID(shortID)
+		if errors.Is(err, os.ErrNotExist) {
+			return c.JSON(http.StatusNotFound, map[string]string{"message": "sandbox not found"})
+		}
+		if err != nil {
+			return c.JSON(http.StatusConflict, map[string]string{"message": err.Error()})
+		}
+		// Same per-sandbox lock as pause/resume/delete: the resume and the
+		// deadline rewrite must not interleave with another transition.
+		release := taskLock(id)
+		defer release()
+		st, err := state.LoadState(id)
+		if err != nil {
+			return c.JSON(http.StatusNotFound, map[string]string{"message": "sandbox not found"})
+		}
+		switch st.Status {
+		case state.StatusSuspended:
+			// Connecting to a paused sandbox brings it back, mirroring the
+			// SDKs (a deep pause revives via criu, a shallow one via thaw).
+			if lifecycle.IsDeepPaused(id) {
+				if derr := autoMgr.DeepResume(id); derr != nil {
+					return c.JSON(http.StatusConflict, map[string]string{"message": "deep resume failed: " + derr.Error()})
+				}
+			} else if rerr := autoMgr.Resume(id); rerr != nil {
+				return c.JSON(http.StatusConflict, map[string]string{"message": "resume failed: " + rerr.Error()})
+			}
+			st, err = state.LoadState(id)
+			if err != nil {
+				return c.JSON(http.StatusInternalServerError, map[string]string{"message": err.Error()})
+			}
+		case state.StatusRunning:
+			// Already live: nothing to resume.
+		default:
+			return c.JSON(http.StatusConflict, map[string]string{
+				"message": fmt.Sprintf("sandbox is %s and cannot be connected to", st.Status),
+			})
+		}
+		// A connect WITHOUT a timeout leaves the deadline alone; a supplied
+		// one applies the create-time contract (-1 = never, 0/omitted =
+		// default window, N>0 = N seconds).
+		if timeoutRaw != "" {
+			if neverExpire {
+				st.Deadline = time.Time{}
+			} else {
+				st.Deadline = time.Now().UTC().Add(idleFor)
+			}
+			if serr := state.SaveState(id, st); serr != nil {
+				return c.JSON(http.StatusInternalServerError, map[string]string{"message": serr.Error()})
+			}
+		}
+		return c.JSON(http.StatusOK, buildE2BSandboxInfo(st))
+	}, auth)
+}
+
+// normalizeMCPConfig validates the E2B create request's opaque `mcp` field
+// and returns the canonical JSON to persist. E2B's Mcp schema is
+// additionalProperties:{} and nullable, so any JSON object is accepted and
+// a null/absent value yields "". Arrays and scalars are rejected: the
+// gateway config is a map of named MCP servers, and accepting a scalar
+// would store a value no launcher can consume.
+func normalizeMCPConfig(raw json.RawMessage) (string, error) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return "", nil
+	}
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		return "", fmt.Errorf("mcp must be a JSON object of MCP servers: %v", err)
+	}
+	canon, err := json.Marshal(obj)
+	if err != nil {
+		return "", fmt.Errorf("mcp marshal: %v", err)
+	}
+	return string(canon), nil
+}
+
+// parseSandboxTimeout interprets the three-value create timeout:
+// omitted/empty/0 = defaultSandboxTimeout, -1 = never (zero Deadline),
+// N>0 = N seconds. The boolean is true only for -1. Non-integer input
+// and values below the never sentinel return an error.
+func parseSandboxTimeout(raw string) (time.Duration, bool, error) {
+	if raw == "" {
+		return defaultSandboxTimeout, false, nil
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, false, fmt.Errorf("timeout must be an integer number of seconds")
+	}
+	switch {
+	case n < neverTimeoutSentinel:
+		return 0, false, fmt.Errorf("timeout must be 0, -1 (never), or a positive number of seconds")
+	case n == neverTimeoutSentinel:
+		return 0, true, nil
+	case n == 0:
+		return defaultSandboxTimeout, false, nil
+	default:
+		return time.Duration(n) * time.Second, false, nil
+	}
 }
 
 // teardownBootedSandbox kills a just-booted sandbox whose create must fail,

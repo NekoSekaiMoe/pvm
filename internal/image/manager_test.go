@@ -14,9 +14,9 @@ func TestPull_AlreadyExistsShortCircuits(t *testing.T) {
 	// Point the image store at a tmp dir and pre-create the target .img so
 	// Pull's existence fast-path returns nil without touching the network.
 	root := t.TempDir()
-	origRoot := state.RootDir
-	state.RootDir = root
-	defer func() { state.RootDir = origRoot }()
+	origRoot := state.Root()
+	state.SetRoot(root)
+	defer func() { state.SetRoot(origRoot) }()
 
 	// imgDir is hardcoded inside Pull; mirror it.
 	imgDir := "/var/lib/uml-container/images"
@@ -243,9 +243,9 @@ func TestCheckTarEntryTypes(t *testing.T) {
 
 func TestMountLayer_ClonesBaseImage(t *testing.T) {
 	root := t.TempDir()
-	origRoot := state.RootDir
-	state.RootDir = root
-	defer func() { state.RootDir = origRoot }()
+	origRoot := state.Root()
+	state.SetRoot(root)
+	defer func() { state.SetRoot(origRoot) }()
 
 	const id = "c-clone"
 	// Create a fake base "image".
@@ -281,9 +281,9 @@ func TestMountLayer_ClonesBaseImage(t *testing.T) {
 
 func TestMountLayer_MissingBaseImage(t *testing.T) {
 	root := t.TempDir()
-	origRoot := state.RootDir
-	state.RootDir = root
-	defer func() { state.RootDir = origRoot }()
+	origRoot := state.Root()
+	state.SetRoot(root)
+	defer func() { state.SetRoot(origRoot) }()
 
 	const id = "c-missing"
 	if _, err := MountLayer(id, filepath.Join(root, "nope.img")); err == nil {

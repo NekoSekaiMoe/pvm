@@ -42,8 +42,7 @@ func TestValidateMatrix(t *testing.T) {
 		{"bad on_anomaly", func(s *TaskSpec) { s.Lifecycle.OnAnomaly = "pray" }, "on_anomaly"},
 		{"bad uml_seccomp", func(s *TaskSpec) { s.Security.UMLSeccomp = "maybe" }, "uml_seccomp"},
 		{"bad approval timeout", func(s *TaskSpec) { s.Approval.Timeout = "soon" }, "approval.timeout"},
-		{"idle timeout zero", func(s *TaskSpec) { s.Lifecycle.IdleTimeout = "0s" }, "idle_timeout must be positive"},
-		{"idle timeout negative", func(s *TaskSpec) { s.Lifecycle.IdleTimeout = "-1s" }, "idle_timeout must be positive"},
+		{"idle timeout below never", func(s *TaskSpec) { s.Lifecycle.IdleTimeout = "-2s" }, "idle_timeout must be 0s, -1s (never), or positive"},
 		{"version mismatch", func(s *TaskSpec) { s.Version = 999 }, "version mismatch"},
 		{"volume path relative", func(s *TaskSpec) {
 			s.Volumes = []VolumeMount{{Name: "v", Path: "data"}}
@@ -76,6 +75,17 @@ func TestValidateMatrix(t *testing.T) {
 				t.Errorf("expected error containing %q, got: %v", c.wantSubstr, err)
 			}
 		})
+	}
+}
+
+func TestValidate_IdleTimeoutThreeValues(t *testing.T) {
+	// Three-value contract: empty/0s = off, -1s = never, positive = TTL.
+	for _, val := range []string{"", "0s", "-1s", "10m"} {
+		s := baseValid()
+		s.Lifecycle.IdleTimeout = val
+		if err := s.Validate(); err != nil {
+			t.Errorf("idle_timeout=%q should be accepted, got: %v", val, err)
+		}
 	}
 }
 

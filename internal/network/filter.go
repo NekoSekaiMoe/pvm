@@ -204,10 +204,21 @@ func bpfIPv4(ip net.IP) uint32 {
 // AttachEgressFilter loads the egress BPF program for ONE task, rewrites
 // its SSRF-floor exemptions to the task's gateway and guest IPs, pins the
 // whitelist map at /sys/fs/bpf/pvm/<taskID>/whitelist_map, attaches the
-// program to tapName's egress clsact classifier and registers the map in
+// program to tapName's INGRESS clsact classifier and registers the map in
 // the per-tap registry. It returns the map so callers can update policy
 // without going through a shared global. On error every loaded resource
 // (program, map, pin) is released.
+//
+// The filter attaches at tc INGRESS, not EGRESS: frames the guest (UML)
+// writes to the tap fd enter the host stack on the tap's receive path
+// (tun_get_user → netif_rx → sch_handle_ingress) — the same direction the
+// tc data plane's tap_ingress program guards (dataplane.go, bpf/tap_dataplane.c
+// "tap_ingress TAP ingress (guest -> host)"). A filter at EGRESS would only
+// ever see host→guest frames and never the guest's own outbound traffic,
+// leaving the SSRF floor and the whitelist unenforced. The gateway and the
+// guest's own IP stay reachable via the exempt_ip_a/b constants, and
+// DNS-learned public IPs pass through whitelist_map — matching the
+// bridgeless data plane's default-deny model.
 //
 // Failures come back as *EgressFilterError: no root/CAP_BPF, an unmounted
 // bpffs and a kernel without clsact all surface the same way — the caller
@@ -278,11 +289,12 @@ func AttachEgressFilter(tapName, taskID string, gatewayIP, guestIP net.IP) (*ebp
 		return fail("qdisc", fmt.Errorf("failed to add clsact qdisc: %w", err))
 	}
 
-	// Attach filter to egress
+	// Attach filter to INGRESS: the guest's outbound frames (written to
+	// the tap fd) traverse the tap's receive path, not its send path.
 	filter := &netlink.BpfFilter{
 		FilterAttrs: netlink.FilterAttrs{
 			LinkIndex: link.Attrs().Index,
-			Parent:    netlink.HANDLE_MIN_EGRESS,
+			Parent:    netlink.HANDLE_MIN_INGRESS,
 			Handle:    1,
 			Protocol:  unix.ETH_P_ALL,
 		},
@@ -327,8 +339,8 @@ func AttachEgressFilter(tapName, taskID string, gatewayIP, guestIP net.IP) (*ebp
 	return m, nil
 }
 
-// delBpfFilter removes the egress BPF filter AttachEgressFilter installed
-// on tapName (clsact egress, handle 1). Best-effort: a vanished tap or a
+// delBpfFilter removes the BPF filter AttachEgressFilter installed on
+// tapName (clsact ingress, handle 1). Best-effort: a vanished tap or a
 // filter someone else replaced is not an error worth surfacing.
 func delBpfFilter(tapName string) {
 	link, err := netlink.LinkByName(tapName)
@@ -338,7 +350,7 @@ func delBpfFilter(tapName string) {
 	_ = netlink.FilterDel(&netlink.BpfFilter{
 		FilterAttrs: netlink.FilterAttrs{
 			LinkIndex: link.Attrs().Index,
-			Parent:    netlink.HANDLE_MIN_EGRESS,
+			Parent:    netlink.HANDLE_MIN_INGRESS,
 			Handle:    1,
 			Protocol:  unix.ETH_P_ALL,
 		},

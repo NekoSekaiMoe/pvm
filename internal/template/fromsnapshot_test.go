@@ -23,10 +23,10 @@ func mkSnapshotTask(t *testing.T) (taskID, snapID, overlay string) {
 	t.Helper()
 	// t.TempDir dies at test end; later tests must not read the stale
 	// state root.
-	old := state.RootDir
-	t.Cleanup(func() { state.RootDir = old })
+	old := state.Root()
+	t.Cleanup(func() { state.SetRoot(old) })
 	root := t.TempDir()
-	state.RootDir = root
+	state.SetRoot(root)
 	taskID = "snaptest"
 	cdir, err := state.ContainerDir(taskID)
 	if err != nil {
@@ -116,9 +116,9 @@ func TestCreateFromSnapshotFlattens(t *testing.T) {
 func TestCreateFromSnapshotValidation(t *testing.T) {
 	// t.TempDir dies at test end; later tests must not read the stale
 	// state root.
-	old := state.RootDir
-	t.Cleanup(func() { state.RootDir = old })
-	state.RootDir = t.TempDir()
+	old := state.Root()
+	t.Cleanup(func() { state.SetRoot(old) })
+	state.SetRoot(t.TempDir())
 	s := NewStore(t.TempDir())
 	cases := []struct {
 		name       string

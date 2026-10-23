@@ -16,6 +16,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -44,7 +45,7 @@ var (
 	globalIncidentMu sync.RWMutex
 	globalIncident   *incident.Controller
 	// Root the cached controller was built against. Tests swap
-	// PVM_STATE_ROOT (and state.RootDir) between cases; a stale controller
+	// PVM_STATE_ROOT (and state.Root()) between cases; a stale controller
 	// would keep a broker writing revocations into a deleted temp dir.
 	globalIncidentRoot string
 
@@ -63,7 +64,7 @@ var (
 func RegisterIncidentController(c *incident.Controller) {
 	globalIncidentMu.Lock()
 	globalIncident = c
-	globalIncidentRoot = state.RootDir
+	globalIncidentRoot = state.Root()
 	globalIncidentMu.Unlock()
 }
 
@@ -89,14 +90,14 @@ func currentIncident() *incident.Controller {
 	globalIncidentMu.RLock()
 	c, cachedRoot := globalIncident, globalIncidentRoot
 	globalIncidentMu.RUnlock()
-	if c != nil && cachedRoot == state.RootDir {
+	if c != nil && cachedRoot == state.Root() {
 		return c
 	}
 	globalIncidentMu.Lock()
 	defer globalIncidentMu.Unlock()
 	// Re-check BOTH slots: an injected or previously built controller is
 	// only valid while the state root is unchanged.
-	if globalIncident != nil && globalIncidentRoot == state.RootDir {
+	if globalIncident != nil && globalIncidentRoot == state.Root() {
 		return globalIncident
 	}
 	broker, _ := CurrentIdentity()
@@ -138,8 +139,19 @@ func currentIncident() *incident.Controller {
 				return fmt.Errorf("incident: no state for task %s", taskID)
 			}
 			if st.PID > 0 {
-				if kerr := killProcessTree(st.PID); kerr != nil {
-					return kerr
+				// PIDs are recycled: a stale persisted PID can name an
+				// unrelated host process by now. Verify the pid still lives
+				// in THIS task's cgroup before killing (same guard as the
+				// container delete path); on mismatch skip the kill — the
+				// state transition below still quarantines the task.
+				belongs, berr := ProcBelongsToContainer(st.PID, taskID)
+				if berr != nil && !errors.Is(berr, os.ErrNotExist) {
+					return fmt.Errorf("incident: pid ownership check for %d: %w", st.PID, berr)
+				}
+				if belongs {
+					if kerr := killProcessTree(st.PID); kerr != nil {
+						return kerr
+					}
 				}
 			}
 			console.Default().Detach(taskID)
@@ -160,7 +172,7 @@ func currentIncident() *incident.Controller {
 			return err
 		},
 	})
-	globalIncidentRoot = state.RootDir
+	globalIncidentRoot = state.Root()
 	return globalIncident
 }
 
